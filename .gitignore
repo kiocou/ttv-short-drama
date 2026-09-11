@@ -1,0 +1,47 @@
+# ============================================================
+#  TTV Short Drama — 版本控制忽略规则
+# ============================================================
+
+# ---- 依赖与前端构建产物 ----
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# ---- Rust / Tauri 构建产物 ----
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# ---- 运行期数据（设备凭据 / SQLite / WebView2 缓存，绝不入库）----
+src-tauri/.app-data/
+.app-data/
+.webview-data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+short-drama-device.json
+
+# ---- 临时目录（build.bat / start-dev-safe.bat 使用）----
+.tmp/
+
+# ---- 随包分发的第三方大体积二进制（合计约 139MB，可重新获取）----
+# 说明：这些是运行期资源而非源码。若需在新机器上恢复，见 README「资源恢复」一节。
+src-tauri/resources/mpv/
+src-tauri/resources/python/
+src-tauri/resources/shortdrama-worker/site-packages/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+
+# ---- 日志 ----
+*.log
+npm-debug.log*
+
+# ---- 编辑器 / 操作系统 ----
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,235 @@
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react';
+import { ChannelType, SeriesItem, CatalogFilter } from '../types/catalog';
+import { ipcService } from '../services/ipc';
+import { WatchHistoryItem } from '../types/history';
+
+interface CatalogContextType {
+  channel: ChannelType;
+  category: string;
+  audience: string;
+  sort: 'recommend' | 'latest' | 'heat';
+  categories: string[];
+  items: SeriesItem[];
+  continueWatching: WatchHistoryItem | null;
+  isLoading: boolean;
+  isLoadingMore: boolean;
+  hasMore: boolean;
+  error: string | null;
+  setChannel: (channel: ChannelType) => void;
+  setCategory: (cat: string) => void;
+  setAudience: (aud: string) => void;
+  setSort: (s: 'recommend' | 'latest' | 'heat') => void;
+  refreshCatalog: (keyword?: string) => Promise<void>;
+  loadMore: (keyword?: string) => Promise<void>;
+}
+
+const CatalogContext = createContext<CatalogContextType | null>(null);
+
+export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+  const [channel, setChannelState] = useState<ChannelType>('drama');
+  const [category, setCategoryState] = useState<string>('全部');
+  const [audience, setAudienceState] = useState<string>('全部');
+  const [sort, setSortState] = useState<'recommend' | 'latest' | 'heat'>('recommend');
+  const [categories, setCategories] = useState<string[]>(['全部']);
+  const [items, setItems] = useState<SeriesItem[]>([]);
+  const [continueWatching, setContinueWatching] = useState<WatchHistoryItem | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
+  const [hasMore, setHasMore] = useState<boolean>(false);
+  const [nextCursor, setNextCursor] = useState<string | undefined>();
+  const [nextPage, setNextPage] = useState<number>(2);
+  const [error, setError] = useState<string | null>(null);
+
+  // 内存缓存字典，彻底消除频道与筛选切换时的闪烁
+  const cacheRef = useRef<Record<string, {
+    items: SeriesItem[];
+    categories: string[];
+    hasMore: boolean;
+    nextCursor?: string;
+  }>>({});
+  const inflightRef = useRef<Record<string, ReturnType<typeof ipcService.catalog.list>>>({});
+  const requestIdRef = useRef(0);
+
+  const requestCatalog = useCallback((cacheKey: string, filter: CatalogFilter) => {
+    const existing = inflightRef.current[cacheKey];
+    if (existing) return existing;
+    const request = ipcService.catalog.list(filter);
+    inflightRef.current[cacheKey] = request;
+    void request.then(() => {
+      if (inflightRef.current[cacheKey] === request) delete inflightRef.current[cacheKey];
+    }, () => {
+      if (inflightRef.current[cacheKey] === request) delete inflightRef.current[cacheKey];
+    });
+    return request;
+  }, []);
+
+  const loadData = useCallback(async (kw?: string) => {
+    const requestId = ++requestIdRef.current;
+    const cacheKey = `${channel}_${category}_${audience}_${sort}_${kw || ''}`;
+    const cached = cacheRef.current[cacheKey];
+
+    if (cached) {
+      setItems(cached.items);
+      setCategories(cached.categories);
+      setHasMore(cached.hasMore);
+      setNextCursor(cached.nextCursor);
+      setNextPage(2);
+      setIsLoading(false);
+    } else {
+      setIsLoading(true);
+      // 切换频道或关键词时，不展示上一频道遗留的分类标签。
+      setCategories(['全部']);
+    }
+
+    setError(null);
+    const filter: CatalogFilter = {
+      channel,
+      category,
+      audience,
+      sort,
+      keyword: kw,
+      page: 1,
+      pageSize: 30,
+    };
+    // 历史记录是辅助信息，不能阻塞目录首屏。
+    const historiesPromise = ipcService.history.list().catch(() => [] as WatchHistoryItem[]);
+
+    try {
+      let res = await requestCatalog(cacheKey, filter);
+      // The public comic page occasionally returns its shell before the rank
+      // articles are present. Retry once instead of caching a false empty page.
+      if (channel === 'comic' && res.items.length === 0 && requestId === requestIdRef.current) {
+        await new Promise(resolve => window.setTimeout(resolve, 250));
+        if (requestId === requestIdRef.current) {
+          res = await requestCatalog(cacheKey, filter);
+        }
+      }
+      if (requestId !== requestIdRef.current) return;
+      cacheRef.current[cacheKey] = {
+        items: res.items,
+        categories: res.categories,
+        hasMore: res.hasMore,
+        nextCursor: res.nextCursor,
+      };
+      setItems(res.items);
+      setCategories(res.categories);
+      setHasMore(res.hasMore);
+      setNextCursor(res.nextCursor);
+      setNextPage(2);
+    } catch (err) {
+      setError((err as Error).message || '目录数据加载失败');
+    } finally {
+      if (requestId === requestIdRef.current) setIsLoading(false);
+    }
+
+    const histories = await historiesPromise;
+    if (requestId !== requestIdRef.current) return;
+    setContinueWatching(histories[0] || null);
+  }, [channel, category, audience, sort, requestCatalog]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  // Warm the alternate channel while the first channel is visible. The
+  // request is deliberately fire-and-forget so it never delays the current
+  // page; switching to 漫剧 then paints from memory on the first click.
+  useEffect(() => {
+    let cancelled = false;
+    const cacheKey = 'comic_全部_全部_recommend_';
+    if (cacheRef.current[cacheKey]) return;
+
+    void requestCatalog(cacheKey, {
+      channel: 'comic',
+      category: '全部',
+      audience: '全部',
+      sort: 'recommend',
+      page: 1,
+      pageSize: 30,
+    }).then((res) => {
+      if (cancelled || cacheRef.current[cacheKey] || res.items.length === 0) return;
+      cacheRef.current[cacheKey] = {
+        items: res.items,
+        categories: res.categories,
+        hasMore: res.hasMore,
+        nextCursor: res.nextCursor,
+      };
+    }).catch(() => {
+      // A warm-up miss is harmless; the normal channel request retries on click.
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [requestCatalog]);
+
+  const setChannel = (newChannel: ChannelType) => {
+    setChannelState(newChannel);
+    setCategoryState('全部');
+    setCategories(['全部']);
+  };
+
+  const loadMore = useCallback(async (kw?: string) => {
+    if (!hasMore || isLoadingMore) return;
+    setIsLoadingMore(true);
+    setError(null);
+    const requestId = requestIdRef.current;
+    try {
+      const res = await ipcService.catalog.list({
+        channel,
+        category,
+        audience,
+        sort,
+        keyword: kw,
+        page: nextPage,
+        pageSize: 30,
+        cursor: nextCursor,
+      });
+      if (requestId !== requestIdRef.current) return;
+      setItems(previous => {
+        const known = new Set(previous.map(item => item.id));
+        return [...previous, ...res.items.filter(item => !known.has(item.id))];
+      });
+      setCategories(previous => [...new Set([...previous, ...res.categories])]);
+      setHasMore(res.hasMore);
+      setNextCursor(res.nextCursor);
+      setNextPage(page => page + 1);
+    } catch (err) {
+      if (requestId === requestIdRef.current) setError((err as Error).message || '加载更多目录数据失败');
+    } finally {
+      if (requestId === requestIdRef.current) setIsLoadingMore(false);
+    }
+  }, [audience, category, channel, hasMore, isLoadingMore, nextCursor, nextPage, sort]);
+
+  return (
+    <CatalogContext.Provider
+      value={{
+        channel,
+        category,
+        audience,
+        sort,
+        categories,
+        items,
+        continueWatching,
+        isLoading,
+        isLoadingMore,
+        hasMore,
+        error,
+        setChannel,
+        setCategory: setCategoryState,
+        setAudience: setAudienceState,
+        setSort: setSortState,
+        refreshCatalog: loadData,
+        loadMore,
+      }}
+    >
+      {children}
+    </CatalogContext.Provider>
+  );
+};
+
+export function useCatalogStore() {
+  const ctx = useContext(CatalogContext);
+  if (!ctx) throw new Error('useCatalogStore must be used within CatalogProvider');
+  return ctx;
+}

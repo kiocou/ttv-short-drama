@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TTV Short Drama",
+  "version": "0.1.0",
+  "identifier": "com.ttv.shortdrama",
+  "build": {
+    "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 5175 --strictPort",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:5175",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TTV Short Drama",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1080,
+        "minHeight": 720,
+        "resizable": true,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' https:; img-src 'self' asset: http://asset.localhost https: data:; media-src 'self' asset: https: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/**", "$APPLOCALDATA/**", "$RESOURCE/**", "$LOCALDATA/**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "resources/python",
+      "resources/shortdrama-worker",
+      "resources/mpv/ffmpeg.exe"
+    ]
+  }
+}

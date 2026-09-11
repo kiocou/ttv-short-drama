@@ -1,0 +1,24 @@
+[package]
+name = "ttv-short-drama"
+version = "0.1.0"
+description = "TTV Short Drama desktop application"
+authors = ["TTV"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+scraper = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["protocol-asset"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
+uuid = { version = "1", features = ["v4"] }
