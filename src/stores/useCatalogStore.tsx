@@ -49,6 +49,9 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
   }>>({});
   const inflightRef = useRef<Record<string, ReturnType<typeof ipcService.catalog.list>>>({});
   const requestIdRef = useRef(0);
+  // 已出现过的剧集 id。用于判定"本次翻页是否真的带来了新内容"：
+  // 站点若对越界页码返回同一页，继续请求只会空转，必须及时收尾。
+  const seenIdsRef = useRef<Set<string>>(new Set());
 
   const requestCatalog = useCallback((cacheKey: string, filter: CatalogFilter) => {
     const existing = inflightRef.current[cacheKey];
@@ -69,6 +72,7 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     const cached = cacheRef.current[cacheKey];
 
     if (cached) {
+      seenIdsRef.current = new Set(cached.items.map(item => item.id));
       setItems(cached.items);
       setCategories(cached.categories);
       setHasMore(cached.hasMore);
@@ -111,6 +115,7 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
         hasMore: res.hasMore,
         nextCursor: res.nextCursor,
       };
+      seenIdsRef.current = new Set(res.items.map(item => item.id));
       setItems(res.items);
       setCategories(res.categories);
       setHasMore(res.hasMore);
@@ -186,12 +191,22 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
         cursor: nextCursor,
       });
       if (requestId !== requestIdRef.current) return;
-      setItems(previous => {
-        const known = new Set(previous.map(item => item.id));
-        return [...previous, ...res.items.filter(item => !known.has(item.id))];
-      });
+      // 先剔除重复再落库：本次没有任何新卡片时直接终止无限滚动。
+      // 后端已把"空页"判为到底，这里是第二道防线（页码估算偏大、
+      // 站点对越界页码回退到同一页等情况都会在这里收口）。
+      // 逐个登记而不是先 filter 再 forEach：站点同一页内偶尔会出现重复卡片，
+      // 那样写法会让页内重复项一起通过过滤。
+      const fresh: SeriesItem[] = [];
+      for (const item of res.items) {
+        if (seenIdsRef.current.has(item.id)) continue;
+        seenIdsRef.current.add(item.id);
+        fresh.push(item);
+      }
+      if (fresh.length > 0) {
+        setItems(previous => [...previous, ...fresh]);
+      }
       setCategories(previous => [...new Set([...previous, ...res.categories])]);
-      setHasMore(res.hasMore);
+      setHasMore(res.hasMore && fresh.length > 0);
       setNextCursor(res.nextCursor);
       setNextPage(page => page + 1);
     } catch (err) {

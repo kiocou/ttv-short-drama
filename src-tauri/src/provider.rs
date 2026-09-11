@@ -46,20 +46,22 @@ impl DramaProvider {
             .filter(|item| matches_filter(item, filter))
             .collect::<Vec<_>>();
         items.truncate(filter.page_size.clamp(1, 60) as usize);
+        // 分页总数优先取站点自带的 loaderData 元数据（实测 /category → 34 页），
+        // 取不到再退回"扫描分页链接里的最大页码"。
         let total_pages = router_data
             .as_ref()
-            .and_then(|value| {
-                value
-                    .pointer("/loaderData/category_page/pagination/totalPages")
-                    .or_else(|| value.pointer("/loaderData/category_page/pagination/total_pages"))
-                    .or_else(|| value.pointer("/loaderData/rank_hot-comic-drama/page/totalPages"))
-            })
-            .and_then(Value::as_u64)
-            .map(|value| value as u32)
-            .unwrap_or_else(|| detect_total_pages(&html, filter.channel.as_str()).max(requested_page));
-        let has_more = requested_page < total_pages;
+            .and_then(|value| find_pagination_value(value, &["totalPages", "total_pages"]))
+            .unwrap_or_else(|| detect_total_pages(&html, filter.channel.as_str()))
+            .max(requested_page);
+        let total = router_data
+            .as_ref()
+            .and_then(|value| find_pagination_value(value, &["total"]))
+            .map(|value| value as usize)
+            .unwrap_or(items.len());
+        // 空页即到底：即使页码估算偏大，也不会让无限滚动空转。
+        let has_more = !items.is_empty() && requested_page < total_pages;
         Ok(CatalogPage {
-            total: items.len(),
+            total,
             items,
             has_more,
             page: requested_page,
@@ -87,14 +89,15 @@ impl DramaProvider {
         let html = self.fetch_page(&path).await?;
         let page_items = parse_catalog_cards(&html, "comic");
         let categories = categories_for(&page_items);
-        let total_pages = detect_total_pages(&html, "comic").max(requested_page);
+        // 漫剧榜单页没有 pagination 元数据，只靠分页链接推算（实测分页链接到 5）。
+        let total_pages = router_data_total_pages(&html, "comic").max(requested_page);
         let filtered = page_items
             .into_iter()
             .filter(|item| matches_filter(item, filter))
             .collect::<Vec<_>>();
         let page_size = filter.page_size.clamp(1, 60) as usize;
         let items = filtered.into_iter().take(page_size).collect::<Vec<_>>();
-        let has_more = requested_page < total_pages;
+        let has_more = !items.is_empty() && requested_page < total_pages;
 
         Ok(CatalogPage {
             total: items.len(),
@@ -348,9 +351,15 @@ fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
 }
 
 fn detect_total_pages(html: &str, channel: &str) -> u32 {
-    let route = if channel == "comic" { "rank/hot-comic-drama" } else { "category" };
-    let pattern = format!(r#"href=[\"']/{route}\?page=(\d+)"#);
-    let Ok(regex) = Regex::new(&pattern) else {
+    // 站点把分类分页链接写成带 slug 的形式：/category/real-drama?page=2。
+    // 旧正则只匹配 `/category?page=N`，被中间多出来的 slug 段挡住而永远失配，
+    // 于是 total_pages 恒为 1、has_more 恒为 false —— 这正是"首页无限流消失"的根因。
+    let route_pattern = if channel == "comic" {
+        r#"href=[\"'](?:https?://[^\"']*)?/rank/hot-comic-drama\?page=(\d+)"#
+    } else {
+        r#"href=[\"'](?:https?://[^\"']*)?/category(?:/[A-Za-z0-9_\-]+)?\?page=(\d+)"#
+    };
+    let Ok(regex) = Regex::new(route_pattern) else {
         return 1;
     };
     regex
@@ -358,6 +367,42 @@ fn detect_total_pages(html: &str, channel: &str) -> u32 {
         .filter_map(|captures| captures.get(1)?.as_str().parse::<u32>().ok())
         .max()
         .unwrap_or(1)
+}
+
+/// 在 loaderData 结构里按"形状"递归寻找分页字段。
+///
+/// 站点把分页元数据挂在随路由命名的键下面：短剧是 `category_$`（动态段以 `$` 结尾），
+/// 漫剧是 `rank_hot-comic-drama`，键名随站点改版会变。旧实现写死了
+/// `/loaderData/category_page/pagination/totalPages` 这个 JSON Pointer，
+/// 站点用了别的键名，指针就返回 None，分页信息随之丢失。
+/// 这里改为按形状搜索：任意一层中名为 `pagination` 的对象里的目标字段。
+fn find_pagination_value(value: &Value, keys: &[&str]) -> Option<u32> {
+    match value {
+        Value::Object(object) => {
+            if let Some(pagination) = object.get("pagination").and_then(Value::as_object) {
+                for key in keys {
+                    if let Some(found) = pagination.get(*key).and_then(Value::as_u64) {
+                        return Some(found as u32);
+                    }
+                }
+            }
+            object
+                .values()
+                .find_map(|child| find_pagination_value(child, keys))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_pagination_value(item, keys)),
+        _ => None,
+    }
+}
+
+/// 总页数：优先站点自带的元数据，其次扫描 HTML 里的分页链接。
+fn router_data_total_pages(html: &str, channel: &str) -> u32 {
+    parse_router_data(html)
+        .as_ref()
+        .and_then(|value| find_pagination_value(value, &["totalPages", "total_pages"]))
+        .unwrap_or_else(|| detect_total_pages(html, channel))
 }
 
 fn parse_router_data(html: &str) -> Option<Value> {
@@ -561,7 +606,11 @@ fn unique(items: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_total_pages, normalize_playback_url, parse_router_script};
+    use super::{
+        detect_total_pages, find_pagination_value, normalize_playback_url, parse_router_script,
+        DramaProvider, Value,
+    };
+    use crate::models::CatalogFilter;
 
     #[test]
     fn detects_comic_pagination() {
@@ -590,5 +639,98 @@ mod tests {
             normalize_playback_url("https://cdn.test/video.mp4?a=1&amp;ch=0&#38;x=1&#x26;y=2&#X26;z=3"),
             "https://cdn.test/video.mp4?a=1&ch=0&x=1&y=2&z=3"
         );
+    }
+
+    /// 回归：分类分页链接带 slug（/category/real-drama?page=N）。
+    ///
+    /// 旧正则只认 `/category?page=N`，slug 段让它永远失配，total_pages 退化成 1，
+    /// has_more 恒为 false —— 首页无限滚动在首屏之后彻底失效。夹具取自线上真实标记。
+    #[test]
+    fn detects_category_total_pages_with_slug() {
+        let html = r#"
+            <a href="/category/real-drama?page=2" class="pc-item-PjMYKE" aria-label="第 2 页">
+            <a href="/category/real-drama?page=3" class="pc-item-PjMYKE" aria-label="第 3 页">
+            <a href="/category/real-drama?page=34" class="pc-item-PjMYKE" aria-label="第 34 页">
+        "#;
+        assert_eq!(detect_total_pages(html, "drama"), 34);
+    }
+
+    /// 无 slug 形态也必须继续可用（`/category?page=2`）。
+    #[test]
+    fn detects_category_total_pages_without_slug() {
+        let html = r#"<a href="/category?page=2">2</a><a href="https://hongguoduanju.com/category?page=7">7</a>"#;
+        assert_eq!(detect_total_pages(html, "drama"), 7);
+    }
+
+    /// 回归：分页元数据挂在 `category_$` 这类随路由命名的键下，而不是 `category_page`。
+    #[test]
+    fn finds_pagination_under_route_named_key() {
+        let data: Value = serde_json::from_str(
+            r#"{"loaderData":{"category_layout":null,"category_$":{
+                "query":{"page":1},
+                "pagination":{"total":800,"pageSize":24,"totalPages":34}}}}"#,
+        )
+        .expect("router data");
+        assert_eq!(
+            find_pagination_value(&data, &["totalPages", "total_pages"]),
+            Some(34)
+        );
+        assert_eq!(find_pagination_value(&data, &["total"]), Some(800));
+    }
+
+    /// 联网端到端验证：目录第一页必须报告 has_more，且第二页必须是新内容。
+    ///
+    /// 默认忽略（避免离线环境跑测试失败），需要时手动执行：
+    ///   cargo test --bins -- --ignored --nocapture catalog_pagination_live
+    #[tokio::test]
+    #[ignore = "需要联网，手动运行"]
+    async fn catalog_pagination_live() {
+        let provider = DramaProvider::new().expect("provider");
+        for channel in ["drama", "comic"] {
+            let filter = |page: u32| CatalogFilter {
+                channel: channel.to_string(),
+                category: "全部".into(),
+                audience: "全部".into(),
+                sort: "recommend".into(),
+                keyword: None,
+                page,
+                page_size: 30,
+                cursor: None,
+            };
+            let first = provider.catalog(&filter(1)).await.expect("first page");
+            println!(
+                "[{channel}] page1 items={} has_more={} total={}",
+                first.items.len(),
+                first.has_more,
+                first.total
+            );
+            assert!(!first.items.is_empty(), "{channel} 第一页为空");
+            assert!(first.has_more, "{channel} 第一页必须报告还有更多内容");
+
+            let second = provider.catalog(&filter(2)).await.expect("second page");
+            let first_ids: std::collections::HashSet<&str> =
+                first.items.iter().map(|item| item.id.as_str()).collect();
+            let overlap = second
+                .items
+                .iter()
+                .filter(|item| first_ids.contains(item.id.as_str()))
+                .count();
+            println!(
+                "[{channel}] page2 items={} has_more={} 与第一页重叠={overlap}",
+                second.items.len(),
+                second.has_more
+            );
+            assert!(!second.items.is_empty(), "{channel} 第二页为空");
+            assert_eq!(overlap, 0, "{channel} 第二页与第一页重叠，翻页无进展");
+        }
+    }
+
+    /// 没有任何分页元数据时必须返回 None，由调用方退回扫描分页链接。
+    #[test]
+    fn pagination_lookup_returns_none_when_absent() {
+        let data: Value =
+            serde_json::from_str(r#"{"loaderData":{"rank_hot-comic-drama":{"items":[]}}}"#)
+                .expect("router data");
+        assert_eq!(find_pagination_value(&data, &["totalPages"]), None);
     }
 }

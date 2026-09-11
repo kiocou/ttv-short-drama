@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { X, Play, CheckCircle2, Search, Layers } from 'lucide-react';
 
@@ -9,10 +9,28 @@ export const EpisodeDrawer: React.FC = () => {
     isSideDrawerOpen,
     toggleSideDrawer,
     openEpisode,
+    prewarmEpisode,
   } = usePlaybackStore();
 
   const [filterKeyword, setFilterKeyword] = useState('');
   const [activeGroupIndex, setActiveGroupIndex] = useState(0);
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 悬停预热：在用户"犹豫要不要点这一集"的间隙就把该集缓存起来。
+  // 必须防抖——鼠标扫过列表会在几百毫秒内触发十几次 hover，每次都起 worker
+  // 会把带宽抢空，结果当前正在播的那一集反而更卡。
+  const schedulePrewarm = (episodeId: string) => {
+    if (!currentSeries) return;
+    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+    hoverTimerRef.current = setTimeout(() => {
+      if (!currentSeries) return;
+      prewarmEpisode(currentSeries.id, episodeId, currentSeries.type === 'comic' ? 1004 : 1);
+    }, 420);
+  };
+
+  useEffect(() => () => {
+    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+  }, []);
 
   if (!isSideDrawerOpen || !currentSeries) return null;
 
@@ -133,6 +151,8 @@ export const EpisodeDrawer: React.FC = () => {
                 <button
                   key={ep.id}
                   type="button"
+                  onMouseEnter={() => schedulePrewarm(ep.id)}
+                  onFocus={() => schedulePrewarm(ep.id)}
                   onClick={() => {
                     openEpisode(currentSeries.id, ep.id, 0);
                     toggleSideDrawer(false);

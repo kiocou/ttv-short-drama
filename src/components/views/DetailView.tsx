@@ -22,8 +22,13 @@ import {
 
 export const DetailView: React.FC = () => {
   const { selectedSeriesId, navigateTo, goBack, showToast } = useAppStore();
-  const { openEpisode } = usePlaybackStore();
+  const { openEpisode, prewarmEpisode } = usePlaybackStore();
   const detailCacheRef = useRef<Record<string, SeriesDetail>>({});
+  // 供 effect 读取最新实现，避免把 prewarmEpisode 放进依赖数组导致每次渲染重跑。
+  const prewarmEpisodeRef = useRef(prewarmEpisode);
+  prewarmEpisodeRef.current = prewarmEpisode;
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prewarmedSeriesRef = useRef<Set<string>>(new Set());
 
   const [detail, setDetail] = useState<SeriesDetail | null>(null);
   const [isDescExpanded, setIsDescExpanded] = useState(false);
@@ -62,6 +67,34 @@ export const DetailView: React.FC = () => {
       active = false;
     };
   }, [selectedSeriesId, showToast]);
+
+  // 详情到手就预热"最可能被点开"的那一集（断点续播集，没有则第一集）。
+  // 用户在详情页看简介、翻选集通常要停留数秒，这段时间足够把该集所需数据拉下来；
+  // 此前预热只在进入播放器之后才开始，等于白白丢掉这段可利用的窗口。
+  useEffect(() => {
+    if (!detail || detail.episodes.length === 0) return;
+    const seriesKey = detail.id;
+    if (prewarmedSeriesRef.current.has(seriesKey)) return;
+    prewarmedSeriesRef.current.add(seriesKey);
+    const target =
+      detail.episodes.find(ep => (ep.watchedSeconds || 0) > 0 && !ep.isFinished) || detail.episodes[0];
+    prewarmEpisodeRef.current(detail.id, target.id, detail.type === 'comic' ? 1004 : 1);
+  }, [detail]);
+
+  // 悬停预热必须防抖：鼠标扫过选集网格会在几百毫秒内触发几十次 hover，
+  // 每次都起 worker 会把带宽抢空（store 侧另有并发上限兜底）。
+  const schedulePrewarm = (episodeId: string) => {
+    if (!detail) return;
+    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+    hoverTimerRef.current = setTimeout(() => {
+      if (!detail) return;
+      prewarmEpisodeRef.current(detail.id, episodeId, detail.type === 'comic' ? 1004 : 1);
+    }, 420);
+  };
+
+  useEffect(() => () => {
+    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+  }, []);
 
   if (!detail) {
     return (
@@ -249,6 +282,8 @@ export const DetailView: React.FC = () => {
                 <button
                   key={ep.id}
                   type="button"
+                  onMouseEnter={() => schedulePrewarm(ep.id)}
+                  onFocus={() => schedulePrewarm(ep.id)}
                   onClick={() => handleStartPlay(ep)}
                   title={isCurrent ? `当前播放：第 ${ep.episodeNumber} 集 · ${ep.title}` : `第 ${ep.episodeNumber} 集 · ${ep.title}${ep.isFinished ? ' (已看完)' : ''}`}
                   className={`group relative h-10 rounded-xl flex items-center justify-center font-bold text-xs shadow-xs active:scale-95 transition-all duration-150 cursor-pointer ${
@@ -406,7 +441,9 @@ export const DetailView: React.FC = () => {
                     <button
                       key={ep.id}
                       type="button"
-                      onClick={() => handleStartPlay(ep)}
+                      onMouseEnter={() => schedulePrewarm(ep.id)}
+                  onFocus={() => schedulePrewarm(ep.id)}
+                  onClick={() => handleStartPlay(ep)}
                       title={isCurrent ? `当前播放：第 ${ep.episodeNumber} 集 · ${ep.title}` : `第 ${ep.episodeNumber} 集 · ${ep.title}${ep.isFinished ? ' (已看完)' : ''}`}
                       className={`group relative h-10 rounded-xl flex items-center justify-center font-bold text-xs shadow-xs active:scale-95 transition-all duration-150 cursor-pointer ${
                         isCurrent
