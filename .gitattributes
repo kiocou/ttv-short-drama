@@ -1,0 +1,20 @@
+# 统一换行符处理，避免跨平台协作时的整文件 diff 噪音
+* text=auto eol=lf
+
+# Windows 脚本必须保持 CRLF，否则 cmd.exe 解析可能出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源不做文本归一化
+*.exe  binary
+*.dll  binary
+*.pyd  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
+
+# 让 git 在语言统计中不把产物算进来
+package-lock.json  linguist-generated

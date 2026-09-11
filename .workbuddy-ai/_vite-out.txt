@@ -1,0 +1,35 @@
+
+  [32m[1mVITE[22m v6.4.3[39m  [2mready in [0m[1m314[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5175[22m/[39m
+[2m[32m  ➜[39m[22m[2m  press [22m[1mh + enter[22m[2m to show help[22m
+[2m16:01:14[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.tmp/player.html[22m
+[2m16:01:15[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.tmp/player.html[22m
+[2m16:02:33[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2mindex.html[22m
+[2m16:02:41[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/stores/usePlaybackStore.tsx, /src/index.css[22m
+[2m16:02:41[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [33mhmr invalidate [39m[2m/src/stores/usePlaybackStore.tsx[22m Could not Fast Refresh ("disposePrepared" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m16:02:41[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/index.css, /src/components/player/VideoSurface.tsx, /src/components/views/HistoryView.tsx, /src/components/views/ExploreView.tsx, /src/components/views/DetailView.tsx, /src/components/player/PlayerControls.tsx, /src/components/player/NextCountdown.tsx, /src/components/player/EpisodeDrawer.tsx, /src/components/player/DiagnosticsModal.tsx[22m
+[2m16:15:02[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.tmp/player.html[22m
+node:internal/fs/watchers:321
+    const error = new UVException({
+                  ^
+
+Error: EBUSY: resource busy or locked, watch 'D:\Users\kioco\Desktop\TTV Short Drama\.tmp\lnk{076F4A71-FC91-4DAE-B5EB-6F642D8EB40F}.tmp'
+    at FSWatcher.<computed> (node:internal/fs/watchers:321:19)
+    at Object.watch (node:fs:2548:36)
+    at createFsWatchInstance (file:///D:/Users/kioco/Desktop/TTV%20Short%20Drama/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:22195:17)
+    at setFsWatchListener (file:///D:/Users/kioco/Desktop/TTV%20Short%20Drama/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:22242:15)
+    at NodeFsHandler._watchWithNodeFs (file:///D:/Users/kioco/Desktop/TTV%20Short%20Drama/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:22397:14)
+    at NodeFsHandler._handleFile (file:///D:/Users/kioco/Desktop/TTV%20Short%20Drama/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:22461:23)
+    at NodeFsHandler._addToNodeFs (file:///D:/Users/kioco/Desktop/TTV%20Short%20Drama/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:22703:21)
+Emitted 'error' event on FSWatcher instance at:
+    at FSWatcher._handleError (file:///D:/Users/kioco/Desktop/TTV%20Short%20Drama/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:23896:10)
+    at NodeFsHandler._addToNodeFs (file:///D:/Users/kioco/Desktop/TTV%20Short%20Drama/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:22711:18) {
+  errno: -4082,
+  syscall: 'watch',
+  code: 'EBUSY',
+  path: 'D:\\Users\\kioco\\Desktop\\TTV Short Drama\\.tmp\\lnk{076F4A71-FC91-4DAE-B5EB-6F642D8EB40F}.tmp',
+  filename: 'D:\\Users\\kioco\\Desktop\\TTV Short Drama\\.tmp\\lnk{076F4A71-FC91-4DAE-B5EB-6F642D8EB40F}.tmp'
+}
+
+Node.js v24.16.0

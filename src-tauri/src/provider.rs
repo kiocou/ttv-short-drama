@@ -1,0 +1,594 @@
+use crate::models::{
+    CatalogFilter, CatalogPage, EpisodeItem, PlaybackSession, SeriesDetail, SeriesItem,
+    VideoQualityOption,
+};
+use regex::Regex;
+use reqwest::Client;
+use scraper::{Html, Selector};
+use serde_json::{Map, Value};
+use std::collections::HashSet;
+use std::time::Duration;
+
+const HONGGUO_BASE: &str = "https://hongguoduanju.com";
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+pub struct DramaProvider {
+    client: Client,
+}
+
+impl DramaProvider {
+    pub fn new() -> Result<Self, String> {
+        let client = Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36")
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok(Self { client })
+    }
+
+    pub async fn catalog(&self, filter: &CatalogFilter) -> Result<CatalogPage, String> {
+        let requested_page = parse_page(filter.cursor.as_deref()).unwrap_or(filter.page.max(1));
+        if filter.channel == "comic" {
+            return self.catalog_comic(filter, requested_page).await;
+        }
+        let path = if requested_page <= 1 {
+            "/category".to_string()
+        } else {
+            format!("/category?page={requested_page}")
+        };
+        let html = self.fetch_page(&path).await?;
+        let router_data = parse_router_data(&html);
+        let raw_items = parse_catalog_cards(&html, filter.channel.as_str());
+        let categories = categories_for(&raw_items);
+        let mut items = raw_items
+            .into_iter()
+            .filter(|item| matches_filter(item, filter))
+            .collect::<Vec<_>>();
+        items.truncate(filter.page_size.clamp(1, 60) as usize);
+        let total_pages = router_data
+            .as_ref()
+            .and_then(|value| {
+                value
+                    .pointer("/loaderData/category_page/pagination/totalPages")
+                    .or_else(|| value.pointer("/loaderData/category_page/pagination/total_pages"))
+                    .or_else(|| value.pointer("/loaderData/rank_hot-comic-drama/page/totalPages"))
+            })
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .unwrap_or_else(|| detect_total_pages(&html, filter.channel.as_str()).max(requested_page));
+        let has_more = requested_page < total_pages;
+        Ok(CatalogPage {
+            total: items.len(),
+            items,
+            has_more,
+            page: requested_page,
+            categories,
+            next_cursor: has_more.then(|| (requested_page + 1).to_string()),
+            source: if filter.channel == "comic" {
+                format!("红果漫剧公开榜单 · {}", sort_label(&filter.sort))
+            } else {
+                format!("红果短剧公开目录 · {}", sort_label(&filter.sort))
+            },
+        })
+    }
+
+    async fn catalog_comic(
+        &self,
+        filter: &CatalogFilter,
+        requested_page: u32,
+    ) -> Result<CatalogPage, String> {
+        // 首屏只取当前公开分页，后续由前端滚动加载继续请求，避免打开漫剧页时等待整榜。
+        let path = if requested_page <= 1 {
+            "/rank/hot-comic-drama".to_string()
+        } else {
+            format!("/rank/hot-comic-drama?page={requested_page}")
+        };
+        let html = self.fetch_page(&path).await?;
+        let page_items = parse_catalog_cards(&html, "comic");
+        let categories = categories_for(&page_items);
+        let total_pages = detect_total_pages(&html, "comic").max(requested_page);
+        let filtered = page_items
+            .into_iter()
+            .filter(|item| matches_filter(item, filter))
+            .collect::<Vec<_>>();
+        let page_size = filter.page_size.clamp(1, 60) as usize;
+        let items = filtered.into_iter().take(page_size).collect::<Vec<_>>();
+        let has_more = requested_page < total_pages;
+
+        Ok(CatalogPage {
+            total: items.len(),
+            items,
+            has_more,
+            page: requested_page,
+            categories,
+            next_cursor: has_more.then(|| (requested_page + 1).to_string()),
+            source: format!("红果漫剧公开榜单 · {}", sort_label(&filter.sort)),
+        })
+    }
+
+    pub async fn detail(&self, series_id: &str, channel: Option<&str>) -> Result<SeriesDetail, String> {
+        validate_numeric_id(series_id, "剧集")?;
+        let html = self.fetch_page(&format!("/detail?series_id={series_id}")).await?;
+        let data = parse_router_data(&html).ok_or_else(|| "详情页未包含可读取的公开数据。".to_string())?;
+        let series = find_series(&data, series_id).ok_or_else(|| "详情页未找到剧集信息。".to_string())?;
+        let vids = string_array(series.get("vid_list"));
+        let total = number_field(series, &["episode_cnt", "episode_total_cnt", "accessible_episode_cnt"])
+            .unwrap_or(vids.len() as u32);
+        let cover = string_field(series, &["series_cover", "cover"]);
+        let title = string_field(series, &["series_name", "title"]);
+        let tags = string_array(series.get("tags"));
+        let episodes = vids
+            .iter()
+            .enumerate()
+            .map(|(index, vid)| EpisodeItem {
+                id: vid.clone(),
+                series_id: series_id.to_string(),
+                episode_number: (index + 1) as u32,
+                title: format!("第 {} 集", index + 1),
+                duration_seconds: 0.0,
+                preview_url: None,
+            })
+            .collect();
+        Ok(SeriesDetail {
+            id: series_id.to_string(),
+            title: if title.is_empty() { "未命名短剧".into() } else { title },
+            cover,
+            item_type: if channel == Some("comic") { "comic".into() } else { "drama".into() },
+            tags,
+            origin: if channel == Some("comic") { "红果漫剧".into() } else { "红果短剧官网".into() },
+            episodes_count: total,
+            description: string_field(series, &["series_intro", "intro", "description"]),
+            episodes,
+            // 公开网页不提供可信的多清晰度列表：只有 auto 一条真实路径。
+            // 之前硬编码 4K/1080P/720P 会让"切清晰度"变成重复下载同一路流，
+            // 且档位与真实分辨率不符（4K 实为 1080p、1080P 实为 540p）。
+            // 真实档位由 App-API 的 short_drama_app_stream 返回 variants 后再补充。
+            available_qualities: vec![
+                VideoQualityOption { label: "自动".into(), value: "auto".into(), resolution: "由播放源自动选择".into() },
+            ],
+            sources: Vec::new(),
+        })
+    }
+
+    pub async fn open_episode(
+        &self,
+        session_id: u64,
+        series_id: &str,
+        episode_id: &str,
+        quality: &str,
+        position: f64,
+    ) -> Result<PlaybackSession, String> {
+        validate_numeric_id(series_id, "剧集")?;
+        validate_numeric_id(episode_id, "剧集分集")?;
+        let html = self.fetch_page(&format!("/player/{series_id}/{episode_id}")).await?;
+        let data = parse_router_data(&html).ok_or_else(|| "播放页未包含可读取的公开数据。".to_string())?;
+        let player = find_player_info(&data).ok_or_else(|| "该集没有公开网页播放信息，可能仅限官方 App。".to_string())?;
+        let mut urls = Vec::new();
+        for key in ["main_url", "play_url", "video_url", "url", "backup_url"] {
+            if let Some(url) = player.get(key).and_then(Value::as_str).filter(|value| is_playback_url(value)) {
+                push_unique(&mut urls, url.to_string());
+            }
+        }
+        for value in player.values() {
+            collect_playback_urls(value, &mut urls);
+        }
+        // Final boundary protection: every URL sent to the WebView must be a
+        // real query string, never an HTML-escaped variant such as `&amp;`.
+        for value in &mut urls {
+            *value = normalize_playback_url(value);
+        }
+        let url = select_quality_url(&urls, quality)
+            .ok_or_else(|| "未找到公开可播放 URL，该集可能需要官方 App。".to_string())?;
+        let backup_url = urls.iter().find(|candidate| *candidate != &url).cloned();
+        Ok(PlaybackSession {
+            session_id,
+            series_id: series_id.to_string(),
+            episode_id: episode_id.to_string(),
+            position: position.max(0.0),
+            quality: if quality.trim().is_empty() { "auto".into() } else { quality.into() },
+            url,
+            backup_url,
+        })
+    }
+
+    async fn fetch_page(&self, path: &str) -> Result<String, String> {
+        fetch_page_with_client(self.client.clone(), path.to_string()).await
+    }
+}
+
+async fn fetch_page_with_client(client: Client, path: String) -> Result<String, String> {
+    let response = client
+        .get(format!("{HONGGUO_BASE}{path}"))
+        .send()
+        .await
+        .map_err(|error| format!("目录请求失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("目录服务返回 HTTP {}。", response.status()));
+    }
+    let bytes = response.bytes().await.map_err(|error| format!("读取目录响应失败：{error}"))?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err("目录响应超过安全大小限制。".into());
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|_| "目录响应不是 UTF-8。".into())
+}
+
+fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
+    if channel == "comic" {
+        return parse_comic_rank_cards(html);
+    }
+
+    let document = Html::parse_document(html);
+    let anchor_selector = Selector::parse("a[href*='detail?series_id=']").expect("anchor selector");
+    let image_selector = Selector::parse("img").expect("image selector");
+    let source_selector = Selector::parse("source").expect("source selector");
+    let episode_re = Regex::new(r"(?:全|更新至|第)\s*(\d+)\s*集").expect("episode regex");
+    let id_re = Regex::new(r"series_id=(\d+)").expect("id regex");
+    let mut seen = HashSet::new();
+    let mut cards = Vec::new();
+
+    for anchor in document.select(&anchor_selector) {
+        let href = anchor.value().attr("href").unwrap_or_default();
+        let Some(id) = id_re.captures(href).and_then(|captures| captures.get(1)).map(|value| value.as_str().to_string()) else {
+            continue;
+        };
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let title = anchor
+            .select(&image_selector)
+            .filter_map(|image| image.value().attr("alt"))
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+            .unwrap_or("未命名短剧")
+            .to_string();
+        let cover = anchor
+            .select(&image_selector)
+            .filter_map(|image| image.value().attr("src"))
+            .find(|value| value.starts_with("https://") && !value.contains("empty_play"))
+            .map(str::to_string)
+            .or_else(|| anchor.select(&source_selector).filter_map(|source| source.value().attr("srcset")).next().map(str::to_string))
+            .unwrap_or_default();
+        let text = anchor.text().collect::<Vec<_>>().join(" ");
+        let episodes_count = episode_re
+            .captures(&text)
+            .and_then(|captures| captures.get(1))
+            .and_then(|value| value.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
+        let tags = anchor
+            .text()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != title.as_str() && !episode_re.is_match(value))
+            .filter(|value| value.chars().count() <= 16)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        cards.push(SeriesItem {
+            id,
+            title,
+            cover,
+            item_type: if channel == "comic" { "comic".into() } else { "drama".into() },
+            episodes_count,
+            latest_episode_title: (episodes_count > 0).then(|| format!("全 {episodes_count} 集")),
+            tags: unique(tags),
+            origin: if channel == "comic" { "红果漫剧公开榜单".into() } else { "红果短剧公开目录".into() },
+            brief: None,
+        });
+    }
+    cards
+}
+
+fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
+    let document = Html::parse_document(html);
+    let article_selector = Selector::parse("article[aria-labelledby]").expect("comic article selector");
+    let detail_selector = Selector::parse("a[href*='detail?series_id=']").expect("comic detail selector");
+    let title_selector = Selector::parse("h2[id^='rank-title-']").expect("comic title selector");
+    let image_selector = Selector::parse("img").expect("comic image selector");
+    let category_selector = Selector::parse("p[class*='pc-categories'] span").expect("comic category selector");
+    let description_selector = Selector::parse("p[class*='pc-description']").expect("comic description selector");
+    let episode_selector = Selector::parse("a[href*='/player/']").expect("comic episode selector");
+    let id_re = Regex::new(r"series_id=(\d+)").expect("comic id regex");
+    let mut seen = HashSet::new();
+    let mut cards = Vec::new();
+
+    for article in document.select(&article_selector) {
+        let Some(detail_anchor) = article.select(&detail_selector).next() else {
+            continue;
+        };
+        let href = detail_anchor.value().attr("href").unwrap_or_default();
+        let Some(id) = id_re
+            .captures(href)
+            .and_then(|captures| captures.get(1))
+            .map(|value| value.as_str().to_string())
+        else {
+            continue;
+        };
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+
+        let title = article
+            .select(&title_selector)
+            .next()
+            .map(|node| node.text().collect::<String>())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "未命名漫剧".into());
+        let cover = article
+            .select(&image_selector)
+            .filter_map(|image| image.value().attr("src"))
+            .find(|value| value.starts_with("https://"))
+            .map(str::to_string)
+            .unwrap_or_default();
+        let tags = article
+            .select(&category_selector)
+            .map(|node| node.text().collect::<String>().trim().to_string())
+            .filter(|value| !value.is_empty() && !value.chars().all(|character| character.is_ascii_digit()))
+            .collect::<Vec<_>>();
+        let episode_count = article.select(&episode_selector).count() as u32;
+        let brief = article
+            .select(&description_selector)
+            .next()
+            .map(|node| node.text().collect::<Vec<_>>().join(" "))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        cards.push(SeriesItem {
+            id,
+            title,
+            cover,
+            item_type: "comic".into(),
+            episodes_count: episode_count,
+            latest_episode_title: (episode_count > 0).then(|| format!("已公开 {} 集", episode_count)),
+            tags: unique(tags),
+            origin: "红果漫剧公开榜单".into(),
+            brief,
+        });
+    }
+    cards
+}
+
+fn detect_total_pages(html: &str, channel: &str) -> u32 {
+    let route = if channel == "comic" { "rank/hot-comic-drama" } else { "category" };
+    let pattern = format!(r#"href=[\"']/{route}\?page=(\d+)"#);
+    let Ok(regex) = Regex::new(&pattern) else {
+        return 1;
+    };
+    regex
+        .captures_iter(html)
+        .filter_map(|captures| captures.get(1)?.as_str().parse::<u32>().ok())
+        .max()
+        .unwrap_or(1)
+}
+
+fn parse_router_data(html: &str) -> Option<Value> {
+    let document = Html::parse_document(html);
+    for selector_text in [
+        "script#__MODERN_ROUTER_DATA__",
+        "script[data-script-src=\"modern-inline\"]",
+    ] {
+        let Ok(selector) = Selector::parse(selector_text) else {
+            continue;
+        };
+        let Some(script) = document.select(&selector).next() else {
+            continue;
+        };
+        if let Some(value) = parse_router_script(&script.inner_html()) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn parse_router_script(raw: &str) -> Option<Value> {
+    // scraper serializes inline script text as HTML. Decode entities before
+    // reading signed media URLs; otherwise `&amp;` becomes part of the query.
+    let normalized = raw.trim().replace("&amp;", "&");
+    if let Ok(value) = serde_json::from_str::<Value>(&normalized) {
+        return Some(value);
+    }
+
+    let start = normalized.find('{')?;
+    let end = normalized
+        .find("function runWindowFn")
+        .unwrap_or(normalized.len());
+    let candidate = normalized[start..end].trim().trim_end_matches(';').trim();
+    serde_json::from_str(candidate).ok()
+}
+
+fn find_series<'a>(value: &'a Value, expected_id: &str) -> Option<&'a Map<String, Value>> {
+    match value {
+        Value::Object(object) => {
+            let matches = object
+                .get("series_id")
+                .and_then(value_as_id)
+                .is_some_and(|id| id == expected_id);
+            if matches && object.get("vid_list").is_some() {
+                return Some(object);
+            }
+            object.values().find_map(|child| find_series(child, expected_id))
+        }
+        Value::Array(values) => values.iter().find_map(|child| find_series(child, expected_id)),
+        _ => None,
+    }
+}
+
+fn find_player_info<'a>(value: &'a Value) -> Option<&'a Map<String, Value>> {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Object(player)) = object.get("video_player_info") {
+                return Some(player);
+            }
+            object.values().find_map(find_player_info)
+        }
+        Value::Array(values) => values.iter().find_map(find_player_info),
+        _ => None,
+    }
+}
+
+fn collect_playback_urls(value: &Value, urls: &mut Vec<String>) {
+    match value {
+        Value::String(value) if is_playback_url(value) => push_unique(urls, value.to_string()),
+        Value::Object(object) => object.values().for_each(|child| collect_playback_urls(child, urls)),
+        Value::Array(values) => values.iter().for_each(|child| collect_playback_urls(child, urls)),
+        _ => {}
+    }
+}
+
+fn is_playback_url(value: &str) -> bool {
+    value.starts_with("https://")
+        && (value.contains(".m3u8") || value.contains(".mp4") || value.contains(".mpd") || value.contains("video"))
+}
+
+fn push_unique(items: &mut Vec<String>, value: String) {
+    let value = normalize_playback_url(&value);
+    if !items.contains(&value) {
+        items.push(value);
+    }
+}
+
+fn normalize_playback_url(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+        .replace("&#x26;", "&")
+        .replace("&#X26;", "&")
+}
+
+fn select_quality_url(urls: &[String], quality: &str) -> Option<String> {
+    if urls.is_empty() {
+        return None;
+    }
+    let quality = quality.trim().to_ascii_lowercase();
+    if quality.is_empty() || quality == "auto" {
+        return urls.first().cloned();
+    }
+    let marker = match quality.as_str() {
+        "4k" => ["2160", "4k"].as_slice(),
+        "1080p" => ["1080"].as_slice(),
+        "720p" => ["720"].as_slice(),
+        _ => [].as_slice(),
+    };
+    urls.iter()
+        .find(|url| marker.iter().any(|part| url.to_ascii_lowercase().contains(part)))
+        .cloned()
+        .or_else(|| match quality.as_str() {
+            "4k" => urls.first().cloned(),
+            "1080p" => urls.get(1).cloned().or_else(|| urls.first().cloned()),
+            "720p" => urls.get(2).cloned().or_else(|| urls.last().cloned()),
+            _ => urls.first().cloned(),
+        })
+}
+
+fn categories_for(items: &[SeriesItem]) -> Vec<String> {
+    let mut categories = vec!["全部".into()];
+    for tag in items.iter().flat_map(|item| &item.tags) {
+        if !tag.is_empty()
+            && !tag.chars().all(|character| character.is_ascii_digit())
+            && !categories.contains(tag)
+        {
+            categories.push(tag.clone());
+        }
+    }
+    categories
+}
+
+fn matches_filter(item: &SeriesItem, filter: &CatalogFilter) -> bool {
+    if filter.category != "全部" && !item.tags.iter().any(|tag| tag == &filter.category) {
+        return false;
+    }
+    if filter.audience != "全部" && !item.tags.iter().any(|tag| tag.contains(&filter.audience)) {
+        return false;
+    }
+    match filter.keyword.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(keyword) => item.title.contains(keyword) || item.tags.iter().any(|tag| tag.contains(keyword)),
+        None => true,
+    }
+}
+
+fn parse_page(cursor: Option<&str>) -> Option<u32> {
+    cursor?.trim().parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn sort_label(sort: &str) -> &'static str {
+    match sort {
+        "latest" => "公开页当前排序",
+        "heat" => "公开热度排序",
+        _ => "公开推荐排序",
+    }
+}
+
+fn validate_numeric_id(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || !value.chars().all(|character| character.is_ascii_digit()) {
+        return Err(format!("{label} ID 无效。"));
+    }
+    Ok(())
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(value_as_id).collect())
+        .unwrap_or_default()
+}
+
+fn value_as_id(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_string).or_else(|| value.as_u64().map(|value| value.to_string()))
+}
+
+fn string_field(object: &Map<String, Value>, keys: &[&str]) -> String {
+    keys
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn number_field(object: &Map<String, Value>, keys: &[&str]) -> Option<u32> {
+    keys.iter().find_map(|key| object.get(*key).and_then(Value::as_u64).map(|value| value as u32))
+}
+
+fn unique(items: Vec<String>) -> Vec<String> {
+    let mut result = Vec::new();
+    for item in items {
+        if !result.contains(&item) {
+            result.push(item);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_total_pages, normalize_playback_url, parse_router_script};
+
+    #[test]
+    fn detects_comic_pagination() {
+        let html = r#"
+            <a href="/rank/hot-comic-drama?page=2">2</a>
+            <a href="/rank/hot-comic-drama?page=5">5</a>
+        "#;
+        assert_eq!(detect_total_pages(html, "comic"), 5);
+    }
+
+    #[test]
+    fn decodes_media_url_entities_in_router_data() {
+        let data = parse_router_script(
+            r#"{"video_player_info":{"main_url":"https://cdn.test/video.mp4?a=1&amp;ch=0"}}"#,
+        )
+        .expect("router data");
+        assert_eq!(
+            data["video_player_info"]["main_url"],
+            "https://cdn.test/video.mp4?a=1&ch=0"
+        );
+    }
+
+    #[test]
+    fn normalizes_all_common_ampersand_entities() {
+        assert_eq!(
+            normalize_playback_url("https://cdn.test/video.mp4?a=1&amp;ch=0&#38;x=1&#x26;y=2&#X26;z=3"),
+            "https://cdn.test/video.mp4?a=1&ch=0&x=1&y=2&z=3"
+        );
+    }
+}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      播放源 CDN（qznovelvod.com）会校验 Referer 并拒绝来自本机来源的请求：
+        无 Referer            -> 206 Partial Content ✓
+        Referer: localhost    -> 403 Forbidden      ✗
+        Referer: hongguoduanju.com -> 206 ✓
+      开发态页面源是 http://127.0.0.1:5175，打包后是 tauri://localhost，
+      两者都会被 CDN 拒绝，导致 <video> 直链播放失败。
+      这里统一不带 Referer，实测视频与封面图（byteimg.com）均可正常加载。
+    -->
+    <meta name="referrer" content="no-referrer" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TTV Short Drama - 极简短剧播放器</title>
+    <!-- Windows 11 Fluent 字体栈与防抖平滑 -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-[#f3f5f8] text-[#0f172a] font-fluent select-none overflow-hidden antialiased">
+    <div id="root" class="w-screen h-screen overflow-hidden"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

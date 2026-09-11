@@ -1,0 +1,287 @@
+/* Windows 11 Mica & Fluent Visual System */
+
+:root {
+  --mica-bg: #f3f5f8;
+  --mica-canvas: rgba(255, 255, 255, 0.72);
+  --mica-card: rgba(255, 255, 255, 0.86);
+  --mica-card-hover: rgba(255, 255, 255, 0.96);
+  --mica-hud: rgba(255, 255, 255, 0.90);
+  --mica-border: rgba(255, 255, 255, 0.92);
+  --mica-border-subtle: rgba(0, 0, 0, 0.05);
+  --accent-primary: #0067c0;
+  --accent-hover: #005bb5;
+  --accent-light: rgba(0, 103, 192, 0.08);
+}
+
+/* Mica Backdrop Layer */
+.mica-backdrop {
+  background: 
+    radial-gradient(1200px 800px at 15% 10%, rgba(224, 239, 255, 0.75) 0%, transparent 60%),
+    radial-gradient(1000px 700px at 85% 85%, rgba(240, 246, 255, 0.85) 0%, transparent 60%),
+    radial-gradient(800px 600px at 50% 50%, rgba(255, 255, 255, 0.9) 0%, transparent 80%),
+    #f2f4f7;
+}
+
+/* Mica Acrylic Surfaces */
+.mica-surface {
+  background: var(--mica-card);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--mica-border);
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.03), 0 1px 3px rgba(0, 0, 0, 0.02);
+}
+
+.mica-surface-hover {
+  transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.mica-surface-hover:hover {
+  background: var(--mica-card-hover);
+  border-color: rgba(255, 255, 255, 1);
+  transform: translateY(-3px);
+  box-shadow: 0 12px 32px -4px rgba(0, 0, 0, 0.06), 0 2px 8px rgba(0, 0, 0, 0.03);
+}
+
+/* Floating HUD Glass */
+.mica-hud {
+  background: var(--mica-hud);
+  backdrop-filter: blur(28px) saturate(200%);
+  -webkit-backdrop-filter: blur(28px) saturate(200%);
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 
+    0 16px 40px -6px rgba(0, 0, 0, 0.09),
+    0 2px 10px rgba(0, 0, 0, 0.03),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+/* Acrylic Drawer */
+.mica-drawer {
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(36px) saturate(190%);
+  -webkit-backdrop-filter: blur(36px) saturate(190%);
+  border-left: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow: -8px 0 32px -4px rgba(0, 0, 0, 0.08);
+}
+
+/* Fluent Button Press */
+.fluent-press {
+  transition: transform 0.12s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.15s ease;
+}
+
+.fluent-press:active {
+  transform: scale(0.96);
+}
+
+/* Windows 11 Fluent Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.14);
+  border-radius: 9999px;
+  transition: background 0.2s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+}
+
+/* Shimmer Loading Skeleton */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.shimmer-loading {
+  background: linear-gradient(
+    90deg,
+    rgba(240, 242, 245, 0.6) 25%,
+    rgba(255, 255, 255, 0.85) 50%,
+    rgba(240, 242, 245, 0.6) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s infinite ease-in-out;
+}
+
+/* Windows 11 Fluent Inset Tray / Embedded Button Group */
+.fluent-inset-tray {
+  background-color: rgba(241, 245, 249, 0.92);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  box-shadow: inset 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+}
+
+.fluent-inset-subtle {
+  background-color: rgba(241, 245, 249, 0.75);
+  border: 1px solid rgba(226, 232, 240, 0.65);
+  box-shadow: inset 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+/* Fluent Motion & Interactive Dynamics */
+.fluent-card-elevate {
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+              background-color 0.2s ease,
+              border-color 0.2s ease;
+  will-change: transform, box-shadow;
+}
+
+.fluent-card-elevate:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 14px 32px -4px rgba(0, 0, 0, 0.07), 0 2px 8px -1px rgba(0, 0, 0, 0.03);
+}
+
+.fluent-card-elevate:active {
+  transform: translateY(0) scale(0.985);
+  transition-duration: 0.1s;
+}
+
+/* Stagger Entrance Delay Utilities */
+.stagger-1 { animation-delay: 25ms; }
+.stagger-2 { animation-delay: 50ms; }
+.stagger-3 { animation-delay: 75ms; }
+.stagger-4 { animation-delay: 100ms; }
+.stagger-5 { animation-delay: 125ms; }
+.stagger-6 { animation-delay: 150ms; }
+.stagger-7 { animation-delay: 175ms; }
+.stagger-8 { animation-delay: 200ms; }
+
+/* ==========================================================================
+   Windows 11 Fluent Convex / Raised Embossed Effects (立体凸出物理质感)
+   ========================================================================== */
+
+/* 1. 嵌入式托盘内的凸起选中态小药丸 / 按钮 (Convex Tab / Segmented Button) */
+.fluent-convex-tab {
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
+  border: 1px solid rgba(203, 213, 225, 0.7) !important;
+  border-top-color: #ffffff !important;
+  box-shadow: 
+    0 2px 5px -1px rgba(0, 0, 0, 0.09),
+    0 1px 2px 0 rgba(0, 0, 0, 0.04),
+    inset 0 1px 0 0 #ffffff !important;
+  transform: translateY(-0.5px);
+}
+
+.fluent-convex-tab:hover {
+  background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%) !important;
+  box-shadow: 
+    0 3px 8px -1px rgba(0, 0, 0, 0.12),
+    0 1px 3px 0 rgba(0, 0, 0, 0.05),
+    inset 0 1px 0 0 #ffffff !important;
+  transform: translateY(-1px);
+}
+
+.fluent-convex-tab:active {
+  transform: translateY(0.5px) !important;
+  box-shadow: 
+    0 1px 2px 0 rgba(0, 0, 0, 0.06),
+    inset 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
+}
+
+/* 2. 实体凸起主操作按键 (Raised Primary Button) */
+.fluent-raised-primary {
+  background: linear-gradient(180deg, #0078d4 0%, #0067c0 100%) !important;
+  border: 1px solid #005bb5 !important;
+  border-top-color: rgba(255, 255, 255, 0.45) !important;
+  box-shadow: 
+    0 4px 12px -2px rgba(0, 103, 192, 0.42),
+    0 1px 3px 0 rgba(0, 0, 0, 0.1),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 -1px 1px 0 rgba(0, 0, 0, 0.15) !important;
+}
+
+.fluent-raised-primary:hover {
+  background: linear-gradient(180deg, #1084d9 0%, #006ec9 100%) !important;
+  border-top-color: rgba(255, 255, 255, 0.6) !important;
+  box-shadow: 
+    0 6px 16px -2px rgba(0, 103, 192, 0.52),
+    0 2px 4px 0 rgba(0, 0, 0, 0.12),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.65) !important;
+  transform: translateY(-1px);
+}
+
+.fluent-raised-primary:active {
+  transform: translateY(1px) !important;
+  box-shadow: 
+    0 1px 4px 0 rgba(0, 103, 192, 0.35),
+    inset 0 2px 4px 0 rgba(0, 0, 0, 0.25) !important;
+}
+
+/* 3. 实体凸起次级按键 / 瓦片 (Raised Secondary / Tile) */
+.fluent-raised-tile {
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+  border: 1px solid rgba(203, 213, 225, 0.75);
+  border-top-color: #ffffff;
+  box-shadow: 
+    0 3px 8px -2px rgba(0, 0, 0, 0.08),
+    0 1px 3px 0 rgba(0, 0, 0, 0.03),
+    inset 0 1px 0 0 #ffffff;
+}
+
+.fluent-raised-tile:hover {
+  transform: translateY(-1.5px);
+  border-color: rgba(147, 197, 253, 0.8);
+  border-top-color: #ffffff;
+  box-shadow: 
+    0 6px 16px -3px rgba(0, 0, 0, 0.1),
+    0 2px 6px -1px rgba(0, 0, 0, 0.04),
+    inset 0 1px 0 0 #ffffff;
+}
+
+.fluent-raised-tile:active {
+  transform: translateY(0.5px);
+  box-shadow: 
+    0 1px 2px 0 rgba(0, 0, 0, 0.05),
+    inset 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+}
+
+/* 4. 圆形凸出播放按钮与浮雕按键 (Convex Play Disc / Knob) */
+.fluent-convex-disc {
+  background: linear-gradient(180deg, #0078d4 0%, #0060b2 100%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.4) !important;
+  border-top-color: rgba(255, 255, 255, 0.8) !important;
+  box-shadow: 
+    0 4px 14px 0 rgba(0, 103, 192, 0.45),
+    0 1px 3px 0 rgba(0, 0, 0, 0.15),
+    inset 0 1.5px 1.5px 0 rgba(255, 255, 255, 0.6),
+    inset 0 -1.5px 2px 0 rgba(0, 0, 0, 0.2) !important;
+}
+
+.fluent-convex-disc:hover {
+  background: linear-gradient(180deg, #1084d9 0%, #0067c0 100%) !important;
+  box-shadow: 
+    0 6px 18px 0 rgba(0, 103, 192, 0.55),
+    0 2px 4px 0 rgba(0, 0, 0, 0.18),
+    inset 0 1.5px 1.5px 0 rgba(255, 255, 255, 0.7) !important;
+  transform: scale(1.06) translateY(-0.5px);
+}
+
+.fluent-convex-disc:active {
+  transform: scale(0.95) translateY(1px) !important;
+  box-shadow: 
+    0 2px 6px 0 rgba(0, 103, 192, 0.3),
+    inset 0 2px 4px 0 rgba(0, 0, 0, 0.3) !important;
+}
+
+/* 5. 悬浮凸出磨砂玻璃浮岛 (Raised Frosted Island) */
+.fluent-raised-island {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(28px) saturate(200%);
+  -webkit-backdrop-filter: blur(28px) saturate(200%);
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  border-top: 1.5px solid #ffffff;
+  box-shadow: 
+    0 12px 36px -4px rgba(0, 0, 0, 0.12),
+    0 2px 8px 0 rgba(0, 0, 0, 0.04),
+    inset 0 1px 1px 0 #ffffff;
+}
+
