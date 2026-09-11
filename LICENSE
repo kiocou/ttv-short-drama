@@ -1,0 +1,50 @@
+MIT License
+
+Copyright (c) 2026 kiocou
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+第三方内容与适用范围说明（IMPORTANT — SCOPE OF THIS LICENSE）
+================================================================================
+
+上面的 MIT 授权**仅覆盖本项目自有代码**，具体指：
+  - src/                      前端应用代码
+  - src-tauri/src/            Rust 后端代码
+  - docs/                     项目文档
+
+以下路径**不在** MIT 授权范围内，它们包含针对第三方服务的逆向工程实现，
+其相关权利属于各自的权利人。这些文件仅供**个人本地使用与学习研究**，
+不得再分发、不得用于商业用途：
+
+  - src-tauri/resources/shortdrama-worker/liushen/
+        第三方私有请求签名算法（xgorgon / sixgod / medusa 等）的实现。
+
+  - src-tauri/resources/shortdrama-worker/worker.py
+        与第三方播放接口交互的实现，包含内容解密与访问控制的处理逻辑。
+
+如果你需要将本项目用于任何再分发场景，请先移除上述两处内容，
+或自行取得相应授权。
+
+================================================================================
+使用须知
+================================================================================
+
+本项目通过非公开接口获取内容，仅应在你拥有合法访问权限的前提下使用。
+使用者需自行承担遵守当地法律、以及相关平台服务条款的全部责任。

@@ -110,14 +110,25 @@ impl DramaProvider {
         })
     }
 
-    pub async fn detail(&self, series_id: &str, channel: Option<&str>) -> Result<SeriesDetail, String> {
+    pub async fn detail(
+        &self,
+        series_id: &str,
+        channel: Option<&str>,
+    ) -> Result<SeriesDetail, String> {
         validate_numeric_id(series_id, "剧集")?;
-        let html = self.fetch_page(&format!("/detail?series_id={series_id}")).await?;
-        let data = parse_router_data(&html).ok_or_else(|| "详情页未包含可读取的公开数据。".to_string())?;
-        let series = find_series(&data, series_id).ok_or_else(|| "详情页未找到剧集信息。".to_string())?;
+        let html = self
+            .fetch_page(&format!("/detail?series_id={series_id}"))
+            .await?;
+        let data =
+            parse_router_data(&html).ok_or_else(|| "详情页未包含可读取的公开数据。".to_string())?;
+        let series =
+            find_series(&data, series_id).ok_or_else(|| "详情页未找到剧集信息。".to_string())?;
         let vids = string_array(series.get("vid_list"));
-        let total = number_field(series, &["episode_cnt", "episode_total_cnt", "accessible_episode_cnt"])
-            .unwrap_or(vids.len() as u32);
+        let total = number_field(
+            series,
+            &["episode_cnt", "episode_total_cnt", "accessible_episode_cnt"],
+        )
+        .unwrap_or(vids.len() as u32);
         let cover = string_field(series, &["series_cover", "cover"]);
         let title = string_field(series, &["series_name", "title"]);
         let tags = string_array(series.get("tags"));
@@ -135,11 +146,23 @@ impl DramaProvider {
             .collect();
         Ok(SeriesDetail {
             id: series_id.to_string(),
-            title: if title.is_empty() { "未命名短剧".into() } else { title },
+            title: if title.is_empty() {
+                "未命名短剧".into()
+            } else {
+                title
+            },
             cover,
-            item_type: if channel == Some("comic") { "comic".into() } else { "drama".into() },
+            item_type: if channel == Some("comic") {
+                "comic".into()
+            } else {
+                "drama".into()
+            },
             tags,
-            origin: if channel == Some("comic") { "红果漫剧".into() } else { "红果短剧官网".into() },
+            origin: if channel == Some("comic") {
+                "红果漫剧".into()
+            } else {
+                "红果短剧官网".into()
+            },
             episodes_count: total,
             description: string_field(series, &["series_intro", "intro", "description"]),
             episodes,
@@ -147,9 +170,11 @@ impl DramaProvider {
             // 之前硬编码 4K/1080P/720P 会让"切清晰度"变成重复下载同一路流，
             // 且档位与真实分辨率不符（4K 实为 1080p、1080P 实为 540p）。
             // 真实档位由 App-API 的 short_drama_app_stream 返回 variants 后再补充。
-            available_qualities: vec![
-                VideoQualityOption { label: "自动".into(), value: "auto".into(), resolution: "由播放源自动选择".into() },
-            ],
+            available_qualities: vec![VideoQualityOption {
+                label: "自动".into(),
+                value: "auto".into(),
+                resolution: "由播放源自动选择".into(),
+            }],
             sources: Vec::new(),
         })
     }
@@ -164,12 +189,20 @@ impl DramaProvider {
     ) -> Result<PlaybackSession, String> {
         validate_numeric_id(series_id, "剧集")?;
         validate_numeric_id(episode_id, "剧集分集")?;
-        let html = self.fetch_page(&format!("/player/{series_id}/{episode_id}")).await?;
-        let data = parse_router_data(&html).ok_or_else(|| "播放页未包含可读取的公开数据。".to_string())?;
-        let player = find_player_info(&data).ok_or_else(|| "该集没有公开网页播放信息，可能仅限官方 App。".to_string())?;
+        let html = self
+            .fetch_page(&format!("/player/{series_id}/{episode_id}"))
+            .await?;
+        let data =
+            parse_router_data(&html).ok_or_else(|| "播放页未包含可读取的公开数据。".to_string())?;
+        let player = find_player_info(&data)
+            .ok_or_else(|| "该集没有公开网页播放信息，可能仅限官方 App。".to_string())?;
         let mut urls = Vec::new();
         for key in ["main_url", "play_url", "video_url", "url", "backup_url"] {
-            if let Some(url) = player.get(key).and_then(Value::as_str).filter(|value| is_playback_url(value)) {
+            if let Some(url) = player
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| is_playback_url(value))
+            {
                 push_unique(&mut urls, url.to_string());
             }
         }
@@ -189,7 +222,11 @@ impl DramaProvider {
             series_id: series_id.to_string(),
             episode_id: episode_id.to_string(),
             position: position.max(0.0),
-            quality: if quality.trim().is_empty() { "auto".into() } else { quality.into() },
+            quality: if quality.trim().is_empty() {
+                "auto".into()
+            } else {
+                quality.into()
+            },
             url,
             backup_url,
         })
@@ -209,7 +246,10 @@ async fn fetch_page_with_client(client: Client, path: String) -> Result<String, 
     if !response.status().is_success() {
         return Err(format!("目录服务返回 HTTP {}。", response.status()));
     }
-    let bytes = response.bytes().await.map_err(|error| format!("读取目录响应失败：{error}"))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取目录响应失败：{error}"))?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err("目录响应超过安全大小限制。".into());
     }
@@ -232,7 +272,11 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
 
     for anchor in document.select(&anchor_selector) {
         let href = anchor.value().attr("href").unwrap_or_default();
-        let Some(id) = id_re.captures(href).and_then(|captures| captures.get(1)).map(|value| value.as_str().to_string()) else {
+        let Some(id) = id_re
+            .captures(href)
+            .and_then(|captures| captures.get(1))
+            .map(|value| value.as_str().to_string())
+        else {
             continue;
         };
         if !seen.insert(id.clone()) {
@@ -250,7 +294,13 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
             .filter_map(|image| image.value().attr("src"))
             .find(|value| value.starts_with("https://") && !value.contains("empty_play"))
             .map(str::to_string)
-            .or_else(|| anchor.select(&source_selector).filter_map(|source| source.value().attr("srcset")).next().map(str::to_string))
+            .or_else(|| {
+                anchor
+                    .select(&source_selector)
+                    .filter_map(|source| source.value().attr("srcset"))
+                    .next()
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
         let text = anchor.text().collect::<Vec<_>>().join(" ");
         let episodes_count = episode_re
@@ -261,7 +311,9 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
         let tags = anchor
             .text()
             .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != title.as_str() && !episode_re.is_match(value))
+            .filter(|value| {
+                !value.is_empty() && *value != title.as_str() && !episode_re.is_match(value)
+            })
             .filter(|value| value.chars().count() <= 16)
             .map(str::to_string)
             .collect::<Vec<_>>();
@@ -269,11 +321,19 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
             id,
             title,
             cover,
-            item_type: if channel == "comic" { "comic".into() } else { "drama".into() },
+            item_type: if channel == "comic" {
+                "comic".into()
+            } else {
+                "drama".into()
+            },
             episodes_count,
             latest_episode_title: (episodes_count > 0).then(|| format!("全 {episodes_count} 集")),
             tags: unique(tags),
-            origin: if channel == "comic" { "红果漫剧公开榜单".into() } else { "红果短剧公开目录".into() },
+            origin: if channel == "comic" {
+                "红果漫剧公开榜单".into()
+            } else {
+                "红果短剧公开目录".into()
+            },
             brief: None,
         });
     }
@@ -282,12 +342,16 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
 
 fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
     let document = Html::parse_document(html);
-    let article_selector = Selector::parse("article[aria-labelledby]").expect("comic article selector");
-    let detail_selector = Selector::parse("a[href*='detail?series_id=']").expect("comic detail selector");
+    let article_selector =
+        Selector::parse("article[aria-labelledby]").expect("comic article selector");
+    let detail_selector =
+        Selector::parse("a[href*='detail?series_id=']").expect("comic detail selector");
     let title_selector = Selector::parse("h2[id^='rank-title-']").expect("comic title selector");
     let image_selector = Selector::parse("img").expect("comic image selector");
-    let category_selector = Selector::parse("p[class*='pc-categories'] span").expect("comic category selector");
-    let description_selector = Selector::parse("p[class*='pc-description']").expect("comic description selector");
+    let category_selector =
+        Selector::parse("p[class*='pc-categories'] span").expect("comic category selector");
+    let description_selector =
+        Selector::parse("p[class*='pc-description']").expect("comic description selector");
     let episode_selector = Selector::parse("a[href*='/player/']").expect("comic episode selector");
     let id_re = Regex::new(r"series_id=(\d+)").expect("comic id regex");
     let mut seen = HashSet::new();
@@ -325,7 +389,9 @@ fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
         let tags = article
             .select(&category_selector)
             .map(|node| node.text().collect::<String>().trim().to_string())
-            .filter(|value| !value.is_empty() && !value.chars().all(|character| character.is_ascii_digit()))
+            .filter(|value| {
+                !value.is_empty() && !value.chars().all(|character| character.is_ascii_digit())
+            })
             .collect::<Vec<_>>();
         let episode_count = article.select(&episode_selector).count() as u32;
         let brief = article
@@ -341,7 +407,8 @@ fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
             cover,
             item_type: "comic".into(),
             episodes_count: episode_count,
-            latest_episode_title: (episode_count > 0).then(|| format!("已公开 {} 集", episode_count)),
+            latest_episode_title: (episode_count > 0)
+                .then(|| format!("已公开 {} 集", episode_count)),
             tags: unique(tags),
             origin: "红果漫剧公开榜单".into(),
             brief,
@@ -450,14 +517,18 @@ fn find_series<'a>(value: &'a Value, expected_id: &str) -> Option<&'a Map<String
             if matches && object.get("vid_list").is_some() {
                 return Some(object);
             }
-            object.values().find_map(|child| find_series(child, expected_id))
+            object
+                .values()
+                .find_map(|child| find_series(child, expected_id))
         }
-        Value::Array(values) => values.iter().find_map(|child| find_series(child, expected_id)),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| find_series(child, expected_id)),
         _ => None,
     }
 }
 
-fn find_player_info<'a>(value: &'a Value) -> Option<&'a Map<String, Value>> {
+fn find_player_info(value: &Value) -> Option<&Map<String, Value>> {
     match value {
         Value::Object(object) => {
             if let Some(Value::Object(player)) = object.get("video_player_info") {
@@ -473,15 +544,22 @@ fn find_player_info<'a>(value: &'a Value) -> Option<&'a Map<String, Value>> {
 fn collect_playback_urls(value: &Value, urls: &mut Vec<String>) {
     match value {
         Value::String(value) if is_playback_url(value) => push_unique(urls, value.to_string()),
-        Value::Object(object) => object.values().for_each(|child| collect_playback_urls(child, urls)),
-        Value::Array(values) => values.iter().for_each(|child| collect_playback_urls(child, urls)),
+        Value::Object(object) => object
+            .values()
+            .for_each(|child| collect_playback_urls(child, urls)),
+        Value::Array(values) => values
+            .iter()
+            .for_each(|child| collect_playback_urls(child, urls)),
         _ => {}
     }
 }
 
 fn is_playback_url(value: &str) -> bool {
     value.starts_with("https://")
-        && (value.contains(".m3u8") || value.contains(".mp4") || value.contains(".mpd") || value.contains("video"))
+        && (value.contains(".m3u8")
+            || value.contains(".mp4")
+            || value.contains(".mpd")
+            || value.contains("video"))
 }
 
 fn push_unique(items: &mut Vec<String>, value: String) {
@@ -514,7 +592,11 @@ fn select_quality_url(urls: &[String], quality: &str) -> Option<String> {
         _ => [].as_slice(),
     };
     urls.iter()
-        .find(|url| marker.iter().any(|part| url.to_ascii_lowercase().contains(part)))
+        .find(|url| {
+            marker
+                .iter()
+                .any(|part| url.to_ascii_lowercase().contains(part))
+        })
         .cloned()
         .or_else(|| match quality.as_str() {
             "4k" => urls.first().cloned(),
@@ -544,14 +626,25 @@ fn matches_filter(item: &SeriesItem, filter: &CatalogFilter) -> bool {
     if filter.audience != "全部" && !item.tags.iter().any(|tag| tag.contains(&filter.audience)) {
         return false;
     }
-    match filter.keyword.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-        Some(keyword) => item.title.contains(keyword) || item.tags.iter().any(|tag| tag.contains(keyword)),
+    match filter
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(keyword) => {
+            item.title.contains(keyword) || item.tags.iter().any(|tag| tag.contains(keyword))
+        }
         None => true,
     }
 }
 
 fn parse_page(cursor: Option<&str>) -> Option<u32> {
-    cursor?.trim().parse::<u32>().ok().filter(|value| *value > 0)
+    cursor?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
 }
 
 fn sort_label(sort: &str) -> &'static str {
@@ -577,12 +670,14 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
 }
 
 fn value_as_id(value: &Value) -> Option<String> {
-    value.as_str().map(str::to_string).or_else(|| value.as_u64().map(|value| value.to_string()))
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
 }
 
 fn string_field(object: &Map<String, Value>, keys: &[&str]) -> String {
-    keys
-        .iter()
+    keys.iter()
         .find_map(|key| object.get(*key).and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -591,7 +686,12 @@ fn string_field(object: &Map<String, Value>, keys: &[&str]) -> String {
 }
 
 fn number_field(object: &Map<String, Value>, keys: &[&str]) -> Option<u32> {
-    keys.iter().find_map(|key| object.get(*key).and_then(Value::as_u64).map(|value| value as u32))
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+    })
 }
 
 fn unique(items: Vec<String>) -> Vec<String> {
@@ -636,7 +736,9 @@ mod tests {
     #[test]
     fn normalizes_all_common_ampersand_entities() {
         assert_eq!(
-            normalize_playback_url("https://cdn.test/video.mp4?a=1&amp;ch=0&#38;x=1&#x26;y=2&#X26;z=3"),
+            normalize_playback_url(
+                "https://cdn.test/video.mp4?a=1&amp;ch=0&#38;x=1&#x26;y=2&#X26;z=3"
+            ),
             "https://cdn.test/video.mp4?a=1&ch=0&x=1&y=2&z=3"
         );
     }

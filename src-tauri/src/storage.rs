@@ -44,7 +44,10 @@ impl Database {
     }
 
     pub fn list_history(&self) -> Result<Vec<WatchHistoryItem>, String> {
-        let connection = self.connection.lock().map_err(|_| "历史数据库锁不可用。".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "历史数据库锁不可用。".to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT series_id, episode_id, title, series_cover, episode_number, total_episodes,
@@ -79,7 +82,10 @@ impl Database {
         if item.series_id.trim().is_empty() || item.episode_id.trim().is_empty() {
             return Err("历史记录缺少剧集或集数标识。".into());
         }
-        let connection = self.connection.lock().map_err(|_| "历史数据库锁不可用。".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "历史数据库锁不可用。".to_string())?;
         connection
             .execute(
                 "INSERT INTO watch_history (
@@ -118,23 +124,41 @@ impl Database {
     }
 
     pub fn remove_history(&self, series_id: &str) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "历史数据库锁不可用。".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "历史数据库锁不可用。".to_string())?;
         connection
-            .execute("DELETE FROM watch_history WHERE series_id = ?1", params![series_id])
+            .execute(
+                "DELETE FROM watch_history WHERE series_id = ?1",
+                params![series_id],
+            )
             .map_err(|error| error.to_string())?;
         Ok(())
     }
 
     pub fn clear_history(&self) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "历史数据库锁不可用。".to_string())?;
-        connection.execute("DELETE FROM watch_history", []).map_err(|error| error.to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "历史数据库锁不可用。".to_string())?;
+        connection
+            .execute("DELETE FROM watch_history", [])
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
     pub fn settings_get(&self) -> Result<UserSettings, String> {
-        let connection = self.connection.lock().map_err(|_| "设置数据库锁不可用。".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "设置数据库锁不可用。".to_string())?;
         let raw: Option<String> = connection
-            .query_row("SELECT value FROM settings WHERE key = 'user_settings'", [], |row| row.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'user_settings'",
+                [],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(|error| error.to_string())?;
         match raw {
@@ -145,7 +169,10 @@ impl Database {
 
     pub fn settings_save(&self, settings: &UserSettings) -> Result<(), String> {
         let value = serde_json::to_string(settings).map_err(|error| error.to_string())?;
-        let connection = self.connection.lock().map_err(|_| "设置数据库锁不可用。".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "设置数据库锁不可用。".to_string())?;
         connection
             .execute(
                 "INSERT INTO settings(key, value) VALUES ('user_settings', ?1)

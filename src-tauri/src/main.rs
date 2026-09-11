@@ -1,7 +1,7 @@
 mod models;
 mod provider;
-mod storage;
 mod short_drama_app;
+mod storage;
 
 use crate::models::{
     CacheClearResult, CatalogFilter, CatalogPage, EnhancementCapabilities, EnhancementEngineInfo,
@@ -9,17 +9,17 @@ use crate::models::{
     SeriesDetail, UserSettings, WatchHistoryItem,
 };
 use crate::provider::DramaProvider;
-use crate::storage::Database;
 use crate::short_drama_app::{
     short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
     short_drama_app_qualities, short_drama_app_resolve, short_drama_app_set_device,
     short_drama_app_status, short_drama_app_stream,
 };
+use crate::storage::Database;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::process::Command;
+use std::sync::Mutex;
 use tauri::{Manager, State};
 
 struct AppState {
@@ -30,7 +30,10 @@ struct AppState {
 }
 
 #[tauri::command]
-async fn catalog_list(filter: CatalogFilter, state: State<'_, AppState>) -> Result<CatalogPage, String> {
+async fn catalog_list(
+    filter: CatalogFilter,
+    state: State<'_, AppState>,
+) -> Result<CatalogPage, String> {
     state.provider.catalog(&filter).await
 }
 
@@ -44,7 +47,10 @@ async fn series_detail(
 }
 
 #[tauri::command]
-async fn playback_open(input: PlaybackOpenInput, state: State<'_, AppState>) -> Result<PlaybackSession, String> {
+async fn playback_open(
+    input: PlaybackOpenInput,
+    state: State<'_, AppState>,
+) -> Result<PlaybackSession, String> {
     let session = state
         .provider
         .open_episode(
@@ -55,15 +61,26 @@ async fn playback_open(input: PlaybackOpenInput, state: State<'_, AppState>) -> 
             input.position,
         )
         .await?;
-    let mut sessions = state.sessions.lock().map_err(|_| "播放会话锁不可用。".to_string())?;
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "播放会话锁不可用。".to_string())?;
     sessions.retain(|id, _| *id >= session.session_id.saturating_sub(8));
     sessions.insert(session.session_id, session.clone());
     Ok(session)
 }
 
 #[tauri::command]
-fn playback_command(session_id: u64, _action: String, _payload: Option<serde_json::Value>, state: State<'_, AppState>) -> Result<(), String> {
-    let sessions = state.sessions.lock().map_err(|_| "播放会话锁不可用。".to_string())?;
+fn playback_command(
+    session_id: u64,
+    _action: String,
+    _payload: Option<serde_json::Value>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "播放会话锁不可用。".to_string())?;
     if sessions.contains_key(&session_id) {
         Ok(())
     } else {
@@ -72,12 +89,23 @@ fn playback_command(session_id: u64, _action: String, _payload: Option<serde_jso
 }
 
 #[tauri::command]
-fn playback_snapshot(session_id: u64, state: State<'_, AppState>) -> Result<PlaybackSnapshot, String> {
-    let sessions = state.sessions.lock().map_err(|_| "播放会话锁不可用。".to_string())?;
-    let session = sessions.get(&session_id).ok_or_else(|| "播放会话已过期，请重新打开剧集。".to_string())?;
+fn playback_snapshot(
+    session_id: u64,
+    state: State<'_, AppState>,
+) -> Result<PlaybackSnapshot, String> {
+    let sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "播放会话锁不可用。".to_string())?;
+    let session = sessions
+        .get(&session_id)
+        .ok_or_else(|| "播放会话已过期，请重新打开剧集。".to_string())?;
     Ok(PlaybackSnapshot {
         session_id,
-        state: PlaybackUiState { kind: "opening".into(), session_id },
+        state: PlaybackUiState {
+            kind: "opening".into(),
+            session_id,
+        },
         position: session.position,
         duration: 0.0,
         buffered: 0.0,
@@ -95,10 +123,15 @@ fn external_player_open(url: String) -> Result<(), String> {
     }
     let candidates = [
         std::env::var_os("TTV_BOX_MPV").map(PathBuf::from),
-        Some(PathBuf::from(r"D:\Users\kioco\Desktop\TTV Box\src-tauri\resources\mpv\mpv.exe")),
+        Some(PathBuf::from(
+            r"D:\Users\kioco\Desktop\TTV Box\src-tauri\resources\mpv\mpv.exe",
+        )),
         Some(PathBuf::from("src-tauri/resources/mpv/mpv.exe")),
     ];
-    let player = candidates.into_iter().flatten().find(|path| path.is_file())
+    let player = candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.is_file())
         .or_else(|| Some(PathBuf::from("mpv.exe")))
         .ok_or_else(|| "未找到兼容播放器 mpv。".to_string())?;
     Command::new(player)
@@ -317,7 +350,6 @@ fn main() {
     // 本机已安装 Microsoft.HEVCVideoExtension，打开这个特性开关即可复用系统解码器，
     // 无需把每集转码成 H.264（转码会耗时 20s+/集、体积膨胀约 2.5 倍）。
     configure_webview_browser_arguments();
-
 
     tauri::Builder::default()
         .setup(|app| {
