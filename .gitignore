@@ -24,15 +24,26 @@ short-drama-device.json
 # ---- 临时目录（build.bat / start-dev-safe.bat 使用）----
 .tmp/
 
-# ---- 随包分发的第三方大体积二进制（合计约 139MB，可重新获取）----
-# 说明：这些是运行期资源而非源码。若需在新机器上恢复，见 README「资源恢复」一节。
-src-tauri/resources/mpv/
-src-tauri/resources/python/
-src-tauri/resources/shortdrama-worker/site-packages/
+# ---- 随包分发的第三方运行期资源 ----
+# 现已纳入版本控制，使仓库开箱即用。
+# 其中 ffmpeg.exe 为 106,888,704 字节（101.94 MiB），**超过 GitHub 单文件
+# 100 MiB 硬限制**，故交由 Git LFS 承载（见 .gitattributes）。
+# 其余资源（嵌入式 Python 21.5MiB、worker 依赖 15.8MiB）单文件均远低于限制，
+# 常规入库即可，无需占用 LFS 配额。
+#
+# 若你想让仓库只保留源码、不带这些可重新获取的第三方产物，取消下面三行的注释：
+# src-tauri/resources/mpv/
+# src-tauri/resources/python/
+# src-tauri/resources/shortdrama-worker/site-packages/
 
 # ---- Python ----
 __pycache__/
-*.py[cod]
+# 只忽略编译缓存，**不要**用 *.py[cod]——
+# 那个模式会连带忽略 *.pyd，而 .pyd 是 Python 的 C 扩展二进制
+# （_ctypes.pyd、pycryptodome 的 _raw_aes.pyd 等），是运行必需品。
+# 实测：该模式会漏掉 108 个 .pyd（6.32 MiB），导致安装包能装但运行失败。
+*.pyc
+*.pyo
 
 # ---- 日志 ----
 *.log
