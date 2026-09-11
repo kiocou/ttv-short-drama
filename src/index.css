@@ -17,6 +17,13 @@ html, body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* 「正在签名/取直链」阶段的循环进度条：此时还没有真实百分比，
+   用一段往复滑动表达"正在进行"，避免读秒前出现静止的空白进度条。 */
+@keyframes eta-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+
 /* Glass panel utility */
 .glass-panel {
   background-color: rgba(255, 255, 255, 0.82);

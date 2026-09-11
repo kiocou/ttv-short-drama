@@ -83,6 +83,15 @@ interface PlaybackContextType {
   acceptCountdown: () => void;
   /** 离开播放器工作区时调用：暂停画面、取消后台连播并落盘进度。 */
   stopPlayback: () => void;
+  /**
+   * 是否正在"切换"到另一部剧/另一集（而非首次进入播放器）。
+   *
+   * 用于区分等待提示的呈现方式：
+   * - 首次进入：全屏加载遮罩（画面本来就是空的）；
+   * - 切换：明确的"预计 N 秒"提示——用户已经等过一次，需要知道要等多久。
+   * 后台预取不进入这个状态，因此对用户完全静默。
+   */
+  isSwitching: boolean;
   /** 云端解析进度。null 表示当前没有在途解析。 */
   prepareStatus: PrepareStatus | null;
   /** 提前预热某一集（详情页 / 选集抽屉），已在缓存或已在途则跳过。 */
@@ -98,6 +107,13 @@ export interface PrepareStatus {
   message: string;
   /** 下载阶段才有真实百分比，其余阶段为 null。 */
   percent: number | null;
+  /**
+   * 预计还需多少秒才能开始播放（下载阶段才有）。
+   *
+   * 等待过程必须可量化：实测单集解析约 7.4 秒（其中签名与 API 往返占 3.6 秒、
+   * 下载与解密占 3.9 秒），只给一个转圈动画会让用户以为卡死。
+   */
+  etaSeconds: number | null;
 }
 
 /** 悬停预热的最大并发数：超过它就不再受理新的预热请求。 */
@@ -132,8 +148,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     nextEpisode: null,
   });
   const [prepareStatus, setPrepareStatus] = useState<PrepareStatus | null>(null);
+  const [isSwitching, setIsSwitching] = useState<boolean>(false);
   // 悬停预热的在途计数，见 prewarmEpisode 的并发上限说明。
   const prewarmInflightRef = useRef<number>(0);
+  // 下载速率采样：worker 每 10% 上报一次百分比，用相邻两点算出速率再推算剩余时间。
+  const downloadSampleRef = useRef<{ percent: number; at: number } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const activeSessionRef = useRef<number>(100);
@@ -149,6 +168,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 供"只绑定一次"的事件监听器间接调用的稳定引用。
   const playNextEpisodeRef = useRef<() => void>(() => {});
   const saveProgressThrottledRef = useRef<(pos: number, dur: number, force?: boolean) => void>(() => {});
+
+  // 播放一旦真正开始，"切换中"就结束。
+  // 用 effect 统一收口，而不是在 9 处 setIsPlaying(true) 旁边各写一行——
+  // 那些分支分别对应快路径、本地解析、公开直链兜底、自动连播等，漏掉任何一处
+  // 都会让"预计 N 秒"的提示永久停在屏幕上。
+  useEffect(() => {
+    if (uiState.kind === 'playing' || uiState.kind === 'error') {
+      setIsSwitching(false);
+    }
+  }, [uiState.kind]);
 
   // ============ 解析进度订阅 ============
 
@@ -172,14 +201,39 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             const payload = event.payload || {};
             const stage = String(payload.stage ?? '');
             if (stage === 'done' || stage === 'error') {
+              downloadSampleRef.current = null;
               setPrepareStatus(null);
               return;
             }
+            const percent = typeof payload.percent === 'number' ? payload.percent : null;
+
+            // 用相邻两次百分比采样估算剩余时间。
+            // worker 每 10% 上报一次，两点之间足以得到一个稳定的速率；
+            // 首次采样（或换了新的下载任务）时无法估算，先给 null。
+            let etaSeconds: number | null = null;
+            if (percent != null) {
+              const now = Date.now();
+              const prev = downloadSampleRef.current;
+              if (prev && percent > prev.percent && now > prev.at) {
+                const perMs = (percent - prev.percent) / (now - prev.at);
+                if (perMs > 0) {
+                  etaSeconds = Math.max(1, Math.round((100 - percent) / perMs / 1000));
+                }
+                downloadSampleRef.current = { percent, at: now };
+              } else if (!prev || percent < prev.percent) {
+                // 新任务开始（百分比回退），重新起算。
+                downloadSampleRef.current = { percent, at: now };
+              }
+            } else {
+              downloadSampleRef.current = null;
+            }
+
             setPrepareStatus({
               episodeId: String(payload.vid ?? ''),
               stage,
               message: typeof payload.message === 'string' ? payload.message : '',
-              percent: typeof payload.percent === 'number' ? payload.percent : null,
+              percent,
+              etaSeconds,
             });
           },
         ),
@@ -491,12 +545,24 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   /**
-   * 预热当前集相邻的集（下两集优先，其次上一集）。
+   * 预取队列：播放期间把"接下来可能被点开"的集按优先级排队，逐个在后台解析。
    *
-   * 旧实现的预取挂在 handlePlaying 上，只有"真正开始播"才触发，而且占位符
-   * `__prefetching__` 会被快路径主动跳过——等于预取从未生效，用户每次换集
-   * 都还是要等完整下载。现在改成 openEpisode 落点就发起，提前一整集的
-   * 播放时长（1-3 分钟）去后台下载，换集时大概率已命中缓存。
+   * 为什么需要队列而不是一次性并发：
+   * - 单集解析实测约 7.4 秒（签名 3.6s + 下载解密 3.9s），而一集时长 50~140 秒，
+   *   所以**只要持续排队，播放期间完全来得及把后面几集都备好**；
+   * - 反过来若一次并发很多个，worker 会互相抢带宽与 CPU，正在播的那一集反而更卡。
+   * 因此这里用"顺序推进 + 并发上限"：既覆盖更深的往后集数，又不影响当前播放。
+   */
+  const prefetchQueueRef = useRef<Array<{ seriesId: string; episodeId: string; contentType: number }>>([]);
+  const prefetchPumpRunningRef = useRef<boolean>(false);
+
+  /**
+   * 播放期间预热后续集数（下三集优先，其次上一集兜底回看）。
+   *
+   * 旧实现只备 idx+1/idx+2，用户进剧后若直接跳到第 5 集仍要等完整解析；
+   * 而且预取曾经挂在 handlePlaying 上、占位符还会被快路径跳过，等于从未生效。
+   * 现在改成 openEpisode 落点即入队，由队列泵在播放期间持续消费——
+   * 目标是"用户随手点后面任意一集，大概率已经在本机"。
    */
   const warmAdjacentEpisodes = (
     series: SeriesDetail,
@@ -506,16 +572,53 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const idx = series.episodes.findIndex(e => e.id === currentEpisodeId);
     if (idx < 0) return;
     const contentType = series.type === 'comic' ? 1004 : 1;
-    // 下一集优先（连播的主要目标），再多备一集作为缓冲；上一集兜底"回看"。
-    // 只备 idx+1 时，用户连跳两集仍要等整集下载，等于没有预取。
-    const next = series.episodes.slice(idx + 1, idx + 3);
+    // 每次重新排队前先清空旧队列：换了剧或换了集之后，之前的预测已经过时。
+    prefetchQueueRef.current = [];
+    // 下三集优先（连播与随手点开的主要目标），上一集兜底"回看"。
+    const next = series.episodes.slice(idx + 1, idx + 4);
     const prev = series.episodes[idx - 1] ? [series.episodes[idx - 1]] : [];
     const targets = [...next, ...prev];
+    // 先把整个序列一次性登记为"在途"，避免队列还没轮到某一集时，
+    // 悬停预热又对同一集发起第二次解析（后端虽有 leader/follower 去重，
+    // 但前端这一层多打一次请求同样浪费）。
     targets.forEach(target => {
-      // 用户已经切走：不再为旧会话占用带宽。
-      if (activeSessionRef.current !== sessionAtRequest) return;
-      startPrewarmResolve(series.id, target.id, contentType);
+      const key = episodeCacheKey(series.id, target.id);
+      if (!resolvedFileByVidRef.current.has(key)) {
+        prefetchQueueRef.current.push({
+          seriesId: series.id,
+          episodeId: target.id,
+          contentType,
+        });
+      }
     });
+    // 交给泵消费。泵会在消费过程中校验会话，用户切走后立即停止。
+    pumpPrefetchQueueForSession(sessionAtRequest);
+  };
+
+  /// 带会话校验的队列泵入口：用户切走后不再为旧会话继续占用带宽。
+  const pumpPrefetchQueueForSession = (sessionAtQueueBuild: number) => {
+    if (prefetchPumpRunningRef.current) return;
+    prefetchPumpRunningRef.current = true;
+    const step = () => {
+      if (activeSessionRef.current !== sessionAtQueueBuild) {
+        prefetchQueueRef.current = [];
+        prefetchPumpRunningRef.current = false;
+        return;
+      }
+      if (prewarmInflightRef.current >= MAX_PREWARM_INFLIGHT) {
+        setTimeout(step, 400);
+        return;
+      }
+      const next = prefetchQueueRef.current.shift();
+      if (!next) {
+        prefetchPumpRunningRef.current = false;
+        return;
+      }
+      const accepted = startPrewarmResolve(next.seriesId, next.episodeId, next.contentType);
+      // 未受理（已缓存/在途）就立刻继续下一项，不占用节奏。
+      setTimeout(step, accepted ? 250 : 0);
+    };
+    step();
   };
 
   /**
@@ -613,6 +716,30 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     setSessionId(newSessionId);
     if (!qualitySwitchRequested) {
       setUiState({ kind: 'opening', sessionId: newSessionId, episodeId: episodeId || '' });
+    }
+
+    // ===== 切换的瞬间就停掉旧视频 =====
+    //
+    // 旧实现的换集链路刻意不暂停主播放器（为了"旧帧保留、避免黑屏"），
+    // 但那条链路只覆盖"同一个 video 元素换 src"的场景。实测发现两个后果：
+    //   1. 点击另一部剧播放时，**上一部剧的声音会继续播放**，直到新剧下载解
+    //      析完成才被替换——用户听到的是自己已经放弃的那部剧，非常困惑；
+    //   2. 这段时间里画面与声音属于不同内容，观感割裂。
+    //
+    // 关键点：pause() **不会清空当前帧**（清空画面的是 load()，见
+    // adoptPreparedSource 的注释）。因此这里暂停即可同时满足两个目标——
+    // 声音立即停止，而最后一帧继续留在屏幕上，不给用户黑屏。
+    //
+    // 只有"同一集切清晰度"例外：那本来就是同一路内容，不该打断播放。
+    if (!qualitySwitchRequested) {
+      const currentVideo = videoRef.current;
+      if (currentVideo && !currentVideo.paused) {
+        currentVideo.pause();
+      }
+      setIsPlaying(false);
+      // 已经有内容在播（或刚播过）才算"切换"；从发现页首次进入播放器不算，
+      // 那种场景画面本来就是空的，用全屏遮罩更合适。
+      setIsSwitching(Boolean(currentEpisode && currentSeries));
     }
 
     try {
@@ -1235,6 +1362,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         cancelCountdown,
         acceptCountdown,
         stopPlayback,
+        isSwitching,
         prepareStatus,
         prewarmEpisode,
       }}
