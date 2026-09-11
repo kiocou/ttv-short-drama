@@ -250,6 +250,44 @@ fn app_storage_root() -> Option<PathBuf> {
     }
 }
 
+/// 配置 WebView2 启动参数。
+///
+/// 两件事：
+/// 1. 确保开启 `PlatformHEVCDecoderSupport` —— 没有它，HEVC 源流无法播放。
+/// 2. 剔除 `--disable-gpu-compositing` —— 那是当年 C 盘写满导致黑屏时的兜底，
+///    如今 user-data 已迁到可写盘、根因消除；而它会把渲染与解码压回软件路径，
+///    既让 30 处 backdrop-blur 异常昂贵，也会让平台 HEVC 硬解走不通。
+///    保留用户/脚本传入的其他参数，只做追加与剔除，不整体覆盖。
+fn configure_webview_browser_arguments() {
+    const HEVC_FEATURE: &str = "PlatformHEVCDecoderSupport";
+    let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+
+    // 保留有效参数，丢弃已过时的软件光栅开关。
+    let mut kept: Vec<String> = existing
+        .split_whitespace()
+        .filter(|arg| *arg != "--disable-gpu-compositing")
+        .map(str::to_string)
+        .collect();
+
+    // 合并 --enable-features：保留他人已启用的特性，追加 HEVC 支持。
+    let feature_index = kept
+        .iter()
+        .position(|arg| arg.starts_with("--enable-features="));
+    match feature_index {
+        Some(index) => {
+            let current = kept[index].clone();
+            if !current.contains(HEVC_FEATURE) {
+                kept[index] = format!("{current},{HEVC_FEATURE}");
+            }
+        }
+        None => kept.push(format!("--enable-features={HEVC_FEATURE}")),
+    }
+
+    let merged = kept.join(" ");
+    eprintln!("[ttv] WebView2 启动参数：{merged}");
+    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
+}
+
 fn main() {
     // 历史背景：系统盘写满时，WebView2 写不了 GPU/着色器缓存 → 合成管线初始化失败
     // → 窗口内容区整片纯黑。当时用 `--disable-gpu-compositing` 兜底，但那会让全部
@@ -262,6 +300,15 @@ fn main() {
     if let Some(data_dir) = app_storage_root().map(|root| root.join("webview-data")) {
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &data_dir);
     }
+    // 允许 WebView2 使用系统平台解码器解 HEVC。
+    //
+    // 播放失败的根因：App-API 返回的源流是 HEVC(H.265)/hvc1（实测短剧 1080x1920、
+    // 漫剧 1920x1080，缓存里每一集都是），而 Chromium 内核默认关闭 HEVC 解码，
+    // HTML5 <video> 直接报错 —— 界面上表现为"该媒体无法由 WebView 解码"。
+    // 本机已安装 Microsoft.HEVCVideoExtension，打开这个特性开关即可复用系统解码器，
+    // 无需把每集转码成 H.264（转码会耗时 20s+/集、体积膨胀约 2.5 倍）。
+    configure_webview_browser_arguments();
+
 
     tauri::Builder::default()
         .setup(|app| {

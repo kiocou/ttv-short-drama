@@ -34,9 +34,13 @@ REM --- 构建链临时目录迁到项目盘 ---
 set "TEMP=%TMPDIR%"
 set "TMP=%TMPDIR%"
 
-REM --- WebView2：软件光栅 + 数据目录落到项目盘 ---
-set "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--disable-gpu-compositing"
+REM --- WebView2：数据目录落到项目盘 ---
+REM 不再设置 --disable-gpu-compositing：该开关是 C 盘写满导致黑屏时的兜底，
+REM 根因（缓存写不进去）已随数据目录迁移而消除；保留它会把渲染压回软件光栅，
+REM 并让 HEVC 平台硬解走不通，直接导致播放失败。
+REM 程序内部会自行追加 --enable-features=PlatformHEVCDecoderSupport。
 set "WEBVIEW2_USER_DATA_FOLDER=%PROJ%.webview-data"
+set "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--enable-features=PlatformHEVCDecoderSupport"
 
 set "NODE=D:\Program Files\nodejs\node.exe"
 set "VITE=%PROJ%node_modules\vite\bin\vite.js"
