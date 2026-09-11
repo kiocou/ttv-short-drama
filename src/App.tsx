@@ -22,6 +22,14 @@ const AppContent: React.FC = () => {
 
   const isPlayer = currentView === 'player';
 
+  // This is a focused desktop player rather than a browser surface. Prevent the
+  // WebView's generic context menu so right-click never exposes browser actions.
+  useEffect(() => {
+    const preventContextMenu = (event: MouseEvent) => event.preventDefault();
+    document.addEventListener('contextmenu', preventContextMenu);
+    return () => document.removeEventListener('contextmenu', preventContextMenu);
+  }, []);
+
   // 播放器宿主常驻 DOM，离开时仅被 display:none 隐藏，video 不会自动停。
   // 不显式停止就会出现"回到主界面但声音还在播"（含后台连播倒计时自动开播）。
   useEffect(() => {
@@ -52,7 +60,10 @@ const AppContent: React.FC = () => {
   }, [isPlayer, isFullscreen, setIsFullscreen]);
 
   return (
-    <div className="w-full h-full flex flex-col mica-backdrop select-none overflow-hidden">
+    <div
+      className="w-full h-full flex flex-col mica-backdrop select-none overflow-hidden"
+      onContextMenu={(event) => event.preventDefault()}
+    >
       {/*
         全屏时隐藏标题栏，让播放器真正占满整个窗口。
         原生窗口全屏已经让窗口铺满屏幕，此时唯一还挡着画面的就是这条 40px

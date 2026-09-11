@@ -1,7 +1,7 @@
 {
   "name": "ttv-short-drama-frontend",
   "private": true,
-  "version": "1.0.0",
+  "version": "0.1.1",
   "description": "TTV Short Drama — Windows 11 Mica 风格短剧/漫剧桌面播放器前端（React + TypeScript + Vite，配套 Tauri/Rust 后端位于 src-tauri/）",
   "type": "module",
   "scripts": {

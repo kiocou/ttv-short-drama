@@ -23,6 +23,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - uses: actions/setup-node@v4
         with:
@@ -52,6 +54,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -61,24 +65,19 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # 补齐随包资源占位。
-      #
-      # 这些资源是第三方大体积二进制（ffmpeg.exe 约 102MB、嵌入式 Python 约
-      # 21.5MB、worker 依赖约 15.8MB），已由 .gitignore 排除，克隆后并不存在。
-      # 但 src-tauri/tauri.conf.json 的 bundle.resources 声明了它们，
-      # tauri-build 会校验路径存在性——缺失时构建直接失败：
-      #     error: resource path `resources\python` doesn't exist（退出码 101）
-      # 因此这里创建占位路径让编译得以进行。
-      #
-      # 注意：CI 只验证「代码能否编译与通过测试」，不产出可发布安装包——
-      # 真正的打包需要补齐上述真实资源。
-      - name: 创建资源占位
+      - name: 校验随包资源
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path src-tauri/resources/python | Out-Null
-          Set-Content -Path src-tauri/resources/python/PLACEHOLDER.txt -Value 'ci placeholder: 真实资源由 README「资源恢复」章节补齐'
-          New-Item -ItemType Directory -Force -Path src-tauri/resources/mpv | Out-Null
-          Set-Content -Path src-tauri/resources/mpv/ffmpeg.exe -Value ''
+          $required = @(
+            'src-tauri/resources/python/python.exe',
+            'src-tauri/resources/shortdrama-worker/worker.py',
+            'src-tauri/resources/mpv/ffmpeg.exe'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "缺少随包资源: $path"
+            }
+          }
 
       - name: 格式检查
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -87,7 +86,7 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       # 只跑 --bins：单元测试是纯逻辑测试（分页解析、缓存淘汰、凭据处理），
-      # 不需要网络、设备凭据或上面那些占位资源。
+      # 不需要网络或设备凭据。
       # 需要联网的 catalog_pagination_live 标记为 #[ignore]，默认跳过。
       - name: 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml --bins
