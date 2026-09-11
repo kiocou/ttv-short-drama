@@ -11,9 +11,9 @@ use crate::models::{
 use crate::provider::DramaProvider;
 use crate::storage::Database;
 use crate::short_drama_app::{
-    short_drama_app_album, short_drama_app_cache_clear, short_drama_app_qualities,
-    short_drama_app_resolve, short_drama_app_set_device, short_drama_app_status,
-    short_drama_app_stream,
+    short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
+    short_drama_app_qualities, short_drama_app_resolve, short_drama_app_set_device,
+    short_drama_app_status, short_drama_app_stream,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -193,11 +193,20 @@ fn enhancement_set_preference(engine: String, _target_fps: u32) -> Result<(), St
     }
 }
 
+/// 清空缓存（设置页按钮）。
+///
+/// 这里曾经只清 AppState::cache_dir（即 <.app-data>/cache）——那是本应用自己的
+/// 目录，而**剧集视频实际由 worker 写在 com.ttv.player/short-drama-cache**，
+/// 两者不是同一个位置。结果是「一键释放缓存」永远报 0 MB，而真正占地的 2GB+
+/// 视频文件从未被触及。现在改为委托给 short_drama_app_cache_clear，
+/// 由它清理真实的剧集缓存并返回释放量。
 #[tauri::command]
 fn cache_clear(state: State<'_, AppState>) -> Result<CacheClearResult, String> {
-    let freed_bytes = clear_directory(&state.cache_dir)?;
+    // 应用自有缓存目录（SQLite 快照等）一并清理。
+    let own = clear_directory(&state.cache_dir).unwrap_or(0);
+    let report = short_drama_app_cache_clear()?;
     Ok(CacheClearResult {
-        freed_mb: freed_bytes as f64 / 1024.0 / 1024.0,
+        freed_mb: (own + report.freed_bytes) as f64 / 1024.0 / 1024.0,
     })
 }
 
@@ -329,6 +338,22 @@ fn main() {
                 sessions: Mutex::new(HashMap::new()),
                 cache_dir,
             });
+
+            // 启动即自动整理缓存，无需用户确认。
+            //
+            // 处理三件事：清掉 worker 中断留下的半成品、删除超过保留期（7 天）
+            // 的陈旧剧集、并把总占用压回全局预算（1GB）内。放在独立线程里执行，
+            // 避免在缓存很大时拖慢窗口创建（首次启动可能要删掉上 GB 文件）。
+            std::thread::spawn(|| {
+                let report = short_drama_app::auto_clean_cache_on_start();
+                if report.removed_files > 0 {
+                    eprintln!(
+                        "[ttv] 缓存自动清理：删除 {} 个剧集，释放 {:.1} MB",
+                        report.removed_files,
+                        report.freed_bytes as f64 / 1024.0 / 1024.0
+                    );
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -342,6 +367,7 @@ fn main() {
             short_drama_app_set_device,
             short_drama_app_resolve,
             short_drama_app_cache_clear,
+            short_drama_app_cache_usage,
             short_drama_app_stream,
             short_drama_app_qualities,
             short_drama_app_album,

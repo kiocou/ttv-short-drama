@@ -516,9 +516,21 @@ fn sweep_cache_dir(dir: &std::path::Path) {
     }
 }
 
-/// 单频道缓存预算（字节）。超出则按 LRU 淘汰最久未访问的整集。
-/// 短剧单集约 5-15MB，1.5GB 约可容纳 120-300 集，够用且不至于失控。
-const CACHE_BUDGET_BYTES: u64 = 1536 * 1024 * 1024;
+/// 缓存**全局**预算（字节），短剧 + 漫剧合计。
+///
+/// 为什么从"单频道 1.5GB"改成"全局 1.0GB"：旧预算按频道独立计算，两个频道
+/// 各自都能长到 1.5GB，实际占用上限是 3GB——实测本机已达到 2.25GB（216 个文件）。
+/// 对一款短剧播放器来说这个体积明显偏大，且用户无法感知它为何一直增长。
+/// 现在改成全局合计 1.0GB，并由启动清理与每次解析后的自动收敛共同保证。
+const CACHE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// 缓存保留期（秒）。超过此时长且未被访问的整集会被自动清理。
+///
+/// 7 天是"看完还会回头"与"不再需要"之间的经验分界：短剧多为连续追更，
+/// 一周内的剧集大概率还要回看；超过一周未触碰的基本不会再打开。
+/// 这一层是时间维度的兜底——即使总占用没超预算，陈旧剧集也会被清掉，
+/// 避免"总量刚好卡在预算内所以永远不清理"的僵局。
+const CACHE_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// 把文件的 mtime 更新为"现在"，作为 LRU 的最近使用时间。
 ///
@@ -552,71 +564,177 @@ const CACHE_EVICT_GRACE_SECONDS: u64 = 900;
 /// LRU 键使用 mtime：命中缓存时 `touch_cache_entry` 会把它推到当前时间，
 /// 因此 mtime 真实反映"最近使用"。再叠加 `CACHE_EVICT_GRACE_SECONDS` 宽限期，
 /// 双重保证不会删除正在播放或刚下载的整集。
-fn enforce_cache_budget(dir: &std::path::Path, keep: &std::path::Path) {
-    evict_to_budget(dir, keep, CACHE_BUDGET_BYTES, std::time::SystemTime::now());
+fn enforce_cache_budget(keep: &std::path::Path) {
+    // 跨频道统一收敛：短剧与漫剧共享同一份预算。
+    evict_channels_to_budget(
+        &[cache_dir().join("short-series"), cache_dir().join("motion-comic")],
+        keep,
+        CACHE_BUDGET_BYTES,
+        CACHE_MAX_AGE_SECONDS,
+        std::time::SystemTime::now(),
+    );
 }
 
-/// 淘汰主体。预算与"当前时刻"显式传入，便于单元测试直接验证排序与宽限期，
-/// 而不必真的制造出 1.5GB 文件。
-fn evict_to_budget(
-    dir: &std::path::Path,
+/// 自动清理的统计结果。
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSweepReport {
+    /// 删除的整集数量。
+    pub removed_files: u64,
+    /// 释放的字节数。
+    pub freed_bytes: u64,
+}
+
+/// 跨频道淘汰主体：把所有频道缓存视为一个池子，按"先过期、再超量"两步收敛。
+///
+/// 这是**全自动**清理的核心——不需要任何用户确认：
+/// 1. **过期清理**：mtime 早于 `max_age_seconds` 的整集直接删除（时间兜底）。
+/// 2. **超量清理**：若删除过期项后总量仍超 `budget_bytes`，按 LRU
+///    （mtime 升序）继续删最旧的，直到回到预算内。
+///
+/// 两道保护始终生效：`keep`（本次正在写入/命中的那一集）与宽限期
+/// （`CACHE_EVICT_GRACE_SECONDS` 内的新文件）永不被删。
+///
+/// 预算、保留期与"当前时刻"都显式传入，便于单元测试直接验证行为。
+fn evict_channels_to_budget(
+    dirs: &[std::path::PathBuf],
     keep: &std::path::Path,
     budget_bytes: u64,
+    max_age_seconds: u64,
     now: std::time::SystemTime,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+) -> CacheSweepReport {
+    let grace = std::time::Duration::from_secs(CACHE_EVICT_GRACE_SECONDS);
+    let max_age = std::time::Duration::from_secs(max_age_seconds);
+
+    // 收集所有频道下的整集缓存（跳过半成品与 keep）。
     let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
     let mut total: u64 = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
-        // 只统计正式整集缓存，半成品不计入预算（它们会被 sweep 清掉）。
-        if !name.ends_with(".mp4") || name.ends_with(".part.mp4") {
-            continue;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".mp4") || name.ends_with(".part.mp4") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let size = meta.len();
+            if size == 0 {
+                continue;
+            }
+            let stamp = meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            total = total.saturating_add(size);
+            files.push((path, size, stamp));
         }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let size = meta.len();
-        if size == 0 {
-            continue;
-        }
-        // 只用 mtime：命中即会被 touch 到当前时间，语义上等价于"最近使用"。
-        // 不能再退回 atime——本机 atime 更新被系统关闭，它恒等于创建时间。
-        let stamp = meta
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        total = total.saturating_add(size);
-        files.push((path, size, stamp));
     }
-    if total <= budget_bytes {
-        return;
-    }
-    files.sort_by_key(|(_, _, stamp)| *stamp);
-    let grace = std::time::Duration::from_secs(CACHE_EVICT_GRACE_SECONDS);
-    for (path, size, stamp) in files {
-        if total <= budget_bytes {
-            break;
-        }
-        // 正在写入或正在播放的文件绝不淘汰。
+
+    let mut report = CacheSweepReport::default();
+    // 宽限期内的文件（正在下载/刚播放）不参与任何清理。
+    let is_protected = |path: &std::path::Path, stamp: std::time::SystemTime| -> bool {
         if path == keep {
+            return true;
+        }
+        now.duration_since(stamp).map(|age| age < grace).unwrap_or(true)
+    };
+
+    // 第一步：过期清理。
+    for (path, size, stamp) in &files {
+        if is_protected(path, *stamp) {
             continue;
         }
-        if now.duration_since(stamp).map(|age| age < grace).unwrap_or(true) {
+        let expired = now.duration_since(*stamp).map(|age| age > max_age).unwrap_or(false);
+        if expired && std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(*size);
+            report.removed_files += 1;
+            report.freed_bytes = report.freed_bytes.saturating_add(*size);
+        }
+    }
+
+    // 第二步：超量清理（LRU）。
+    if total > budget_bytes {
+        let mut survivors: Vec<&(std::path::PathBuf, u64, std::time::SystemTime)> = files
+            .iter()
+            .filter(|(path, _, _)| path.exists())
+            .collect();
+        survivors.sort_by_key(|(_, _, stamp)| *stamp);
+        for (path, size, stamp) in survivors {
+            if total <= budget_bytes {
+                break;
+            }
+            if is_protected(path, *stamp) {
+                continue;
+            }
+            if std::fs::remove_file(path).is_ok() {
+                total = total.saturating_sub(*size);
+                report.removed_files += 1;
+                report.freed_bytes = report.freed_bytes.saturating_add(*size);
+            }
+        }
+    }
+
+    report
+}
+
+/// 统计当前缓存占用（短剧 + 漫剧合计）。
+pub fn cache_usage() -> CacheSweepReport {
+    let mut total: u64 = 0;
+    let mut count: u64 = 0;
+    for dir in [cache_dir().join("short-series"), cache_dir().join("motion-comic")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() == 0 {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".mp4") || name.ends_with(".part.mp4") {
+                continue;
+            }
+            total = total.saturating_add(meta.len());
+            count += 1;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(size);
-        }
+    }
+    CacheSweepReport {
+        removed_files: count,
+        freed_bytes: total,
     }
 }
+
+/// 启动时的全自动清理：清理半成品 + 过期剧集 + 超量剧集，并在根目录做一次整理。
+///
+/// 由 setup 钩子调用，**无需用户任何确认**。返回统计供日志输出。
+pub fn auto_clean_cache_on_start() -> CacheSweepReport {
+    let root = cache_dir();
+    for dir in [root.clone(), root.join("short-series"), root.join("motion-comic")] {
+        sweep_cache_dir(&dir);
+    }
+    // keep 指向一个不可能存在的路径：启动时没有任何"正在写入"的剧集。
+    let sentinel = root.join("__none__");
+    evict_channels_to_budget(
+        &[root.join("short-series"), root.join("motion-comic")],
+        &sentinel,
+        CACHE_BUDGET_BYTES,
+        CACHE_MAX_AGE_SECONDS,
+        std::time::SystemTime::now(),
+    )
+}
+
+
 
 /// 解析一集：命中缓存直接返回；否则拉起 worker.py（下载+解密+转存）并转发进度。
 ///
@@ -682,9 +800,10 @@ pub async fn short_drama_app_resolve<R: Runtime>(
     // - `{vid}-{quality}.mp4` 是旧版按清晰度拼文件的产物，现已统一到 `{vid}.mp4`，
     //   保留只会白占空间。
     sweep_cache_dir(out_path.parent().unwrap_or(&cache_dir()));
-    // 容量上限：缓存无界增长会把用户磁盘吃满（实测已积累 73 集 / 0.51GB 且只增
-    // 不减）。落盘前按 LRU 淘汰最久未播放的整集，保持在预算内。
-    enforce_cache_budget(out_path.parent().unwrap_or(&cache_dir()), &out_path);
+    // 容量上限：缓存无界增长会把用户磁盘吃满（实测已积累 2.25GB 且只增不减）。
+    // 这是**全自动**收敛：跨频道按 LRU 淘汰、并清掉超过保留期的陈旧剧集，
+    // 全程无需用户确认。keep 传本次要写入的那一集，避免自我删除。
+    enforce_cache_budget(&out_path);
 
     // ===== 在途去重（leader / follower）=====
     // follower 每 500ms 轮询缓存；leader 落盘后直接读缓存返回。leader 失败
@@ -936,14 +1055,42 @@ async fn run_resolve_worker<R: Runtime>(
     })
 }
 
+/// 手动清空全部剧集缓存（设置页按钮）。**只清整集视频**，不动其他应用数据。
+///
+/// 注意：这是用户显式点击时的行为；日常清理完全自动化，不需要用户介入
+/// （见 `auto_clean_cache_on_start` 与 `enforce_cache_budget`）。
 #[tauri::command]
-pub fn short_drama_app_cache_clear() -> Result<String, String> {
-    let dir = cache_dir();
-    if dir.is_dir() {
-        std::fs::remove_dir_all(&dir).map_err(|error| format!("清理缓存失败：{error}"))?;
+pub fn short_drama_app_cache_clear() -> Result<CacheSweepReport, String> {
+    let before = cache_usage();
+    for dir in [cache_dir().join("short-series"), cache_dir().join("motion-comic")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
-    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    Ok(dir.to_string_lossy().to_string())
+    // 顺带清掉根目录下的历史遗留文件（旧版本直接写在 short-drama-cache 根下）。
+    sweep_cache_dir(&cache_dir());
+    let Ok(entries) = std::fs::read_dir(cache_dir()) else {
+        return Ok(before);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(before)
+}
+
+/// 查询当前缓存占用（供设置页显示真实数字）。
+#[tauri::command]
+pub fn short_drama_app_cache_usage() -> CacheSweepReport {
+    cache_usage()
 }
 
 // ============ stream / album（签名直链与专辑详情，共用 worker 进程） ============
@@ -1497,13 +1644,22 @@ mod tests {
         let fresh = fx.write("333.mp4", 100, 0);
 
         // 预算 250 字节：总量 300，必须淘汰到只剩 2 个。
-        super::evict_to_budget(&fx.dir, &fresh, 250, std::time::SystemTime::now());
+        // 保留期设为 7 天，因此 2 小时/1 小时的文件不算过期，走 LRU 分支。
+        let report = super::evict_channels_to_budget(
+            &[fx.dir.clone()],
+            &fresh,
+            250,
+            7 * 24 * 3600,
+            std::time::SystemTime::now(),
+        );
 
         assert!(!oldest.exists(), "最旧的文件应当被淘汰");
         assert!(fresh.exists(), "刚写入的文件在宽限期内，不得被淘汰");
         // 淘汰顺序必须是"先最旧"，因此 older 应比 oldest 更可能存活。
         assert!(older.exists(), "次旧文件在淘汰一个后应仍存活");
         assert_eq!(fresh.metadata().expect("stat").len(), 100);
+        assert_eq!(report.removed_files, 1);
+        assert_eq!(report.freed_bytes, 100);
     }
 
     /// 回归：即便在预算内，keep 指向的文件也绝不能被删。
@@ -1514,7 +1670,13 @@ mod tests {
         fx.write("888.mp4", 100, 7200);
 
         // 预算极低：必须淘汰，但 keep 必须豁免。
-        super::evict_to_budget(&fx.dir, &keep, 0, std::time::SystemTime::now());
+        super::evict_channels_to_budget(
+            &[fx.dir.clone()],
+            &keep,
+            0,
+            7 * 24 * 3600,
+            std::time::SystemTime::now(),
+        );
 
         assert!(keep.exists(), "keep 指向的文件被删除，会导致刚下载完就自我销毁");
     }
@@ -1527,7 +1689,13 @@ mod tests {
         let recent_b = fx.write("bbb.mp4", 100, 10);
 
         // 预算 0：若没有宽限期，两者都会被删。
-        super::evict_to_budget(&fx.dir, &recent_a, 0, std::time::SystemTime::now());
+        super::evict_channels_to_budget(
+            &[fx.dir.clone()],
+            &recent_a,
+            0,
+            7 * 24 * 3600,
+            std::time::SystemTime::now(),
+        );
 
         assert!(recent_a.exists(), "宽限期内的文件不得被淘汰");
         assert!(recent_b.exists(), "宽限期内的文件不得被淘汰");
@@ -1540,9 +1708,91 @@ mod tests {
         let old = fx.write("555.mp4", 100, 7200);
         let keep = fx.write("666.mp4", 100, 7200);
 
-        super::evict_to_budget(&fx.dir, &keep, 1024 * 1024, std::time::SystemTime::now());
+        let report = super::evict_channels_to_budget(
+            &[fx.dir.clone()],
+            &keep,
+            1024 * 1024,
+            7 * 24 * 3600,
+            std::time::SystemTime::now(),
+        );
 
         assert!(old.exists());
         assert!(keep.exists());
+        assert_eq!(report.removed_files, 0);
+    }
+
+    /// 新增能力：超过保留期的整集即使没超预算也会被自动清掉。
+    ///
+    /// 这是"占空间不会无限增长"的时间维度兜底——否则用户看过的零散剧集
+    /// 只要总量没到预算就一直留着。
+    #[test]
+    fn eviction_removes_expired_episodes() {
+        let fx = CacheFixture::new("expire");
+        // 8 天前（超过 7 天保留期）与 1 小时前。
+        let expired = fx.write("old.mp4", 100, 8 * 24 * 3600);
+        let recent = fx.write("new.mp4", 100, 3600);
+
+        // 预算给得很大：只有"过期"这一条能触发删除。
+        let report = super::evict_channels_to_budget(
+            &[fx.dir.clone()],
+            &fx.dir.join("__none__"),
+            1024 * 1024 * 1024,
+            7 * 24 * 3600,
+            std::time::SystemTime::now(),
+        );
+
+        assert!(!expired.exists(), "超过保留期的整集应被自动清理");
+        assert!(recent.exists(), "保留期内的整集不得被清理");
+        assert_eq!(report.removed_files, 1);
+    }
+
+    /// 新增能力：短剧与漫剧共享同一份预算（而非各自独立）。
+    ///
+    /// 旧实现按频道分别限制，两个频道合计可长到 3GB；实测本机已达 2.25GB。
+    #[test]
+    fn budget_is_shared_across_channels() {
+        let fx = CacheFixture::new("shared");
+        let drama_dir = fx.dir.join("short-series");
+        let comic_dir = fx.dir.join("motion-comic");
+        std::fs::create_dir_all(&drama_dir).expect("mkdir");
+        std::fs::create_dir_all(&comic_dir).expect("mkdir");
+
+        // 每个频道各写两个 100 字节的陈旧文件：合计 400 字节。
+        let mut paths = Vec::new();
+        for (dir, prefix) in [(&drama_dir, "d"), (&comic_dir, "c")] {
+            for i in 0..2 {
+                let p = dir.join(format!("{prefix}{i}.mp4"));
+                std::fs::write(&p, vec![b'x'; 100]).expect("write");
+                let stamp = std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(7200);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&p)
+                    .expect("open")
+                    .set_modified(stamp)
+                    .expect("age");
+                paths.push(p);
+            }
+        }
+
+        // 预算 250 字节（小于合计 400）：必须跨频道淘汰到预算内。
+        let report = super::evict_channels_to_budget(
+            &[drama_dir.clone(), comic_dir.clone()],
+            &fx.dir.join("__none__"),
+            250,
+            7 * 24 * 3600,
+            std::time::SystemTime::now(),
+        );
+
+        let remaining: u64 = paths
+            .iter()
+            .filter(|p| p.exists())
+            .map(|p| p.metadata().expect("stat").len())
+            .sum();
+        assert!(
+            remaining <= 250,
+            "跨频道合计应被压回预算内，实际剩余 {remaining} 字节"
+        );
+        assert_eq!(report.removed_files, 2, "400 - 250 需淘汰 2 个 100 字节文件");
     }
 }

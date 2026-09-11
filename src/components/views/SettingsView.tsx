@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useSettingsStore } from '../../stores/useSettingsStore';
 import { useEnhancementStore } from '../../stores/useEnhancementStore';
 import { useAppStore } from '../../stores/useAppStore';
@@ -21,11 +21,19 @@ import {
 import { EnhancementEngine } from '../../types/enhancement';
 
 export const SettingsView: React.FC = () => {
-  const { settings, updateSettings, clearCache } = useSettingsStore();
+  const { settings, updateSettings, clearCache, cacheUsage, refreshCacheUsage } = useSettingsStore();
   const { capabilities, engine, setEngine } = useEnhancementStore();
   const { showToast } = useAppStore();
 
   const [isCleaning, setIsCleaning] = useState(false);
+
+  // 进入设置页时刷新真实占用：缓存由后台自动增删，静态快照会过期。
+  useEffect(() => {
+    void refreshCacheUsage();
+  }, [refreshCacheUsage]);
+
+  const cacheMb = cacheUsage.bytes / 1024 / 1024;
+  const cacheLabel = cacheMb >= 1024 ? (cacheMb / 1024).toFixed(2) + ' GB' : cacheMb.toFixed(1) + ' MB';
 
   const handleClearCache = async () => {
     setIsCleaning(true);
@@ -240,13 +248,20 @@ export const SettingsView: React.FC = () => {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex flex-col gap-1.5">
               <div className="flex items-center gap-2 flex-wrap">
-                <h4 className="text-xs font-semibold text-slate-800">短剧目录与分片预载缓存</h4>
+                <h4 className="text-xs font-semibold text-slate-800">剧集缓存</h4>
                 <span className="text-[11px] font-bold text-blue-600 font-mono bg-blue-50 px-2.5 py-0.5 rounded-md border border-blue-200/60">
-                  {(settings.catalogCacheMb + settings.playbackCacheMb).toFixed(1)} MB
+                  {cacheLabel}
                 </span>
+                {cacheUsage.files > 0 && (
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    {cacheUsage.files} 集
+                  </span>
+                )}
               </div>
               <p className="text-xs text-slate-500 leading-relaxed">
-                本地 SQLite 数据库快照与视频首帧预载缓冲，清理后将在需要时自动重新获取
+                播放过的剧集会缓存到本地，以便回看与换集时秒开。
+                <span className="text-slate-600 font-medium">已开启全自动清理</span>
+                ：超过 7 天未播放的剧集、以及总量超过 1 GB 时最旧的剧集，都会自动移除，无需手动操作。
               </p>
             </div>
 
@@ -260,7 +275,7 @@ export const SettingsView: React.FC = () => {
                 onClick={handleClearCache}
                 className="shadow-sm"
               >
-                {isCleaning ? '正在清理...' : '一键释放缓存'}
+                {isCleaning ? '正在清理...' : '立即全部清空'}
               </FluentButton>
             </div>
           </div>
