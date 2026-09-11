@@ -17,7 +17,7 @@ import { SettingsView } from './components/views/SettingsView';
 import { VideoSurface } from './components/player/VideoSurface';
 
 const AppContent: React.FC = () => {
-  const { currentView, selectedSeriesId } = useAppStore();
+  const { currentView, selectedSeriesId, isFullscreen, setIsFullscreen } = useAppStore();
   const { stopPlayback } = usePlaybackStore();
 
   const isPlayer = currentView === 'player';
@@ -28,10 +28,37 @@ const AppContent: React.FC = () => {
     if (!isPlayer) stopPlayback();
   }, [isPlayer, stopPlayback]);
 
+  // 非播放视图下必须退出全屏。
+  // 否则用户在全屏播放时返回详情页/发现页，窗口仍停在全屏，整个程序看起来
+  // 被"卡"在全屏状态（实测现象：返回详情页后程序仍全屏，底部还留一条黑边——
+  // 那是被隐藏的播放器容器）。
+  useEffect(() => {
+    if (isPlayer || !isFullscreen) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const win = getCurrentWindow();
+        if (await win.isFullscreen()) await win.setFullscreen(false);
+      } catch {
+        // 非 Tauri 环境下无需处理。
+      } finally {
+        if (!cancelled) setIsFullscreen(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isPlayer, isFullscreen, setIsFullscreen]);
+
   return (
     <div className="w-full h-full flex flex-col mica-backdrop select-none overflow-hidden">
-      {/* 统一 Mica 标题栏 */}
-      <TitleBar />
+      {/*
+        全屏时隐藏标题栏，让播放器真正占满整个窗口。
+        原生窗口全屏已经让窗口铺满屏幕，此时唯一还挡着画面的就是这条 40px
+        标题栏——不隐藏它，用户就会觉得"全屏了但视频没放大"。
+      */}
+      {!isFullscreen && <TitleBar />}
 
       {/* 主工作区：持久化常驻渲染，杜绝切换时的卸载闪屏与白屏 */}
       <div className="flex-1 w-full flex overflow-hidden relative">

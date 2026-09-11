@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { useAppStore } from '../../stores/useAppStore';
 import { isTauriEnvironment } from '../../services/ipc';
 import { PlayerControls } from './PlayerControls';
 import { EpisodeDrawer } from './EpisodeDrawer';
@@ -54,8 +55,10 @@ export const VideoSurface: React.FC = () => {
     isSwitching,
   } = usePlaybackStore();
 
+  // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
+  const { isFullscreen, setIsFullscreen } = useAppStore();
+
   const [isControlsVisible, setIsControlsVisible] = useState(true);
-  const [isFullscreen, setIsFullscreen] = useState(false);
   // 平滑倒计时读数：worker 每 10% 才上报一次，直接用上报值会几秒才跳一下。
   const [etaTick, setEtaTick] = useState<number | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -81,77 +84,90 @@ export const VideoSurface: React.FC = () => {
   }, [isPlaying, handleUserActivity]);
 
   /**
-   * 全屏切换。
+   * 全屏切换（**只使用原生窗口全屏**）。
    *
-   * 这里有两条必须同时走的路径，缺一不可：
-   * 1. **原生窗口全屏**（Tauri `setFullscreen`）：让 OS 窗口真正进入全屏状态。
-   *    旧实现只调用 `element.requestFullscreen()`，那仅仅是让 DOM 元素撑满
-   *    应用自己的窗口——窗口边框、任务栏位置、窗口层级都还是窗口态，所以
-   *    用户会觉得"全屏是假的"。
-   * 2. **DOM 全屏**：让视频容器占据整个视口，把标题栏与导航栏交给浏览器隐藏。
+   * 为什么不再用 element.requestFullscreen()：
+   * 两套机制各自独立、无法可靠同步，实测导致两类故障——
+   *   1. 窗口进了全屏但 DOM 全屏失败（await 之后用户手势已失效），视频仍被
+   *      挤在标题栏下方，表现为"全屏后视频不放大"；
+   *   2. Esc 由 Chromium 处理退出 DOM 全屏、状态置为 false，而原生窗口仍停在
+   *      全屏，表现为"退出全屏后整个程序还是全屏"。
    *
-   * 原生调用失败（浏览器环境或权限未授予）时静默退回纯 DOM 全屏，保证功能可用。
+   * 现在窗口真正铺满屏幕，由 App 在 isFullscreen 时隐藏标题栏，播放器即可
+   * 占满整个窗口。单一事实来源，不存在失步。
    */
   const toggleFullscreen = useCallback(async () => {
-    const container = containerRef.current;
-    if (!container) return;
     const entering = !isFullscreen;
-
-    if (isTauriEnvironment()) {
-      try {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        await getCurrentWindow().setFullscreen(entering);
-      } catch {
-        // 权限或环境不支持：继续走 DOM 全屏兜底。
-      }
+    if (!isTauriEnvironment()) {
+      // 浏览器（Mock）模式没有原生窗口，退化为纯 CSS 全屏展示。
+      setIsFullscreen(entering);
+      return;
     }
-
     try {
-      if (entering) {
-        if (!document.fullscreenElement) await container.requestFullscreen();
-      } else if (document.fullscreenElement) {
-        await document.exitFullscreen();
-      }
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      await getCurrentWindow().setFullscreen(entering);
+      setIsFullscreen(entering);
     } catch {
-      // DOM 全屏被拒绝也不影响已完成的原生全屏。
+      // 权限或环境不支持：保持原状，不谎报状态。
     }
-    setIsFullscreen(entering);
-  }, [isFullscreen]);
+  }, [isFullscreen, setIsFullscreen]);
 
-  // 同步全屏状态：既要跟随 DOM 全屏事件，也要跟随原生窗口状态，
-  // 否则用户用系统快捷键（如 F11）退出全屏后，界面按钮会停留在"退出全屏"。
+  /**
+   * 退出全屏（离开播放器、或用户按 Esc 时调用）。
+   *
+   * 独立成函数是因为它有多个调用点，且必须幂等——重复调用不能报错。
+   */
+  const exitFullscreen = useCallback(async () => {
+    if (!isTauriEnvironment()) {
+      setIsFullscreen(false);
+      return;
+    }
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      const win = getCurrentWindow();
+      if (await win.isFullscreen()) await win.setFullscreen(false);
+    } catch {
+      // 忽略：下次进入播放器会重新校正状态。
+    } finally {
+      setIsFullscreen(false);
+    }
+  }, [setIsFullscreen]);
+
+  /**
+   * 与原生窗口状态保持同步。
+   *
+   * 用户可能用系统方式（F11、Win+Up、窗口快捷键）改变全屏，那样界面按钮会
+   * 与实际状态脱节。这里直接查询窗口的真实全屏状态作为唯一依据，
+   * 不再参考 document.fullscreenElement。
+   */
   useEffect(() => {
-    const handleFullscreenChange = () => {
-      if (!document.fullscreenElement) setIsFullscreen(false);
-    };
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-
+    if (!isTauriEnvironment()) return;
     let unlisten: (() => void) | null = null;
     let disposed = false;
-    if (isTauriEnvironment()) {
-      void import('@tauri-apps/api/window')
-        .then(async ({ getCurrentWindow }) => {
-          const win = getCurrentWindow();
-          const off = await win.onResized(async () => {
-            try {
-              const full = await win.isFullscreen();
-              setIsFullscreen(full || Boolean(document.fullscreenElement));
-            } catch {
-              // 查询失败时保留当前状态。
-            }
-          });
-          if (disposed) off();
-          else unlisten = off;
-        })
-        .catch(() => {});
-    }
-
+    void import('@tauri-apps/api/window')
+      .then(async ({ getCurrentWindow }) => {
+        const win = getCurrentWindow();
+        const sync = async () => {
+          try {
+            setIsFullscreen(await win.isFullscreen());
+          } catch {
+            // 查询失败时保留当前状态。
+          }
+        };
+        const off = await win.onResized(sync);
+        if (disposed) {
+          off();
+          return;
+        }
+        unlisten = off;
+        await sync();
+      })
+      .catch(() => {});
     return () => {
       disposed = true;
-      document.removeEventListener('fullscreenchange', handleFullscreenChange);
       if (unlisten) unlisten();
     };
-  }, []);
+  }, [setIsFullscreen]);
 
   // 视频单击播放/暂停，双击全屏优化
   const handleVideoSurfaceClick = () => {
@@ -212,15 +228,10 @@ export const VideoSurface: React.FC = () => {
           playNextEpisode();
           break;
         case 'Escape':
-          if (document.fullscreenElement) {
-            void document.exitFullscreen();
-          }
-          // 原生窗口全屏下浏览器不会自动处理 Esc，需要显式退出。
-          if (isTauriEnvironment()) {
-            void import('@tauri-apps/api/window')
-              .then(({ getCurrentWindow }) => getCurrentWindow().setFullscreen(false))
-              .then(() => setIsFullscreen(false))
-              .catch(() => {});
+          // 纯原生全屏下浏览器不会代为处理 Esc（那是 DOM 全屏的行为），
+          // 必须显式退出，否则用户会觉得"退不出全屏"。
+          if (isFullscreen) {
+            void exitFullscreen();
           }
           break;
       }
@@ -228,7 +239,20 @@ export const VideoSurface: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, handleUserActivity]);
+  }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity]);
+
+  // 全屏时给一个短暂的退出提示：纯原生全屏没有浏览器自带的全屏提示条，
+  // 用户不一定会想到 Esc。
+  const [showFsHint, setShowFsHint] = useState(false);
+  useEffect(() => {
+    if (!isFullscreen) {
+      setShowFsHint(false);
+      return;
+    }
+    setShowFsHint(true);
+    const timer = setTimeout(() => setShowFsHint(false), 3200);
+    return () => clearTimeout(timer);
+  }, [isFullscreen]);
 
   // 加载态的呈现方式取决于画面上是否已有内容：换集时主播放器保留了上一集的
   // 最后一帧（切换路径刻意不调用 load()），此时用全屏遮罩等于把这一帧盖掉。
@@ -281,6 +305,15 @@ export const VideoSurface: React.FC = () => {
         className="w-full h-full object-contain cursor-pointer"
         onClick={handleVideoSurfaceClick}
       />
+
+      {/* 全屏退出提示：纯原生全屏没有浏览器自带的提示条，短暂告知 Esc 可用。 */}
+      {isFullscreen && showFsHint && (
+        <div className="absolute top-6 inset-x-0 z-30 pointer-events-none flex justify-center">
+          <div className="px-3.5 py-2 rounded-xl bg-black/70 border border-white/15 shadow-lg text-[11px] font-semibold text-white/90">
+            已进入全屏 · 按 Esc 退出
+          </div>
+        </div>
+      )}
 
       {/*
         等待提示分两种，取决于用户是"切换"还是"首次进入"：
