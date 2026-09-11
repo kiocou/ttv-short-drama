@@ -26,6 +26,23 @@ interface AppContextType {
   selectedSeriesId: string | null;
   searchKeyword: string;
   isNavCollapsed: boolean;
+  /**
+   * 是否处于全屏播放。
+   *
+   * 这里只描述**原生窗口是否全屏**，不再掺入 DOM 全屏状态。
+   *
+   * 历史教训：此前同时使用 Tauri 窗口全屏与 element.requestFullscreen()
+   * 两套机制，它们各自独立、无法可靠同步，导致两类故障：
+   *   1. 窗口确实进了全屏，但 DOM 全屏调用失败（await 之后用户手势已失效），
+   *      视频仍被挤在标题栏下方的应用壳里 —— 表现为"全屏后视频不放大"；
+   *   2. Esc 由 Chromium 处理退出 DOM 全屏，状态随之置为 false，
+   *      但原生窗口仍停在全屏 —— 表现为"退出全屏后整个程序还是全屏"。
+   *
+   * 现在只用原生窗口全屏：窗口真正铺满屏幕，应用自身隐藏标题栏让播放器
+   * 占满窗口。单一事实来源，不存在失步。
+   */
+  isFullscreen: boolean;
+  setIsFullscreen: (value: boolean) => void;
   toasts: ToastMessage[];
   cardTransition: CardTransitionData | null;
   navigateTo: (view: AppView, seriesId?: string) => void;
@@ -46,6 +63,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [selectedSeriesId, setSelectedSeriesId] = useState<string | null>(null);
   const [searchKeyword, setSearchKeyword] = useState<string>('');
   const [isNavCollapsed, setIsNavCollapsed] = useState<boolean>(false);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [cardTransition, setCardTransition] = useState<CardTransitionData | null>(null);
 
@@ -104,6 +122,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         selectedSeriesId,
         searchKeyword,
         isNavCollapsed,
+        isFullscreen,
+        setIsFullscreen,
         toasts,
         cardTransition,
         navigateTo,
