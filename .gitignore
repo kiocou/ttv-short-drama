@@ -24,6 +24,7 @@ short-drama-device.json
 # ---- 临时目录（build.bat / start-dev-safe.bat 使用）----
 .tmp/
 .workbuddy-ai/
+.serena/
 
 # ---- 随包分发的第三方运行期资源 ----
 # 现已纳入版本控制，使仓库开箱即用。

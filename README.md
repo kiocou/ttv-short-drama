@@ -1,4 +1,6 @@
-# TTV Short Drama - Windows 云母 (Mica) 极简纯白短剧播放器前端
+# TTV Short Drama - Windows 云母 (Mica) 极简纯白短剧播放器
+
+当前发布版本：`0.1.1`（Windows x64）。安装包发布在 [GitHub Releases](https://github.com/kiocou/ttv-short-drama/releases)。
 
 本项目专为 **短剧与漫剧** 桌面播放场景打造，深度遵循 [`docs/frontend-design.md`](./docs/frontend-design.md) 与 [`docs/backend-architecture.md`](./docs/backend-architecture.md) 规范。
 
@@ -58,17 +60,29 @@ npm run build
 
 ---
 
-## 🔧 资源恢复（新机器 / 重新克隆后）
+## 🔧 随包资源与 Git LFS
 
-以下随包分发的第三方大体积二进制**不纳入版本控制**（合计约 139MB），克隆后需按需补齐：
+发布所需的运行时资源已经随仓库纳入版本控制，克隆后即可构建。`ffmpeg.exe` 超过 GitHub 的单文件限制，使用 Git LFS 存储；首次克隆或切换提交后请确认已安装 Git LFS 并执行 `git lfs pull`。
 
 | 路径 | 内容 | 恢复方式 |
 | --- | --- | --- |
-| `src-tauri/resources/mpv/ffmpeg.exe` | 解密与转码用 ffmpeg | 从 ffmpeg 官方或 gyan.dev 构建下载后放入该目录 |
-| `src-tauri/resources/python/` | 嵌入式 CPython 运行时 | 解压 embeddable 版 Python 到该目录 |
-| `src-tauri/resources/shortdrama-worker/site-packages/` | worker 的 Python 依赖 | `pip install requests pycryptodome gmssl betterproto -t <该目录>` |
+| `src-tauri/resources/mpv/ffmpeg.exe` | 解密与转码用 ffmpeg（Git LFS） | `git lfs pull` |
+| `src-tauri/resources/python/` | 嵌入式 CPython 运行时 | 已随仓库提供 |
+| `src-tauri/resources/shortdrama-worker/site-packages/` | worker 的 Python 依赖 | 已随仓库提供 |
 
-`worker.py`、`liushen/`（签名实现）等本项目自有源码均已正常纳入版本控制。
+`worker.py`、`liushen/`（签名实现）等本项目自有源码也已纳入版本控制。CI 会启用 LFS 并校验这些资源存在，避免生成缺少运行时文件的安装包。
+
+## 🚢 发布前检查
+
+```bash
+npm ci
+npm run build
+npm run tauri build
+cargo fmt --manifest-path src-tauri/Cargo.toml --check
+cargo test --manifest-path src-tauri/Cargo.toml --bins
+```
+
+生产 Windows 包使用 GUI 子系统，不会额外打开终端窗口；应用 WebView 的右键浏览器菜单也已禁用。
 
 ---
 
