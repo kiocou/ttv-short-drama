@@ -338,14 +338,14 @@ export const ExploreView: React.FC = () => {
 
                   {/* 顶部标签 */}
                   <div className="absolute top-2 left-2 flex gap-1">
-                    <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-blue-600/90 text-white backdrop-blur-sm shadow-xs">
+                    <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-blue-600/95 text-white shadow-xs">
                       {series.tags[0] || '热门'}
                     </span>
                   </div>
 
                   {/* 评分角标 */}
                   {series.rating && (
-                    <div className="absolute top-2 right-2 flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-black/50 text-amber-300 backdrop-blur-sm">
+                    <div className="absolute top-2 right-2 flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-black/65 text-amber-300">
                       <Star className="w-2.5 h-2.5 fill-current" />
                       <span>{series.rating.toFixed(1)}</span>
                     </div>
@@ -358,7 +358,7 @@ export const ExploreView: React.FC = () => {
                   </div>
 
                   {/* 悬停快捷播放图标 (实体凸出的立体浮雕圆盘) */}
-                  <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-200 bg-black/20 backdrop-blur-[0.5px]">
+                  <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-200 bg-black/20">
                     <div className="w-11 h-11 rounded-full fluent-convex-disc text-white flex items-center justify-center shadow-lg transform scale-75 group-hover:scale-100 transition-all duration-200 ease-[cubic-bezier(0.34,1.56,0.64,1)]">
                       <Play className="w-5 h-5 fill-current ml-0.5" />
                     </div>

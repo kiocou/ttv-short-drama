@@ -1,7 +1,7 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { AppProvider, useAppStore } from './stores/useAppStore';
 import { CatalogProvider } from './stores/useCatalogStore';
-import { PlaybackProvider } from './stores/usePlaybackStore';
+import { PlaybackProvider, usePlaybackStore } from './stores/usePlaybackStore';
 import { EnhancementProvider } from './stores/useEnhancementStore';
 import { HistoryProvider } from './stores/useHistoryStore';
 import { SettingsProvider } from './stores/useSettingsStore';
@@ -18,8 +18,15 @@ import { VideoSurface } from './components/player/VideoSurface';
 
 const AppContent: React.FC = () => {
   const { currentView, selectedSeriesId } = useAppStore();
+  const { stopPlayback } = usePlaybackStore();
 
   const isPlayer = currentView === 'player';
+
+  // 播放器宿主常驻 DOM，离开时仅被 display:none 隐藏，video 不会自动停。
+  // 不显式停止就会出现"回到主界面但声音还在播"（含后台连播倒计时自动开播）。
+  useEffect(() => {
+    if (!isPlayer) stopPlayback();
+  }, [isPlayer, stopPlayback]);
 
   return (
     <div className="w-full h-full flex flex-col mica-backdrop select-none overflow-hidden">
