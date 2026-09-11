@@ -266,6 +266,17 @@ export const ipcService = {
       saveStorage(STORAGE_KEYS.SETTINGS, settings);
     },
 
+    /** 查询真实缓存占用（短剧 + 漫剧合计）。返回 { files, bytes }。 */
+    async cacheUsage(): Promise<{ files: number; bytes: number }> {
+      if (isTauriEnvironment()) {
+        const r = await invokeBackend<{ removedFiles: number; freedBytes: number }>(
+          'short_drama_app_cache_usage',
+        );
+        return { files: r.removedFiles ?? 0, bytes: r.freedBytes ?? 0 };
+      }
+      return { files: 0, bytes: 0 };
+    },
+
     async clearCache(): Promise<{ freedMb: number }> {
       if (isTauriEnvironment()) return invokeBackend<{ freedMb: number }>('cache_clear');
       await new Promise(resolve => setTimeout(resolve, 300));
