@@ -520,12 +520,50 @@ fn sweep_cache_dir(dir: &std::path::Path) {
 /// 短剧单集约 5-15MB，1.5GB 约可容纳 120-300 集，够用且不至于失控。
 const CACHE_BUDGET_BYTES: u64 = 1536 * 1024 * 1024;
 
+/// 把文件的 mtime 更新为"现在"，作为 LRU 的最近使用时间。
+///
+/// 为什么需要它：旧实现直接用 atime 当 LRU 键，但 Windows 默认
+/// `DisableLastAccess=1`（本机实测 fsutil 确认，读取文件后 atime 完全不变），
+/// atime 因此恒等于创建时间，LRU 排序退化为"按文件名/目录顺序"，
+/// 淘汰会随机删掉**正在播放**的那一集——表现为播放中途报错、
+/// 以及刚看过的剧集下次又要重新整集下载。
+///
+/// 文件可能正被播放器以只读方式打开，写入权限未必拿得到；拿不到就静默放弃，
+/// 下一次命中还会再试，不会影响播放。
+fn touch_cache_entry(path: &std::path::Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// 刚写入的文件在此时长内绝不被淘汰（秒）。
+///
+/// 保护两种"正在被使用"的文件：
+/// 1. 正在下载/转存、尚未被播放器接管的产物；
+/// 2. 播放器刚刚打开、可能仍在读取的那一集。
+/// 淘汰只看 mtime，而正在播放的文件 mtime 很新，因此不会被选中。
+const CACHE_EVICT_GRACE_SECONDS: u64 = 900;
+
 /// 按 LRU 把频道缓存压回预算内。
 ///
 /// `keep` 是本次即将写入/刚命中的那一集，绝不淘汰——否则会出现"刚下载完
-/// 立刻被自己删掉"的荒谬情况。淘汰按访问时间升序（最旧优先），用文件的
-/// atime 优先、退化到 mtime，因为播放走的是文件读取，atime 更贴近"最近播放"。
+/// 立刻被自己删掉"的荒谬情况。
+///
+/// LRU 键使用 mtime：命中缓存时 `touch_cache_entry` 会把它推到当前时间，
+/// 因此 mtime 真实反映"最近使用"。再叠加 `CACHE_EVICT_GRACE_SECONDS` 宽限期，
+/// 双重保证不会删除正在播放或刚下载的整集。
 fn enforce_cache_budget(dir: &std::path::Path, keep: &std::path::Path) {
+    evict_to_budget(dir, keep, CACHE_BUDGET_BYTES, std::time::SystemTime::now());
+}
+
+/// 淘汰主体。预算与"当前时刻"显式传入，便于单元测试直接验证排序与宽限期，
+/// 而不必真的制造出 1.5GB 文件。
+fn evict_to_budget(
+    dir: &std::path::Path,
+    keep: &std::path::Path,
+    budget_bytes: u64,
+    now: std::time::SystemTime,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -550,22 +588,28 @@ fn enforce_cache_budget(dir: &std::path::Path, keep: &std::path::Path) {
         if size == 0 {
             continue;
         }
+        // 只用 mtime：命中即会被 touch 到当前时间，语义上等价于"最近使用"。
+        // 不能再退回 atime——本机 atime 更新被系统关闭，它恒等于创建时间。
         let stamp = meta
-            .accessed()
-            .or_else(|_| meta.modified())
+            .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         total = total.saturating_add(size);
         files.push((path, size, stamp));
     }
-    if total <= CACHE_BUDGET_BYTES {
+    if total <= budget_bytes {
         return;
     }
     files.sort_by_key(|(_, _, stamp)| *stamp);
-    for (path, size, _) in files {
-        if total <= CACHE_BUDGET_BYTES {
+    let grace = std::time::Duration::from_secs(CACHE_EVICT_GRACE_SECONDS);
+    for (path, size, stamp) in files {
+        if total <= budget_bytes {
             break;
         }
+        // 正在写入或正在播放的文件绝不淘汰。
         if path == keep {
+            continue;
+        }
+        if now.duration_since(stamp).map(|age| age < grace).unwrap_or(true) {
             continue;
         }
         if std::fs::remove_file(&path).is_ok() {
@@ -612,6 +656,7 @@ pub async fn short_drama_app_resolve<R: Runtime>(
         .find(|path| path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false))
         .unwrap_or(namespace_path);
     let cached_payload = |path: &std::path::Path| {
+        touch_cache_entry(path);
         Ok(ShortDramaAppPlayback {
             play_url: path.to_string_lossy().to_string(),
             width: 0,
@@ -1396,5 +1441,108 @@ mod tests {
     fn masks_device_id_without_leaking_full_value() {
         assert_eq!(super::mask_device_id("1234567890"), "…7890");
         assert_eq!(super::mask_device_id("12"), "****");
+    }
+
+    /// 临时目录夹具：创建后写若干文件并把部分文件的 mtime 调老。
+    struct CacheFixture {
+        dir: std::path::PathBuf,
+    }
+
+    impl CacheFixture {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("ttv-cache-{tag}-{unique}"));
+            std::fs::create_dir_all(&dir).expect("create fixture dir");
+            Self { dir }
+        }
+
+        fn write(&self, name: &str, bytes: usize, age_secs: u64) -> std::path::PathBuf {
+            let path = self.dir.join(name);
+            std::fs::write(&path, vec![b'x'; bytes]).expect("write fixture");
+            if age_secs > 0 {
+                let stamp = std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(age_secs);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .expect("open fixture")
+                    .set_modified(stamp)
+                    .expect("age fixture");
+            }
+            path
+        }
+    }
+
+    impl Drop for CacheFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 回归：预算超限时，淘汰的是**最旧**的文件，新文件与 keep 必须存活。
+    ///
+    /// 旧实现用 atime 当 LRU 键，但 Windows 默认 `DisableLastAccess=1`
+    /// （本机 fsutil 实测确认：读取文件后 atime 完全不变），atime 恒等于
+    /// 创建时间，排序退化后会删掉**正在播放**的那一集——表现为播放中途报错、
+    /// 刚看过的剧集下次又要重新整集下载。
+    #[test]
+    fn eviction_removes_oldest_and_protects_recent() {
+        let fx = CacheFixture::new("evict");
+        // 两个陈旧文件（远超宽限期）与一个刚写入的新文件，各 100 字节。
+        let oldest = fx.write("111.mp4", 100, 7200);
+        let older = fx.write("222.mp4", 100, 3600);
+        let fresh = fx.write("333.mp4", 100, 0);
+
+        // 预算 250 字节：总量 300，必须淘汰到只剩 2 个。
+        super::evict_to_budget(&fx.dir, &fresh, 250, std::time::SystemTime::now());
+
+        assert!(!oldest.exists(), "最旧的文件应当被淘汰");
+        assert!(fresh.exists(), "刚写入的文件在宽限期内，不得被淘汰");
+        // 淘汰顺序必须是"先最旧"，因此 older 应比 oldest 更可能存活。
+        assert!(older.exists(), "次旧文件在淘汰一个后应仍存活");
+        assert_eq!(fresh.metadata().expect("stat").len(), 100);
+    }
+
+    /// 回归：即便在预算内，keep 指向的文件也绝不能被删。
+    #[test]
+    fn eviction_never_deletes_keep() {
+        let fx = CacheFixture::new("keep");
+        let keep = fx.write("999.mp4", 100, 7200); // 故意做得很旧
+        fx.write("888.mp4", 100, 7200);
+
+        // 预算极低：必须淘汰，但 keep 必须豁免。
+        super::evict_to_budget(&fx.dir, &keep, 0, std::time::SystemTime::now());
+
+        assert!(keep.exists(), "keep 指向的文件被删除，会导致刚下载完就自我销毁");
+    }
+
+    /// 回归：宽限期内的文件即使超预算也不淘汰（保护正在下载/播放的整集）。
+    #[test]
+    fn eviction_respects_grace_period() {
+        let fx = CacheFixture::new("grace");
+        let recent_a = fx.write("aaa.mp4", 100, 0);
+        let recent_b = fx.write("bbb.mp4", 100, 10);
+
+        // 预算 0：若没有宽限期，两者都会被删。
+        super::evict_to_budget(&fx.dir, &recent_a, 0, std::time::SystemTime::now());
+
+        assert!(recent_a.exists(), "宽限期内的文件不得被淘汰");
+        assert!(recent_b.exists(), "宽限期内的文件不得被淘汰");
+    }
+
+    /// 预算足够时不做任何删除。
+    #[test]
+    fn eviction_is_noop_within_budget() {
+        let fx = CacheFixture::new("noop");
+        let old = fx.write("555.mp4", 100, 7200);
+        let keep = fx.write("666.mp4", 100, 7200);
+
+        super::evict_to_budget(&fx.dir, &keep, 1024 * 1024, std::time::SystemTime::now());
+
+        assert!(old.exists());
+        assert!(keep.exists());
     }
 }

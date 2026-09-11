@@ -81,6 +81,8 @@ interface PlaybackContextType {
   toggleDiagnostics: (open?: boolean) => void;
   cancelCountdown: () => void;
   acceptCountdown: () => void;
+  /** 离开播放器工作区时调用：暂停画面、取消后台连播并落盘进度。 */
+  stopPlayback: () => void;
   /** 云端解析进度。null 表示当前没有在途解析。 */
   prepareStatus: PrepareStatus | null;
   /** 提前预热某一集（详情页 / 选集抽屉），已在缓存或已在途则跳过。 */
@@ -936,6 +938,39 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   /**
+   * 离开播放器工作区时停止播放。
+   *
+   * 为什么必须显式停止：播放器宿主是**常驻 DOM** 的（为了保住 videoRef 就绪、
+   * 切换不闪屏），离开播放器时它只是被 `display:none` 隐藏——`<video>` 并不会
+   * 因此暂停，于是退出后声音继续在后台播放（实测：返回主界面后 paused 仍为
+   * false，currentTime 持续前进）。
+   *
+   * 连播倒计时必须一并取消：否则它在后台到点仍会调用 playNextEpisode，
+   * 在用户看不到画面的情况下自动开播下一集、继续出声。
+   *
+   * 同时强制落盘进度，避免"看了半集、退出后进度丢失"。
+   */
+  const stopPlayback = useCallback(() => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setCountdown({ active: false, remaining: 5, nextEpisode: null });
+
+    const video = videoRef.current;
+    if (video) {
+      if (!video.paused) video.pause();
+      if (video.duration > 0 && Number.isFinite(video.duration)) {
+        saveProgressThrottledRef.current(video.currentTime, video.duration, true);
+      }
+    }
+    setIsPlaying(false);
+    // 回到 idle 而不是保留 playing/buffering：否则重新进入播放器时
+    // 界面会先闪一下上一集的加载遮罩。
+    setUiState(prev => (prev.kind === 'idle' ? prev : { kind: 'idle' }));
+  }, []);
+
+  /**
    * 事件处理器上下文。
    *
    * 旧实现把 6 个监听器直接绑在 effect 里，依赖数组带着 `countdown.active`——
@@ -1199,6 +1234,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         toggleDiagnostics: (open) => setIsDiagnosticsOpen(prev => open ?? !prev),
         cancelCountdown,
         acceptCountdown,
+        stopPlayback,
         prepareStatus,
         prewarmEpisode,
       }}

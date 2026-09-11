@@ -15,13 +15,15 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({
   className = '',
   dot = false,
 }) => {
+  // 提高不透明度以替代原先的 backdrop-blur-sm：徽章是成批出现的小元素，
+  // 每个 backdrop-filter 都是一次额外的合成器模糊，代价远高于它带来的观感。
   const variantStyles = {
-    default: 'bg-slate-100/90 text-slate-600 border-slate-200/80',
-    blue: 'bg-blue-50/90 text-blue-700 border-blue-200/80',
-    green: 'bg-emerald-50/90 text-emerald-700 border-emerald-200/80',
-    amber: 'bg-amber-50/90 text-amber-700 border-amber-200/80',
-    purple: 'bg-purple-50/90 text-purple-700 border-purple-200/80',
-    red: 'bg-rose-50/90 text-rose-700 border-rose-200/80',
+    default: 'bg-slate-100 text-slate-600 border-slate-200/80',
+    blue: 'bg-blue-50 text-blue-700 border-blue-200/80',
+    green: 'bg-emerald-50 text-emerald-700 border-emerald-200/80',
+    amber: 'bg-amber-50 text-amber-700 border-amber-200/80',
+    purple: 'bg-purple-50 text-purple-700 border-purple-200/80',
+    red: 'bg-rose-50 text-rose-700 border-rose-200/80',
   };
 
   const dotStyles = {
@@ -40,7 +42,7 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({
 
   return (
     <span
-      className={`inline-flex items-center gap-1.5 border shadow-sm backdrop-blur-sm select-none ${
+      className={`inline-flex items-center gap-1.5 border shadow-sm select-none ${
         variantStyles[variant]
       } ${sizeStyles[size]} ${className}`}
     >
