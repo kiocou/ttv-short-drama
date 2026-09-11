@@ -1,4 +1,0 @@
-app pid=7384
-webview2 进程数 = 32
-webview2 CPU 增量 = 2.06s / 4s  (即 51.6% 单核)
-app CPU 增量      = 0s / 4s
