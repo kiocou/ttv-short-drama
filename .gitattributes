@@ -18,3 +18,14 @@
 
 # 让 git 在语言统计中不把产物算进来
 package-lock.json  linguist-generated
+
+# ============================================================
+#  Git LFS
+# ============================================================
+# ffmpeg.exe 为 106,888,704 字节（101.94 MiB），**超过 GitHub 单文件 100 MiB
+# 硬限制**，直接提交会被服务端拒绝（push 报 file exceeds 100.00 MB）。
+# 交给 LFS 后由指针文件入库、实体存于 LFS 存储，即可正常克隆。
+#
+# 注意：克隆此仓库前需安装 git-lfs（https://git-lfs.com）；
+# 未安装时拿到的只是文本指针，运行时资源会失效。
+src-tauri/resources/mpv/ffmpeg.exe  filter=lfs diff=lfs merge=lfs -text
