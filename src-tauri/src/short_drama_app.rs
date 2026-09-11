@@ -553,6 +553,7 @@ fn touch_cache_entry(path: &std::path::Path) {
 /// 保护两种"正在被使用"的文件：
 /// 1. 正在下载/转存、尚未被播放器接管的产物；
 /// 2. 播放器刚刚打开、可能仍在读取的那一集。
+///
 /// 淘汰只看 mtime，而正在播放的文件 mtime 很新，因此不会被选中。
 const CACHE_EVICT_GRACE_SECONDS: u64 = 900;
 
@@ -567,7 +568,10 @@ const CACHE_EVICT_GRACE_SECONDS: u64 = 900;
 fn enforce_cache_budget(keep: &std::path::Path) {
     // 跨频道统一收敛：短剧与漫剧共享同一份预算。
     evict_channels_to_budget(
-        &[cache_dir().join("short-series"), cache_dir().join("motion-comic")],
+        &[
+            cache_dir().join("short-series"),
+            cache_dir().join("motion-comic"),
+        ],
         keep,
         CACHE_BUDGET_BYTES,
         CACHE_MAX_AGE_SECONDS,
@@ -631,9 +635,7 @@ fn evict_channels_to_budget(
             if size == 0 {
                 continue;
             }
-            let stamp = meta
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let stamp = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             total = total.saturating_add(size);
             files.push((path, size, stamp));
         }
@@ -645,7 +647,9 @@ fn evict_channels_to_budget(
         if path == keep {
             return true;
         }
-        now.duration_since(stamp).map(|age| age < grace).unwrap_or(true)
+        now.duration_since(stamp)
+            .map(|age| age < grace)
+            .unwrap_or(true)
     };
 
     // 第一步：过期清理。
@@ -653,7 +657,10 @@ fn evict_channels_to_budget(
         if is_protected(path, *stamp) {
             continue;
         }
-        let expired = now.duration_since(*stamp).map(|age| age > max_age).unwrap_or(false);
+        let expired = now
+            .duration_since(*stamp)
+            .map(|age| age > max_age)
+            .unwrap_or(false);
         if expired && std::fs::remove_file(path).is_ok() {
             total = total.saturating_sub(*size);
             report.removed_files += 1;
@@ -663,10 +670,8 @@ fn evict_channels_to_budget(
 
     // 第二步：超量清理（LRU）。
     if total > budget_bytes {
-        let mut survivors: Vec<&(std::path::PathBuf, u64, std::time::SystemTime)> = files
-            .iter()
-            .filter(|(path, _, _)| path.exists())
-            .collect();
+        let mut survivors: Vec<&(std::path::PathBuf, u64, std::time::SystemTime)> =
+            files.iter().filter(|(path, _, _)| path.exists()).collect();
         survivors.sort_by_key(|(_, _, stamp)| *stamp);
         for (path, size, stamp) in survivors {
             if total <= budget_bytes {
@@ -690,7 +695,10 @@ fn evict_channels_to_budget(
 pub fn cache_usage() -> CacheSweepReport {
     let mut total: u64 = 0;
     let mut count: u64 = 0;
-    for dir in [cache_dir().join("short-series"), cache_dir().join("motion-comic")] {
+    for dir in [
+        cache_dir().join("short-series"),
+        cache_dir().join("motion-comic"),
+    ] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -720,7 +728,11 @@ pub fn cache_usage() -> CacheSweepReport {
 /// 由 setup 钩子调用，**无需用户任何确认**。返回统计供日志输出。
 pub fn auto_clean_cache_on_start() -> CacheSweepReport {
     let root = cache_dir();
-    for dir in [root.clone(), root.join("short-series"), root.join("motion-comic")] {
+    for dir in [
+        root.clone(),
+        root.join("short-series"),
+        root.join("motion-comic"),
+    ] {
         sweep_cache_dir(&dir);
     }
     // keep 指向一个不可能存在的路径：启动时没有任何"正在写入"的剧集。
@@ -733,8 +745,6 @@ pub fn auto_clean_cache_on_start() -> CacheSweepReport {
         std::time::SystemTime::now(),
     )
 }
-
-
 
 /// 解析一集：命中缓存直接返回；否则拉起 worker.py（下载+解密+转存）并转发进度。
 ///
@@ -766,8 +776,7 @@ pub async fn short_drama_app_resolve<R: Runtime>(
     // TTV Box stored short-drama files directly under short-drama-cache before
     // the per-channel namespaces were added. Reuse those files instead of
     // downloading the same episode again after an upgrade.
-    let legacy_path = (requested_quality == "auto")
-        .then(|| cache_dir().join(format!("{vid}.mp4")));
+    let legacy_path = (requested_quality == "auto").then(|| cache_dir().join(format!("{vid}.mp4")));
     let out_path = std::iter::once(namespace_path.clone())
         .chain(legacy_path)
         .into_iter()
@@ -879,6 +888,11 @@ pub async fn short_drama_app_resolve<R: Runtime>(
 }
 
 /// leader 专属：拉起 worker 进程完成下载+解密+转存，转发进度事件。
+///
+/// 参数偏多是这条链路的固有特征：它需要目标路径、进度上报句柄，以及一组
+/// worker 运行期凭据。这些值分别来自不同的上层调用点，强行打包成一个结构体
+/// 只会把同一个签名换个地方写，可读性并不会更好。
+#[allow(clippy::too_many_arguments)]
 async fn run_resolve_worker<R: Runtime>(
     app: &AppHandle<R>,
     python: PathBuf,
@@ -1062,7 +1076,10 @@ async fn run_resolve_worker<R: Runtime>(
 #[tauri::command]
 pub fn short_drama_app_cache_clear() -> Result<CacheSweepReport, String> {
     let before = cache_usage();
-    for dir in [cache_dir().join("short-series"), cache_dir().join("motion-comic")] {
+    for dir in [
+        cache_dir().join("short-series"),
+        cache_dir().join("motion-comic"),
+    ] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -1610,8 +1627,7 @@ mod tests {
             let path = self.dir.join(name);
             std::fs::write(&path, vec![b'x'; bytes]).expect("write fixture");
             if age_secs > 0 {
-                let stamp = std::time::SystemTime::now()
-                    - std::time::Duration::from_secs(age_secs);
+                let stamp = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
                 std::fs::OpenOptions::new()
                     .write(true)
                     .open(&path)
@@ -1646,7 +1662,7 @@ mod tests {
         // 预算 250 字节：总量 300，必须淘汰到只剩 2 个。
         // 保留期设为 7 天，因此 2 小时/1 小时的文件不算过期，走 LRU 分支。
         let report = super::evict_channels_to_budget(
-            &[fx.dir.clone()],
+            std::slice::from_ref(&fx.dir),
             &fresh,
             250,
             7 * 24 * 3600,
@@ -1671,14 +1687,17 @@ mod tests {
 
         // 预算极低：必须淘汰，但 keep 必须豁免。
         super::evict_channels_to_budget(
-            &[fx.dir.clone()],
+            std::slice::from_ref(&fx.dir),
             &keep,
             0,
             7 * 24 * 3600,
             std::time::SystemTime::now(),
         );
 
-        assert!(keep.exists(), "keep 指向的文件被删除，会导致刚下载完就自我销毁");
+        assert!(
+            keep.exists(),
+            "keep 指向的文件被删除，会导致刚下载完就自我销毁"
+        );
     }
 
     /// 回归：宽限期内的文件即使超预算也不淘汰（保护正在下载/播放的整集）。
@@ -1690,7 +1709,7 @@ mod tests {
 
         // 预算 0：若没有宽限期，两者都会被删。
         super::evict_channels_to_budget(
-            &[fx.dir.clone()],
+            std::slice::from_ref(&fx.dir),
             &recent_a,
             0,
             7 * 24 * 3600,
@@ -1709,7 +1728,7 @@ mod tests {
         let keep = fx.write("666.mp4", 100, 7200);
 
         let report = super::evict_channels_to_budget(
-            &[fx.dir.clone()],
+            std::slice::from_ref(&fx.dir),
             &keep,
             1024 * 1024,
             7 * 24 * 3600,
@@ -1734,7 +1753,7 @@ mod tests {
 
         // 预算给得很大：只有"过期"这一条能触发删除。
         let report = super::evict_channels_to_budget(
-            &[fx.dir.clone()],
+            std::slice::from_ref(&fx.dir),
             &fx.dir.join("__none__"),
             1024 * 1024 * 1024,
             7 * 24 * 3600,
@@ -1763,8 +1782,7 @@ mod tests {
             for i in 0..2 {
                 let p = dir.join(format!("{prefix}{i}.mp4"));
                 std::fs::write(&p, vec![b'x'; 100]).expect("write");
-                let stamp = std::time::SystemTime::now()
-                    - std::time::Duration::from_secs(7200);
+                let stamp = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
                 std::fs::OpenOptions::new()
                     .write(true)
                     .open(&p)
@@ -1793,6 +1811,9 @@ mod tests {
             remaining <= 250,
             "跨频道合计应被压回预算内，实际剩余 {remaining} 字节"
         );
-        assert_eq!(report.removed_files, 2, "400 - 250 需淘汰 2 个 100 字节文件");
+        assert_eq!(
+            report.removed_files, 2,
+            "400 - 250 需淘汰 2 个 100 字节文件"
+        );
     }
 }
