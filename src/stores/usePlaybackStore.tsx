@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useRef, useEffect, useCallback, ReactNode } from 'react';
 import { PlaybackUiState } from '../types/playback';
 import { SeriesDetail, EpisodeItem } from '../types/series';
-import { ipcService } from '../services/ipc';
+import { ipcService, isTauriEnvironment } from '../services/ipc';
 import { useSettingsStore } from './useSettingsStore';
 
 /**
@@ -81,7 +81,25 @@ interface PlaybackContextType {
   toggleDiagnostics: (open?: boolean) => void;
   cancelCountdown: () => void;
   acceptCountdown: () => void;
+  /** 云端解析进度。null 表示当前没有在途解析。 */
+  prepareStatus: PrepareStatus | null;
+  /** 提前预热某一集（详情页 / 选集抽屉），已在缓存或已在途则跳过。 */
+  prewarmEpisode: (seriesId: string, episodeId: string, contentType?: number) => void;
 }
+
+/** 原生解析 worker 上报的进度（Rust 转发的 `shortdrama://app-resolve` 事件）。 */
+export interface PrepareStatus {
+  /** 正在解析的集 vid。 */
+  episodeId: string;
+  /** start / sign / model / fallback / download / transcode。 */
+  stage: string;
+  message: string;
+  /** 下载阶段才有真实百分比，其余阶段为 null。 */
+  percent: number | null;
+}
+
+/** 悬停预热的最大并发数：超过它就不再受理新的预热请求。 */
+const MAX_PREWARM_INFLIGHT = 2;
 
 const PlaybackContext = createContext<PlaybackContextType | null>(null);
 
@@ -111,6 +129,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     remaining: 5,
     nextEpisode: null,
   });
+  const [prepareStatus, setPrepareStatus] = useState<PrepareStatus | null>(null);
+  // 悬停预热的在途计数，见 prewarmEpisode 的并发上限说明。
+  const prewarmInflightRef = useRef<number>(0);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const activeSessionRef = useRef<number>(100);
@@ -126,6 +147,56 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 供"只绑定一次"的事件监听器间接调用的稳定引用。
   const playNextEpisodeRef = useRef<() => void>(() => {});
   const saveProgressThrottledRef = useRef<(pos: number, dur: number, force?: boolean) => void>(() => {});
+
+  // ============ 解析进度订阅 ============
+
+  /**
+   * 订阅原生解析进度。
+   *
+   * worker 每推进 10% 就会输出一行 download 进度，Rust 侧已经原样转发到
+   * `shortdrama://app-resolve`——但此前**前端没有任何监听者**，于是换集时用户
+   * 只能面对一个不透明的转圈，无法区分"正在签名""正在下载 40%"还是卡死了。
+   * 这里把阶段与百分比接出来，等待过程因此变得可解释。
+   */
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void import('@tauri-apps/api/event')
+      .then(({ listen }) =>
+        listen<{ vid?: string; stage?: string; message?: string; percent?: number | null }>(
+          'shortdrama://app-resolve',
+          event => {
+            const payload = event.payload || {};
+            const stage = String(payload.stage ?? '');
+            if (stage === 'done' || stage === 'error') {
+              setPrepareStatus(null);
+              return;
+            }
+            setPrepareStatus({
+              episodeId: String(payload.vid ?? ''),
+              stage,
+              message: typeof payload.message === 'string' ? payload.message : '',
+              percent: typeof payload.percent === 'number' ? payload.percent : null,
+            });
+          },
+        ),
+      )
+      .then(off => {
+        if (disposed) {
+          off();
+          return;
+        }
+        unlisten = off;
+      })
+      .catch(() => {
+        // 事件通道不可用时不影响播放主流程。
+      });
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   // ============ 无缝切换基础设施 ============
 
@@ -376,7 +447,49 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   /**
-   * 预热当前集相邻的集（下一集优先，其次上一集）。
+   * 发起一次后台整集预热（内部实现，所有预热入口共用同一个并发闸门）。
+   *
+   * 闸门是必要的：warmAdjacentEpisodes 一次要备 3 集，悬停入口还可能同时进来；
+   * 若不限并发，鼠标扫过一屏选集就能让十几个 worker 同时抢带宽与 CPU，
+   * 结果正在播的那一集反而更卡——适得其反。
+   *
+   * 返回是否真的发起了请求。
+   */
+  const startPrewarmResolve = (seriesId: string, episodeId: string, contentType: number): boolean => {
+    if (!isTauriEnvironment()) return false;
+    if (prewarmInflightRef.current >= MAX_PREWARM_INFLIGHT) return false;
+    const key = episodeCacheKey(seriesId, episodeId);
+    if (resolvedFileByVidRef.current.has(key)) return false; // 已缓存或已在途
+    resolvedFileByVidRef.current.set(key, '__prefetching__');
+    prewarmInflightRef.current += 1;
+    // 占位必须保证最终释放：网络异常会被吞掉，若不在约定时间内收尾，
+    // '__prefetching__' 会永久占住 key，导致该集再也无法被预热或被快路径命中。
+    const guard = setTimeout(() => {
+      if (resolvedFileByVidRef.current.get(key) === '__prefetching__') {
+        resolvedFileByVidRef.current.delete(key);
+      }
+    }, 330_000);
+    // 只发一次请求：prefetchNative 与 resolveNative 调用的是同一条
+    // short_drama_app_resolve 命令，串成 .then 链等于把同一集解析两遍。
+    void ipcService.playback
+      .resolveNative(seriesId, episodeId, contentType, 'auto')
+      .then(resolved => {
+        clearTimeout(guard);
+        if (resolved.playUrl) resolvedFileByVidRef.current.set(key, resolved.playUrl);
+        else resolvedFileByVidRef.current.delete(key);
+      })
+      .catch(() => {
+        clearTimeout(guard);
+        resolvedFileByVidRef.current.delete(key);
+      })
+      .finally(() => {
+        prewarmInflightRef.current = Math.max(0, prewarmInflightRef.current - 1);
+      });
+    return true;
+  };
+
+  /**
+   * 预热当前集相邻的集（下两集优先，其次上一集）。
    *
    * 旧实现的预取挂在 handlePlaying 上，只有"真正开始播"才触发，而且占位符
    * `__prefetching__` 会被快路径主动跳过——等于预取从未生效，用户每次换集
@@ -391,36 +504,27 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const idx = series.episodes.findIndex(e => e.id === currentEpisodeId);
     if (idx < 0) return;
     const contentType = series.type === 'comic' ? 1004 : 1;
-    // 下一集优先（连播的主要目标），其次上一集。
-    const targets = [series.episodes[idx + 1], series.episodes[idx - 1]].filter(Boolean) as EpisodeItem[];
+    // 下一集优先（连播的主要目标），再多备一集作为缓冲；上一集兜底"回看"。
+    // 只备 idx+1 时，用户连跳两集仍要等整集下载，等于没有预取。
+    const next = series.episodes.slice(idx + 1, idx + 3);
+    const prev = series.episodes[idx - 1] ? [series.episodes[idx - 1]] : [];
+    const targets = [...next, ...prev];
     targets.forEach(target => {
-      const key = episodeCacheKey(series.id, target.id);
-      const existing = resolvedFileByVidRef.current.get(key);
-      if (existing && existing !== '__prefetching__') return; // 已热
-      if (existing === '__prefetching__') return; // 在途
+      // 用户已经切走：不再为旧会话占用带宽。
       if (activeSessionRef.current !== sessionAtRequest) return;
-      resolvedFileByVidRef.current.set(key, '__prefetching__');
-      // 占位必须保证最终释放：prefetchNative 会吞掉网络异常，若不在约定时间内
-      // 收尾，'__prefetching__' 会永久占住 key，导致该集再也无法被预取或被
-      // 快路径命中。用一个兜底定时器强制清理。
-      const guard = setTimeout(() => {
-        if (resolvedFileByVidRef.current.get(key) === '__prefetching__') {
-          resolvedFileByVidRef.current.delete(key);
-        }
-      }, 330_000);
-      void ipcService.playback
-        .prefetchNative(series.id, target.id, contentType, 'auto')
-        .then(() => ipcService.playback.resolveNative(series.id, target.id, contentType, 'auto'))
-        .then(resolved => {
-          clearTimeout(guard);
-          if (resolved.playUrl) resolvedFileByVidRef.current.set(key, resolved.playUrl);
-          else resolvedFileByVidRef.current.delete(key);
-        })
-        .catch(() => {
-          clearTimeout(guard);
-          resolvedFileByVidRef.current.delete(key); // 预取失败释放占位
-        });
+      startPrewarmResolve(series.id, target.id, contentType);
     });
+  };
+
+  /**
+   * 为指定集提前预热（详情页选集悬停、选集抽屉悬停）。
+   *
+   * 从"用户瞄上某一集"到"真正点进播放器"通常有几百毫秒到数秒的间隔，
+   * 这段时间足以让 worker 把该集下载推进一截。此前只有进入播放器之后才
+   * 才开始预取，等于白白丢掉这段本可以利用的时间。
+   */
+  const prewarmEpisode = (seriesId: string, episodeId: string, contentType = 1) => {
+    startPrewarmResolve(seriesId, episodeId, contentType);
   };
 
   const playLocalFile = async (
@@ -500,6 +604,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       countdownIntervalRef.current = null;
     }
     setCountdown({ active: false, remaining: 5, nextEpisode: null });
+    // 上一集的解析进度不能留在界面上：新的解析会立刻重新上报。
+    setPrepareStatus(null);
 
     const newSessionId = (activeSessionRef.current += 1);
     setSessionId(newSessionId);
@@ -1093,6 +1199,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         toggleDiagnostics: (open) => setIsDiagnosticsOpen(prev => open ?? !prev),
         cancelCountdown,
         acceptCountdown,
+        prepareStatus,
+        prewarmEpisode,
       }}
     >
       {children}

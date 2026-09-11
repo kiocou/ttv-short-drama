@@ -6,6 +6,16 @@ import { NextCountdown } from './NextCountdown';
 import { DiagnosticsModal } from './DiagnosticsModal';
 import { Loader2, AlertCircle, RefreshCw } from 'lucide-react';
 
+/** worker 上报的解析阶段 → 用户可读文案。 */
+const STAGE_LABEL: Record<string, string> = {
+  start: '正在启动云端解析…',
+  sign: '正在校验播放凭据…',
+  model: '正在获取播放信息…',
+  fallback: '正在切换备用线路…',
+  download: '正在缓存本集…',
+  transcode: '正在转换格式…',
+};
+
 export const VideoSurface: React.FC = () => {
   const {
     videoRef,
@@ -22,6 +32,7 @@ export const VideoSurface: React.FC = () => {
     currentEpisode,
     position,
     isMuted,
+    prepareStatus,
   } = usePlaybackStore();
 
   const [isControlsVisible, setIsControlsVisible] = useState(true);
@@ -136,6 +147,17 @@ export const VideoSurface: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, handleUserActivity]);
 
+  // 加载态的呈现方式取决于画面上是否已有内容：换集时主播放器保留了上一集的
+  // 最后一帧（切换路径刻意不调用 load()），此时用全屏遮罩等于把这一帧盖掉。
+  // readyState >= HAVE_CURRENT_DATA(2) 且已有播放进度，即认为"有旧帧可留"。
+  const isLoadingVisible = uiState.kind === 'opening' || uiState.kind === 'buffering';
+  const hasVisibleFrame = (videoRef.current?.readyState ?? 0) >= 2 && position > 0;
+  const loadingLabel = uiState.kind === 'buffering'
+    ? '缓冲中…'
+    : prepareStatus
+      ? prepareStatus.message || STAGE_LABEL[prepareStatus.stage] || '正在准备播放源…'
+      : '正在准备播放源…';
+
   return (
     <div
       ref={containerRef}
@@ -150,14 +172,59 @@ export const VideoSurface: React.FC = () => {
         onClick={handleVideoSurfaceClick}
       />
 
-      {/* 缓冲与加载状态覆盖 */}
-      {(uiState.kind === 'opening' || uiState.kind === 'buffering') && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 backdrop-blur-xs pointer-events-none z-20">
-          <div className="p-4 rounded-2xl bg-white/85 backdrop-blur-xl shadow-fluent-lg flex flex-col items-center gap-3">
-            <Loader2 className="w-8 h-8 text-blue-600 animate-spin" />
-            <span className="text-xs font-semibold text-slate-800">
-              {uiState.kind === 'opening' ? '正在连接高码流源...' : '缓冲中...'}
+      {/*
+        加载态分两种呈现，取决于画面上是否已有上一帧：
+        - 首次进入（无帧）：全屏遮罩 + 阶段文案 + 真实下载百分比。
+        - 换集（有帧）：旧画面继续留在屏幕上（这正是"无缝"的意义），
+          只在角落给一个不遮挡内容的进度胶囊。全屏黑罩会把保留的旧帧盖掉，
+          等于把无缝切换的设计意图又抹掉了。
+      */}
+      {isLoadingVisible && hasVisibleFrame && (
+        <div className="absolute bottom-24 right-4 z-20 pointer-events-none">
+          <div className="px-3 py-2 rounded-xl bg-black/55 backdrop-blur-md shadow-lg flex items-center gap-2.5 border border-white/15">
+            <Loader2 className="w-3.5 h-3.5 text-white animate-spin flex-shrink-0" />
+            <span className="text-[11px] font-semibold text-white whitespace-nowrap">
+              {loadingLabel}
             </span>
+            {prepareStatus?.percent != null && (
+              <span className="text-[11px] font-mono text-white/80 tabular-nums w-9 text-right">
+                {prepareStatus.percent}%
+              </span>
+            )}
+          </div>
+          {prepareStatus?.percent != null && (
+            <div className="mt-1 h-1 w-full rounded-full bg-white/20 overflow-hidden">
+              <div
+                className="h-full bg-blue-400 rounded-full transition-[width] duration-300 ease-out"
+                style={{ width: `${Math.min(100, Math.max(0, prepareStatus.percent))}%` }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {isLoadingVisible && !hasVisibleFrame && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 backdrop-blur-xs pointer-events-none z-20">
+          <div className="p-4 min-w-[232px] rounded-2xl bg-white/85 backdrop-blur-xl shadow-fluent-lg flex flex-col items-center gap-3">
+            <Loader2 className="w-8 h-8 text-blue-600 animate-spin" />
+            <span className="text-xs font-semibold text-slate-800 text-center">
+              {loadingLabel}
+            </span>
+            {prepareStatus?.percent != null ? (
+              <>
+                <div className="w-44 h-1.5 rounded-full bg-slate-200/90 overflow-hidden">
+                  <div
+                    className="h-full bg-blue-600 rounded-full transition-[width] duration-300 ease-out"
+                    style={{ width: `${Math.min(100, Math.max(0, prepareStatus.percent))}%` }}
+                  />
+                </div>
+                <span className="text-[11px] font-mono text-slate-500">{prepareStatus.percent}%</span>
+              </>
+            ) : (
+              <span className="text-[10px] text-slate-400 text-center leading-relaxed">
+                首次播放需完整缓存本集，之后即可秒开
+              </span>
+            )}
           </div>
         </div>
       )}
