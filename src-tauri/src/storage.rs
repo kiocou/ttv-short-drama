@@ -86,6 +86,13 @@ impl Database {
             .connection
             .lock()
             .map_err(|_| "历史数据库锁不可用。".to_string())?;
+        // 冲突时是否采用本次的播放进度，取决于本次上报的时长是否可信。
+        //
+        // duration 为 0 意味着上报时视频元数据还没就绪——前端在 metadata 到达
+        // 之前也会保存一次（用于先记住"看到第几集"）。旧实现无条件覆盖，
+        // 于是这样一次上报就会把之前正确的时长冲成 0，历史页随即显示成
+        // "0分0秒 / 0分0秒"，且进度条永远为空。时长不可信时只更新元数据，
+        // position / duration / percent 三件套一律保留库里的旧值。
         connection
             .execute(
                 "INSERT INTO watch_history (
@@ -98,9 +105,12 @@ impl Database {
                     series_cover = excluded.series_cover,
                     episode_number = excluded.episode_number,
                     total_episodes = excluded.total_episodes,
-                    position_seconds = excluded.position_seconds,
-                    duration_seconds = excluded.duration_seconds,
-                    progress_percent = excluded.progress_percent,
+                    position_seconds = CASE WHEN excluded.duration_seconds > 0
+                        THEN excluded.position_seconds ELSE watch_history.position_seconds END,
+                    duration_seconds = CASE WHEN excluded.duration_seconds > 0
+                        THEN excluded.duration_seconds ELSE watch_history.duration_seconds END,
+                    progress_percent = CASE WHEN excluded.duration_seconds > 0
+                        THEN excluded.progress_percent ELSE watch_history.progress_percent END,
                     updated_at = excluded.updated_at,
                     is_finished = excluded.is_finished,
                     channel = excluded.channel",
