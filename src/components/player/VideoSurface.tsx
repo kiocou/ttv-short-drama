@@ -6,7 +6,7 @@ import { PlayerControls } from './PlayerControls';
 import { EpisodeDrawer } from './EpisodeDrawer';
 import { NextCountdown } from './NextCountdown';
 import { DiagnosticsModal } from './DiagnosticsModal';
-import { Loader2, AlertCircle, RefreshCw } from 'lucide-react';
+import { Loader2, AlertCircle, RefreshCw, Copy } from 'lucide-react';
 
 /** worker 上报的解析阶段 → 用户可读文案。 */
 const STAGE_LABEL: Record<string, string> = {
@@ -57,7 +57,7 @@ export const VideoSurface: React.FC = () => {
   } = usePlaybackStore();
 
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
-  const { isFullscreen, setIsFullscreen } = useAppStore();
+  const { isFullscreen, setIsFullscreen, showToast } = useAppStore();
 
   const [isControlsVisible, setIsControlsVisible] = useState(true);
   // 平滑倒计时读数：worker 每 10% 才上报一次，直接用上报值会几秒才跳一下。
@@ -403,9 +403,30 @@ export const VideoSurface: React.FC = () => {
             {/* 失败原因必须可见：否则用户（和排查者）只能看到一句笼统的
                 "播放源连接受阻"，分不清是整集解析失败、解码失败还是 play 被打断。 */}
             {errorDetail && (
-              <p className="max-w-[17rem] text-[10px] leading-relaxed text-slate-400 font-mono break-words">
-                {errorDetail}
-              </p>
+              <button
+                onClick={() => {
+                  const report = [
+                    `错误码: ${uiState.kind === 'error' ? uiState.code : '未知'}`,
+                    `原因: ${errorDetail}`,
+                    `剧集: ${currentSeries?.title ?? '未知'} (${currentSeries?.id ?? '-'})`,
+                    `集数: 第 ${currentEpisode?.episodeNumber ?? '-'} 集 (${currentEpisode?.id ?? '-'})`,
+                    `位置: ${Math.round(position)}s`,
+                  ].join('\n');
+                  void navigator.clipboard?.writeText(report)
+                    .then(() => showToast('诊断信息已复制', 'success'))
+                    .catch(() => showToast('复制失败，请手动截图', 'error'));
+                }}
+                title="复制诊断信息（错误码 / 原因 / 剧集 / 集数）"
+                className="max-w-[17rem] text-left px-2.5 py-2 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 transition-colors cursor-pointer group"
+              >
+                <span className="block text-[10px] leading-relaxed text-slate-500 font-mono break-words">
+                  {errorDetail}
+                </span>
+                <span className="mt-1 flex items-center gap-1 text-[10px] font-semibold text-slate-400 group-hover:text-blue-600">
+                  <Copy className="w-3 h-3" />
+                  复制诊断信息
+                </span>
+              </button>
             )}
             <button
               onClick={() => {
