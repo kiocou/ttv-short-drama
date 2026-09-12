@@ -1187,6 +1187,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             recoverable: true,
           });
         });
+      } else {
+        // 播放器宿主缺失（VideoSurface 常驻 DOM，理论上不会发生；但一旦发生，
+        // 上面两个分支都不进，uiState 会永远停在 opening——既不出画也不报错，
+        // "正在切换到第 N 集"的提示也会一直挂着）。这里兜底宣判失败。
+        noteFailure('播放器宿主不可用', new Error('videoRef.current 为空'));
+        setIsPlaying(false);
+        setUiState({
+          kind: 'error',
+          sessionId: newSessionId,
+          code: 'MEDIA_LOAD_FAILED',
+          recoverable: true,
+        });
       }
     } catch (err) {
       if (activeSessionRef.current === newSessionId) {
