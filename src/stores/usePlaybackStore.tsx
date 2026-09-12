@@ -788,6 +788,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         setTimeout(step, 400);
         return;
       }
+      // 前台正在解析（换集 / 自动连播）时，暂缓后台预取。
+      //
+      // 预取走的是 startPrewarmResolve → 直接调 resolveNative，不会登记
+      // nativeResolveInFlightRef，所以这个判断只对**前台**生效，不会自己卡自己。
+      //
+      // 必要性：单集解析要拉起 python worker + ffmpeg（下载 + 解密 + 转存），
+      // 前台 1 个加上预取 2 个就是 3 个进程同时抢带宽与 CPU。而前台那一集是
+      // 用户**正在等**的，预取只是"最好有"——让前台先跑完更符合直觉，
+      // 也避免前台的探针预热被拖到超时（那会白白多绕一圈 playDirect）。
+      if (nativeResolveInFlightRef.current) {
+        setTimeout(step, 500);
+        return;
+      }
       const next = prefetchQueueRef.current.shift();
       if (!next) {
         prefetchPumpRunningRef.current = false;
