@@ -1,7 +1,26 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { useEnhancementStore } from '../../stores/useEnhancementStore';
 import { X, Activity, Cpu, HardDrive, Wifi, ShieldCheck, Zap } from 'lucide-react';
+
+/** WebView 真正能测到的播放指标。 */
+interface LiveStats {
+  fps: number;
+  decoded: number;
+  dropped: number;
+  width: number;
+  height: number;
+  source: string;
+}
+
+const EMPTY_LIVE: LiveStats = { fps: 0, decoded: 0, dropped: 0, width: 0, height: 0, source: '—' };
+
+/** 主播放器元素（本应用常驻且唯一）。 */
+type FrameVideo = HTMLVideoElement & {
+  requestVideoFrameCallback?: (cb: () => void) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+  getVideoPlaybackQuality?: () => { totalVideoFrames: number; droppedVideoFrames: number };
+};
 
 export const DiagnosticsModal: React.FC = () => {
   const {
@@ -15,16 +34,48 @@ export const DiagnosticsModal: React.FC = () => {
     toggleDiagnostics,
   } = usePlaybackStore();
 
-  const {
-    engine,
-    uiState: enhState,
-    targetFps,
-    currentFps,
-    decodeFps,
-    droppedFrames,
-    latencyMs,
-    capabilities,
-  } = useEnhancementStore();
+  const { uiState: enhState, capabilities } = useEnhancementStore();
+
+  // 指标直接从 <video> 采样，而不是读增强引擎的状态。
+  //
+  // 原因：本项目尚未接入任何补帧 SDK，后端上报的 actual_fps / 丢帧恒为空
+  // （旧面板因此常年显示 0，还叠加了写死的 "0.00%" 与 "D3D11 共享纹理模式"
+  // ——渲染实际是 WebView2 原生 <video>）。这里改为展示真正可测量的事实。
+  const [live, setLive] = useState<LiveStats>(EMPTY_LIVE);
+  useEffect(() => {
+    if (!isDiagnosticsOpen) return;
+    const video = document.querySelector('video') as FrameVideo | null;
+    if (!video) return;
+    let frames = 0;
+    let handle = 0;
+    let last = performance.now();
+    if (video.requestVideoFrameCallback) {
+      const onFrame = () => {
+        frames += 1;
+        handle = video.requestVideoFrameCallback?.(onFrame) ?? 0;
+      };
+      handle = video.requestVideoFrameCallback(onFrame);
+    }
+    const timer = setInterval(() => {
+      const now = performance.now();
+      const elapsedSeconds = (now - last) / 1000;
+      const quality = video.getVideoPlaybackQuality?.();
+      setLive({
+        fps: elapsedSeconds > 0 ? frames / elapsedSeconds : 0,
+        decoded: quality ? quality.totalVideoFrames : 0,
+        dropped: quality ? quality.droppedVideoFrames : 0,
+        width: video.videoWidth,
+        height: video.videoHeight,
+        source: video.src.startsWith('http://asset.localhost') ? '本地解密文件' : '网络直链',
+      });
+      frames = 0;
+      last = now;
+    }, 1000);
+    return () => {
+      clearInterval(timer);
+      if (handle && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(handle);
+    };
+  }, [isDiagnosticsOpen]);
 
   if (!isDiagnosticsOpen) return null;
 
@@ -71,21 +122,21 @@ export const DiagnosticsModal: React.FC = () => {
 
             <div className="grid grid-cols-3 gap-2 pt-1 text-center">
               <div className="p-2 bg-white/90 rounded-lg border border-slate-200/60 shadow-xs">
-                <div className="text-[10px] text-slate-400">输出帧率</div>
+                <div className="text-[10px] text-slate-400">实时帧率</div>
                 <div className="text-sm font-bold text-blue-600 font-mono mt-0.5">
-                  {currentFps} <span className="text-[9px] font-normal text-slate-400">FPS</span>
+                  {live.fps.toFixed(1)} <span className="text-[9px] font-normal text-slate-400">FPS</span>
                 </div>
               </div>
               <div className="p-2 bg-white/90 rounded-lg border border-slate-200/60 shadow-xs">
-                <div className="text-[10px] text-slate-400">原生解码</div>
+                <div className="text-[10px] text-slate-400">已解码帧</div>
                 <div className="text-sm font-bold text-slate-700 font-mono mt-0.5">
-                  {decodeFps} <span className="text-[9px] font-normal text-slate-400">FPS</span>
+                  {live.decoded}
                 </div>
               </div>
               <div className="p-2 bg-white/90 rounded-lg border border-slate-200/60 shadow-xs">
-                <div className="text-[10px] text-slate-400">处理延迟</div>
-                <div className="text-sm font-bold text-emerald-600 font-mono mt-0.5">
-                  {latencyMs} <span className="text-[9px] font-normal text-slate-400">ms</span>
+                <div className="text-[10px] text-slate-400">画面尺寸</div>
+                <div className="text-[11px] font-bold text-emerald-600 font-mono mt-1">
+                  {live.width && live.height ? `${live.width}×${live.height}` : '—'}
                 </div>
               </div>
             </div>
@@ -108,7 +159,8 @@ export const DiagnosticsModal: React.FC = () => {
               <div>
                 <p className="text-[10px] text-slate-400">丢帧计数</p>
                 <p className="font-semibold text-slate-800 font-mono">
-                  {droppedFrames} 帧 (0.00%)
+                  {live.dropped} 帧
+                  {live.decoded > 0 ? ` (${((live.dropped / live.decoded) * 100).toFixed(2)}%)` : ''}
                 </p>
               </div>
             </div>
@@ -118,7 +170,7 @@ export const DiagnosticsModal: React.FC = () => {
               <div className="truncate">
                 <p className="text-[10px] text-slate-400">显卡设备探测</p>
                 <p className="font-semibold text-slate-800 truncate" title={capabilities?.gpuName}>
-                  {capabilities?.gpuName || 'DirectX 12 硬件加速'}
+                  {capabilities?.gpuName || '未探测'}
                 </p>
               </div>
             </div>
@@ -126,9 +178,9 @@ export const DiagnosticsModal: React.FC = () => {
             <div className="p-3 rounded-xl bg-slate-50/70 border border-slate-200/60 flex items-center gap-2.5">
               <HardDrive className="w-4 h-4 text-amber-500" />
               <div>
-                <p className="text-[10px] text-slate-400">播放器渲染模式</p>
+                <p className="text-[10px] text-slate-400">片源类型</p>
                 <p className="font-semibold text-slate-800">
-                  D3D11 共享纹理模式
+                  {live.source}
                 </p>
               </div>
             </div>

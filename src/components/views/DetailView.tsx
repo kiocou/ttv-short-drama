@@ -33,6 +33,21 @@ export const DetailView: React.FC = () => {
   const [detail, setDetail] = useState<SeriesDetail | null>(null);
   const [isDescExpanded, setIsDescExpanded] = useState(false);
   const [showAllEpisodesModal, setShowAllEpisodesModal] = useState(false);
+
+  // 打开详情页就预签名接下来几集的播放直链。
+  //
+  // `stream` 只有两次 App API 往返、不下载任何媒体，实测固定 2.16s，是首播
+  // 耗时里最大的一块固定开销。用户在详情页通常停留数秒到数十秒，正好覆盖它；
+  // 点集时后端直接命中缓存，这段等待就消失了。从"继续观看"那一集开始取，
+  // 因为那是最可能被点的。失败静默——预签名是纯优化。
+  useEffect(() => {
+    if (!detail || detail.episodes.length === 0) return;
+    const anchor = detail.episodes.findIndex(ep => (ep.watchedSeconds || 0) > 0 && !ep.isFinished);
+    const start = anchor >= 0 ? anchor : 0;
+    const vids = detail.episodes.slice(start, start + 4).map(ep => ep.id);
+    if (vids.length === 0) return;
+    void ipcService.playback.prefetchStream(vids, detail.type === 'comic' ? 1004 : 1);
+  }, [detail]);
   const [modalSearch, setModalSearch] = useState('');
 
   // 详情和可播放集数始终以当前项目后端返回的数据为准。
@@ -227,7 +242,16 @@ export const DetailView: React.FC = () => {
 
               <button
                 onClick={() => {
-                  showToast('已复制剧集链接到剪贴板', 'success');
+                  // 旧实现只弹了个"已复制"的提示，从未真正写入剪贴板——
+                  // 用户粘贴时拿到的是空的。这里改为真的复制，并在失败时
+                  // 如实告知，而不是继续假装成功。
+                  const link = `https://hongguoduanju.com/detail?series_id=${detail?.id ?? ''}`;
+                  void navigator.clipboard
+                    ?.writeText(link)
+                    .then(
+                      () => showToast('已复制剧集链接到剪贴板', 'success'),
+                      () => showToast('复制失败，请手动复制剧集 ID', 'error'),
+                    );
                 }}
                 className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-200/80 text-xs font-semibold shadow-xs active:scale-95 transition-all cursor-pointer"
               >

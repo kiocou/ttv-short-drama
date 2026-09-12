@@ -33,6 +33,83 @@ fn resolve_inflight() -> &'static Mutex<std::collections::HashSet<String>> {
     MAP.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
+/// 预签名直链缓存：vid -> (url, 解密密钥, 宽高, 时长)。
+///
+/// 为什么要有它：`stream` 子命令要跑两次 App API 往返（multi_video_model +
+/// fallback_api），实测固定 2.16s，是未命中解析里最大的一块固定开销。
+/// 用户打开详情页到真正点某一集之间通常有数秒到数十秒，足够提前做完。
+/// 直链带时间戳签名，因此这里绝不长期持有：超过 TTL 直接当作没有。
+#[derive(Debug, Clone)]
+struct CachedStream {
+    url: String,
+    content_key: String,
+    width: u32,
+    height: u32,
+    duration_ms: i64,
+    cached_at: std::time::Instant,
+}
+
+/// 直链有效期保守取 10 分钟。宁可少命中，也不能把可能过期的地址交给 worker
+/// —— 过期直链会让 ffmpeg 拉流失败，虽然调用方有重新签名的兜底，但那是
+/// 一次额外的整轮重跑。
+const STREAM_CACHE_TTL: Duration = Duration::from_secs(600);
+
+fn stream_cache() -> &'static Mutex<std::collections::HashMap<String, CachedStream>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, CachedStream>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 把一次 `stream` 的产物存进缓存。url 为空时直接丢弃，避免缓存一条废条目。
+fn store_stream(vid: &str, payload: &serde_json::Value) {
+    let url = payload
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if url.is_empty() {
+        return;
+    }
+    let entry = CachedStream {
+        url,
+        content_key: payload
+            .get("content_key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        width: payload
+            .get("width")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        height: payload
+            .get("height")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        duration_ms: payload
+            .get("duration_ms")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+        cached_at: std::time::Instant::now(),
+    };
+    if let Ok(mut guard) = stream_cache().lock() {
+        guard.insert(vid.to_owned(), entry);
+    }
+}
+
+/// 读一条未过期的缓存（顺带清掉过期项，防止长期运行后缓存只增不减）。
+fn peek_stream(vid: &str) -> Option<CachedStream> {
+    let mut guard = stream_cache().lock().ok()?;
+    guard.retain(|_, item| item.cached_at.elapsed() < STREAM_CACHE_TTL);
+    guard.get(vid).cloned()
+}
+
+fn clear_stream(vid: &str) {
+    if let Ok(mut guard) = stream_cache().lock() {
+        guard.remove(vid);
+    }
+}
+
 /// 前端传入的解析请求。解析链路只依赖 vid；其余字段保留用于诊断与
 /// 向前兼容，不参与缓存寻址。
 #[derive(Debug, Deserialize)]
@@ -290,12 +367,70 @@ fn explain_hongguo_api_error(detail: &str) -> String {
 }
 
 fn data_dir() -> PathBuf {
-    if let Some(base) = dirs::data_local_dir() {
-        return base.join("com.ttv.player");
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(resolve_data_dir).clone()
+}
+
+/// 应用数据根目录：设备凭据与剧集缓存都落在这里。
+///
+/// 历史遗留：早期版本直接复用 TTV Box 的 `com.ttv.player`，于是两个应用
+/// 共用同一份设备凭据与剧集缓存——"清空缓存"会伸进另一个应用的目录，
+/// 卸载其中一个也会带走另一个的数据。现在改用本应用自己的
+/// `com.ttv.shortdrama`（与 tauri.conf.json 的 identifier 一致）。
+///
+/// 首次启动时会把旧目录里的凭据与缓存搬过来：用户的设备身份与已经下载好的
+/// 剧集不该因为一次改名而作废（重新生成凭据意味着重新走一遍注册）。
+fn resolve_data_dir() -> PathBuf {
+    let Some(base) = dirs::data_local_dir() else {
+        return std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".ttv-data");
+    };
+    let current = base.join("com.ttv.shortdrama");
+    migrate_legacy_data_dir(&base.join("com.ttv.player"), &current);
+    current
+}
+
+/// 把历史目录里的设备凭据与剧集缓存搬到新目录。
+///
+/// 两条安全约束：只在"目标尚不存在"时搬（绝不覆盖新目录里的数据），以及
+/// 优先用 rename（同一磁盘上只是一次元数据操作，上 GB 缓存也不会卡启动），
+/// 只有跨卷等场景才退回逐文件复制。任何一步失败都不阻断启动——凭据缺失时
+/// 应用本来就会重新生成，缓存缺失只会重新下载。
+fn migrate_legacy_data_dir(legacy: &std::path::Path, current: &std::path::Path) {
+    if !legacy.is_dir() || legacy == current {
+        return;
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".ttv-data")
+    let _ = std::fs::create_dir_all(current);
+    for name in ["short-drama-device.json", "short-drama-cache"] {
+        let from = legacy.join(name);
+        let to = current.join(name);
+        if !from.exists() || to.exists() {
+            continue;
+        }
+        if std::fs::rename(&from, &to).is_ok() {
+            continue;
+        }
+        if from.is_dir() {
+            let _ = copy_dir_recursive(&from, &to);
+        } else {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+}
+
+fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn device_config_path() -> PathBuf {
@@ -898,18 +1033,30 @@ pub async fn short_drama_app_resolve<R: Runtime>(
         // 回外层循环抢 leader 位。
     }
 
-    let result = run_resolve_worker(
-        &app,
-        python,
-        worker,
-        ffmpeg,
-        credentials,
-        profile,
-        vid.clone(),
-        requested_quality,
-        out_path.clone(),
-    )
-    .await;
+    // 预签名直链让 worker 跳过签名链路，代价是直链可能已过期（带时间戳签名）。
+    // 因此失败且用过预签名时清掉缓存重跑一次：这一轮 worker 会重新签名，
+    // 用户既不会看到过期直链导致的错误，也不必自己手动重试。
+    let had_prefetched = peek_stream(&vid).is_some();
+    let mut attempt = 0;
+    let result = loop {
+        attempt += 1;
+        let outcome = run_resolve_worker(
+            &app,
+            python.clone(),
+            worker.clone(),
+            ffmpeg.clone(),
+            credentials.clone(),
+            profile,
+            vid.clone(),
+            requested_quality,
+            out_path.clone(),
+        )
+        .await;
+        if outcome.is_ok() || !had_prefetched || attempt >= 2 {
+            break outcome;
+        }
+        clear_stream(&vid);
+    };
     // 无论成败都摘除 leader 位：follower 读到产物则返回，否则自行接管重跑。
     {
         let map = resolve_inflight();
@@ -946,6 +1093,17 @@ async fn run_resolve_worker<R: Runtime>(
     command.arg(&worker).arg("resolve").arg(&vid);
     apply_hongguo_worker_env(&mut command, &credentials, profile);
     command.env("TTV_SD_QUALITY", requested_quality);
+    // 命中预签名缓存时把直链与解密密钥直接交给 worker，跳过两次 App API 往返
+    // （实测固定 2.16s）。直链过期会让 ffmpeg 拉流失败，调用方
+    // short_drama_app_resolve 会在失败后清掉缓存并重跑一次。
+    if let Some(cached) = peek_stream(&vid) {
+        command
+            .env("TTV_SD_DIRECT_URL", &cached.url)
+            .env("TTV_SD_DIRECT_KEY", &cached.content_key)
+            .env("TTV_SD_DIRECT_WIDTH", cached.width.to_string())
+            .env("TTV_SD_DIRECT_HEIGHT", cached.height.to_string())
+            .env("TTV_SD_DIRECT_DURATION", cached.duration_ms.to_string());
+    }
     command
         .env("TTV_SD_FFMPEG", &ffmpeg)
         .env("TTV_SD_OUT", &out_path)
@@ -1146,6 +1304,52 @@ pub fn short_drama_app_cache_clear() -> Result<CacheSweepReport, String> {
 #[tauri::command]
 pub fn short_drama_app_cache_usage() -> CacheSweepReport {
     cache_usage()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefetchStreamInput {
+    pub vids: Vec<String>,
+    #[serde(default)]
+    pub content_type: Option<u16>,
+    #[serde(default)]
+    pub app_id: Option<u32>,
+}
+
+/// 预签名：提前把接下来几集的播放直链与解密密钥取回并缓存。
+///
+/// 这是"秒开"的关键一步。`stream` 只有两次 API 往返、不下载任何媒体数据，
+/// 几乎不占带宽，实测 2.1-2.3s；而用户从打开详情页到点某一集通常有
+/// 数秒到数十秒的空档。把这段做完，点集时的 resolve 就从 3-5s 掉到 1s 上下。
+///
+/// 逐个串行执行：瓶颈是签名计算与 API 往返而非带宽，串行还能让结果按
+/// "用户最可能点的顺序"先进缓存。任一集失败都静默跳过——预签名是纯优化。
+#[tauri::command]
+pub async fn short_drama_app_prefetch_stream<R: Runtime>(
+    app: AppHandle<R>,
+    input: PrefetchStreamInput,
+) -> Result<u32, String> {
+    let profile = HongguoAppProfile::from_input(input.content_type, input.app_id)?;
+    let mut ready = 0u32;
+    // 上限 6 集：再多也只是把缓存塞满，用户点不到那么远。
+    for raw in input.vids.iter().take(6) {
+        let vid = raw.trim().to_owned();
+        if vid.is_empty() || !vid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if peek_stream(&vid).is_some() {
+            ready += 1;
+            continue;
+        }
+        match run_worker_subcommand(&app, "stream", &vid, "prefetch", profile).await {
+            Ok(payload) => {
+                store_stream(&vid, &payload);
+                ready += 1;
+            }
+            Err(error) => eprintln!("[ttv] 预签名跳过 {vid}：{error}"),
+        }
+    }
+    Ok(ready)
 }
 
 // ============ stream / album（签名直链与专辑详情，共用 worker 进程） ============

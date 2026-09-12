@@ -13,8 +13,8 @@ use crate::models::{
 use crate::provider::DramaProvider;
 use crate::short_drama_app::{
     short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
-    short_drama_app_qualities, short_drama_app_resolve, short_drama_app_set_device,
-    short_drama_app_status, short_drama_app_stream,
+    short_drama_app_prefetch_stream, short_drama_app_qualities, short_drama_app_resolve,
+    short_drama_app_set_device, short_drama_app_status, short_drama_app_stream,
 };
 use crate::storage::Database;
 use std::collections::HashMap;
@@ -125,9 +125,6 @@ fn external_player_open(url: String) -> Result<(), String> {
     }
     let candidates = [
         std::env::var_os("TTV_BOX_MPV").map(PathBuf::from),
-        Some(PathBuf::from(
-            r"D:\Users\kioco\Desktop\TTV Box\src-tauri\resources\mpv\mpv.exe",
-        )),
         Some(PathBuf::from("src-tauri/resources/mpv/mpv.exe")),
     ];
     let player = candidates
@@ -231,7 +228,7 @@ fn enhancement_set_preference(engine: String, _target_fps: u32) -> Result<(), St
 /// 清空缓存（设置页按钮）。
 ///
 /// 这里曾经只清 AppState::cache_dir（即 <.app-data>/cache）——那是本应用自己的
-/// 目录，而**剧集视频实际由 worker 写在 com.ttv.player/short-drama-cache**，
+/// 目录，而**剧集视频实际由 worker 写在 <data_dir>/short-drama-cache**，
 /// 两者不是同一个位置。结果是「一键释放缓存」永远报 0 MB，而真正占地的 2GB+
 /// 视频文件从未被触及。现在改为委托给 short_drama_app_cache_clear，
 /// 由它清理真实的剧集缓存并返回释放量。
@@ -405,6 +402,7 @@ fn main() {
             short_drama_app_stream,
             short_drama_app_qualities,
             short_drama_app_album,
+            short_drama_app_prefetch_stream,
             history_list,
             history_save,
             history_remove,

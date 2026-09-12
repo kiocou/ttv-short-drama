@@ -181,6 +181,23 @@ export const ipcService = {
       }
     },
 
+    // 预签名：只取播放直链与解密密钥，不下载任何媒体数据。
+    //
+    // 后端实测这条链路是两次 App API 往返、固定 2.16s，是首播耗时里最大的一块
+    // 固定开销。提前做完，点集时 resolve 就不必再等它。
+    async prefetchStream(vids: string[], contentType?: number): Promise<number> {
+      if (!isTauriEnvironment() || vids.length === 0) return 0;
+      try {
+        const ready = await invokeBackend<number>('short_drama_app_prefetch_stream', {
+          input: { vids, contentType },
+        });
+        return ready ?? 0;
+      } catch {
+        // 纯优化：失败静默，点集时后端照常走完整签名链路。
+        return 0;
+      }
+    },
+
     async snapshot(sessionId: number): Promise<PlaybackSnapshot> {
       if (isTauriEnvironment()) return invokeBackend<PlaybackSnapshot>('playback_snapshot', { sessionId });
       return {

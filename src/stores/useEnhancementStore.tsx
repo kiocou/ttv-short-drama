@@ -7,13 +7,8 @@ interface EnhancementContextType {
   uiState: EnhancementUiState;
   targetFps: number;
   currentFps: number;
-  decodeFps: number;
-  droppedFrames: number;
-  latencyMs: number;
   capabilities: EnhancementCapabilities | null;
   setEngine: (engine: EnhancementEngine) => Promise<void>;
-  simulateDegrade: () => void;
-  resetDegrade: () => void;
 }
 
 const EnhancementContext = createContext<EnhancementContextType | null>(null);
@@ -23,9 +18,6 @@ export const EnhancementProvider: React.FC<{ children: ReactNode }> = ({ childre
   const [uiState, setUiState] = useState<EnhancementUiState>({ kind: 'probing' });
   const [targetFps, setTargetFps] = useState<number>(60);
   const [currentFps, setCurrentFps] = useState<number>(0);
-  const [decodeFps] = useState<number>(0);
-  const [droppedFrames, setDroppedFrames] = useState<number>(0);
-  const [latencyMs, setLatencyMs] = useState<number>(0);
   const [capabilities, setCapabilities] = useState<EnhancementCapabilities | null>(null);
 
   useEffect(() => {
@@ -38,14 +30,12 @@ export const EnhancementProvider: React.FC<{ children: ReactNode }> = ({ childre
           setEngineState('off');
           setUiState({ kind: 'off' });
           setCurrentFps(status?.actualFps || 0);
-          setLatencyMs(0);
           return;
         }
         const activeEngine: EnhancementEngine = status.mode.toLowerCase().includes('rife') ? 'rife' : 'compatible';
         setEngineState(activeEngine);
         setTargetFps(status.displayFps || 60);
         setCurrentFps(status.actualFps || 0);
-        setLatencyMs(0);
         setUiState(status.fallbackActive
           ? { kind: 'degraded', engine: activeEngine, reason: status.reason || '后端已降级增强链路。' }
           : { kind: 'running', engine: activeEngine, outputFps: status.actualFps || undefined });
@@ -66,7 +56,6 @@ export const EnhancementProvider: React.FC<{ children: ReactNode }> = ({ childre
       setUiState({ kind: 'off' });
       setTargetFps(60);
       setCurrentFps(0);
-      setLatencyMs(0);
       return;
     }
 
@@ -76,22 +65,9 @@ export const EnhancementProvider: React.FC<{ children: ReactNode }> = ({ childre
     setEngineState(newEngine);
     setTargetFps(status?.displayFps || 60);
     setCurrentFps(status?.actualFps || 0);
-    setLatencyMs(0);
     setUiState(status?.fallbackActive
       ? { kind: 'degraded', engine: newEngine, reason: status.reason || '后端已降级增强链路。' }
       : { kind: 'running', engine: newEngine, outputFps: status?.actualFps || undefined });
-  };
-
-  const simulateDegrade = () => {
-    setUiState({
-      kind: 'degraded',
-      engine: engine,
-      reason: 'GPU 渲染超时，自动降级为原生帧率保护播放',
-    });
-  };
-
-  const resetDegrade = () => {
-    setEngine(engine);
   };
 
   return (
@@ -101,13 +77,8 @@ export const EnhancementProvider: React.FC<{ children: ReactNode }> = ({ childre
         uiState,
         targetFps,
         currentFps,
-        decodeFps,
-        droppedFrames,
-        latencyMs,
         capabilities,
         setEngine,
-        simulateDegrade,
-        resetDegrade,
       }}
     >
       {children}
