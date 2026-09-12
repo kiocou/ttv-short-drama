@@ -485,7 +485,23 @@ pub fn short_drama_app_set_device(
 ///    `{vid}.mp4`，这些副本是重复下载的产物，保留纯属浪费。
 ///
 /// 只做这两类精确匹配，绝不删除 `{vid}.mp4` 正式缓存。
-fn sweep_cache_dir(dir: &std::path::Path) {
+/// 半成品（`.part.mp4` / `.source.tmp`）的"正在写入"判定门槛（秒）。
+///
+/// mtime 新于此值的半成品视为**正被某个 worker 写入**，不清理。见
+/// `sweep_cache_dir` 里关于预取与前台解析互殴的说明。
+const PARTIAL_STALE_SECONDS: u64 = 600;
+
+/// 清理目录里的半成品与幻影清晰度副本。
+///
+/// `stale_after` 只作用于半成品：mtime 比它更"新"的半成品会被跳过。
+///
+/// 为什么需要这个门槛：本函数既在启动时调用，也在**每次解析前**调用，而解析
+/// 与后台预取是并发的（`MAX_PREWARM_INFLIGHT` 个预取 worker 可能正在写各自
+/// 的 `.part.mp4`）。无条件删除所有半成品，就会让"前台换一次集"顺手把"后台
+/// 预取正在写的那一集"删掉——两者互殴，表现为换集莫名变慢、偶发失败。
+/// 用 mtime 门槛把正在写的文件排除掉即可；启动时与手动清空缓存时传 0，
+/// 那时本来就没有 worker 在跑。
+fn sweep_cache_dir(dir: &std::path::Path, stale_after: Duration, now: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -510,7 +526,18 @@ fn sweep_cache_dir(dir: &std::path::Path) {
                         && !quality.is_empty()
                 })
                 .unwrap_or(false);
-        if is_partial || is_phantom_quality {
+        // 幻影清晰度副本是旧版遗留（`{vid}-4k.mp4` 之类），新代码不会再产生，
+        // 不存在并发写入，可以直接删。
+        // 半成品则必须过了门槛才删；mtime 读不到时按"正在写"处理，保守不删。
+        let partial_is_stale = is_partial
+            && entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .map(|age| age >= stale_after)
+                .unwrap_or(false);
+        if partial_is_stale || is_phantom_quality {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -733,7 +760,8 @@ pub fn auto_clean_cache_on_start() -> CacheSweepReport {
         root.join("short-series"),
         root.join("motion-comic"),
     ] {
-        sweep_cache_dir(&dir);
+        // 启动时没有任何 worker 在跑，陈旧门槛传 0 = 全部清理。
+        sweep_cache_dir(&dir, Duration::from_secs(0), std::time::SystemTime::now());
     }
     // keep 指向一个不可能存在的路径：启动时没有任何"正在写入"的剧集。
     let sentinel = root.join("__none__");
@@ -808,7 +836,12 @@ pub async fn short_drama_app_resolve<R: Runtime>(
     //   读取，只会占盘（实测残留过 0 字节的 xxx-1080p.mp4.part.mp4）。
     // - `{vid}-{quality}.mp4` 是旧版按清晰度拼文件的产物，现已统一到 `{vid}.mp4`，
     //   保留只会白占空间。
-    sweep_cache_dir(out_path.parent().unwrap_or(&cache_dir()));
+    // 保留 mtime 很新的半成品：那很可能是并发预取 worker 正在写的那一集。
+    sweep_cache_dir(
+        out_path.parent().unwrap_or(&cache_dir()),
+        Duration::from_secs(PARTIAL_STALE_SECONDS),
+        std::time::SystemTime::now(),
+    );
     // 容量上限：缓存无界增长会把用户磁盘吃满（实测已积累 2.25GB 且只增不减）。
     // 这是**全自动**收敛：跨频道按 LRU 淘汰、并清掉超过保留期的陈旧剧集，
     // 全程无需用户确认。keep 传本次要写入的那一集，避免自我删除。
@@ -1091,7 +1124,12 @@ pub fn short_drama_app_cache_clear() -> Result<CacheSweepReport, String> {
         }
     }
     // 顺带清掉根目录下的历史遗留文件（旧版本直接写在 short-drama-cache 根下）。
-    sweep_cache_dir(&cache_dir());
+    // 这里是用户主动"清空缓存"，门槛传 0 = 全部清理。
+    sweep_cache_dir(
+        &cache_dir(),
+        Duration::from_secs(0),
+        std::time::SystemTime::now(),
+    );
     let Ok(entries) = std::fs::read_dir(cache_dir()) else {
         return Ok(before);
     };
