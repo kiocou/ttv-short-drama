@@ -224,6 +224,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 在途的本地解析 promise。play() 拒绝与 video error 事件可能先后触发同一次
   // 恢复流程，记录在途任务让后到的分支等待同一结果，而不是重复起 worker 或提前报错。
   const nativeResolveInFlightRef = useRef<Promise<PlayOutcome> | null>(null);
+  // 在途本地解析所属的会话号。用于判断"这个在途任务还是不是本次会话的"——
+  // 只看 ref 是否为 null 会误复用上一会话的任务，拿到 'stale' 后既不播放
+  // 也不报错，界面就永远停在转圈。
+  const nativeResolveSessionRef = useRef<number>(0);
+  /**
+   * 是否正在把新源接管到主播放器（`adoptPreparedSource` / `playDirect`）。
+   *
+   * 这期间主 <video> 派发的任何 `error` 都属于**本次接管的内部事务**：
+   * 接管流程自己会重试（`playDirect`）或自己判死。
+   * `handleError` 必须让路——否则它会在重试成功之前抢先弹出错误页，
+   * 结果是"视频其实已经播起来了，界面却停在错误页"。
+   */
+  const adoptingRef = useRef<boolean>(false);
   const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // 供"只绑定一次"的事件监听器间接调用的稳定引用。
   const playNextEpisodeRef = useRef<() => void>(() => {});
@@ -388,17 +401,21 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       await video.play();
       return 'ok';
     } catch (error) {
-      if (error instanceof DOMException && error.name === 'NotAllowedError' && !video.muted) {
-        // WebView2 拒绝带声自动播放时静音重试，之后由用户手动恢复音量。
-        video.muted = true;
-        setIsMuted(true);
-        try {
-          await video.play();
-          return 'ok';
-        } catch {
-          noteFailure('自动播放被拒绝（静音重试仍失败）', error);
-          return 'autoplay-blocked';
+      if (error instanceof DOMException && error.name === 'NotAllowedError') {
+        // 静音还有救：再试一次。注意判断必须基于"是否还能静音"，
+        // 而不是"当前是否已静音"——若视频本来就是静音的（比如上一次自动播放
+        // 被拦后被我们静音过），再判断 !video.muted 就会漏判，
+        // 把"源是好的、只差用户手势"误报成 error，进而触发删缓存 + 整集重解析。
+        if (!video.muted) {
+          video.muted = true;
+          setIsMuted(true);
+          try {
+            await video.play();
+            return 'ok';
+          } catch { /* 落到下面的 autoplay-blocked */ }
         }
+        noteFailure('自动播放被拒绝（需用户手势）', error);
+        return 'autoplay-blocked';
       }
       noteFailure('起播失败', error);
       return 'error';
@@ -421,6 +438,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     sessionId: number,
     startPosition: number,
   ): Promise<PlayOutcome> => {
+    adoptingRef.current = true;
     try {
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
@@ -473,6 +491,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     } catch (error) {
       noteFailure('接管新源异常', error);
       return 'error';
+    } finally {
+      adoptingRef.current = false;
     }
   };
 
@@ -490,6 +510,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     sessionId: number,
     startPosition: number,
   ): Promise<PlayOutcome> => {
+    adoptingRef.current = true;
     try {
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
@@ -539,6 +560,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     } catch (error) {
       noteFailure('直接播放异常', error);
       return 'error';
+    } finally {
+      adoptingRef.current = false;
     }
   };
 
@@ -599,8 +622,21 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         if (nativeResolveInFlightRef.current === attempt) nativeResolveInFlightRef.current = null;
       });
     nativeResolveInFlightRef.current = attempt;
+    nativeResolveSessionRef.current = sessionId;
     return attempt;
   };
+
+  /**
+   * 取"属于当前会话"的在途本地解析；没有则 null。
+   *
+   * 直接读 `nativeResolveInFlightRef` 有个坑：它可能挂着**上一会话**的任务。
+   * 复用它只会拿到 'stale'——既不起播也不报错，界面永久转圈。
+   */
+  const currentSessionResolve = (): Promise<PlayOutcome> | null => (
+    nativeResolveInFlightRef.current && nativeResolveSessionRef.current === activeSessionRef.current
+      ? nativeResolveInFlightRef.current
+      : null
+  );
 
   // 已预取/已解析成功的集（seriesId:episodeId → playUrl）。命中则换集秒开，
   // 跳过注定被 CDN 防盗链拦截的公开直链链路（直链→备用→Blob 三连失败）。
@@ -994,6 +1030,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
               startPosition,
             );
           }
+          // 额度已用掉就释放。原来只在成功时清除，导致这一集一旦失败过，
+          // 之后每次打开都不再自动重试——用户手动点"重新解析播放"也拿不回额度。
+          resolveRetriedRef.current.delete(ep.id);
         }
         if (isSettled(outcome)) {
           if (activeSessionRef.current !== newSessionId) return;
@@ -1185,7 +1224,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }).catch((error: unknown) => {
         if (currentSeries && currentEpisode && videoRef.current) {
           // 复用已在途的解析任务（error 事件链可能已启动 worker），没有才新起。
-          const attempt = nativeResolveInFlightRef.current ?? (() => {
+          // 只复用**当前会话**的：旧会话的任务返回 'stale'，拿来用等于什么都不做。
+          const attempt = currentSessionResolve() ?? (() => {
             hasTriedNativeResolveRef.current = true;
             setUiState({ kind: 'opening', sessionId: activeSessionRef.current, episodeId: currentEpisode.id });
             return startNativeResolve(
@@ -1443,6 +1483,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const handleError = () => {
       // 清理旧源时 WebView2 可能派发一次空源 error，不应覆盖真实播放状态。
       if (!video.currentSrc && !video.src) return;
+      // 接管流程（adoptPreparedSource / playDirect）进行中：这次 error 是它自己的
+      // 事务，由它重试或判死。这里若抢先弹错误页，就会出现"视频已播起来、
+      // 界面却停在错误页"，也会让 playDirect 的兜底完全失效。
+      if (adoptingRef.current) return;
       // 本地解析已在途（openEpisode 或 play() 拒绝分支已启动 worker）：
       // 直链失败不代表应用内播不了，保持 opening 状态等待结果，禁止弹错误页或降级。
       if (nativeResolveInFlightRef.current) return;
@@ -1544,7 +1588,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           ctx.currentSeries.type === 'comic' ? 1004 : 1,
           video,
           activeSessionRef.current,
-        );
+        ).then(result => {
+          // 必须收口：漏掉这个 .then 的话，一旦解析也失败，uiState 会永远停在
+          // opening —— 既不出画也不报错，用户只能看着转圈干等。
+          if (isSettled(result)) return;
+          setIsPlaying(false);
+          setUiState({
+            kind: 'error',
+            sessionId: activeSessionRef.current,
+            code: outcomeErrorCode(result),
+            recoverable: true,
+          });
+        });
         return;
       }
       setIsPlaying(false);
