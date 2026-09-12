@@ -70,9 +70,9 @@ async fn catalog_list(
             title: suggestion.title,
             cover: suggestion.cover,
             item_type: filter.channel.clone(),
-            episodes_count: 0,
+            episodes_count: suggestion.episode_count,
             latest_episode_title: None,
-            tags: Vec::new(),
+            tags: suggestion.tags,
             origin: "红果 App 联想".into(),
             brief: None,
         });
