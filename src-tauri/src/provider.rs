@@ -29,6 +29,19 @@ impl DramaProvider {
 
     pub async fn catalog(&self, filter: &CatalogFilter) -> Result<CatalogPage, String> {
         let requested_page = parse_page(filter.cursor.as_deref()).unwrap_or(filter.page.max(1));
+        // 关键词搜索必须走站点自己的搜索路由。
+        //
+        // 旧实现是在"当前这一页"的 24 条里做本地过滤，而全站有 800+ 部：
+        // 搜"好雨"能命中（它恰好在第一页）、搜"战神"返回 0 条。用户看到的
+        // 就是"搜索框没用"。
+        if let Some(keyword) = filter
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return self.search_catalog(filter, keyword, requested_page).await;
+        }
         if filter.channel == "comic" {
             return self.catalog_comic(filter, requested_page).await;
         }
@@ -72,6 +85,42 @@ impl DramaProvider {
             } else {
                 format!("红果短剧公开目录 · {}", sort_label(&filter.sort))
             },
+        })
+    }
+
+    /// 全站搜索：走站点自己的 `/search/{keyword}` 路由。
+    ///
+    /// 站点把搜索结果放在 SSR 的 router data 里（loaderData 下键名形如
+    /// "search_(keyword)/page"，内含 searchList），因此无需逆向内部 XHR 接口，
+    /// 也不需要翻 34 页目录自己做索引。
+    async fn search_catalog(
+        &self,
+        filter: &CatalogFilter,
+        keyword: &str,
+        requested_page: u32,
+    ) -> Result<CatalogPage, String> {
+        let encoded = encode_uri_component(keyword);
+        let html = self.fetch_page(&format!("/search/{encoded}")).await?;
+        let data =
+            parse_router_data(&html).ok_or_else(|| "搜索页未包含可读取的公开数据。".to_string())?;
+        let mut items = parse_search_items(&data, &filter.channel)
+            .into_iter()
+            .filter(|item| matches_filter(item, filter))
+            .collect::<Vec<_>>();
+        let categories = categories_for(&items);
+        let page_size = filter.page_size.clamp(1, 60) as usize;
+        let total = items.len();
+        let start = ((requested_page.saturating_sub(1)) as usize * page_size).min(total);
+        let page_items = items.drain(start..).take(page_size).collect::<Vec<_>>();
+        let has_more = start + page_items.len() < total;
+        Ok(CatalogPage {
+            total,
+            items: page_items,
+            has_more,
+            page: requested_page,
+            categories,
+            next_cursor: has_more.then(|| (requested_page + 1).to_string()),
+            source: format!("红果官网搜索 · {keyword}"),
         })
     }
 
@@ -262,6 +311,98 @@ async fn fetch_page_with_client(client: Client, path: String) -> Result<String, 
         return Err("目录响应超过安全大小限制。".into());
     }
     String::from_utf8(bytes.to_vec()).map_err(|_| "目录响应不是 UTF-8。".into())
+}
+
+/// 从搜索页的 router data 里提取剧集条目。
+///
+/// 实测数据形状：`loaderData["search_(keyword)/page"].searchList[]`，每项带
+/// `video_data`，其中有 series_id / series_title / series_cover / episode_cnt /
+/// category_list / series_intro。比抓 HTML 卡片可靠得多：标题、封面、集数、
+/// 题材都是结构化字段，不受样式改版影响。
+fn parse_search_items(data: &Value, channel: &str) -> Vec<SeriesItem> {
+    let Some(list) = find_search_list(data) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for entry in list {
+        let Some(video) = entry
+            .get("video_data")
+            .and_then(Value::as_object)
+            .or_else(|| entry.as_object())
+        else {
+            continue;
+        };
+        let Some(id) = video.get("series_id").and_then(value_as_id) else {
+            continue;
+        };
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let title = string_field(video, &["series_title", "title", "name"]);
+        if title.trim().is_empty() {
+            continue;
+        }
+        let tags = video
+            .get("category_list")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let brief = string_field(video, &["series_intro", "intro", "description"]);
+        items.push(SeriesItem {
+            id,
+            title,
+            cover: string_field(video, &["series_cover", "cover"]),
+            item_type: if channel == "comic" {
+                "comic".into()
+            } else {
+                "drama".into()
+            },
+            episodes_count: number_field(video, &["episode_cnt", "episode_total_cnt"]).unwrap_or(0),
+            latest_episode_title: None,
+            tags,
+            origin: "红果官网搜索".into(),
+            brief: (!brief.trim().is_empty()).then(|| brief.trim().to_string()),
+        });
+    }
+    items
+}
+
+/// 按形状查找 searchList，不写死 loaderData 的键名——那是随路由命名的
+/// （实测为 "search_(keyword)/page"），站点改版就会变。
+fn find_search_list(value: &Value) -> Option<&Vec<Value>> {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(items)) = map.get("searchList") {
+                return Some(items);
+            }
+            map.values().find_map(find_search_list)
+        }
+        Value::Array(items) => items.iter().find_map(find_search_list),
+        _ => None,
+    }
+}
+
+/// 按 RFC 3986 的 unreserved 规则做百分号编码（搜索关键词常含中文）。
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 3);
+    for byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
