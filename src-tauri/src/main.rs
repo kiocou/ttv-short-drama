@@ -8,7 +8,7 @@ mod storage;
 use crate::models::{
     CacheClearResult, CatalogFilter, CatalogPage, EnhancementCapabilities, EnhancementEngineInfo,
     EnhancementStatus, PlaybackOpenInput, PlaybackSession, PlaybackSnapshot, PlaybackUiState,
-    SeriesDetail, UserSettings, WatchHistoryItem,
+    SeriesDetail, SeriesItem, UserSettings, WatchHistoryItem,
 };
 use crate::provider::DramaProvider;
 use crate::short_drama_app::{
@@ -33,10 +33,53 @@ struct AppState {
 
 #[tauri::command]
 async fn catalog_list(
+    app: tauri::AppHandle,
     filter: CatalogFilter,
     state: State<'_, AppState>,
 ) -> Result<CatalogPage, String> {
-    state.provider.catalog(&filter).await
+    let keyword = filter
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let Some(keyword) = keyword else {
+        return state.provider.catalog(&filter).await;
+    };
+    // 两个来源并发：网页搜索（结构化、带集数与题材）与 App 联想（分季齐全）。
+    // 串行会让搜索凭空多等一次往返，而两者互不依赖。
+    let comic = filter.channel == "comic";
+    let (web, suggestions) = tokio::join!(
+        state.provider.catalog(&filter),
+        crate::short_drama_app::search_suggest(&app, &keyword, comic),
+    );
+    let mut page = web?;
+    if suggestions.is_empty() {
+        return Ok(page);
+    }
+    // 联想结果排在后面：网页结果的排序更贴关键词，联想只用于补齐缺项。
+    let existing: std::collections::HashSet<String> =
+        page.items.iter().map(|item| item.id.clone()).collect();
+    let mut added = 0usize;
+    for suggestion in suggestions {
+        if existing.contains(&suggestion.id) {
+            continue;
+        }
+        page.items.push(SeriesItem {
+            id: suggestion.id,
+            title: suggestion.title,
+            cover: suggestion.cover,
+            item_type: filter.channel.clone(),
+            episodes_count: 0,
+            latest_episode_title: None,
+            tags: Vec::new(),
+            origin: "红果 App 联想".into(),
+            brief: None,
+        });
+        added += 1;
+    }
+    page.total += added;
+    Ok(page)
 }
 
 #[tauri::command]

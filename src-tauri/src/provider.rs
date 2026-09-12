@@ -99,14 +99,40 @@ impl DramaProvider {
         keyword: &str,
         requested_page: u32,
     ) -> Result<CatalogPage, String> {
-        let encoded = encode_uri_component(keyword);
-        let html = self.fetch_page(&format!("/search/{encoded}")).await?;
-        let data =
-            parse_router_data(&html).ok_or_else(|| "搜索页未包含可读取的公开数据。".to_string())?;
-        let mut items = parse_search_items(&data, &filter.channel)
-            .into_iter()
-            .filter(|item| matches_filter(item, filter))
-            .collect::<Vec<_>>();
+        // 依次尝试原词与中文数字变体，合并去重（原词结果排在前面）。
+        //
+        // 站点剧名普遍使用中文数字，而它的搜索接口不做数字归一：实测搜
+        // "…真BOSS第11季"会被模糊匹配到"第十季"，精确的那一部反而找不到，
+        // 用户看到的就是"显示了其他几季、还不连续"。
+        let mut items: Vec<SeriesItem> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut last_error: Option<String> = None;
+        for variant in keyword_variants(keyword) {
+            let encoded = encode_uri_component(&variant);
+            let html = match self.fetch_page(&format!("/search/{encoded}")).await {
+                Ok(html) => html,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let Some(data) = parse_router_data(&html) else {
+                continue;
+            };
+            for item in parse_search_items(&data, &filter.channel) {
+                if seen.insert(item.id.clone()) {
+                    items.push(item);
+                }
+            }
+        }
+        if items.is_empty() {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+        // 刻意不再叠加列表页的题材/受众筛选：站点返回的本就是按相关度排序的
+        // 搜索结果，再用"当前选中的题材"剪一刀就会出现"明明搜得到却显示不全"。
+        // 筛选器服务于浏览目录，不该作用于搜索。
         let categories = categories_for(&items);
         let page_size = filter.page_size.clamp(1, 60) as usize;
         let total = items.len();
@@ -311,6 +337,66 @@ async fn fetch_page_with_client(client: Client, path: String) -> Result<String, 
         return Err("目录响应超过安全大小限制。".into());
     }
     String::from_utf8(bytes.to_vec()).map_err(|_| "目录响应不是 UTF-8。".into())
+}
+
+/// 生成搜索关键词的候选形式：原词 + 阿拉伯数字转中文数字的变体。
+fn keyword_variants(keyword: &str) -> Vec<String> {
+    let mut variants = vec![keyword.to_owned()];
+    let converted = replace_arabic_with_chinese(keyword);
+    if converted != keyword {
+        variants.push(converted);
+    }
+    variants
+}
+
+/// 把独立出现的阿拉伯数字段整体转成中文数字（"第11季" -> "第十一季"）。
+///
+/// 只处理被非数字字符分隔的连续数字段，上限 99（分季数不会更大）；超出范围的
+/// 数字原样保留，避免把非季数内容改得不伦不类。
+fn replace_arabic_with_chinese(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut digits = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        if !digits.is_empty() {
+            flush_number(&mut out, &digits);
+            digits.clear();
+        }
+        out.push(ch);
+    }
+    if !digits.is_empty() {
+        flush_number(&mut out, &digits);
+    }
+    out
+}
+
+fn flush_number(out: &mut String, digits: &str) {
+    match digits.parse::<u32>() {
+        Ok(value) if value <= 99 => out.push_str(&to_chinese_number(value)),
+        _ => out.push_str(digits),
+    }
+}
+
+fn to_chinese_number(value: u32) -> String {
+    const DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    match value {
+        0..=9 => DIGITS[value as usize].to_string(),
+        10 => "十".to_string(),
+        11..=19 => format!("十{}", DIGITS[(value % 10) as usize]),
+        20..=99 => {
+            let tens = value / 10;
+            let ones = value % 10;
+            if ones == 0 {
+                format!("{}十", DIGITS[tens as usize])
+            } else {
+                format!("{}十{}", DIGITS[tens as usize], DIGITS[ones as usize])
+            }
+        }
+        _ => value.to_string(),
+    }
 }
 
 /// 从搜索页的 router data 里提取剧集条目。

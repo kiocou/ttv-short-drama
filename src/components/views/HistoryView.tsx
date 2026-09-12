@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useHistoryStore } from '../../stores/useHistoryStore';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { useAppStore } from '../../stores/useAppStore';
@@ -31,11 +31,21 @@ function formatRelativeTime(timestamp: number): string {
 }
 
 export const HistoryView: React.FC = () => {
-  const { records, removeRecord, clearHistory } = useHistoryStore();
+  const { records, loadHistory, removeRecord, clearHistory } = useHistoryStore();
   const { openEpisode } = usePlaybackStore();
-  const { navigateTo, showToast } = useAppStore();
+  const { currentView, navigateTo, showToast } = useAppStore();
 
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+
+  // 每次进入历史页都重新拉取一次。
+  //
+  // 视图是常驻 DOM（切换只切 hidden，不卸载），而 HistoryProvider 只在应用
+  // 启动时 loadHistory 一次——于是启动之后看过的任何一集都不会出现在这里。
+  // 用户看到的现象就是"某些剧的播放历史不出现"（漫剧、短剧都会中招，
+  // 取决于它是不是启动前就看过）。
+  useEffect(() => {
+    if (currentView === 'history') void loadHistory();
+  }, [currentView, loadHistory]);
 
   const handleResume = (seriesId: string, episodeId: string, position: number) => {
     navigateTo('player', seriesId);

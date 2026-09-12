@@ -700,6 +700,86 @@ def _ffmpeg_direct_decrypt(ffmpeg: str, url: str, key_hex: str | None,
     return True
 
 
+SEARCH_SUGGEST_PATH = "/reading/bookapi/search/suggest/v1/"
+
+
+def signed_get(session: requests.Session, url: str, extra_params: dict,
+               device_id: str, install_id: str) -> dict:
+    """GET 签名请求。
+
+    worker 原有链路只有 signed_post（播放模型/专辑都是 POST）。搜索联想这类
+    只读接口走 GET，需要在这里单独做一次六代签名。
+    关键点：业务参数必须连同 iid/device_id 一起进 query——缺这两个会被服务端
+    判成 PARAM_INVALID(100103)，而不是签名错误，很容易误判成"接口不可用"。
+    """
+    parts = urlsplit(url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    params.update(extra_params)
+    base_headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json; charset=utf-8",
+    }
+    signed_headers, signed_url = core_sixgod(
+        surl=f"{parts.scheme}://{parts.netloc}{parts.path}",
+        params=params,
+        data={},
+        devices=device_keys(device_id, install_id),
+        header=base_headers,
+        log=False,
+    )
+    response = session.get(signed_url, headers=signed_headers, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def search_cmd(keyword: str, device_id: str, install_id: str, aid: int) -> dict:
+    """搜索联想：拿到该关键词对应的剧集（含 series_id 与封面）。
+
+    为什么需要它：网页搜索每次只返回前 10 条，且分季剧集（"…第 N 季"）在结果里
+    是跳着出现的，用户搜某一季经常看不到它。App 联想接口按名称前缀返回整组季，
+    把两者合并后覆盖度明显更好。
+    """
+    session = http_session()
+    emit({"event": "progress", "stage": "search", "message": "正在检索剧集"})
+    last_error: Exception | None = None
+    for url in player_urls(SEARCH_SUGGEST_PATH, install_id, device_id, aid):
+        try:
+            payload = signed_get(session, url, {"q": keyword, "count": "20"},
+                                 device_id, install_id)
+        except requests.RequestException as error:
+            last_error = error
+            continue
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            last_error = RuntimeError(str(payload.get("message") or "搜索接口返回异常"))
+            continue
+        data = payload.get("data") or {}
+        items = []
+        seen = set()
+        for entry in (data.get("query_result_v2") or []):
+            if not isinstance(entry, dict):
+                continue
+            series_id = str(entry.get("keyword") or "").strip()
+            title = str(entry.get("name") or "").strip()
+            if not series_id.isdigit() or not title or series_id in seen:
+                continue
+            seen.add(series_id)
+            items.append({
+                "id": series_id,
+                "title": title,
+                "cover": str(entry.get("pic_url") or "").strip(),
+            })
+        if items:
+            result = {"ok": True, "keyword": keyword, "items": items}
+            emit({"event": "done", **result})
+            return result
+    raise RuntimeError(f"搜索联想失败：{last_error or '无可用线路'}")
+
+
+def search_cmd_placeholder() -> None:
+    """占位：保持函数定义顺序稳定（实际逻辑见 search_cmd）。"""
+    return None
+
+
 def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: str,
             content_type: int, aid: int) -> dict:
     session = http_session()
@@ -935,12 +1015,13 @@ def main() -> int:
         }) == ["https://a.example/a.mp4", "https://b.example/a.mp4"]
         emit({"ok": True, "event": "done", "hosts": [urlsplit(item).netloc for item in urls]})
         return 0
-    if subcommand not in ("resolve", "stream", "album") or len(argv) < 2:
+    if subcommand not in ("resolve", "stream", "album", "search") or len(argv) < 2:
         emit({"ok": False, "error": f"未知子命令: {subcommand or '(空)'}"})
         return 2
     target = argv[1].strip()
-    if not target or not target.isdigit():
-        emit({"ok": False, "error": f"缺少有效的 {subcommand} 目标 ID。"})
+    # search 的目标是关键词（可含中文），其余子命令要求是纯数字 ID。
+    if not target or (subcommand != "search" and not target.isdigit()):
+        emit({"ok": False, "error": f"缺少有效的 {subcommand} 目标。"})
         return 2
     device_id = os.getenv("TTV_SD_DEVICE_ID", "").strip()
     install_id = os.getenv("TTV_SD_INSTALL_ID", "").strip()
@@ -961,6 +1042,8 @@ def main() -> int:
             resolve(target, Path(out), device_id, install_id, ffmpeg, content_type, aid)
         elif subcommand == "stream":
             stream_cmd(target, device_id, install_id, content_type, aid)
+        elif subcommand == "search":
+            search_cmd(target, device_id, install_id, aid)
         else:
             album_cmd(target, device_id, install_id, aid)
         return 0
