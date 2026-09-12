@@ -1306,6 +1306,65 @@ pub fn short_drama_app_cache_usage() -> CacheSweepReport {
     cache_usage()
 }
 
+/// App 搜索联想返回的单条剧集。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchSuggestion {
+    pub id: String,
+    pub title: String,
+    pub cover: String,
+}
+
+/// 用 App 搜索联想补充网页搜索的缺项。
+///
+/// 网页搜索每次只返回前 10 条，且分季剧集（"…第 N 季"）在结果里是跳着出现的
+/// ——用户搜"…第11季"经常根本看不到那一季。App 联想会按名称前缀把整组季列全
+/// （实测搜"聚宝仙盆"能列出第十一/十/九/七/五/四/三/二季与仙界篇、灵界篇）。
+///
+/// 失败一律返回空列表：这是锦上添花的补充来源，不该让整次搜索失败。
+pub async fn search_suggest<R: Runtime>(
+    app: &AppHandle<R>,
+    keyword: &str,
+    comic: bool,
+) -> Vec<SearchSuggestion> {
+    let profile = match HongguoAppProfile::from_input(Some(if comic { 1004 } else { 1 }), None) {
+        Ok(profile) => profile,
+        Err(_) => return Vec::new(),
+    };
+    let payload = match run_worker_subcommand(app, "search", keyword, "search", profile).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("[ttv] 搜索联想不可用：{error}");
+            return Vec::new();
+        }
+    };
+    payload
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?.trim();
+                    let title = entry.get("title")?.as_str()?.trim();
+                    if id.is_empty() || title.is_empty() {
+                        return None;
+                    }
+                    Some(SearchSuggestion {
+                        id: id.to_owned(),
+                        title: title.to_owned(),
+                        cover: entry
+                            .get("cover")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrefetchStreamInput {
