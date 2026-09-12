@@ -93,7 +93,7 @@ export const SettingsView: React.FC = () => {
             <span>系统与播放偏好设置</span>
           </h1>
           <p className="text-xs text-slate-400 mt-1">
-            自定义默认清晰度、自动连播参数、AI 插帧引擎与本地高速缓存
+            自定义默认清晰度、自动连播参数、画质增强偏好与本地高速缓存
           </p>
         </div>
 

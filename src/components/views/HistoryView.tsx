@@ -142,7 +142,12 @@ export const HistoryView: React.FC = () => {
                   </div>
 
                   <div className="flex items-center gap-3 text-xs text-slate-400">
-                    <span>进度：{formatDuration(item.positionSeconds)} / {formatDuration(item.durationSeconds)}</span>
+                    <span>
+                  进度：
+                  {item.durationSeconds > 0
+                    ? `${formatDuration(item.positionSeconds)} / ${formatDuration(item.durationSeconds)}`
+                    : '尚未开始播放'}
+                </span>
                     <span>·</span>
                     <span className="flex items-center gap-1">
                       <Clock className="w-3 h-3" />

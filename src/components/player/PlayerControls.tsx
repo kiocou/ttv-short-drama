@@ -103,6 +103,18 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
         ? '增强已降级'
         : '原始播放';
 
+  // 集数徽章文案。
+  //
+  // 后端在缺少真实分集标题时会把 title 填成"第 N 集"（见 provider.rs 的
+  // 详情解析），直接拼接就会显示成"第 1 集 · 第 1 集"。标题与集数基名
+  // 等价时不再重复；将来接入真实分集标题时会自动显示成"第 3 集 · 真相"。
+  const episodeBadge = (() => {
+    if (!currentEpisode) return '第 1 集';
+    const base = `第 ${currentEpisode.episodeNumber} 集`;
+    const title = (currentEpisode.title || '').trim();
+    return title && title !== base ? `${base} · ${title}` : base;
+  })();
+
   return (
     <div
       onMouseMove={onUserActivity}
@@ -134,7 +146,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
               {currentSeries?.title || '精彩短剧'}
             </span>
             <span className="text-[11px] font-semibold text-blue-600 bg-blue-50/90 px-2.5 py-0.5 rounded-lg border border-blue-200/60 shadow-xs flex-shrink-0">
-              {currentEpisode ? `第 ${currentEpisode.episodeNumber} 集 · ${currentEpisode.title}` : '第 1 集'}
+              {episodeBadge}
             </span>
           </div>
         </div>
