@@ -189,11 +189,19 @@ impl DramaProvider {
     ) -> Result<PlaybackSession, String> {
         validate_numeric_id(series_id, "剧集")?;
         validate_numeric_id(episode_id, "剧集分集")?;
-        let html = self
-            .fetch_page(&format!("/player/{series_id}/{episode_id}"))
-            .await?;
+        // 站点路由是 /player/{series_id}（实测 200），整部剧的播放数据都在这张
+        // 页上。旧实现拼成 /player/{series}/{episode}，实测恒定返回 404 —— 这条
+        // 兜底链路从来没有成功过，只会把本地解析的真实失败原因盖成"HTTP 404"。
+        let html = self.fetch_page(&format!("/player/{series_id}")).await?;
         let data =
             parse_router_data(&html).ok_or_else(|| "播放页未包含可读取的公开数据。".to_string())?;
+        // 公开页只带"默认集"的播放数据，所以必须确认它确实属于请求的这一集。
+        // 拿别的集的地址去播比播不出来更糟：用户会看到完全不相干的内容。
+        let mut page_vids = Vec::new();
+        collect_vids(&data, &mut page_vids);
+        if !page_vids.iter().any(|candidate| candidate == episode_id) {
+            return Err("该集没有公开网页直链（公开页仅提供默认集）。".into());
+        }
         let player = find_player_info(&data)
             .ok_or_else(|| "该集没有公开网页播放信息，可能仅限官方 App。".to_string())?;
         let mut urls = Vec::new();
@@ -538,6 +546,34 @@ fn find_player_info(value: &Value) -> Option<&Map<String, Value>> {
         }
         Value::Array(values) => values.iter().find_map(find_player_info),
         _ => None,
+    }
+}
+
+/// 从播放页 JSON 里收集出现的所有 vid。
+///
+/// 用途只有一个：确认页面携带的播放数据属于请求的那一集。公开播放页只返回
+/// 默认集的数据，不做这一步校验就可能把别的集的地址当成目标集交出去。
+fn collect_vids(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "vid" {
+                    if let Some(text) = child.as_str() {
+                        let text = text.trim();
+                        if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
+                            out.push(text.to_owned());
+                        }
+                    }
+                }
+                collect_vids(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_vids(child, out);
+            }
+        }
+        _ => {}
     }
 }
 

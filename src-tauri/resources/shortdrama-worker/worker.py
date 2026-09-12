@@ -607,19 +607,118 @@ def fetch_stream(session: requests.Session, vid: str, device_id: str,
         raise ValueError("没有可用的清晰度")
     best = variants[0]
 
+    # duration 用于直连解密的进度换算（out_time_us / 总时长）。字段名按形状
+    # 防御性取，取不到就退回"只有阶段提示"的进度，不影响任何功能。
+    duration_ms = 0
+    for probe in (video_data.get("duration"), video_data.get("video_duration"),
+                  video_data.get("video_time"), best.get("duration")):
+        try:
+            candidate = int(probe or 0)
+        except (TypeError, ValueError):
+            candidate = 0
+        if candidate > 0:
+            duration_ms = candidate
+            break
     return {
         "url": best["url"],
         "content_key": best["content_key"] or None,
         "width": best["width"],
         "height": best["height"],
+        "duration_ms": duration_ms,
         "variants": variants,
     }
+
+
+def _ffmpeg_direct_decrypt(ffmpeg: str, url: str, key_hex: str | None,
+                           out_path: Path, duration_ms: int,
+                           with_app_headers: bool) -> bool:
+    """让 ffmpeg 直连 CDN 完成"拉流 + CENC 解密 + 转存"，一步到位。
+
+    旧路径是"python 下载到 .source.tmp（8.8MB 写盘）→ ffmpeg 读 tmp 解密转存
+    （再写 8.8MB）"，实测 3.4s。直连把两步合一，实测 1.2s，且不再产生临时
+    整集文件（省一次写 + 一次读 + 一次删除）。
+
+    -tls_verify 0 不可省略：随包 ffmpeg 没有 CA 证书链，直连 https 必然以
+    "certificate verify failed / Error opening input: I/O error" 失败。
+
+    进度用 ffmpeg 的 -progress 输出换算：out_time_us 对已知总时长。这样
+    百分比与真实拉取进度同源，不会退化成假的"匀速进度条"。
+    """
+    partial = out_path.with_name(out_path.name + ".part.mp4")
+    partial.unlink(missing_ok=True)
+    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+               "-tls_verify", "0",
+               "-rw_timeout", "60000000",
+               "-progress", "pipe:1", "-nostats"]
+    if with_app_headers:
+        command += ["-user_agent", DOWNLOAD_UA,
+                    "-headers", f"Referer: {DOWNLOAD_REFERER}\r\n"]
+    if key_hex:
+        command += ["-decryption_key", key_hex]
+    command += ["-i", url, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                "-movflags", "+faststart", str(partial)]
+
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace")
+    last_pct = -10
+    try:
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("out_time_us=") and duration_ms > 0:
+                    try:
+                        micros = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    if micros <= 0:
+                        continue
+                    pct = min(99, int(micros / 1000.0 / duration_ms * 100))
+                    if pct >= last_pct + 10:
+                        last_pct = pct
+                        emit({"event": "progress", "stage": "download", "percent": pct})
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    finally:
+        stderr_text = ""
+        if proc.stderr is not None:
+            stderr_text = proc.stderr.read() or ""
+        for handle in (proc.stdout, proc.stderr):
+            try:
+                if handle is not None:
+                    handle.close()
+            except Exception:
+                pass
+    if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(
+            "ffmpeg 直连失败: " + (stderr_text or "").strip().replace("\n", " ")[:200]
+        )
+    partial.replace(out_path)
+    return True
 
 
 def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: str,
             content_type: int, aid: int) -> dict:
     session = http_session()
-    stream_info = fetch_stream(session, vid, device_id, install_id, content_type, aid)
+    # 预签名直链：Rust 侧已提前调用 stream 并把 (url, key) 缓存下来。命中时
+    # 直接跳过签名链路——实测那两次 App API 往返是固定 2.16s，占未命中总耗时
+    # 的一半以上，而用户从打开详情页到点集通常有足够空档提前做完。
+    cached_url = os.getenv("TTV_SD_DIRECT_URL", "").strip()
+    if cached_url:
+        emit({"event": "progress", "stage": "cache", "message": "复用已预取的播放直链"})
+        stream_info = {
+            "url": cached_url,
+            "content_key": os.getenv("TTV_SD_DIRECT_KEY", "").strip() or None,
+            "width": int(os.getenv("TTV_SD_DIRECT_WIDTH", "0") or 0),
+            "height": int(os.getenv("TTV_SD_DIRECT_HEIGHT", "0") or 0),
+            "duration_ms": int(os.getenv("TTV_SD_DIRECT_DURATION", "0") or 0),
+            "variants": [],
+        }
+    else:
+        stream_info = fetch_stream(session, vid, device_id, install_id, content_type, aid)
     # Honor the requested quality when the App API returns multiple variants.
     # Keep auto/unknown on the highest quality selected by fetch_stream.
     requested_quality = os.getenv("TTV_SD_QUALITY", "auto").strip().lower()
@@ -649,8 +748,31 @@ def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: s
             content_key = None
     width = stream_info["width"]
     height = stream_info["height"]
-    emit({"event": "progress", "stage": "download", "message": f"正在下载源流（{height}p）"})
+    # ===== 主路径：ffmpeg 直连，拉流 + 解密 + 转存一步完成 =====
+    emit({"event": "progress", "stage": "download",
+          "message": f"正在下载并解密源流（{height}p）"})
+    key_hex = content_key.hex() if content_key else None
+    direct_error = ""
+    for with_app_headers in (False, True):
+        try:
+            if _ffmpeg_direct_decrypt(ffmpeg, real_url, key_hex, out_path,
+                                      int(stream_info.get("duration_ms") or 0),
+                                      with_app_headers):
+                size = out_path.stat().st_size
+                emit({"event": "done", "ok": True, "file": str(out_path), "width": width,
+                      "height": height, "size": size})
+                return {"ok": True, "file": str(out_path), "width": width,
+                        "height": height, "size": size}
+        except Exception as exc:  # noqa: BLE001 - 任何失败都要能回退
+            direct_error = str(exc)
+        if not with_app_headers:
+            # 第一轮不带请求头（实测最快）；被 CDN 拒绝时再带红果 App 的
+            # UA/Referer 重试一次，兼顾速度与兼容性。
+            emit({"event": "progress", "stage": "fallback",
+                  "message": "直连失败，改用应用请求头重试"})
 
+    # ===== 回退路径：下载到本地再解密（直连被 CDN 拒绝时使用）=====
+    emit({"event": "progress", "stage": "fallback", "message": "改用本地下载模式"})
     source = out_path.with_name(out_path.name + ".source.tmp")
     source.unlink(missing_ok=True)
     try:

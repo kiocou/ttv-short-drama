@@ -98,7 +98,7 @@ export const NavigationRail: React.FC = () => {
             className={`absolute inset-0 flex items-center justify-center transition-opacity duration-150 ${
               isNavCollapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'
             }`}
-            title="Windows Mica · 120 FPS AI 插帧"
+            title="Windows Mica · 本地高速播放"
           >
             <div className="w-10 h-10 rounded-xl bg-slate-100/90 border border-slate-200/70 shadow-2xs flex items-center justify-center text-blue-600 cursor-default">
               <Film className="w-4 h-4" />
@@ -119,7 +119,7 @@ export const NavigationRail: React.FC = () => {
                 <span>Windows Mica</span>
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-xs" />
               </div>
-              <p className="text-slate-400 font-medium truncate mt-0.5">120 FPS AI 插帧</p>
+              <p className="text-slate-400 font-medium truncate mt-0.5">本地高速播放</p>
             </div>
           </div>
         </div>

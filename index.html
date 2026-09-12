@@ -15,10 +15,13 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TTV Short Drama - 极简短剧播放器</title>
-    <!-- Windows 11 Fluent 字体栈与防抖平滑 -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!--
+      字体：刻意不引外部 Web Font。
+      一是 CSP（style-src 'self' / 未开放 font-src）本就把它拦掉，只在启动时
+      留下一次失败请求与控制台报错；二是本应用面向 Windows 11，Segoe UI
+      Variable 才是与 Mica 材质同源的系统字体（见 tailwind.config.js 的
+      font-fluent）。离线场景下外链字体也只会拖慢首屏。
+    -->
   </head>
   <body class="bg-[#f3f5f8] text-[#0f172a] font-fluent select-none overflow-hidden antialiased">
     <div id="root" class="w-screen h-screen overflow-hidden"></div>

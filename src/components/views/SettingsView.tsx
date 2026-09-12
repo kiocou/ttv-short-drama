@@ -63,7 +63,9 @@ export const SettingsView: React.FC = () => {
     a.href = url;
     a.download = `ttv-short-drama-diagnostics-${Date.now()}.json`;
     a.click();
-    URL.revokeObjectURL(url);
+    // 延后释放：立刻 revoke 有可能在浏览器的下载真正开工前就把 blob 撤掉，
+    // 表现为"提示已导出但文件没出现"。
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
     showToast('诊断日志已导出', 'success');
   };
 
