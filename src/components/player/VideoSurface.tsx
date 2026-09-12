@@ -53,6 +53,7 @@ export const VideoSurface: React.FC = () => {
     isMuted,
     prepareStatus,
     isSwitching,
+    errorDetail,
   } = usePlaybackStore();
 
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
@@ -399,6 +400,13 @@ export const VideoSurface: React.FC = () => {
                 ? '浏览器限制了自动播放，点击下方按钮即可继续。'
                 : '该媒体无法由 WebView 解码，已尝试备用源与兼容 Blob 播放。'}
             </p>
+            {/* 失败原因必须可见：否则用户（和排查者）只能看到一句笼统的
+                "播放源连接受阻"，分不清是整集解析失败、解码失败还是 play 被打断。 */}
+            {errorDetail && (
+              <p className="max-w-[17rem] text-[10px] leading-relaxed text-slate-400 font-mono break-words">
+                {errorDetail}
+              </p>
+            )}
             <button
               onClick={() => {
                 if (uiState.code === 'MEDIA_AUTOPLAY_FAILED') {

@@ -94,6 +94,8 @@ interface PlaybackContextType {
   isSwitching: boolean;
   /** 云端解析进度。null 表示当前没有在途解析。 */
   prepareStatus: PrepareStatus | null;
+  /** 最近一次失败的具体原因（用于错误卡片与用户反馈定位）。 */
+  errorDetail: string | null;
   /** 提前预热某一集（详情页 / 选集抽屉），已在缓存或已在途则跳过。 */
   prewarmEpisode: (seriesId: string, episodeId: string, contentType?: number) => void;
 }
@@ -118,6 +120,51 @@ export interface PrepareStatus {
 
 /** 悬停预热的最大并发数：超过它就不再受理新的预热请求。 */
 const MAX_PREWARM_INFLIGHT = 2;
+
+/**
+ * 把各种来源的错误压成一行可读文本。
+ *
+ * 媒体链路上的错误有三类形态：`MediaError`（有 code/message，但 `String()`
+ * 出来是 `[object MediaError]`）、`DOMException`（有 name/message）、
+ * 以及后端直接返回的中文字符串。不统一处理的话，错误卡片上只会留下
+ * "undefined"，失去了诊断价值。
+ */
+function describeError(error: unknown): string {
+  if (!error) return '未知错误';
+  if (typeof error === 'string') return error;
+  const candidate = error as { name?: string; message?: string; code?: number };
+  if (candidate.code != null && candidate.message) return `MediaError ${candidate.code}: ${candidate.message}`;
+  if (candidate.name && candidate.message) return `${candidate.name}: ${candidate.message}`;
+  return String(error);
+}
+
+/**
+ * `startPlayback` 的结果分类。三种失败的处理方式不同，不能压成一个 false。
+ */
+type PlayStartResult = 'ok' | 'autoplay-blocked' | 'error';
+
+/**
+ * 一次"打开并播放"的最终结局。
+ *
+ * `stale` 单独列出很关键：它表示这次切换已被**更新的切换**接管，既不是成功
+ * 也不是失败。上层必须原样放过——继续降级或弹错误页都会毁掉新会话刚建立的状态。
+ */
+type PlayOutcome = PlayStartResult | 'stale';
+
+/**
+ * 结局是否算"成功或已交棒"——供只需要判成败的调用点使用。
+ *
+ * 不能简单写成 `outcome === 'ok'`：`stale` 表示这次切换已被更新的切换接管，
+ * 新会话自会善后，这里继续报错会毁掉它刚建立的状态。
+ */
+function isSettled(outcome: PlayOutcome): boolean {
+  return outcome === 'ok' || outcome === 'stale';
+}
+
+/** 把结局翻译成错误码：自动播放被拦要如实报，不能混进"播放源连接受阻"。 */
+function outcomeErrorCode(outcome: PlayOutcome, fallback = 'MEDIA_LOAD_FAILED'): string {
+  return outcome === 'autoplay-blocked' ? 'MEDIA_AUTOPLAY_FAILED' : fallback;
+}
 
 const PlaybackContext = createContext<PlaybackContextType | null>(null);
 
@@ -153,6 +200,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const prewarmInflightRef = useRef<number>(0);
   // 下载速率采样：worker 每 10% 上报一次百分比，用相邻两点算出速率再推算剩余时间。
   const downloadSampleRef = useRef<{ percent: number; at: number } | null>(null);
+  /**
+   * 最近一次失败的具体原因。
+   *
+   * 换集失败此前只有一句"播放源连接受阻"，无法区分是整集解析被服务端拒绝、
+   * 解码失败，还是 play() 被另一次切换打断——而这三种的修法完全不同。
+   * 错误卡片会把它显示出来，用户截图即可定位。
+   */
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
+  const noteFailure = (stage: string, error: unknown) => {
+    const line = `${stage} — ${describeError(error)}`;
+    console.warn('[playback]', line);
+    setErrorDetail(line);
+  };
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const activeSessionRef = useRef<number>(100);
@@ -163,7 +223,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const objectUrlRef = useRef<string>('');
   // 在途的本地解析 promise。play() 拒绝与 video error 事件可能先后触发同一次
   // 恢复流程，记录在途任务让后到的分支等待同一结果，而不是重复起 worker 或提前报错。
-  const nativeResolveInFlightRef = useRef<Promise<boolean> | null>(null);
+  const nativeResolveInFlightRef = useRef<Promise<PlayOutcome> | null>(null);
   const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // 供"只绑定一次"的事件监听器间接调用的稳定引用。
   const playNextEpisodeRef = useRef<() => void>(() => {});
@@ -276,7 +336,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     probe.preload = 'auto';
     probe.muted = true;
     probe.playsInline = true;
-    probe.crossOrigin = 'anonymous';
+    // 不设 crossOrigin：这块只负责把新源"解到可播"，从不读取像素。
+    // 设了反而让 WebView 对本地 asset 也走一次 CORS 校验——只有失败面，没有收益。
     // 不挂进文档流，避免 Layout/绘制开销。
     probe.src = assetUrl;
     const ready = await new Promise<boolean>(resolve => {
@@ -312,6 +373,39 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   /**
+   * 让主播放器真正起播。
+   *
+   * 返回**结果分类**而不是布尔值，是因为三种失败的处理方式完全不同，
+   * 压成一个 false 会让上层只能无差别重试：
+   * - `ok`：起播成功；
+   * - `autoplay-blocked`：WebView2 连静音都不让自动播。**源是好的**，
+   *   重试毫无意义——正确做法是提示用户点一下，而不是谎报"播放源连接受阻"；
+   * - `error`：解码失败或 `play()` 被新 load()/pause() 打断（AbortError）。
+   *   换一次 load() 能自愈，值得重试。
+   */
+  const startPlayback = async (video: HTMLVideoElement): Promise<PlayStartResult> => {
+    try {
+      await video.play();
+      return 'ok';
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'NotAllowedError' && !video.muted) {
+        // WebView2 拒绝带声自动播放时静音重试，之后由用户手动恢复音量。
+        video.muted = true;
+        setIsMuted(true);
+        try {
+          await video.play();
+          return 'ok';
+        } catch {
+          noteFailure('自动播放被拒绝（静音重试仍失败）', error);
+          return 'autoplay-blocked';
+        }
+      }
+      noteFailure('起播失败', error);
+      return 'error';
+    }
+  };
+
+  /**
    * 把主播放器切换到已预载好的源。
    *
    * 关键：**不调用 `video.load()`**。
@@ -324,15 +418,15 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const adoptPreparedSource = async (
     prepared: PreparedSource,
     video: HTMLVideoElement,
-    newSessionId: number,
+    sessionId: number,
     startPosition: number,
-  ): Promise<boolean> => {
+  ): Promise<PlayOutcome> => {
     try {
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
         objectUrlRef.current = '';
       }
-      video.dataset.sessionId = String(newSessionId);
+      video.dataset.sessionId = String(sessionId);
       video.playbackRate = playbackRate;
       video.volume = isMuted ? 0 : volume;
       video.muted = isMuted;
@@ -355,6 +449,14 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       video.src = prepared.url;
       await firstFrameReady;
 
+      // 已被更新的切换接管：不是失败，别让调用方降级。
+      if (activeSessionRef.current !== sessionId) return 'stale';
+      // 解码层明确报错：不浪费一次 play()，直接交给调用方重试/换源。
+      if (video.error) {
+        noteFailure('解码失败', video.error);
+        return 'error';
+      }
+
       if (startPosition > 0) {
         try {
           video.currentTime = startPosition;
@@ -362,24 +464,81 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           // metadata 未就绪则从 0 播
         }
       }
-      try {
-        await video.play();
-      } catch (error) {
-        // WebView2 拒绝带声自动播放时静音重试。
-        if (error instanceof DOMException && error.name === 'NotAllowedError' && !video.muted) {
-          video.muted = true;
-          setIsMuted(true);
-          await video.play();
-        } else {
-          throw error;
+      const started = await startPlayback(video);
+      if (started !== 'ok') return started;
+      if (activeSessionRef.current !== sessionId) return 'stale';
+      setIsPlaying(true);
+      setUiState({ kind: 'playing', sessionId, position: video.currentTime });
+      return 'ok';
+    } catch (error) {
+      noteFailure('接管新源异常', error);
+      return 'error';
+    }
+  };
+
+  /**
+   * 不经隐藏探针，直接把源喂给主播放器。
+   *
+   * 这是所有"探针预热没就绪 / 接管失败"之后的统一兜底：文件在盘上、
+   * 本地解析也返回了路径，仅仅因为预热超时就判定整集不可用是完全不划算的。
+   * 旧实现在 playLocalFile 里遇到探针失败直接 return false，于是换集时
+   * 明明命中了本机缓存，也会掉到公开直链（已知被防盗链拦截）→ 错误页。
+   */
+  const playDirect = async (
+    assetUrl: string,
+    video: HTMLVideoElement,
+    sessionId: number,
+    startPosition: number,
+  ): Promise<PlayOutcome> => {
+    try {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = '';
+      }
+      video.dataset.sessionId = String(sessionId);
+      video.playbackRate = playbackRate;
+      video.volume = isMuted ? 0 : volume;
+      video.muted = isMuted;
+
+      const ready = new Promise<void>(resolve => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          video.removeEventListener('loadeddata', done);
+          video.removeEventListener('error', done);
+          resolve();
+        };
+        const timer = setTimeout(done, 10000);
+        video.addEventListener('loadeddata', done, { once: true });
+        video.addEventListener('error', done, { once: true });
+      });
+      video.src = assetUrl;
+      video.load();
+      await ready;
+
+      if (activeSessionRef.current !== sessionId) return 'stale';
+      if (video.error) {
+        noteFailure('直接播放解码失败', video.error);
+        return 'error';
+      }
+      if (startPosition > 0) {
+        try {
+          video.currentTime = startPosition;
+        } catch {
+          // metadata 未就绪则从 0 播
         }
       }
+      const started = await startPlayback(video);
+      if (started !== 'ok') return started;
+      if (activeSessionRef.current !== sessionId) return 'stale';
       setIsPlaying(true);
-      setUiState({ kind: 'playing', sessionId: newSessionId, position: video.currentTime });
-      return true;
+      setUiState({ kind: 'playing', sessionId, position: video.currentTime });
+      return 'ok';
     } catch (error) {
-      console.warn('[playback] adopt prepared source failed', { error });
-      return false;
+      noteFailure('直接播放异常', error);
+      return 'error';
     }
   };
 
@@ -389,8 +548,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     quality: string,
     contentType: number,
     video: HTMLVideoElement,
+    sessionId: number,
     startPosition = 0,
-  ): Promise<boolean> => {
+  ): Promise<PlayOutcome> => {
     try {
       const resolved = await ipcService.playback.resolveNative(
         seriesId,
@@ -402,56 +562,39 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       if (resolved.cached || resolved.sizeBytes > 0) {
         resolvedFileByVidRef.current.set(episodeCacheKey(seriesId, episodeId), resolved.playUrl);
       }
-      if (activeSessionRef.current !== Number(video.dataset.sessionId)) return true;
-      const { convertFileSrc } = await import('@tauri-apps/api/core');
-      const assetUrl = convertFileSrc(resolved.playUrl);
-      // 先预载到可播，再接管主播放器——旧画面在新源就绪前一直保留。
-      const prepared = await preloadSource(assetUrl, startPosition);
-      if (activeSessionRef.current !== Number(video.dataset.sessionId)) {
-        disposePrepared(prepared ? { url: assetUrl, element: prepared } : null);
-        return true;
+      if (activeSessionRef.current !== sessionId) return 'stale';
+      const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition);
+      // 只有"源本身有问题"才撤掉登记。自动播放被拦（autoplay-blocked）时
+      // 文件是完好的，撤掉会导致下次重下一整集——白等 7 秒。
+      if (outcome === 'error' && activeSessionRef.current === sessionId) {
+        resolvedFileByVidRef.current.delete(episodeCacheKey(seriesId, episodeId));
       }
-      if (!prepared) {
-        // 预载失败：退化为直接喂给主播放器，至少给出真实错误而不是静默卡住。
-        if (objectUrlRef.current) {
-          URL.revokeObjectURL(objectUrlRef.current);
-          objectUrlRef.current = '';
-        }
-        video.src = assetUrl;
-        video.load();
-        try {
-          await video.play();
-          setIsPlaying(true);
-          setUiState({ kind: 'playing', sessionId: activeSessionRef.current, position: video.currentTime });
-          return true;
-        } catch {
-          return false;
-        }
-      }
-      const adopted = await adoptPreparedSource(
-        { url: assetUrl, element: prepared },
-        video,
-        activeSessionRef.current,
-        startPosition,
-      );
-      disposePrepared({ url: assetUrl, element: prepared });
-      return adopted;
+      return outcome;
     } catch (error) {
-      console.warn('[playback] native resolve failed', { seriesId, episodeId, contentType, quality, error });
-      return false;
+      noteFailure(`本地解析失败 ${seriesId}/${episodeId}`, error);
+      return 'error';
     }
   };
 
   // 统一的本地解析入口：把在途 promise 记到 ref 上，供 error 事件链等待复用。
+  //
+  // `sessionId` 必须是**调用那一刻**的会话号。旧实现改用
+  // `video.dataset.sessionId` 判活，而它永远指向最新的会话——于是旧会话的解析
+  // 在 await 之后发现自己"还算当前"，继续去改 video.src 并 play()，把新会话
+  // 刚设好的源打断（AbortError），两边一起失败。这正是换集/自动连播弹错误页
+  // 的主要来源：连播时 ended 与倒计时可能各发一次 openEpisode。
   const startNativeResolve = (
     seriesId: string,
     episodeId: string,
     quality: string,
     contentType: number,
     video: HTMLVideoElement,
+    sessionId: number,
     startPosition = 0,
-  ): Promise<boolean> => {
-    const attempt = playNativeResolvedFile(seriesId, episodeId, quality, contentType, video, startPosition)
+  ): Promise<PlayOutcome> => {
+    const attempt = playNativeResolvedFile(
+      seriesId, episodeId, quality, contentType, video, sessionId, startPosition,
+    )
       .finally(() => {
         if (nativeResolveInFlightRef.current === attempt) nativeResolveInFlightRef.current = null;
       });
@@ -635,35 +778,42 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const playLocalFile = async (
     playUrl: string,
     video: HTMLVideoElement,
-    newSessionId: number,
+    sessionId: number,
     startPosition: number,
-  ): Promise<boolean> => {
+  ): Promise<PlayOutcome> => {
     try {
       const { convertFileSrc } = await import('@tauri-apps/api/core');
       const assetUrl = convertFileSrc(playUrl);
-      if (activeSessionRef.current !== newSessionId) return true; // 已切走
+      if (activeSessionRef.current !== sessionId) return 'stale'; // 已切走
       // 本地整集文件同样走"先预载、再接管"：即便文件已在盘上，
       // 也让旧帧留到新源解码就绪，避免同一条换集链路上出现两套体验。
-      const prepared = await preloadSource(assetUrl, startPosition, 6000);
-      if (activeSessionRef.current !== newSessionId) {
+      const prepared = await preloadSource(assetUrl, startPosition, 10000);
+      if (activeSessionRef.current !== sessionId) {
         disposePrepared(prepared ? { url: assetUrl, element: prepared } : null);
-        return true;
+        return 'stale';
       }
-      if (!prepared) {
-        // 预载失败（文件被删/损坏）：交回调用方清缓存并走完整链路。
-        return false;
+      if (prepared) {
+        const adopted = await adoptPreparedSource(
+          { url: assetUrl, element: prepared },
+          video,
+          sessionId,
+          startPosition,
+        );
+        disposePrepared({ url: assetUrl, element: prepared });
+        // 自动播放被拦说明源是好的、只是缺一次用户手势，再 load() 一次也没用；
+        // 直接把结果交回上层，让它如实提示"点击播放"，而不是谎报源故障。
+        if (adopted !== 'error') return adopted;
+        if (activeSessionRef.current !== sessionId) return 'stale';
       }
-      const adopted = await adoptPreparedSource(
-        { url: assetUrl, element: prepared },
-        video,
-        newSessionId,
-        startPosition,
-      );
-      disposePrepared({ url: assetUrl, element: prepared });
-      return adopted;
+      // 探针没就绪、或接管时解码/起播失败，都**不等于这个文件坏了**。
+      //
+      // 旧实现在这里直接 return false，调用方于是清掉缓存登记、掉到公开直链
+      // 兜底——而那条链路已被证实会被防盗链拦截，结果就是"整集明明在本机，
+      // 换集却弹播放失败"。这里改成退一步直接喂给主播放器再试一次。
+      return await playDirect(assetUrl, video, sessionId, startPosition);
     } catch (error) {
-      console.warn('[playback] local file play failed', { playUrl, error });
-      return false;
+      noteFailure(`本地文件播放失败 ${playUrl}`, error);
+      return 'error';
     }
   };
 
@@ -696,8 +846,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 喂给"只绑定一次"的事件监听器，保证它们拿到最新闭包。
   saveProgressThrottledRef.current = saveProgressThrottled;
 
-  // 打开剧集与换集核心
-  const openEpisode = async (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string) => {
+  // 打开剧集与换集核心（实现体；对外暴露的 openEpisode 只做同键去重）
+  const runOpenEpisode = async (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string) => {
     const qualitySwitchRequested = Boolean(
       qualityOverride
       && currentSeries?.id === seriesId
@@ -709,8 +859,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       countdownIntervalRef.current = null;
     }
     setCountdown({ active: false, remaining: 5, nextEpisode: null });
-    // 上一集的解析进度不能留在界面上：新的解析会立刻重新上报。
+    // 上一集的解析进度与失败原因都不能留到这一集：新的解析会立刻重新上报，
+    // 而残留的旧错误说明会让本次失败的原因被误读。
     setPrepareStatus(null);
+    setErrorDetail(null);
 
     const newSessionId = (activeSessionRef.current += 1);
     setSessionId(newSessionId);
@@ -774,10 +926,25 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         hasTriedBackupRef.current = true;
         hasTriedBlobRef.current = true;
         hasTriedNativeResolveRef.current = true;
-        const played = await playLocalFile(cachedPlayUrl, video, newSessionId, startPosition);
-        if (played) {
+        const outcome = await playLocalFile(cachedPlayUrl, video, newSessionId, startPosition);
+        if (isSettled(outcome)) {
+          // 已被更新的切换接管就直接退出：warmAdjacentEpisodes 会先清空预取队列，
+          // 而队列是共享的——这里再排一次会把新会话刚建好的队列清掉。
+          if (activeSessionRef.current !== newSessionId) return;
           // 命中快路径才预热相邻集：此时播放已稳定，后台下载不影响出画。
           warmAdjacentEpisodes(detail, ep.id, newSessionId);
+          return;
+        }
+        if (outcome === 'autoplay-blocked') {
+          // 源已经就绪，只是 WebView 不允许无手势起播。如实告知用户点一下，
+          // 绝不降级到公开直链——那样会显示成"播放源连接受阻"，完全误导。
+          setIsPlaying(false);
+          setUiState({
+            kind: 'error',
+            sessionId: newSessionId,
+            code: 'MEDIA_AUTOPLAY_FAILED',
+            recoverable: true,
+          });
           return;
         }
         // 本地文件播不了（被删/损坏）：清缓存回退完整链路。
@@ -795,18 +962,56 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         hasTriedBlobRef.current = true;
         setUiState({ kind: 'opening', sessionId: newSessionId, episodeId: ep.id });
         hasTriedNativeResolveRef.current = true;
-        const recovered = await startNativeResolve(
+        let outcome = await startNativeResolve(
           seriesId,
           ep.id,
           selectedQuality,
           detail.type === 'comic' ? 1004 : 1,
           video,
+          newSessionId,
           startPosition,
         );
-        if (recovered) {
+        // autoplay-blocked 不重试：源已经解析好、文件也在盘上，重跑一整集
+        // 只是让用户多等 7 秒，结果还是"需要点一下"。
+        if (outcome === 'error' && activeSessionRef.current === newSessionId && !resolveRetriedRef.current.has(ep.id)) {
+          // 整集解析要走"签名 → 取直链 → 下载 → 解密转存"，任何一环都可能是
+          // 瞬时故障（签名过期、网络抖动、worker 被并发挤掉）。这类失败重试一次
+          // 大概率就过了，直接弹错误页太浪费——用户点"重新解析播放"做的也是同一件事。
+          // 只重试一次：真失败时再多等一轮只会拖延用户看到结论的时间。
+          resolveRetriedRef.current.add(ep.id);
+          await new Promise(resolve => setTimeout(resolve, 700));
+          if (activeSessionRef.current === newSessionId) {
+            // 撤掉登记，确保这一轮是真正的重新解析而不是再读一次坏文件。
+            resolvedFileByVidRef.current.delete(episodeCacheKey(seriesId, ep.id));
+            setUiState({ kind: 'opening', sessionId: newSessionId, episodeId: ep.id });
+            outcome = await startNativeResolve(
+              seriesId,
+              ep.id,
+              selectedQuality,
+              detail.type === 'comic' ? 1004 : 1,
+              video,
+              newSessionId,
+              startPosition,
+            );
+          }
+        }
+        if (isSettled(outcome)) {
+          if (activeSessionRef.current !== newSessionId) return;
+          resolveRetriedRef.current.delete(ep.id);
           // 首次进入该集且播放成功：后台探测真实清晰度档位，不阻塞播放。
           void probeQualities(ep.id, detail.type === 'comic' ? 1004 : 1);
           warmAdjacentEpisodes(detail, ep.id, newSessionId);
+          return;
+        }
+        if (outcome === 'autoplay-blocked') {
+          // 源已就绪、只差一次用户手势：如实提示，别去碰公开直链。
+          setIsPlaying(false);
+          setUiState({
+            kind: 'error',
+            sessionId: newSessionId,
+            code: 'MEDIA_AUTOPLAY_FAILED',
+            recoverable: true,
+          });
           return;
         }
         // 本地解析也失败（API 拒绝/网络断）：最后再试公开网页直链兜底。
@@ -909,10 +1114,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
               selectedQuality,
               detail.type === 'comic' ? 1004 : 1,
               video,
-            ).then(recovered => {
-              if (recovered) return;
+              newSessionId,
+            ).then(result => {
+              if (isSettled(result)) return;
               setIsPlaying(false);
-              setUiState({ kind: 'error', sessionId: newSessionId, code, recoverable: true });
+              setUiState({
+                kind: 'error',
+                sessionId: newSessionId,
+                code: outcomeErrorCode(result, code),
+                recoverable: true,
+              });
             });
             return;
           }
@@ -927,6 +1138,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
     } catch (err) {
       if (activeSessionRef.current === newSessionId) {
+        noteFailure('打开集数失败', err);
         setUiState({
           kind: 'error',
           sessionId: newSessionId,
@@ -935,6 +1147,33 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         });
       }
     }
+  };
+
+  /**
+   * 对"同一集、同一起点"的重复打开做去重。
+   *
+   * 自动连播是这条防线存在的理由：倒计时到点会调用一次 playNextEpisode，
+   * 而 `ended` 事件在 React 状态（currentEpisode）尚未落地时也会再调一次，
+   * 于是同一集在几百毫秒内被打开两次。旧实现让两条解析链并行跑：
+   * 后到的 session 改掉 `video.dataset.sessionId` 并抢先设 src/play()，
+   * 先到的那条在 await 之后仍认为自己是当前的，跟着再设一次 src——
+   * 于是两次 `play()` 互相 Abort，双双失败并弹错误页。
+   *
+   * 去重后第二次调用直接复用第一次的 promise，既省一次解析，也消除了互殴。
+   */
+  // 已经整集重试过的 vid：见 runOpenEpisode 里的"只重试一次"约定。
+  const resolveRetriedRef = useRef<Set<string>>(new Set());
+  const openInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+  const openEpisode = (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string): Promise<void> => {
+    const key = `${seriesId}|${episodeId || ''}|${Math.round(startPosition)}|${qualityOverride || ''}`;
+    const inflight = openInFlightRef.current.get(key);
+    if (inflight) return inflight;
+    const task = runOpenEpisode(seriesId, episodeId, startPosition, qualityOverride)
+      .finally(() => {
+        if (openInFlightRef.current.get(key) === task) openInFlightRef.current.delete(key);
+      });
+    openInFlightRef.current.set(key, task);
+    return task;
   };
 
   const togglePlay = () => {
@@ -955,12 +1194,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
               currentQuality,
               currentSeries.type === 'comic' ? 1004 : 1,
               videoRef.current,
+              activeSessionRef.current,
               position,
             );
           })();
-          void attempt.then(recovered => {
-            if (!recovered) {
-              setUiState({ kind: 'error', sessionId: activeSessionRef.current, code: 'MEDIA_LOAD_FAILED', recoverable: true });
+          void attempt.then(result => {
+            if (!isSettled(result)) {
+              setUiState({
+                kind: 'error',
+                sessionId: activeSessionRef.current,
+                code: outcomeErrorCode(result),
+                recoverable: true,
+              });
             }
           });
           return;
@@ -1260,13 +1505,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
                     snapshot.currentQuality,
                     snapshot.currentSeries!.type === 'comic' ? 1004 : 1,
                     video,
+                    activeSessionRef.current,
                   );
                 })()
-              : Promise.resolve(false);
-            void nativeAttempt.then(recovered => {
-              if (recovered) return;
+              : Promise.resolve<PlayOutcome>('error');
+            void nativeAttempt.then(result => {
+              if (isSettled(result)) return;
               setIsPlaying(false);
-              setUiState({ kind: 'error', sessionId: activeSessionRef.current, code: 'MEDIA_LOAD_FAILED', recoverable: true });
+              setUiState({
+                kind: 'error',
+                sessionId: activeSessionRef.current,
+                code: outcomeErrorCode(result),
+                recoverable: true,
+              });
             });
           });
         return;
@@ -1292,6 +1543,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           ctx.currentQuality,
           ctx.currentSeries.type === 'comic' ? 1004 : 1,
           video,
+          activeSessionRef.current,
         );
         return;
       }
@@ -1364,6 +1616,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         stopPlayback,
         isSwitching,
         prepareStatus,
+        errorDetail,
         prewarmEpisode,
       }}
     >
