@@ -1313,6 +1313,8 @@ pub struct SearchSuggestion {
     pub id: String,
     pub title: String,
     pub cover: String,
+    pub episode_count: u32,
+    pub tags: Vec<String>,
 }
 
 /// 用 App 搜索联想补充网页搜索的缺项。
@@ -1358,6 +1360,21 @@ pub async fn search_suggest<R: Runtime>(
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default()
                             .to_owned(),
+                        episode_count: entry
+                            .get("episodeCount")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as u32,
+                        tags: entry
+                            .get("tags")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     })
                 })
                 .collect()

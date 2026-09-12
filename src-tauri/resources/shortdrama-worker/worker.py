@@ -758,15 +758,29 @@ def search_cmd(keyword: str, device_id: str, install_id: str, aid: int) -> dict:
         for entry in (data.get("query_result_v2") or []):
             if not isinstance(entry, dict):
                 continue
-            series_id = str(entry.get("keyword") or "").strip()
-            title = str(entry.get("name") or "").strip()
+            # 真实数据在 video_data 里：外层 pic_url 是所有条目共用的类型通用图，
+            # 拿它当封面会得到一排名为"加载失败"的占位方块。
+            video = entry.get("video_data") if isinstance(entry.get("video_data"), dict) else {}
+            series_id = str(video.get("series_id") or entry.get("keyword") or "").strip()
+            title = str(entry.get("name") or video.get("title") or "").strip()
             if not series_id.isdigit() or not title or series_id in seen:
                 continue
             seen.add(series_id)
+            # sub_title_list 形如 [{"第11季"}, {"传统玄幻"}, {"391万热度"}]：
+            # 只取题材，季数与热度不是标签。
+            tags = []
+            for sub in (entry.get("sub_title_list") or []):
+                if not isinstance(sub, dict):
+                    continue
+                name = str(sub.get("content") or "").strip()
+                if name and not name.startswith("第") and "热度" not in name:
+                    tags.append(name)
             items.append({
                 "id": series_id,
                 "title": title,
-                "cover": str(entry.get("pic_url") or "").strip(),
+                "cover": str(video.get("cover") or "").strip(),
+                "episodeCount": int(video.get("episode_cnt") or 0),
+                "tags": tags[:3],
             })
         if items:
             result = {"ok": True, "keyword": keyword, "items": items}

@@ -326,13 +326,24 @@ export const ExploreView: React.FC = () => {
               >
                 {/* 海报封面 (3:4 黄金竖屏比例) */}
                 <div className="relative w-full aspect-[3/4] overflow-hidden bg-slate-100 rounded-t-2xl">
+                  {/* 封面缺失时露出剧名首字，而不是留一个空框。
+                      App 联想结果里有部分条目不带封面（其 video_data 为空），
+                      onError 也统一走这里——图片 403/超时同样会退回占位。 */}
+                  <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-slate-100 to-slate-200">
+                    <span className="text-3xl font-bold text-slate-300 select-none">
+                      {(series.title || '剧').trim().slice(0, 1)}
+                    </span>
+                  </div>
                   <img
                     src={series.cover}
                     alt={series.title}
-                    className="w-full h-full object-cover transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
+                    className="relative w-full h-full object-cover transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
                     loading={index < 8 ? 'eager' : 'lazy'}
                     decoding="async"
                     fetchPriority={index < 4 ? 'high' : 'auto'}
+                    onError={(event) => {
+                      event.currentTarget.style.opacity = '0';
+                    }}
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
 
@@ -353,7 +364,11 @@ export const ExploreView: React.FC = () => {
 
                   {/* 底部集数与来源 */}
                   <div className="absolute bottom-2 inset-x-2 flex items-center justify-between text-[11px] text-white/95">
-                    <span className="font-semibold">{series.episodesCount} 集全</span>
+                    {series.episodesCount > 0 ? (
+                      <span className="font-semibold">{series.episodesCount} 集全</span>
+                    ) : (
+                      <span className="font-semibold text-white/60">集数未知</span>
+                    )}
                     <span className="text-[10px] text-white/75 truncate max-w-[80px]">{series.origin}</span>
                   </div>
 
