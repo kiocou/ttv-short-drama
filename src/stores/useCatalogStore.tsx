@@ -21,6 +21,14 @@ interface CatalogContextType {
   setSort: (s: 'recommend' | 'latest' | 'heat') => void;
   refreshCatalog: (keyword?: string) => Promise<void>;
   loadMore: (keyword?: string) => Promise<void>;
+  /**
+   * 重新读取"继续观看"。
+   *
+   * 目录数据不会因为看了几集而变化，所以 `loadData` 不会重跑；但继续观看横幅
+   * 依赖历史记录——不单独刷新，用户看完一集回到发现页，横幅还停在启动那一刻的
+   * 结果，观感就是"历史没有同步"。
+   */
+  refreshContinueWatching: () => Promise<void>;
 }
 
 const CatalogContext = createContext<CatalogContextType | null>(null);
@@ -174,6 +182,15 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     setCategories(['全部']);
   };
 
+  const refreshContinueWatching = useCallback(async () => {
+    try {
+      const histories = await ipcService.history.list();
+      setContinueWatching(histories[0] || null);
+    } catch {
+      // 辅助信息：拉取失败保持原值，不打扰用户。
+    }
+  }, []);
+
   const loadMore = useCallback(async (kw?: string) => {
     if (!hasMore || isLoadingMore) return;
     setIsLoadingMore(true);
@@ -236,6 +253,7 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
         setSort: setSortState,
         refreshCatalog: loadData,
         loadMore,
+        refreshContinueWatching,
       }}
     >
       {children}

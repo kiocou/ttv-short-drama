@@ -130,18 +130,61 @@ pub struct PlaybackUiState {
     pub session_id: u64,
 }
 
+/// 宽容解析：`null`（以及缺失）一律当 0。
+///
+/// 为什么需要：前端把 `video.duration` 直接送进来，而分片 MP4 / 未知时长的源
+/// 在 WebView 里报 `Infinity`——`JSON.stringify` 会把它变成 `null`。这些字段
+/// 原本是必填 f64/u32/u8，一个 `null` 就让**整个参数反序列化失败**，
+/// `history_save` 被拒，用户看到的是"这集明明看了，历史里却没有"。
+/// 宁可记下 0 秒，也不能丢掉"看到哪一集"这个信息。
+fn de_f64_lenient<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(0.0))
+}
+
+fn de_u32_lenient<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(deserializer)?.unwrap_or(0))
+}
+
+fn de_u8_lenient<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u8>::deserialize(deserializer)?.unwrap_or(0).min(100))
+}
+
+fn de_i64_lenient<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WatchHistoryItem {
     pub series_id: String,
     pub episode_id: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub series_cover: String,
+    #[serde(default, deserialize_with = "de_u32_lenient")]
     pub episode_number: u32,
+    #[serde(default, deserialize_with = "de_u32_lenient")]
     pub total_episodes: u32,
+    #[serde(default, deserialize_with = "de_f64_lenient")]
     pub position_seconds: f64,
+    #[serde(default, deserialize_with = "de_f64_lenient")]
     pub duration_seconds: f64,
+    #[serde(default, deserialize_with = "de_u8_lenient")]
     pub progress_percent: u8,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
     pub updated_at: i64,
     pub is_finished: bool,
     pub channel: Option<String>,
@@ -205,8 +248,83 @@ pub struct EnhancementStatus {
     pub display_fps: Option<f64>,
 }
 
+/// 增强播放（交给 mpv 接管）的能力探测结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnhancementProbe {
+    pub mpv_available: bool,
+    pub mpv_path: String,
+    pub display_hz: f64,
+    pub min_target_fps: u32,
+    pub max_target_fps: u32,
+    pub running: bool,
+    pub current_target_fps: u32,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheClearResult {
     pub freed_mb: f64,
+}
+
+#[cfg(test)]
+mod history_payload_tests {
+    use super::WatchHistoryItem;
+
+    /// `null` 数值不能再让整条历史记录被拒收。
+    ///
+    /// 这是"漫剧播完历史页里根本没有这条记录"的根因回归测试：前端把
+    /// `video.duration` 原样上报，而分片 MP4 在 WebView 里报 `Infinity`，
+    /// `JSON.stringify` 把它变成 `null`。字段原本是必填 f64/u32/u8，
+    /// 一个 `null` 就让整个 `history_save` 参数反序列化失败——记录一条都写不进去。
+    #[test]
+    fn accepts_null_numeric_fields() {
+        let json = r#"{
+            "seriesId": "s1",
+            "episodeId": "e1",
+            "title": "漫剧",
+            "seriesCover": "",
+            "episodeNumber": null,
+            "totalEpisodes": null,
+            "positionSeconds": null,
+            "durationSeconds": null,
+            "progressPercent": null,
+            "updatedAt": null,
+            "isFinished": false,
+            "channel": "comic"
+        }"#;
+        let item: WatchHistoryItem =
+            serde_json::from_str(json).expect("null 数值必须被宽容接受，否则整条记录丢失");
+        assert_eq!(item.position_seconds, 0.0);
+        assert_eq!(item.duration_seconds, 0.0);
+        assert_eq!(item.progress_percent, 0);
+        assert_eq!(item.episode_number, 0);
+        assert_eq!(item.updated_at, 0);
+        assert_eq!(item.channel.as_deref(), Some("comic"));
+    }
+
+    /// 正常的完整载荷必须照常解析，且百分比被夹在 0-100。
+    #[test]
+    fn accepts_well_formed_payload_and_clamps_percent() {
+        let json = r#"{
+            "seriesId": "s2",
+            "episodeId": "e2",
+            "title": "短剧",
+            "seriesCover": "https://example.com/c.jpg",
+            "episodeNumber": 7,
+            "totalEpisodes": 80,
+            "positionSeconds": 42.5,
+            "durationSeconds": 90.0,
+            "progressPercent": 250,
+            "updatedAt": 1700000000000,
+            "isFinished": false
+        }"#;
+        let item: WatchHistoryItem = serde_json::from_str(json).expect("正常载荷必须可解析");
+        assert_eq!(item.episode_number, 7);
+        assert_eq!(item.total_episodes, 80);
+        assert!((item.position_seconds - 42.5).abs() < f64::EPSILON);
+        assert_eq!(item.progress_percent, 100, "百分比必须夹在 0-100，否则 u8 会溢出");
+        assert!(item.channel.is_none());
+    }
 }
