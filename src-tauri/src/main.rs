@@ -194,6 +194,86 @@ fn history_list(state: State<'_, AppState>) -> Result<Vec<WatchHistoryItem>, Str
     state.database.list_history()
 }
 
+/**
+ * 进全屏前，**静默**解除窗口的最大化状态。
+ *
+ * ## 为什么需要这个命令（而不是直接调 unmaximize）
+ *
+ * 窗口处于最大化时进全屏会出错：tao（wry 0.35 的 `window.rs`，WM_NCCALCSIZE 分支）
+ * 为了保证"无边框窗口最大化时不盖住任务栏"，会把**仍是最大化状态**的窗口客户区
+ * 裁到工作区（屏幕减任务栏）。而 `set_fullscreen` 只改全屏标记、从不清除最大化，
+ * 于是用户看到"进了全屏，任务栏还在、画面没铺满"。
+ *
+ * 解除最大化确实能解决它，但 tao 的 `set_maximized(false)` 走的是
+ * `ShowWindow(SW_RESTORE)`——**带系统还原动画**，窗口会先缩回原始尺寸再撑成全屏，
+ * 用户看到的就是"进全屏时回弹一下"，观感很怪。
+ *
+ * 这里改用 `SetWindowPlacement`：把显示状态改回 `SW_SHOWNORMAL`，同时把
+ * "常规位置"设成**当前（最大化时的）矩形**。窗口因此原地不动、无动画，只是不再
+ * 处于最大化状态——tao 的裁切随之失效，紧接着的 `set_fullscreen(true)` 就能
+ * 一步铺满整屏。
+ */
+#[cfg(windows)]
+#[tauri::command]
+fn window_prepare_fullscreen(window: tauri::Window) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, SetWindowLongPtrW,
+        SetWindowPlacement, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_SHOWNORMAL, WINDOWPLACEMENT, WS_MAXIMIZE,
+    };
+
+    let hwnd: HWND = window.hwnd().map_err(|error| error.to_string())?.0;
+
+    unsafe {
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut placement) == 0 {
+            return Err("读取窗口位置失败。".into());
+        }
+        // 没最大化就不用管（例如窗口本来就只是普通尺寸）。
+        if placement.showCmd != SW_MAXIMIZE as u32 {
+            return Ok(false);
+        }
+
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return Err("读取窗口矩形失败。".into());
+        }
+
+        // 1) 摘掉 WS_MAXIMIZE：窗口不再是"最大化窗口"，tao 的任务栏裁切随之失效。
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_MAXIMIZE as isize));
+
+        // 2) 显示状态改回普通，但"常规位置"保持当前矩形——窗口原地不动，无动画。
+        placement.showCmd = SW_SHOWNORMAL as u32;
+        placement.rcNormalPosition = rect;
+        if SetWindowPlacement(hwnd, &placement) == 0 {
+            return Err("应用窗口位置失败。".into());
+        }
+
+        // 3) 让非客户区重新计算：客户区立刻按"非最大化"的规则铺满，不必等下一次窗口变化。
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn window_prepare_fullscreen(_window: tauri::Window) -> Result<bool, String> {
+    Ok(false)
+}
+
 #[tauri::command]
 fn history_save(item: WatchHistoryItem, state: State<'_, AppState>) -> Result<(), String> {
     state.database.save_history(&item)
@@ -450,6 +530,7 @@ fn main() {
             history_save,
             history_remove,
             history_clear,
+            window_prepare_fullscreen,
             settings_get,
             settings_save,
             enhancement_capabilities,

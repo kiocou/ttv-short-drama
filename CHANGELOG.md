@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.4 - 2026-09-15
+
+### 修复
+- **自动连播有时一次跳好几集**。换集时 React 状态会**先于画面**推进（新源要解析/下载几秒才接管），这段窗口里迟到的 `ended`、旧倒计时到点，都会再按"下一集"算一次，于是连跳多集。实测把 3 次 `ended` 连续派发给主播放器，修复前会从第 3 集一路跳到第 5 集。现在自动跳集只认"画面里实际装载的那一集"，并加了三重闸门：触发所属的集必须就是当前装载的集、期间不能有更新的切换在途、源装载后要过 2 秒结算期、同一次装载只允许自动跳过一集。回归验证：3 连发 `ended` 只前进一集；自然播到结尾仍恰好连播一集。
+- **窗口最大化时进全屏，任务栏还在、画面没铺满**。根因在 tao 的 Windows 窗口过程：为了让"最大化时别盖住任务栏"，它会把**仍处于最大化状态**的无边框窗口客户区裁到工作区（屏幕减任务栏），而 `set_fullscreen` 只改全屏标记、从不清除最大化。现在进全屏前先解除最大化，且必须是**静默**解除——新增 Rust 命令 `window_prepare_fullscreen`，用 `SetWindowPlacement` 原地改状态；直接调 `unmaximize()` 会走系统还原动画，实测窗口高度 1019 → 920 → 1067，看起来就是"进全屏回弹一下"。同时补齐 capabilities 里缺失的 `is-maximized` / `maximize` / `unmaximize` 权限（没有它 `unmaximize` 会被 Tauri 直接拒绝）。实测：最大化 1019 → 全屏 1067（铺满整屏、标题栏隐藏）→ 退出恢复最大化 1019，进/出全屏全程单调变化、无回弹。
+- **漫剧播放后历史页里根本没有这条记录**。`video.duration` 对分片 MP4 / 未知时长的源会报 `Infinity`，`Math.floor(Infinity)` 仍是 `Infinity`，而 `JSON.stringify` 把它写成 `null`，后端 `position_seconds` / `duration_seconds` 是必填 f64——一个 `null` 就让整条 `history_save` 参数反序列化失败，记录一条都写不进去（实测某漫剧的 `video.duration === Infinity`，正是这个形态）。现在：前端把非有限值压成 0、并优先用 `seekable` 末值兜底出真实时长；后端宽容解析 `null`；真正开播就落一条记录；保存失败会打日志而不是静默变成 unhandled rejection。历史页时长缺失时显示"已看 X 分钟"而不是"尚未开始播放"；时长未知的上报不再把"已看完"标记冲掉。
+- 回到发现页会重新读取"继续观看"，不再停留在应用启动那一刻的进度。
+
+### 构建提示
+- 独立运行的 release 包**必须带 `custom-protocol` 特性**：`cargo build --release --features tauri/custom-protocol`（`npm run tauri build` 会自动带上）。只写 `cargo build --release` 时前端资源不会内嵌，产物启动后仍去连开发服务器 `127.0.0.1:5175`，表现为"无法访问此页面"。
+
 ## 0.2.3 - 2026-09-12
 
 ### 修复

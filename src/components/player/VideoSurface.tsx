@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { isTauriEnvironment } from '../../services/ipc';
+import { enterFullscreen, leaveFullscreen, queryFullscreen } from '../../services/windowFx';
 import { PlayerControls } from './PlayerControls';
 import { EpisodeDrawer } from './EpisodeDrawer';
 import { NextCountdown } from './NextCountdown';
@@ -96,6 +97,10 @@ export const VideoSurface: React.FC = () => {
    *
    * 现在窗口真正铺满屏幕，由 App 在 isFullscreen 时隐藏标题栏，播放器即可
    * 占满整个窗口。单一事实来源，不存在失步。
+   *
+   * **窗口最大化时必须先解除最大化再进全屏**（详见 windowFx 的注释）：
+   * tao 对仍带最大化的无边框窗口会把客户区裁到"屏幕减任务栏"，于是全屏后
+   * 任务栏还在、画面铺不满——这正是用户报告的"窗口全屏下打开播放器全屏不对"。
    */
   const toggleFullscreen = useCallback(async () => {
     const entering = !isFullscreen;
@@ -104,34 +109,24 @@ export const VideoSurface: React.FC = () => {
       setIsFullscreen(entering);
       return;
     }
-    try {
-      const { getCurrentWindow } = await import('@tauri-apps/api/window');
-      await getCurrentWindow().setFullscreen(entering);
-      setIsFullscreen(entering);
-    } catch {
-      // 权限或环境不支持：保持原状，不谎报状态。
-    }
+    // 状态以窗口真实状态为准（windowFx 内部会核实），不乐观写入。
+    const actual = entering ? await enterFullscreen() : await leaveFullscreen();
+    setIsFullscreen(actual);
   }, [isFullscreen, setIsFullscreen]);
 
   /**
    * 退出全屏（离开播放器、或用户按 Esc 时调用）。
    *
    * 独立成函数是因为它有多个调用点，且必须幂等——重复调用不能报错。
+   * 同样会还原进入全屏前的最大化状态。
    */
   const exitFullscreen = useCallback(async () => {
     if (!isTauriEnvironment()) {
       setIsFullscreen(false);
       return;
     }
-    try {
-      const { getCurrentWindow } = await import('@tauri-apps/api/window');
-      const win = getCurrentWindow();
-      if (await win.isFullscreen()) await win.setFullscreen(false);
-    } catch {
-      // 忽略：下次进入播放器会重新校正状态。
-    } finally {
-      setIsFullscreen(false);
-    }
+    await leaveFullscreen();
+    setIsFullscreen(false);
   }, [setIsFullscreen]);
 
   /**

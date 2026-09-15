@@ -47,6 +47,13 @@ interface CountdownState {
   active: boolean;
   remaining: number;
   nextEpisode: EpisodeItem | null;
+  /**
+   * 这次倒计时是为**哪一集**启动的（vid）。
+   *
+   * 没有它就无法判断倒计时是否已经过期：用户手动切集后，旧倒计时的
+   * "下一集"是相对旧集算出来的，若还按它跳，就会跳过一整集。
+   */
+  episodeId: string | null;
 }
 
 interface PlaybackContextType {
@@ -139,10 +146,39 @@ function describeError(error: unknown): string {
 }
 
 /**
+ * 取"可用于展示与落盘"的时长。
+ *
+ * `video.duration` 对分片 MP4 / 未知时长的源可能是 `Infinity` 或 `NaN`：
+ * 前者会让进度条满格、百分比恒为 0，还会经 `Math.floor` 变成 `null`，
+ * 导致整条历史记录被后端拒绝。这种情况下退一步用 `seekable` / `buffered`
+ * 的末尾值——它们描述"已确定可用的时间轴终点"，是这类源最接近真实的时长。
+ */
+function usableDuration(video: HTMLVideoElement): number {
+  const native = video.duration;
+  if (Number.isFinite(native) && native > 0) return native;
+  const ends: number[] = [];
+  try {
+    if (video.seekable && video.seekable.length > 0) {
+      ends.push(video.seekable.end(video.seekable.length - 1));
+    }
+  } catch {
+    // 尚未就绪的媒体元素访问 seekable 可能抛错：忽略，退回 buffered。
+  }
+  try {
+    if (video.buffered && video.buffered.length > 0) {
+      ends.push(video.buffered.end(video.buffered.length - 1));
+    }
+  } catch {
+    // 同上。
+  }
+  const candidates = ends.filter(value => Number.isFinite(value) && value > 0);
+  return candidates.length > 0 ? Math.max(...candidates) : 0;
+}
+
+/**
  * `startPlayback` 的结果分类。三种失败的处理方式不同，不能压成一个 false。
  */
 type PlayStartResult = 'ok' | 'autoplay-blocked' | 'error';
-
 /**
  * 一次"打开并播放"的最终结局。
  *
@@ -193,6 +229,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     active: false,
     remaining: 5,
     nextEpisode: null,
+    episodeId: null,
   });
   const [prepareStatus, setPrepareStatus] = useState<PrepareStatus | null>(null);
   const [isSwitching, setIsSwitching] = useState<boolean>(false);
@@ -238,9 +275,77 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    */
   const adoptingRef = useRef<boolean>(false);
   const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /**
+   * 已经为哪一集武装过连播倒计时，键为 `${sessionId}:${episodeId}`。
+   *
+   * `timeupdate` 每 ~250ms 触发一次，而换集交接期主播放器上残留的
+   * duration/currentTime 仍属于上一集——没有这个"只武装一次"的标记，
+   * 倒计时会被反复重建，甚至在用户点过"立即播放"之后又重新出现。
+   */
+  const countdownArmedRef = useRef<string>('');
   // 供"只绑定一次"的事件监听器间接调用的稳定引用。
   const playNextEpisodeRef = useRef<() => void>(() => {});
   const saveProgressThrottledRef = useRef<(pos: number, dur: number, force?: boolean) => void>(() => {});
+
+  /**
+   * 主播放器里**实际装载的是哪一集**（连同装载它时的会话号与时刻）。
+   *
+   * 自动跳集必须以"画面里正在放的这一集"为准，而不是 React 状态。两者的推进
+   * 时机不同：切换第 N+1 集时状态立刻变成 N+1，而画面里还在放第 N 集（新源要
+   * 解析/下载几秒才接管）。这段窗口里如果又收到一次针对第 N 集的触发
+   * （`ended` 迟到、旧倒计时到点），按状态算出来的"下一集"就是 N+2——
+   * 用户看到的就是"有时候一次跳好几集"。
+   *
+   * `at` 是"源落到 video 元素上的时刻"，用于判断这次触发是否来得太早（见
+   * `tryClaimAutoAdvance`）：刚装载的源不可能已经播到结尾。
+   */
+  const videoCommittedRef = useRef<{ episodeId: string; sessionId: number; at: number } | null>(null);
+  /**
+   * 自动跳集的去重闩锁，键为 `${sessionId}:${episodeId}`。
+   *
+   * `ended` 与连播倒计时是两条独立链路，都可能要求"放下一集"，而且可能先后都到
+   * （倒计时先跳、旧源的 `ended` 迟到）。闩锁保证同一次装载只被消费一次；
+   * 键里带会话号，所以用户"重新打开同一集再看一遍"仍能正常连播。
+   */
+  const autoAdvanceLatchRef = useRef<string>('');
+
+  /**
+   * 源装载后多久才允许自动跳集。
+   *
+   * 装载瞬间到下一次 loadeddata 之间，媒体元素上的 `duration` / `currentTime`
+   * 仍是**上一集**的残留值（接管刻意不调 video.load()，见 adoptPreparedSource）。
+   * 实测：3 连发 `ended` 时，按下"刚装载就跳"的实现会从第 3 集一路跳到第 5 集。
+   * 真实内容不可能在 2 秒内播完，因此这段时间内的自动跳集触发一律作废。
+   */
+  const AUTO_ADVANCE_SETTLE_MS = 2000;
+
+  /**
+   * 记录"这一刻起，video 元素装载的源属于哪一集"。
+   * 所有给 video 赋 src 的落点都必须调用它（含兜底与 Blob 分支）。
+   */
+  const markSourceCommitted = (sessionId: number, episodeId: string) => {
+    videoCommittedRef.current = { episodeId, sessionId, at: Date.now() };
+  };
+
+  /**
+   * 申请"从 `fromEpisodeId` 自动往后跳一集"的资格；返回 false 表示这次触发已过期。
+   *
+   * 四重把关，任一不满足即拒绝——这是"连跳多集"的根治点：
+   *   1. 画面里装的必须就是 `fromEpisodeId`（不是它说明触发属于上一集）；
+   *   2. 期间不能有更新的切换在途（装载时的会话号必须仍是当前会话）；
+   *   3. 源装载后要经过"结算期"，否则这次触发还是旧源残留的事件；
+   *   4. 同一次装载还没被自动跳过（闩锁）。
+   */
+  const tryClaimAutoAdvance = (fromEpisodeId: string): boolean => {
+    const committed = videoCommittedRef.current;
+    if (!committed || committed.episodeId !== fromEpisodeId) return false;
+    if (committed.sessionId !== activeSessionRef.current) return false;
+    if (Date.now() - committed.at < AUTO_ADVANCE_SETTLE_MS) return false;
+    const latchKey = `${committed.sessionId}:${fromEpisodeId}`;
+    if (autoAdvanceLatchRef.current === latchKey) return false;
+    autoAdvanceLatchRef.current = latchKey;
+    return true;
+  };
 
   // 播放一旦真正开始，"切换中"就结束。
   // 用 effect 统一收口，而不是在 9 处 setIsPlaying(true) 旁边各写一行——
@@ -437,6 +542,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     video: HTMLVideoElement,
     sessionId: number,
     startPosition: number,
+    episodeId: string,
   ): Promise<PlayOutcome> => {
     adoptingRef.current = true;
     try {
@@ -465,6 +571,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         video.addEventListener('error', done, { once: true });
       });
       video.src = prepared.url;
+      // 从这一刻起，画面属于这一集——自动跳集只认这个事实来源。
+      markSourceCommitted(sessionId, episodeId);
       await firstFrameReady;
 
       // 已被更新的切换接管：不是失败，别让调用方降级。
@@ -509,6 +617,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     video: HTMLVideoElement,
     sessionId: number,
     startPosition: number,
+    episodeId: string,
   ): Promise<PlayOutcome> => {
     adoptingRef.current = true;
     try {
@@ -536,6 +645,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         video.addEventListener('error', done, { once: true });
       });
       video.src = assetUrl;
+      markSourceCommitted(sessionId, episodeId);
       video.load();
       await ready;
 
@@ -586,7 +696,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         resolvedFileByVidRef.current.set(episodeCacheKey(seriesId, episodeId), resolved.playUrl);
       }
       if (activeSessionRef.current !== sessionId) return 'stale';
-      const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition);
+      const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition, episodeId);
       // 只有"源本身有问题"才撤掉登记。自动播放被拦（autoplay-blocked）时
       // 文件是完好的，撤掉会导致下次重下一整集——白等 7 秒。
       if (outcome === 'error' && activeSessionRef.current === sessionId) {
@@ -829,6 +939,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     video: HTMLVideoElement,
     sessionId: number,
     startPosition: number,
+    episodeId: string,
   ): Promise<PlayOutcome> => {
     try {
       const { convertFileSrc } = await import('@tauri-apps/api/core');
@@ -847,6 +958,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           video,
           sessionId,
           startPosition,
+          episodeId,
         );
         disposePrepared({ url: assetUrl, element: prepared });
         // 自动播放被拦说明源是好的、只是缺一次用户手势，再 load() 一次也没用；
@@ -859,7 +971,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 旧实现在这里直接 return false，调用方于是清掉缓存登记、掉到公开直链
       // 兜底——而那条链路已被证实会被防盗链拦截，结果就是"整集明明在本机，
       // 换集却弹播放失败"。这里改成退一步直接喂给主播放器再试一次。
-      return await playDirect(assetUrl, video, sessionId, startPosition);
+      return await playDirect(assetUrl, video, sessionId, startPosition, episodeId);
     } catch (error) {
       noteFailure(`本地文件播放失败 ${playUrl}`, error);
       return 'error';
@@ -868,13 +980,40 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
 
   // 节流保存历史记录
   const lastSaveTimeRef = useRef<number>(0);
+
+  /**
+   * 把可能非有限的媒体时间压成可以安全落库的数字。
+   *
+   * 为什么必须做：`Math.floor(Infinity)` 还是 `Infinity`，而 `JSON.stringify`
+   * 会把 `Infinity`/`NaN` 序列化成 **null**；后端 `WatchHistoryItem` 里
+   * `position_seconds` / `duration_seconds` 是必填 f64，收到 null 会**整个
+   * 参数反序列化失败**——`history_save` 直接拒绝，一集看完历史页里什么都没有。
+   *
+   * 这不是假想：部分源（分片 MP4 / 未知时长的流）在 WebView 里 `duration`
+   * 长期是 `Infinity`，而原本的写法 `Math.floor(dur)` 正好把它变成 null。
+   * 漫剧里这类源尤其常见，表现为"漫剧播放后历史记录根本不出现"。
+   */
+  const safeSeconds = (value: number): number => (
+    Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+  );
+
+  /**
+   * 保存进度。
+   *
+   * - 非有限时长一律按 0 上报（后端对 duration=0 有专门的"只更新元数据、
+   *   保留旧进度"分支，不会把已有进度冲掉）；
+   * - 保存失败必须**可见**：旧实现既不 await 也不 catch，一次序列化失败
+   *   就变成静默的 unhandled rejection，用户只看到"历史没同步"。
+   */
   const saveProgressThrottled = useCallback((pos: number, dur: number, force = false) => {
     if (!currentSeries || !currentEpisode) return;
     const now = Date.now();
     if (!force && now - lastSaveTimeRef.current < 4000) return;
     lastSaveTimeRef.current = now;
 
-    const percent = dur > 0 ? Math.min(100, Math.round((pos / dur) * 100)) : 0;
+    const safeDur = Number.isFinite(dur) && dur > 0 ? dur : 0;
+    const safePos = Number.isFinite(pos) && pos > 0 ? Math.min(pos, safeDur > 0 ? safeDur : pos) : 0;
+    const percent = safeDur > 0 ? Math.min(100, Math.max(0, Math.round((safePos / safeDur) * 100))) : 0;
     const isFinished = percent >= 95;
 
     ipcService.history.save({
@@ -884,12 +1023,20 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       seriesCover: currentSeries.cover,
       episodeNumber: currentEpisode.episodeNumber,
       totalEpisodes: currentSeries.episodesCount,
-      positionSeconds: Math.floor(pos),
-      durationSeconds: Math.floor(dur),
+      positionSeconds: safeSeconds(safePos),
+      durationSeconds: safeSeconds(safeDur),
       progressPercent: percent,
       updatedAt: now,
       isFinished,
       channel: currentSeries.type,
+    }).catch((error: unknown) => {
+      // 落盘失败必须留痕：否则用户只会看到"历史记录没同步"，无从排查。
+      console.warn('[playback] 历史记录保存失败', describeError(error), {
+        seriesId: currentSeries.id,
+        episodeId: currentEpisode.id,
+        positionSeconds: safeSeconds(safePos),
+        durationSeconds: safeSeconds(safeDur),
+      });
     });
   }, [currentSeries, currentEpisode]);
   // 喂给"只绑定一次"的事件监听器，保证它们拿到最新闭包。
@@ -902,12 +1049,14 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       && currentSeries?.id === seriesId
       && currentEpisode?.id === episodeId,
     );
-    // 清除现有的连播倒计时
+    // 清除现有的连播倒计时。换集后上一集的"已武装"标记必须一起作废，
+    // 否则新一集（sessionId 变了、键不同）之外的残留状态会互相干扰。
     if (countdownIntervalRef.current) {
       clearInterval(countdownIntervalRef.current);
       countdownIntervalRef.current = null;
     }
-    setCountdown({ active: false, remaining: 5, nextEpisode: null });
+    countdownArmedRef.current = '';
+    setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
     // 上一集的解析进度与失败原因都不能留到这一集：新的解析会立刻重新上报，
     // 而残留的旧错误说明会让本次失败的原因被误读。
     setPrepareStatus(null);
@@ -975,7 +1124,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         hasTriedBackupRef.current = true;
         hasTriedBlobRef.current = true;
         hasTriedNativeResolveRef.current = true;
-        const outcome = await playLocalFile(cachedPlayUrl, video, newSessionId, startPosition);
+        const outcome = await playLocalFile(cachedPlayUrl, video, newSessionId, startPosition, ep.id);
         if (isSettled(outcome)) {
           // 已被更新的切换接管就直接退出：warmAdjacentEpisodes 会先清空预取队列，
           // 而队列是共享的——这里再排一次会把新会话刚建好的队列清掉。
@@ -1115,6 +1264,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           video.addEventListener('error', done, { once: true });
         });
         video.src = session.url;
+        markSourceCommitted(newSessionId, ep.id);
         await webFirstFrame;
 
         if (startPosition > 0) {
@@ -1366,11 +1516,15 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       clearInterval(countdownIntervalRef.current);
       countdownIntervalRef.current = null;
     }
-    setCountdown({ active: false, remaining: 5, nextEpisode: null });
+    setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
   };
 
   const acceptCountdown = () => {
+    // 手动点"立即播放"同样要过闸门：否则它会与"旧源随后派发的 ended"各跳一集，
+    // 用户点一次却跳了两集。claim 失败说明这一集已经被自动跳过了，直接收手。
+    const fromEpisodeId = countdown.episodeId;
     cancelCountdown();
+    if (fromEpisodeId && !tryClaimAutoAdvance(fromEpisodeId)) return;
     playNextEpisode();
   };
 
@@ -1392,14 +1546,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       clearInterval(countdownIntervalRef.current);
       countdownIntervalRef.current = null;
     }
-    setCountdown({ active: false, remaining: 5, nextEpisode: null });
+    countdownArmedRef.current = '';
+    setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
 
     const video = videoRef.current;
     if (video) {
       if (!video.paused) video.pause();
-      if (video.duration > 0 && Number.isFinite(video.duration)) {
-        saveProgressThrottledRef.current(video.currentTime, video.duration, true);
-      }
+      // 时长不可信（分片 MP4 会报 Infinity）时也要落盘：此时按 0 上报，
+      // 后端保留旧的时长/百分比，只更新"看到哪一集、哪个位置"。
+      // 旧实现用 `Number.isFinite(duration)` 直接跳过保存，那类源于是永远
+      // 留不下历史记录——漫剧里最容易中。
+      saveProgressThrottledRef.current(video.currentTime, usableDuration(video), true);
     }
     setIsPlaying(false);
     // 回到 idle 而不是保留 playing/buffering：否则重新进入播放器时
@@ -1441,20 +1598,41 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
 
     const handleTimeUpdate = () => {
       const cur = video.currentTime;
-      const dur = video.duration || 0;
+      const dur = usableDuration(video);
       setPosition(cur);
       setDuration(dur);
       saveProgressThrottledRef.current(cur, dur);
 
       const ctx = handlerCtxRef.current;
+
+      // 武装倒计时的前置条件：主播放器此刻承载的必须就是当前这一集。
+      //
+      // 少了这道判断就会复现"点了立即播放，下一集还在倒计时、到点又跳一集"：
+      //   cancelCountdown 清掉读秒后，主播放器开始把新源接管进来；而
+      //   adoptPreparedSource 为了保住旧帧、不黑屏，**刻意不调用 video.load()**，
+      //   于是 `video.src = 新源` 之后、`loadeddata` 之前，媒体元素上残留的
+      //   duration/currentTime 仍属于上一集（仍在结尾 8 秒内）。这次 timeupdate
+      //   会让 `dur - cur <= 8` 继续成立，把刚被取消的倒计时重新武装起来，
+      //   读秒结束后再切一集。
+      const liveSession = Number(video.dataset.sessionId);
+      const armedKey = `${liveSession}:${ctx.currentEpisode?.id ?? ''}`;
+      const playerCarriesCurrentEpisode = !adoptingRef.current
+        && liveSession === activeSessionRef.current;
+
       // 距离结束 8 秒且还有下一集时触发连播倒计时（尊重用户的自动连播开关）。
-      if (dur > 20 && dur - cur <= 8 && !ctx.countdownActive && ctx.autoNext
+      if (playerCarriesCurrentEpisode
+          && countdownArmedRef.current !== armedKey
+          && dur > 20 && dur - cur <= 8 && !ctx.countdownActive && ctx.autoNext
           && ctx.currentSeries && ctx.currentEpisode) {
         const curIdx = ctx.currentSeries.episodes.findIndex(e => e.id === ctx.currentEpisode!.id);
         if (curIdx >= 0 && curIdx < ctx.currentSeries.episodes.length - 1) {
           const nextEp = ctx.currentSeries.episodes[curIdx + 1];
+          // 记下这次倒计时是"为哪一集"启动的：读秒期间用户可能手动切集，
+          // 那时 nextEpisode 已经是相对旧集算出来的，绝不能照跳。
+          const armedEpisodeId = ctx.currentEpisode.id;
           const total = Math.max(3, Math.min(15, ctx.countdownSeconds || 5));
-          setCountdown({ active: true, remaining: total, nextEpisode: nextEp });
+          countdownArmedRef.current = armedKey;
+          setCountdown({ active: true, remaining: total, nextEpisode: nextEp, episodeId: armedEpisodeId });
 
           let sec = total;
           if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
@@ -1463,8 +1641,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             if (sec <= 0) {
               if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
               countdownIntervalRef.current = null;
-              // 倒计时读秒期间用户若关掉了自动连播，则不跳集。
-              if (handlerCtxRef.current.autoNext) playNextEpisodeRef.current();
+              // 先收起面板再跳集：跳集要走"解析 → 接管"若干秒，状态留着会让
+              // 倒计时停在最后一秒不消失。
+              setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
+              const ctxNow = handlerCtxRef.current;
+              // 读秒期间用户若关掉了自动连播、或已经手动切走这一集，都不跳集。
+              // `tryClaimAutoAdvance` 再确认"画面里放的就是这一集、期间没有更新的
+              // 切换、且这一集还没被自动跳过"——三道关都过了才允许往后跳一集。
+              if (ctxNow.autoNext
+                  && ctxNow.currentEpisode?.id === armedEpisodeId
+                  && tryClaimAutoAdvance(armedEpisodeId)) {
+                playNextEpisodeRef.current();
+              }
             } else {
               setCountdown(prev => ({ ...prev, remaining: sec }));
             }
@@ -1491,6 +1679,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const handlePlaying = () => {
       setIsPlaying(true);
       setUiState({ kind: 'playing', sessionId: activeSessionRef.current, position: video.currentTime });
+      // 真正出画就立刻落一条历史，而不是等第一次 timeupdate 的 4 秒节流窗口。
+      //
+      // 这样"打开一集看两眼就退出"也会留下"看到第 N 集"；时长此刻可能还没就绪，
+      // 按 0 上报——后端对 duration=0 有专门分支，只更新元数据、不覆盖已有进度，
+      // 所以这次提前上报不会有副作用。
+      saveProgressThrottledRef.current(video.currentTime, usableDuration(video), true);
       // 预取已迁移到 openEpisode 落点（warmAdjacentEpisodes），这里不再重复发起：
       // 挂在 playing 上会导致"必须真正开播才预取"，而用户往往在开播瞬间就切集，
       // 预取来不及完成，等于没做。
@@ -1499,10 +1693,27 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const handleEnded = () => {
       setIsPlaying(false);
       setUiState({ kind: 'ended', sessionId: activeSessionRef.current });
-      saveProgressThrottledRef.current(video.duration, video.duration, true);
-      if (handlerCtxRef.current.autoNext) {
-        playNextEpisodeRef.current();
+      // 落盘"这一集看完了"必须归属**真正放完的那一集**。
+      //
+      // 旧实现无条件按 currentEpisode 写 100% 完成：交接期 currentEpisode 已经是
+      // 下一集，于是一次播放结束会把下一集标成"已看完"，历史页随即显示错误的集数。
+      const committed = videoCommittedRef.current;
+      const ctxEnded = handlerCtxRef.current;
+      const endedEpisodeId = committed?.episodeId ?? ctxEnded.currentEpisode?.id ?? null;
+      if (endedEpisodeId && endedEpisodeId === ctxEnded.currentEpisode?.id) {
+        const endedDuration = usableDuration(video);
+        saveProgressThrottledRef.current(endedDuration, endedDuration, true);
       }
+      // 主播放器正在把新源接管进来：这次 ended 属于被交接掉的旧一集，
+      // 再发起下一集就会连跳两级（用户点"立即播放"后旧视频恰好播完时最容易中）。
+      if (adoptingRef.current) return;
+      if (!endedEpisodeId) return;
+      // 画面里装的已经不是 currentEpisode（说明这次 ended 是迟到的旧源事件），
+      // 或这一集刚被倒计时跳过——一律不再往后跳，否则就是"一次跳好几集"。
+      if (endedEpisodeId !== ctxEnded.currentEpisode?.id) return;
+      if (!ctxEnded.autoNext) return;
+      if (!tryClaimAutoAdvance(endedEpisodeId)) return;
+      playNextEpisodeRef.current();
     };
 
     const handleError = () => {
@@ -1524,6 +1735,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         const preferredMuted = ctx.isMuted;
         video.muted = true;
         video.src = backupUrl;
+        if (ctx.currentEpisode) markSourceCommitted(activeSessionRef.current, ctx.currentEpisode.id);
         video.load();
         void video.play()
           .then(() => {
@@ -1553,6 +1765,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             if (activeSessionRef.current !== Number(video.dataset.sessionId)) return;
             objectUrlRef.current = URL.createObjectURL(blob);
             video.src = objectUrlRef.current;
+            const blobCtx = handlerCtxRef.current;
+            if (blobCtx.currentEpisode) markSourceCommitted(activeSessionRef.current, blobCtx.currentEpisode.id);
             video.load();
             return video.play();
           })

@@ -156,7 +156,11 @@ export const HistoryView: React.FC = () => {
                   进度：
                   {item.durationSeconds > 0
                     ? `${formatDuration(item.positionSeconds)} / ${formatDuration(item.durationSeconds)}`
-                    : '尚未开始播放'}
+                    /* 时长拿不到（分片 MP4 报 Infinity）时，仍然如实显示"看到哪儿"，
+                       而不是一句"尚未开始播放"——位置是有效信息，不该被时长拖累。 */
+                    : item.positionSeconds > 0
+                      ? `已看 ${formatDuration(item.positionSeconds)}`
+                      : '尚未开始播放'}
                 </span>
                     <span>·</span>
                     <span className="flex items-center gap-1">
