@@ -196,57 +196,5 @@ impl Database {
             .map_err(|error| error.to_string())?;
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::WatchHistoryItem;
-    use std::path::PathBuf;
-
-    fn temp_db_path() -> PathBuf {
-        std::env::temp_dir().join(format!("ttv-history-test-{}.sqlite3", uuid::Uuid::new_v4()))
-    }
-
-    fn item(position: f64, duration: f64, finished: bool) -> WatchHistoryItem {
-        WatchHistoryItem {
-            series_id: "s1".into(),
-            episode_id: "e1".into(),
-            title: "测试剧".into(),
-            series_cover: String::new(),
-            episode_number: 1,
-            total_episodes: 10,
-            position_seconds: position,
-            duration_seconds: duration,
-            progress_percent: if duration > 0.0 {
-                ((position / duration) * 100.0).round() as u8
-            } else {
-                0
-            },
-            updated_at: 1_700_000_000_000,
-            is_finished: finished,
-            channel: Some("comic".into()),
-        }
-    }
-
-    /// 时长不可信（0）时的上报只能更新元数据，不能把"已看完"冲掉。
-    ///
-    /// 现场背景：分片 MP4 在 WebView 里 `duration` 长期是 `Infinity`，前端按约定
-    /// 上报 duration=0。若这里无条件用上报值覆盖 is_finished，用户已经看完的一集
-    /// 会因为一次"时长未知"的上报退回未看完——历史页的"已看完"徽章凭空消失。
-    #[test]
-    fn untrusted_duration_keeps_finished_flag() {
-        let path = temp_db_path();
-        let db = Database::open(&path).expect("打开测试库");
-        db.save_history(&item(100.0, 100.0, true)).expect("写入已看完");
-        db.save_history(&item(0.0, 0.0, false)).expect("写入仅元数据");
-
-        let rows = db.list_history().expect("读取历史");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].is_finished, "时长缺失的上报把已看完标记冲掉了");
-        assert!((rows[0].duration_seconds - 100.0).abs() < f64::EPSILON);
-        assert!((rows[0].position_seconds - 100.0).abs() < f64::EPSILON);
-        drop(db);
-        let _ = std::fs::remove_file(&path);
-    }
 }

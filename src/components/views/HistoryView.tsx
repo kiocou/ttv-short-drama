@@ -5,14 +5,13 @@ import { useAppStore } from '../../stores/useAppStore';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
 import { StatusBadge } from '../common/StatusBadge';
-import { 
-  History, 
-  Trash2, 
-  Play, 
-  Clock, 
-  CheckCircle2, 
-  AlertTriangle,
-  Clapperboard
+import {
+  History,
+  Trash2,
+  Play,
+  Clock,
+  CheckCircle2,
+  AlertTriangle
 } from 'lucide-react';
 
 function formatDuration(seconds: number): string {
@@ -90,9 +89,7 @@ export const HistoryView: React.FC = () => {
       {/* 历史记录列表 */}
       {records.length === 0 ? (
         <div className="py-24 flex flex-col items-center justify-center text-center gap-3">
-          <div className="w-14 h-14 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-300">
-            <Clapperboard className="w-7 h-7" />
-          </div>
+          <img src="/app-icon.png" alt="" className="w-14 h-14 object-contain opacity-60" draggable={false} />
           <p className="text-sm font-semibold text-slate-700">暂无观看历史</p>
           <p className="text-xs text-slate-400">在发现页寻找心仪短剧开启追剧体验吧</p>
           <div className="p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner inline-flex mt-2">

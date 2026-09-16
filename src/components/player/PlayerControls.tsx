@@ -1,11 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
-import { useEnhancementStore } from '../../stores/useEnhancementStore';
-import { useRtxVsrStore } from '../../stores/useRtxVsrStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { ProgressBar } from './ProgressBar';
 import { RollingPercent, RollingTime } from './RollingNumber';
-import { EnhancementFlyout } from './EnhancementFlyout';
 import {
   Play,
   Pause,
@@ -19,8 +16,6 @@ import {
   Minimize,
   ArrowLeft,
   Layers,
-  Sparkles,
-  MonitorUp,
   Lock,
   LockOpen,
 } from 'lucide-react';
@@ -71,22 +66,11 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
   } = usePlaybackStore();
 
   const { goBack, showToast } = useAppStore();
-  const { uiState: enhancementState, currentFps } = useEnhancementStore();
-  const {
-    stage: vsrStage,
-    busy: vsrBusy,
-    statusLabel: vsrStatusLabel,
-    detailLines: vsrDetailLines,
-    notes: vsrNotes,
-    renderProbe: vsrRenderProbe,
-    toggle: toggleVsr,
-  } = useRtxVsrStore();
 
   // 弹窗状态
   const [showVolumeSlider, setShowVolumeSlider] = useState(false);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
-  const [showEnhancement, setShowEnhancement] = useState(false);
 
   const controlsRef = useRef<HTMLDivElement | null>(null);
 
@@ -109,7 +93,6 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
       setShowQualityMenu(false);
       setShowSpeedMenu(false);
       setShowVolumeSlider(false);
-      setShowEnhancement(false);
     }
   }, [isLocked]);
 
@@ -132,70 +115,6 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
     : [{ label: '自动', value: 'auto', resolution: '由播放源自动选择' }];
   // 单档位时禁用切换（点了也没得选，徒增困惑）。
   const qualitySelectable = qualityOptions.length > 1;
-  const enhancementLabel = enhancementState.kind === 'running'
-    ? `${enhancementState.engine} ${currentFps > 0 ? `${currentFps.toFixed(1)} FPS` : '运行中'}`
-    : enhancementState.kind === 'warming'
-      ? `${enhancementState.engine} 预热中`
-      : enhancementState.kind === 'degraded'
-        ? '增强已降级'
-        : '原始播放';
-
-  /**
-   * 「RTX VSR」按钮的点击处理。
-   *
-   * 开启动作本身只写入应用侧偏好——真正的超分请求由 WebView2 内核发给 NVIDIA
-   * 驱动。因此这里按**真实结果**分情况反馈：链路不满足就直说哪一环不满足，
-   * 不回一句笼统的"已开启"让用户误以为超分正在运行。
-   */
-  const handleToggleVsr = useCallback(async () => {
-    if (vsrStage === 'unsupported') {
-      const reason = vsrDetailLines[vsrDetailLines.length - 1] ?? '当前环境不满足 RTX VSR 的前置条件。';
-      showToast(`RTX VSR 不可用：${reason}`, 'error');
-      return;
-    }
-    try {
-      const updated = await toggleVsr();
-      if (!updated) return;
-      if (!updated.enabled) {
-        showToast('RTX VSR 已关闭', 'success');
-        return;
-      }
-      if (!updated.ready) {
-        showToast('RTX VSR 已开启，但当前环境尚不满足超分条件', 'error');
-        return;
-      }
-
-      // 开启成功不等于"已经超分"。按当前渲染条件分三种情况如实反馈——
-      // 否则用户点完看到按钮是「待放大」却不知道为什么，只能干瞪眼。
-      const rendererKnown = vsrRenderProbe.renderer.length > 0;
-      const onRtx = !rendererKnown || vsrRenderProbe.rendererIsRtx;
-
-      if (!onRtx) {
-        // 这条最有价值：用户报的"驱动总闸开着却没反应"就是这种情况。
-        // 注册表首选项按进程路径绑定，只对桌面应用生效——重启的是本应用，
-        // 浏览器里访问开发服务器不受它约束。
-        showToast('RTX VSR 已开启：已写入高性能 GPU 图形首选项，重启本应用后生效', 'success');
-        return;
-      }
-      if (!vsrRenderProbe.scale || vsrRenderProbe.scale <= 1.001) {
-        showToast('RTX VSR 已开启，但当前画面是缩小显示，超分尚未介入', 'warning');
-        return;
-      }
-
-      // 真正具备介入条件时，再把"NVIDIA 侧总闸"这条边界说清楚：应用无法代开
-      // 驱动侧的超分开关，用户若发现画面无变化，需要去 NVIDIA App 确认。
-      const driverGateNote = vsrNotes.find(note => note.startsWith('NVIDIA App'));
-      showToast(
-        driverGateNote
-          ? `RTX VSR 已开启。${driverGateNote}`
-          : 'RTX VSR 已开启：内核将向 NVIDIA 驱动请求视频超分',
-        'success',
-      );
-    } catch (error) {
-      showToast(`RTX VSR 切换失败：${(error as Error).message}`, 'error');
-    }
-  }, [vsrStage, vsrDetailLines, vsrNotes, vsrRenderProbe, toggleVsr, showToast]);
-
   // 集数徽章文案。
   //
   // 后端在缺少真实分集标题时会把 title 填成"第 N 集"（见 provider.rs 的
@@ -286,34 +205,6 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
             </div>
           </div>
 
-          {/*
-            右上角：画面增强运行状态。
-
-            设计稿要求把这里"彻底清空"，但这不是装饰——它是后端真实上报的
-            插帧/超分运行状态，删掉用户就无从知道增强到底有没有生效。
-            折中是保留胶囊、改用与其它控件一致的晶体材质，并降低存在感；
-            点击可展开增强引擎选择。若确实要完全清空，删掉本块即可。
-          */}
-          <div className="relative flex-shrink-0">
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setShowEnhancement(prev => !prev);
-                setShowQualityMenu(false);
-                setShowSpeedMenu(false);
-                setShowVolumeSlider(false);
-              }}
-              className={`btn-text-action crystal-surface rounded-full${showEnhancement ? ' is-on' : ''}`}
-              title={`画面增强：${enhancementLabel}（点击切换引擎）`}
-              aria-expanded={showEnhancement}
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>{enhancementLabel}</span>
-            </button>
-
-            <EnhancementFlyout isOpen={showEnhancement} onClose={() => setShowEnhancement(false)} />
-          </div>
         </div>
 
         {/* 底部操控坞：进度槽与控件同处一张晶体大卡片 */}
@@ -416,8 +307,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                     setShowVolumeSlider(prev => !prev);
                     setShowQualityMenu(false);
                     setShowSpeedMenu(false);
-                    setShowEnhancement(false);
-                  }}
+                                }}
                   onToggleMute={toggleMute}
                   onVolumeChange={(v) => setVolume(v)}
                 />
@@ -433,8 +323,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                       setShowQualityMenu(prev => !prev);
                       setShowSpeedMenu(false);
                       setShowVolumeSlider(false);
-                      setShowEnhancement(false);
-                    }}
+                                    }}
                     title={qualitySelectable ? '切换清晰度' : '当前播放源仅提供单一画质'}
                     className="btn-text-action"
                   >
@@ -471,8 +360,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                       setShowSpeedMenu(prev => !prev);
                       setShowQualityMenu(false);
                       setShowVolumeSlider(false);
-                      setShowEnhancement(false);
-                    }}
+                                    }}
                     className="btn-text-action"
                     title="切换播放倍速"
                   >
@@ -495,24 +383,6 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                     ))}
                   </div>
                 </div>
-
-                {/* RTX VSR 开关。
-                    开启后由 WebView2 内核向 NVIDIA 驱动请求 D3D11 视频处理器超分——
-                    应用不能直接调用超分 API，因此按钮的职责是"打开这条链路并如实报告
-                    它现在是否真的具备介入条件"。不满足时仍然可点，点下去会说明原因。 */}
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void handleToggleVsr();
-                  }}
-                  disabled={vsrBusy}
-                  title={vsrDetailLines.join('\n')}
-                  className={`btn-text-action${vsrStage === 'enabled' ? ' is-on' : ''}`}
-                >
-                  <MonitorUp className="w-3.5 h-3.5" />
-                  <span>{vsrStatusLabel}</span>
-                </button>
 
                 <button
                   type="button"

@@ -443,7 +443,7 @@ fn cache_dir() -> PathBuf {
 
 /// 与 runtime::discover_resource_dir 相同的候选顺序，但以 worker/python 的
 /// 存在为判据（worker 目录随 bundle.resources 复制到可执行文件旁）。
-fn resource_base() -> Option<PathBuf> {
+pub fn resource_base() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(value) = std::env::var_os("TTV_RESOURCE_DIR") {
         candidates.push(PathBuf::from(value));
@@ -727,7 +727,39 @@ const CACHE_EVICT_GRACE_SECONDS: u64 = 900;
 /// LRU 键使用 mtime：命中缓存时 `touch_cache_entry` 会把它推到当前时间，
 /// 因此 mtime 真实反映"最近使用"。再叠加 `CACHE_EVICT_GRACE_SECONDS` 宽限期，
 /// 双重保证不会删除正在播放或刚下载的整集。
+/// 上次执行全量缓存淘汰的时间（节流用）。
+fn last_eviction() -> &'static Mutex<Option<std::time::Instant>> {
+    static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(None))
+}
+
+/// 两次全量淘汰之间的最小间隔。
+const EVICTION_MIN_INTERVAL: Duration = Duration::from_secs(90);
+
 fn enforce_cache_budget(keep: &std::path::Path) {
+    // 节流。
+    //
+    // 淘汰要遍历两个频道目录、对每个文件 stat 取 mtime、排序，缓存贴着预算时
+    // 还要真的删掉上百 MB 文件。这段开销被放在**每次解析**的必经路径上，于是
+    // "点开一集"凭空多等约两秒——实测同一集：worker 侧只用 632ms，而整条命令
+    // 走完要 2761ms，差额全在这里（当时缓存 1020.9MB，正卡在 1GB 上限）。
+    // 淘汰本身是收敛性维护，没必要每集都做一遍。
+    {
+        let mut guard = match last_eviction().lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if let Some(last) = *guard {
+            if last.elapsed() < EVICTION_MIN_INTERVAL {
+                return;
+            }
+        }
+        *guard = Some(std::time::Instant::now());
+    }
+    evict_channels_to_budget_unthrottled(keep);
+}
+
+fn evict_channels_to_budget_unthrottled(keep: &std::path::Path) {
     // 跨频道统一收敛：短剧与漫剧共享同一份预算。
     evict_channels_to_budget(
         &[
@@ -1406,7 +1438,7 @@ pub async fn short_drama_app_prefetch_stream<R: Runtime>(
     input: PrefetchStreamInput,
 ) -> Result<u32, String> {
     let profile = HongguoAppProfile::from_input(input.content_type, input.app_id)?;
-    let mut ready = 0u32;
+    let mut targets: Vec<String> = Vec::new();
     // 上限 6 集：再多也只是把缓存塞满，用户点不到那么远。
     for raw in input.vids.iter().take(6) {
         let vid = raw.trim().to_owned();
@@ -1414,15 +1446,42 @@ pub async fn short_drama_app_prefetch_stream<R: Runtime>(
             continue;
         }
         if peek_stream(&vid).is_some() {
-            ready += 1;
             continue;
         }
-        match run_worker_subcommand(&app, "stream", &vid, "prefetch", profile).await {
-            Ok(payload) => {
-                store_stream(&vid, &payload);
+        targets.push(vid);
+    }
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    // 并发签名（限流 3）。
+    //
+    // 每集是两次独立的 App API 往返、实测约 2.4s。串行做 6 集就是十几秒，
+    // 用户点第一集时后面几集根本还没签上，等于白排。限流 3 路既能把这批压到
+    // 一轮往返的量级，又不会把后端和带宽打满。
+    let mut ready = 0u32;
+    for chunk in targets.chunks(3) {
+        let mut handles = Vec::new();
+        for vid in chunk {
+            let app_handle = app.clone();
+            let target = vid.clone();
+            handles.push(tokio::spawn(async move {
+                match run_worker_subcommand(&app_handle, "stream", &target, "prefetch", profile).await
+                {
+                    Ok(payload) => {
+                        store_stream(&target, &payload);
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!("[ttv] 预签名跳过 {target}：{error}");
+                        false
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            if handle.await.unwrap_or(false) {
                 ready += 1;
             }
-            Err(error) => eprintln!("[ttv] 预签名跳过 {vid}：{error}"),
         }
     }
     Ok(ready)

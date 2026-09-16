@@ -1,0 +1,1848 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TTV Short Drama 播放器</title>
+  <style>
+    /* =========================================================================
+       1. 方案 D (温润亚克力 2.0 · 微软 Fluent 终极形态) 专属设计变量
+       ========================================================================= */
+    :root {
+      /* 经典原生 Fluent 配色 (绝无多余杂色) */
+      --fluent-slate-900: #0f172a;
+      --fluent-slate-800: #1e293b;
+      --fluent-slate-700: #334155;
+      --fluent-slate-500: #64748b;
+      --fluent-slate-400: #94a3b8;
+      
+      --fluent-blue: #0078d4;
+      --fluent-blue-hover: #005bb5;
+      --fluent-blue-light: rgba(0, 120, 212, 0.08);
+
+      /* 纯正毛玻璃质感参数 (已按要求固定：透光度 15% · 模糊度 22px · 渐变暗衬底) */
+      --crystal-opacity: 0.15;    /* 15% 通透磨砂白底，底层画面清晰可见 */
+      --crystal-blur: 22px;       /* 22px 自然高斯模糊扩散 */
+
+      /* 极简平缓动效 */
+      --curve-fluent: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI Variable Display", "Segoe UI Variable Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+      background: #000000;
+      color: #ffffff;
+      height: 100vh;
+      width: 100vw;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* =========================================================================
+       2. 播放器核心材质 (温润高透亚克力 · 15% 浅白磨砂原色 + 精准防泛光底层暗衬)
+       ========================================================================= */
+    /* 纯正通透毛玻璃表面 (固定 15% 浅白高光磨砂 + 22px 自然高斯模糊) */
+    .crystal-surface {
+      position: relative;
+      background: rgba(255, 255, 255, var(--crystal-opacity));
+      backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+      -webkit-backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      box-shadow: 0 8px 30px -4px rgba(0, 0, 0, 0.18);
+      transition: all 0.2s ease;
+    }
+
+    /* 元素正下方 1:1 精确贴合暗衬 (作为 ::after 依附在元素内部底层，100% 同步宽度与位移动效，强光与白背景下文字零泛光) */
+    .title-crystal-island::after,
+    .mica-crystal-card::after,
+    .player-lock-btn::after,
+    .next-countdown-card::after,
+    .crystal-flyout::after,
+    .crystal-volume-bubble::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background: rgba(0, 0, 0, 0.40);
+      z-index: -1;
+      pointer-events: none;
+    }
+
+    /* 选集抽屉大弹窗景深暗衬 */
+    .crystal-drawer-box::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background: rgba(15, 23, 42, 0.55);
+      z-index: -1;
+      pointer-events: none;
+    }
+
+    /* 确保各元素内部所有子级文字与控件处于暗衬上方 */
+    .title-crystal-island > *,
+    .mica-crystal-card > *,
+    .player-lock-btn > *,
+    .next-countdown-card > * {
+      position: relative;
+      z-index: 1;
+    }
+
+    /* =========================================================================
+       3. 播放舞台与真实短剧视频 (无多余花哨外置光感，底层画面纯净呈现)
+       ========================================================================= */
+    .player-stage {
+      flex: 1;
+      position: relative;
+      background: #000000;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .video-viewport {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0b0f19;
+    }
+
+    video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      cursor: pointer;
+    }
+
+    .backdrop-poster {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: none;
+      transition: opacity 0.3s ease;
+    }
+
+    /* =========================================================================
+       4.0 播放器右侧小锁 (展开 / 收起播放控制器) & 底部迷你贴边进度条
+       ========================================================================= */
+    /* 1. 右侧居中小锁悬浮按钮 (材质完全与控制栏 crystal-surface 统一) */
+    .player-lock-btn {
+      position: absolute !important;
+      right: 22px !important;
+      top: 50% !important;
+      transform: translateY(-50%) !important;
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      z-index: 45;
+      opacity: 0.92;
+      transition: opacity 0.25s var(--curve-fluent), transform 0.25s var(--curve-fluent), background-color 0.2s, border-color 0.2s, box-shadow 0.2s, color 0.2s, right 0.35s var(--curve-fluent);
+    }
+
+    .player-lock-btn svg {
+      filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+    }
+
+    .player-stage:hover .player-lock-btn {
+      opacity: 0.96;
+    }
+
+    .player-lock-btn:hover {
+      opacity: 1 !important;
+      transform: translateY(-50%) scale(1.1);
+      background: rgba(255, 255, 255, 0.26);
+      color: #38bdf8;
+      box-shadow: 0 8px 24px rgba(0, 120, 212, 0.35);
+    }
+
+    .player-lock-btn:active {
+      transform: translateY(-50%) scale(0.95);
+    }
+
+    /* 锁定/收起状态高亮 */
+    .player-lock-btn.locked {
+      background: var(--fluent-blue);
+      border-color: rgba(255, 255, 255, 0.35);
+      color: #ffffff;
+      box-shadow: 0 0 20px rgba(0, 120, 212, 0.65);
+      opacity: 0.95;
+    }
+
+    .player-lock-btn.locked:hover {
+      opacity: 1 !important;
+      background: var(--fluent-blue-hover);
+      transform: translateY(-50%) scale(1.12);
+    }
+
+    /* 2. 收起状态下播放器最底部的贴边微型进度条 */
+    .mini-bottom-progressbar {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 3.5px;
+      background: rgba(255, 255, 255, 0.22);
+      z-index: 35;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(100%);
+      cursor: pointer;
+      transition: opacity 0.28s var(--curve-fluent), transform 0.28s var(--curve-fluent), height 0.15s ease;
+    }
+
+    .mini-progress-buffer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      background: rgba(255, 255, 255, 0.38);
+      transition: width 0.2s;
+    }
+
+    .mini-progress-played {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      background: var(--fluent-blue);
+      box-shadow: 0 0 10px rgba(0, 120, 212, 0.8);
+    }
+
+    /* 3. 锁定/收起时的动画与联动 */
+    .player-stage.is-locked .player-hud-layer {
+      opacity: 0;
+      pointer-events: none;
+      transform: scale(0.985);
+      transition: opacity 0.28s var(--curve-fluent), transform 0.28s var(--curve-fluent);
+    }
+
+    .player-stage.is-locked .top-bar-row {
+      transform: translateY(-16px);
+    }
+
+    .player-stage.is-locked .bottom-dock-wrapper {
+      transform: translateY(20px);
+    }
+
+
+    /* 核心交互：收起后小锁自动贴边半隐藏 (仅露出精致弧面与图标，悬停平滑弹出) */
+    .player-stage.is-locked .player-lock-btn {
+      right: 0;
+      transform: translate(26%, -50%);
+      opacity: 0.88;
+      box-shadow: -3px 0 16px rgba(0, 120, 212, 0.45);
+      transition: right 0.35s var(--curve-fluent), transform 0.35s var(--curve-fluent), opacity 0.28s ease, background-color 0.2s, box-shadow 0.2s;
+    }
+
+    /* 扩大悬停热区，靠近边缘即可唤出完整小锁 */
+    .player-stage.is-locked .player-lock-btn::before {
+      content: '';
+      position: absolute;
+      top: -14px;
+      bottom: -14px;
+      left: -28px;
+      right: 0;
+    }
+
+    /* 鼠标悬停时平滑弹出到画面内，方便直接点击展开 */
+    .player-stage.is-locked .player-lock-btn:hover {
+      transform: translate(-16px, -50%) scale(1.08);
+      opacity: 1 !important;
+      box-shadow: 0 0 24px rgba(0, 120, 212, 0.7);
+    }
+
+    .player-stage.is-locked .mini-bottom-progressbar {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+
+    .player-stage.is-locked .mini-bottom-progressbar:hover {
+      height: 6px;
+    }
+
+    /* =========================================================================
+       4.1 下一集连播倒计时悬浮卡片 (材质完全与控制栏 crystal-surface 统一)
+       ========================================================================= */
+    .next-countdown-card {
+      position: absolute !important;
+      bottom: 88px !important;
+      right: 28px !important;
+      z-index: 50;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 10px 8px 12px;
+      border-radius: 18px;
+      color: #ffffff;
+      transform: translateY(0);
+      opacity: 1;
+      transition: opacity 0.3s var(--curve-fluent), transform 0.3s var(--curve-fluent), bottom 0.3s var(--curve-fluent);
+      pointer-events: auto;
+      user-select: none;
+    }
+
+    .next-countdown-card.hidden {
+      opacity: 0;
+      transform: translateY(16px) scale(0.95);
+      pointer-events: none;
+    }
+
+    /* 当控制器被锁定/收起时，倒计时卡片平滑下沉至贴角位置 */
+    .player-stage.is-locked .next-countdown-card {
+      bottom: 24px !important;
+    }
+
+    /* 环形倒计时进度 */
+    .countdown-ring-wrap {
+      position: relative;
+      width: 38px;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .countdown-svg {
+      width: 38px;
+      height: 38px;
+      transform: rotate(-90deg);
+      overflow: visible;
+    }
+
+    .countdown-ring-bg {
+      fill: none;
+      stroke: rgba(255, 255, 255, 0.22);
+      stroke-width: 2.8;
+    }
+
+    .countdown-ring-meter {
+      fill: none;
+      stroke: #38bdf8;
+      stroke-width: 2.8;
+      stroke-linecap: round;
+      stroke-dasharray: 91.1;
+      stroke-dashoffset: 0;
+      transition: stroke-dashoffset 1s linear;
+    }
+
+    .countdown-num {
+      position: absolute;
+      font-size: 12px;
+      font-weight: 700;
+      color: #ffffff;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.2px;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+    }
+
+    /* 剧集信息 */
+    .countdown-info-group {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      max-width: 170px;
+      padding-right: 2px;
+    }
+
+    .countdown-tag {
+      font-size: 10px;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.78);
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+    }
+
+    .countdown-title {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #ffffff;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* 立即播放胶囊按钮 */
+    .btn-countdown-play {
+      background: var(--fluent-blue);
+      border: none;
+      color: #ffffff;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      box-shadow: 0 2px 10px rgba(0, 120, 212, 0.35);
+      transition: all 0.15s ease;
+      flex-shrink: 0;
+    }
+
+    .btn-countdown-play:hover {
+      background: var(--fluent-blue-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(0, 120, 212, 0.5);
+    }
+
+    .btn-countdown-play:active {
+      transform: scale(0.96);
+    }
+
+    /* 取消/关闭按钮 */
+    .btn-countdown-cancel {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: transparent;
+      border: none;
+      color: #94a3b8;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      flex-shrink: 0;
+    }
+
+    .btn-countdown-cancel:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: #ffffff;
+    }
+
+    .btn-countdown-cancel:active {
+      transform: scale(0.92);
+    }
+
+    /* =========================================================================
+       4. 方案 D 核心：双层折射超透晶体与切角高光卡片 (Squircle Crystal Acrylic)
+       ========================================================================= */
+    .player-hud-layer {
+      position: absolute !important;
+      inset: 0 !important;
+      pointer-events: none;
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 26px;
+      transition: opacity 0.3s ease, transform 0.3s var(--curve-fluent);
+    }
+
+    /* 纯正通透毛玻璃表面 (恢复用户固定 15% 浅白高光磨砂，绝不修改用户颜色) */
+    .crystal-surface {
+      background: rgba(255, 255, 255, var(--crystal-opacity));
+      backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+      -webkit-backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      box-shadow: 0 8px 30px -4px rgba(0, 0, 0, 0.18);
+      transition: all 0.2s ease;
+    }
+
+    /* -------------------------------------------------------------------------
+       4.1 顶部栏：极简轻量标题岛
+       ------------------------------------------------------------------------- */
+    .top-bar-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      pointer-events: auto;
+    }
+
+    .title-crystal-island {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 14px 6px 8px;
+      border-radius: 14px;
+    }
+
+    .btn-crystal-back {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      background: transparent;
+      border: none;
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: none;
+      transition: all 0.15s ease;
+    }
+
+    .btn-crystal-back:hover {
+      background: rgba(255, 255, 255, 0.14);
+      color: #38bdf8;
+      transform: none;
+    }
+
+    .btn-crystal-back:active {
+      transform: scale(0.96);
+    }
+
+    .crystal-divider {
+      width: 1px;
+      height: 16px;
+      background: rgba(255, 255, 255, 0.22);
+      box-shadow: none;
+    }
+
+    .title-text-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding-right: 6px;
+    }
+
+    .drama-title {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: #ffffff;
+      letter-spacing: -0.1px;
+      max-width: 260px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .episode-badge {
+      font-size: 11px;
+      font-weight: 600;
+      color: #38bdf8;
+      background: rgba(0, 120, 212, 0.25);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 2px 8px;
+      border-radius: 6px;
+      box-shadow: none;
+      white-space: nowrap;
+    }
+
+    /* 右上角：彻底删除原本突兀的白色增强状态卡片，保持完全透明空旷 */
+    .top-right-clear {
+      /* 完全留空，零遮挡 */
+    }
+
+    /* -------------------------------------------------------------------------
+       4.2 底部操控岛：极简轻量化控制卡片 (纯净通透，清晰透视底层视频)
+       ------------------------------------------------------------------------- */
+    .bottom-dock-wrapper {
+      width: 100%;
+      max-width: 860px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      pointer-events: auto;
+    }
+
+    /* 极简内嵌式进度槽 (纯扁平无任何拟物凹槽或白光) */
+    .progress-box {
+      padding: 0 4px;
+      height: 16px;
+      display: flex;
+      align-items: center;
+      cursor: pointer;
+      position: relative;
+    }
+
+    .progress-track {
+      position: relative;
+      width: 100%;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.22);
+      border-radius: 9999px;
+      overflow: visible;
+      transition: height 0.15s ease;
+    }
+
+    .progress-box:hover .progress-track {
+      height: 6px;
+    }
+
+    .progress-buffer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      background: rgba(255, 255, 255, 0.38);
+      border-radius: 9999px;
+      transition: width 0.2s;
+    }
+
+    .progress-played {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      background: var(--fluent-blue);
+      border-radius: 9999px;
+    }
+
+    .progress-thumb {
+      position: absolute;
+      top: 50%;
+      width: 12px;
+      height: 12px;
+      background: #ffffff;
+      border: 2px solid var(--fluent-blue);
+      border-radius: 50%;
+      box-shadow: 0 0 6px rgba(0, 120, 212, 0.5);
+      transform: translate(-50%, -50%) scale(0);
+      transition: transform 0.15s ease;
+      pointer-events: none;
+    }
+
+    .progress-box:hover .progress-thumb {
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    /* 方案 D 主控制卡片：极简轻量化圆角卡片，进度条完全内置于卡片中 */
+    .mica-crystal-card {
+      position: relative;
+      padding: 8px 16px 8px;
+      border-radius: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    /* 卡片内部控制按钮行 */
+    .controls-deck-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      width: 100%;
+    }
+
+    .mica-crystal-card:hover {
+      box-shadow: 0 6px 20px -2px rgba(0, 0, 0, 0.1);
+    }
+
+    /* 控制按钮 (原生扁平 Slate 色系，轻快利落) */
+    .btn-fluent-action {
+      background: transparent;
+      border: none;
+      padding: 7px;
+      border-radius: 10px;
+      color: #ffffff;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background-color 0.15s, color 0.15s;
+      position: relative;
+    }
+
+    .btn-fluent-action:hover {
+      color: #38bdf8;
+      background: rgba(255, 255, 255, 0.14);
+    }
+
+    .btn-fluent-action:active {
+      transform: scale(0.96);
+    }
+
+    /* 播放主圆按键 (扁平现代极简纯蓝正圆，无任何拟物宝石高光与白光描边) */
+    .btn-play-hero {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--fluent-blue);
+      border: none;
+      color: #ffffff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 6px rgba(0, 120, 212, 0.25);
+      cursor: pointer;
+      margin: 0 2px;
+      transition: background-color 0.15s, transform 0.12s ease;
+    }
+
+    .btn-play-hero:hover {
+      background: var(--fluent-blue-hover);
+      transform: scale(1.04);
+      box-shadow: 0 3px 8px rgba(0, 120, 212, 0.3);
+    }
+
+    .btn-play-hero:active {
+      transform: scale(0.96);
+    }
+
+    /* =========================================================================
+       时间读数 (ReactBits 风格精密机械滚轮动效 · Rolling Counter)
+       ========================================================================= */
+    .time-readout {
+      display: inline-flex;
+      align-items: center;
+      padding: 0 4px;
+      user-select: none;
+      vertical-align: middle;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    }
+
+    .rolling-counter {
+      display: inline-flex;
+      align-items: center;
+      height: 18px;
+      line-height: 18px;
+      overflow: hidden;
+      font-variant-numeric: tabular-nums;
+      -webkit-font-feature-settings: "tnum";
+      font-feature-settings: "tnum";
+      font-size: 13px;
+      font-weight: 600;
+      color: #ffffff;
+    }
+
+    .rolling-counter.dur-counter {
+      color: rgba(255, 255, 255, 0.72);
+      font-weight: 500;
+    }
+
+    .roller-col {
+      position: relative;
+      display: inline-block;
+      width: 8.5px;
+      height: 18px;
+      overflow: hidden;
+      vertical-align: middle;
+      /* 顶部与底部的柔和羽化遮罩：数字从虚空顺滑滑入/滑出的高质感视觉 */
+      mask-image: linear-gradient(to bottom, transparent 0%, black 22%, black 78%, transparent 100%);
+      -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 22%, black 78%, transparent 100%);
+    }
+
+    .roller-list {
+      display: flex;
+      flex-direction: column;
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      /* 专属顺滑弹簧阻尼缓动 */
+      transition: transform 0.38s cubic-bezier(0.16, 1, 0.3, 1);
+      will-change: transform;
+    }
+
+    /* 拖拽/快进寻道时开启即时更新，零延迟无拖影 */
+    .rolling-counter.instant .roller-list {
+      transition: none !important;
+    }
+
+    .roller-list span {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 18px;
+      line-height: 18px;
+      width: 100%;
+      font-size: 13px;
+      font-weight: 600;
+      color: inherit;
+      text-align: center;
+    }
+
+    .roller-colon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 5px;
+      height: 18px;
+      line-height: 18px;
+      color: rgba(255, 255, 255, 0.45);
+      font-size: 13px;
+      margin: 0 1px;
+    }
+
+    .time-sep {
+      margin: 0 6px;
+      color: rgba(255, 255, 255, 0.35);
+      font-weight: 400;
+      font-size: 12px;
+    }
+
+    /* 右侧文字按键 (清晰度、倍速、选集) */
+    .btn-text-action {
+      background: transparent;
+      border: none;
+      padding: 6px 11px;
+      border-radius: 10px;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.2px;
+      color: rgba(255, 255, 255, 0.92);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.15s;
+    }
+
+    .btn-text-action:hover {
+      color: #38bdf8;
+      background: rgba(255, 255, 255, 0.14);
+    }
+
+    .svg-icon {
+      width: 17px;
+      height: 17px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    /* -------------------------------------------------------------------------
+       4.3 二级微晶气泡 (Upward Crystal Flyouts) - 统一方案 D 高透磨砂亚克力材质
+       ------------------------------------------------------------------------- */
+    .crystal-flyout {
+      position: absolute;
+      bottom: calc(100% + 14px);
+      left: 50%;
+      transform: translateX(-50%) translateY(8px) scale(0.96);
+      border-radius: 14px;
+      padding: 5px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.18s ease;
+      z-index: 50;
+      min-width: 110px;
+      background: rgba(255, 255, 255, var(--crystal-opacity));
+      backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+      -webkit-backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.20);
+      box-shadow: 0 12px 32px -4px rgba(0, 0, 0, 0.40), 0 2px 8px rgba(0, 0, 0, 0.18);
+      overflow: hidden;
+    }
+
+    .crystal-flyout::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background: rgba(15, 23, 42, 0.50);
+      z-index: -1;
+      pointer-events: none;
+    }
+
+    .crystal-flyout.open {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(-50%) translateY(0) scale(1);
+    }
+
+    .crystal-menu-item {
+      position: relative;
+      z-index: 1;
+      background: transparent;
+      border: none;
+      padding: 7px 12px;
+      border-radius: 9px;
+      font-size: 12px;
+      font-weight: 600;
+      text-align: left;
+      color: rgba(255, 255, 255, 0.88);
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+
+    .crystal-menu-item:hover {
+      background: rgba(255, 255, 255, 0.16);
+      color: #ffffff;
+    }
+
+    .crystal-menu-item.active {
+      background: var(--fluent-blue);
+      color: #ffffff;
+      box-shadow: 0 2px 8px rgba(0, 120, 212, 0.4);
+    }
+
+    /* 垂直极简音量柱 (统一方案 D 高透磨砂亚克力材质) */
+    .crystal-volume-bubble {
+      position: absolute;
+      bottom: calc(100% + 14px);
+      left: 50%;
+      transform: translateX(-50%) translateY(8px) scale(0.96);
+      width: 46px;
+      height: 156px;
+      border-radius: 14px;
+      padding: 10px 6px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.18s ease;
+      z-index: 50;
+      background: rgba(255, 255, 255, var(--crystal-opacity));
+      backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+      -webkit-backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.20);
+      box-shadow: 0 12px 32px -4px rgba(0, 0, 0, 0.40), 0 2px 8px rgba(0, 0, 0, 0.18);
+      overflow: hidden;
+    }
+
+    .crystal-volume-bubble::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background: rgba(15, 23, 42, 0.50);
+      z-index: -1;
+      pointer-events: none;
+    }
+
+    .crystal-volume-bubble.open {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(-50%) translateY(0) scale(1);
+    }
+
+    /* 垂直音量交互轨道 */
+    .vol-track-vertical {
+      width: 24px;
+      height: 94px;
+      position: relative;
+      display: flex;
+      justify-content: center;
+      cursor: pointer;
+      touch-action: none;
+      user-select: none;
+      margin: 6px 0;
+      z-index: 1;
+    }
+
+    /* 浅色半透明未激活背景槽 */
+    .vol-track-bg {
+      position: absolute;
+      width: 4px;
+      height: 100%;
+      background: rgba(255, 255, 255, 0.22);
+      box-shadow: none;
+      border-radius: 9999px;
+    }
+
+    /* 激活的纯色微软蓝进度槽 */
+    .vol-track-fill {
+      position: absolute;
+      bottom: 0;
+      width: 4px;
+      background: var(--fluent-blue);
+      box-shadow: none;
+      border-radius: 9999px;
+    }
+
+    /* 游标圆点 */
+    .vol-track-thumb {
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #ffffff;
+      border: 2px solid var(--fluent-blue);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+      transform: translate(-50%, 50%);
+      left: 50%;
+      pointer-events: none;
+      transition: transform 0.12s ease;
+    }
+
+    .vol-track-vertical:hover .vol-track-thumb {
+      transform: translate(-50%, 50%) scale(1.15);
+    }
+
+    .vol-mute-btn {
+      position: relative;
+      z-index: 1;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px;
+      border-radius: 6px;
+      color: rgba(255, 255, 255, 0.85);
+      transition: all 0.15s;
+    }
+
+    .vol-mute-btn:hover {
+      background: rgba(255, 255, 255, 0.15);
+      color: #38bdf8;
+    }
+
+    /* -------------------------------------------------------------------------
+       4.4 方案 D 超透选集巨幕 (Mica Drawer Box) - 统一方案 D 高透磨砂亚克力材质
+       ------------------------------------------------------------------------- */
+    .crystal-modal-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      z-index: 70;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 26px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.28s ease;
+    }
+
+    .crystal-modal-overlay.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    /* 方案 D 选集大弹窗：统一通透温润亚克力磨砂 (与播放控制栏完全相同的高级微晶质感) */
+    .crystal-drawer-box {
+      position: relative;
+      width: 100%;
+      max-width: 800px;
+      max-height: 80vh;
+      border-radius: 26px;
+      background: rgba(255, 255, 255, var(--crystal-opacity));
+      backdrop-filter: blur(32px) saturate(190%);
+      -webkit-backdrop-filter: blur(32px) saturate(190%);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      box-shadow: 0 25px 60px -10px rgba(0, 0, 0, 0.55), inset 0 1px 1px 0 rgba(255, 255, 255, 0.35);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      transform: scale(0.96) translateY(12px);
+      transition: transform 0.25s var(--curve-fluent);
+    }
+
+    .crystal-drawer-box::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background: rgba(15, 23, 42, 0.55);
+      z-index: -1;
+      pointer-events: none;
+    }
+
+    .crystal-modal-overlay.open .crystal-drawer-box {
+      transform: scale(1) translateY(0);
+    }
+
+    .drawer-top-header {
+      position: relative;
+      z-index: 1;
+      height: 58px;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(255, 255, 255, 0.05);
+      flex-shrink: 0;
+    }
+
+    .drawer-ep-grid {
+      position: relative;
+      z-index: 1;
+      padding: 22px 26px;
+      background: transparent;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(68px, 1fr));
+      gap: 10px;
+      overflow-y: auto;
+      max-height: 52vh;
+    }
+
+    .drawer-ep-grid::-webkit-scrollbar {
+      width: 6px;
+    }
+    .drawer-ep-grid::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.20);
+      border-radius: 99px;
+    }
+    .drawer-ep-grid::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.35);
+    }
+
+    .ep-card-item {
+      height: 44px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.88);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s var(--curve-fluent);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+
+    .ep-card-item:hover {
+      background: rgba(255, 255, 255, 0.20);
+      border-color: rgba(56, 189, 248, 0.6);
+      color: #38bdf8;
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
+
+    .ep-card-item.active {
+      background: var(--fluent-blue);
+      border-color: rgba(255, 255, 255, 0.35);
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(0, 120, 212, 0.45);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- =======================================================================
+       主播放器 (全屏纯净沉浸式播放舞台)
+       ======================================================================= -->
+  <main class="player-stage" id="player-stage">
+    <div class="video-viewport">
+      <video id="main-video" autoplay muted loop playsinline>
+        <source src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4" type="video/mp4">
+      </video>
+    </div>
+
+
+    <!-- 播放器右边中间的小锁：展开 / 收起播放控制器 (统一温润亚克力材质) -->
+    <button class="player-lock-btn crystal-surface" id="player-lock-btn" onclick="toggleControlsLock(event)" title="收起播放控制器">
+      <span id="lock-icon-wrap">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="width:18px;height:18px;display:block;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 9.9-1"></path></svg>
+      </span>
+    </button>
+
+    <!-- 收起状态下播放器最底部的贴边微型视频进度条 (可点击快寻) -->
+    <div class="mini-bottom-progressbar" id="mini-bottom-progressbar" onclick="handleMiniSeek(event)" title="点击跳转进度">
+      <div class="mini-progress-buffer" id="mini-progress-buffer" style="width: 76%;"></div>
+      <div class="mini-progress-played" id="mini-progress-played" style="width: 32%;"></div>
+    </div>
+
+    <!-- 4.5 下一集自动连播倒计时卡片 (统一温润亚克力材质 · 与控制栏完全看齐) -->
+    <div class="next-countdown-card crystal-surface" id="next-countdown-card" onclick="event.stopPropagation()">
+      <!-- 环形倒计时进度 -->
+      <div class="countdown-ring-wrap">
+        <svg class="countdown-svg" viewBox="0 0 36 36">
+          <circle class="countdown-ring-bg" cx="18" cy="18" r="14.5" />
+          <circle class="countdown-ring-meter" id="countdown-meter" cx="18" cy="18" r="14.5" />
+        </svg>
+        <span class="countdown-num" id="countdown-sec-text">5s</span>
+      </div>
+
+      <!-- 剧集信息 -->
+      <div class="countdown-info-group">
+        <span class="countdown-tag">即将连播</span>
+        <span class="countdown-title" id="countdown-ep-title">第 2 集 · 逆天崛起</span>
+      </div>
+
+      <!-- 立即播放胶囊按钮 -->
+      <button class="btn-countdown-play" onclick="triggerNextEpisode()" title="立即播放下一集">
+        <svg class="svg-icon" style="width:11px;height:11px;fill:currentColor;stroke:none;margin-left:1px;" viewBox="0 0 24 24">
+          <polygon points="5 3 19 12 5 21 5 3"/>
+        </svg>
+        <span>立即播放</span>
+      </button>
+
+      <!-- 取消/关闭按钮 -->
+      <button class="btn-countdown-cancel" onclick="dismissCountdown()" title="取消自动连播">
+        <svg class="svg-icon" style="width:13px;height:13px;" viewBox="0 0 24 24">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- =====================================================================
+         HUD 控制层：方案 D 专属双层折射超透晶体
+         ===================================================================== -->
+    <div class="player-hud-layer" id="player-hud">
+
+      <!-- 顶部标题岛 (双层折射晶体，右上角白色按钮已按要求彻底删除！) -->
+      <div class="top-bar-row">
+        <div class="title-crystal-island crystal-surface">
+          <button class="btn-crystal-back" title="返回剧集列表" onclick="alert('返回')">
+            <svg class="svg-icon" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+          </button>
+          <div class="crystal-divider"></div>
+          <div class="title-text-group">
+            <span class="drama-title">龙王出狱：镇世无双</span>
+            <span class="episode-badge" id="ep-badge-label">第 1 集 · 序章</span>
+          </div>
+        </div>
+
+        <!-- 右上角彻底清空，完全零遮挡 -->
+        <div class="top-right-clear"></div>
+      </div>
+
+      <!-- 底部操控坞：方案 D 统一双层折射超透晶体卡片 (进度条与按钮全部包含在卡片内部) -->
+      <div class="bottom-dock-wrapper" onclick="event.stopPropagation()">
+
+        <!-- 方案 D 统一大卡片：大曲率 Squircle 26px + 1px 镜面切角高光，进度条与控件全部内置 -->
+        <div class="mica-crystal-card crystal-surface">
+
+          <!-- 进度条完全内置在卡片顶部 -->
+          <div class="progress-box" onclick="handleSeek(event)">
+            <div class="progress-track">
+              <div class="progress-buffer" style="width: 76%;"></div>
+              <div class="progress-played" id="progress-played" style="width: 32%;"></div>
+            </div>
+            <div class="progress-thumb" id="progress-thumb" style="left: 32%;"></div>
+          </div>
+
+          <!-- 卡片内部核心控制区 -->
+          <div class="controls-deck-row">
+            <!-- 左侧控制区：上一集、快退、播放主键、快进、下一集、时间 -->
+            <div style="display:flex;align-items:center;gap:12px;">
+              <div style="display:flex;align-items:center;gap:4px;">
+              <!-- 上一集 -->
+              <button class="btn-fluent-action" title="上一集 ([)" onclick="prevEpisode()">
+                <svg class="svg-icon" viewBox="0 0 24 24"><polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
+              </button>
+
+              <!-- 播放主圆键 (微软蓝温润高光宝石，带物理阻尼动效) -->
+              <button class="btn-play-hero" id="play-btn" onclick="togglePlay()" title="播放 / 暂停 (空格)">
+                <svg class="svg-icon" id="play-icon" style="fill:currentColor;stroke:none;width:18px;height:18px;margin-left:2px;" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              </button>
+
+              <!-- 下一集 -->
+              <button class="btn-fluent-action" title="下一集 (])" onclick="nextEpisode()">
+                <svg class="svg-icon" viewBox="0 0 24 24"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
+              </button>
+            </div>
+
+            <div class="crystal-divider"></div>
+
+            <!-- 时间读数 (ReactBits 风格精密机械滚轮动效) -->
+            <div class="time-readout">
+              <div class="rolling-counter" id="pos-counter"></div>
+              <span class="time-sep">/</span>
+              <div class="rolling-counter dur-counter" id="dur-counter"></div>
+            </div>
+          </div>
+
+          <!-- 右侧控制区：音量、清晰度、倍速、选集、全屏 -->
+          <div style="display:flex;align-items:center;gap:4px;">
+            <!-- 垂直超透晶体音量柱 -->
+            <div style="position:relative;">
+              <button class="btn-fluent-action" title="音量调节" onclick="toggleVolFlyout(event)">
+                <svg class="svg-icon" id="vol-icon" viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+              </button>
+              <div class="crystal-volume-bubble" id="vol-flyout">
+                <div class="rolling-counter" id="vol-counter" style="color:#ffffff;font-size:11px;font-weight:700;"></div>
+                <!-- 垂直音量交互轨道 (下方蓝色填充，上方灰色未激活) -->
+                <div class="vol-track-vertical" id="vol-track-vertical" onclick="handleVolClick(event)" onpointerdown="handleVolPointer(event)">
+                  <div class="vol-track-bg"></div>
+                  <div class="vol-track-fill" id="vol-track-fill" style="height: 80%;"></div>
+                  <div class="vol-track-thumb" id="vol-track-thumb" style="bottom: 80%;"></div>
+                </div>
+                <!-- 底部喇叭按钮，点击可静音/恢复 -->
+                <button class="vol-mute-btn" onclick="toggleMute(event)" title="静音 / 恢复">
+                  <svg class="svg-icon" id="vol-flyout-icon" style="width:14px;height:14px;" viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- 清晰度上浮微晶气泡 -->
+            <div style="position:relative;">
+              <button class="btn-text-action" onclick="toggleQualityFlyout(event)" title="切换清晰度">
+                <span id="quality-display">自动</span>
+              </button>
+              <div class="crystal-flyout" id="quality-flyout">
+                <button class="crystal-menu-item active" onclick="setQuality('自动')">自动</button>
+                <button class="crystal-menu-item" onclick="setQuality('1080P')">1080P 高清</button>
+                <button class="crystal-menu-item" onclick="setQuality('720P')">720P 标清</button>
+              </div>
+            </div>
+
+            <!-- 倍速上浮微晶气泡 -->
+            <div style="position:relative;">
+              <button class="btn-text-action" onclick="toggleSpeedFlyout(event)" title="倍速切换">
+                <span id="speed-display">倍速</span>
+              </button>
+              <div class="crystal-flyout" id="speed-flyout">
+                <button class="crystal-menu-item" onclick="setSpeed(0.75)">0.75x</button>
+                <button class="crystal-menu-item active" onclick="setSpeed(1.0)">1.0x 正常</button>
+                <button class="crystal-menu-item" onclick="setSpeed(1.25)">1.25x</button>
+                <button class="crystal-menu-item" onclick="setSpeed(1.5)">1.5x</button>
+                <button class="crystal-menu-item" onclick="setSpeed(2.0)">2.0x</button>
+              </div>
+            </div>
+
+            <!-- 选集抽屉按钮 -->
+            <button class="btn-text-action" onclick="openDrawer(event)" title="打开选集抽屉">
+              <svg class="svg-icon" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+              <span>选集</span>
+            </button>
+
+            <!-- 全屏按钮 -->
+            <button class="btn-fluent-action" title="全屏 (F)" onclick="toggleFullscreen()">
+              <svg class="svg-icon" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+            </button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- =====================================================================
+         方案 D 专属超透选集巨幕 (双层折射超透晶体，背景视频完全透视)
+         ===================================================================== -->
+    <div class="crystal-modal-overlay" id="drawer-overlay" onclick="closeDrawer(event)">
+      <div class="crystal-drawer-box" onclick="event.stopPropagation()">
+        <div class="drawer-top-header">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="width:32px;height:32px;border-radius:10px;background:rgba(0,120,212,0.22);color:#38bdf8;display:flex;align-items:center;justify-content:center;border:1px solid rgba(56,189,248,0.35);">
+              <svg class="svg-icon" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+            </div>
+            <div>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span style="font-size:13px;font-weight:700;color:#ffffff;">选集播放</span>
+                <span style="font-size:10px;font-weight:700;color:#38bdf8;background:rgba(0,120,212,0.25);border:1px solid rgba(56,189,248,0.3);padding:1px 6px;border-radius:99px;">共 80 集</span>
+              </div>
+              <span style="font-size:11px;color:rgba(255,255,255,0.65);">龙王出狱：镇世无双</span>
+            </div>
+          </div>
+          <button class="btn-fluent-action" onclick="closeDrawer()" title="关闭 (Esc)">
+            <svg class="svg-icon" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="drawer-ep-grid" id="episodes-box">
+          <!-- 动态塞入 80 集 -->
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- =======================================================================
+       交互脚本 (Full Interactive Controls)
+       ======================================================================= -->
+  <script>
+    const video = document.getElementById('main-video');
+    let isPlaying = false;
+    let currentEpisode = 1;
+    let currentPos = 42;
+    let videoDuration = 135;
+
+    // 1. 初始化 80 集选集卡片
+    const epBox = document.getElementById('episodes-box');
+    for (let i = 1; i <= 80; i++) {
+      const card = document.createElement('button');
+      card.className = `ep-card-item ${i === 1 ? 'active' : ''}`;
+      card.textContent = `${i}`;
+      card.onclick = () => selectEpisode(i);
+      epBox.appendChild(card);
+    }
+
+    // 2. 播放与时间控制
+    function togglePlay() {
+      isPlaying = !isPlaying;
+      if (isPlaying) {
+        video.play().catch(() => {});
+      } else {
+        video.pause();
+      }
+      updatePlayBtn();
+    }
+
+    function updatePlayBtn() {
+      const playSvg = '<polygon points="5 3 19 12 5 21 5 3"/>';
+      const pauseSvg = '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>';
+      document.getElementById('play-icon').innerHTML = isPlaying ? pauseSvg : playSvg;
+    }
+
+    video.addEventListener('play', () => { isPlaying = true; updatePlayBtn(); });
+    video.addEventListener('pause', () => { isPlaying = false; updatePlayBtn(); });
+
+    video.addEventListener('timeupdate', () => {
+      if (video.duration) {
+        currentPos = video.currentTime;
+        videoDuration = video.duration;
+        renderProgress();
+      }
+    });
+
+    // =========================================================================
+    // ReactBits 风格精密机械滚轮数字 (Animated Odometer Rolling Counter)
+    // =========================================================================
+    class RollingTimeCounter {
+      constructor(containerEl, isDuration = false) {
+        this.container = containerEl;
+        this.isDuration = isDuration;
+        this.cols = [];
+        this.prevValues = [-1, -1, -1, -1];
+        this.init();
+      }
+
+      init() {
+        this.container.innerHTML = '';
+        // 2 分钟位，冒号，2 秒位: MM:SS
+        for (let i = 0; i < 4; i++) {
+          if (i === 2) {
+            const colon = document.createElement('span');
+            colon.className = 'roller-colon';
+            colon.textContent = ':';
+            this.container.appendChild(colon);
+          }
+          const col = document.createElement('div');
+          col.className = 'roller-col';
+          const list = document.createElement('div');
+          list.className = 'roller-list';
+          // 数字 0-9，外加末尾平滑环回 0 (一共 11 个元素)
+          for (let d = 0; d <= 9; d++) {
+            const s = document.createElement('span');
+            s.textContent = d;
+            list.appendChild(s);
+          }
+          const wrap0 = document.createElement('span');
+          wrap0.textContent = '0';
+          list.appendChild(wrap0);
+
+          col.appendChild(list);
+          this.container.appendChild(col);
+          this.cols.push(list);
+        }
+      }
+
+      update(seconds, instant = false) {
+        const sTotal = Math.max(0, Math.floor(seconds));
+        const m = Math.floor(sTotal / 60);
+        const s = sTotal % 60;
+        const targetDigits = [
+          Math.floor(m / 10) % 10,
+          m % 10,
+          Math.floor(s / 10) % 10,
+          s % 10
+        ];
+
+        if (instant) {
+          this.container.classList.add('instant');
+        } else {
+          this.container.classList.remove('instant');
+        }
+
+        const h = 18; // 每个字形高度精确 18px
+
+        targetDigits.forEach((digit, idx) => {
+          const list = this.cols[idx];
+          const prev = this.prevValues[idx];
+
+          if (digit === prev && !instant) return;
+
+          // 核心优化：9 -> 0 前向平滑自然滚动，而不是倒转回退
+          if (!instant && prev === 9 && digit === 0) {
+            list.style.transform = `translateY(-${10 * h}px)`;
+            setTimeout(() => {
+              if (this.prevValues[idx] === 0) {
+                list.style.transition = 'none';
+                list.style.transform = 'translateY(0px)';
+                void list.offsetHeight; // 强制重绘
+                list.style.transition = '';
+              }
+            }, 380);
+          } else {
+            list.style.transform = `translateY(-${digit * h}px)`;
+          }
+
+          this.prevValues[idx] = digit;
+        });
+      }
+    }
+
+    class RollingNumberCounter {
+      constructor(containerEl, maxDigits = 3, suffix = '%') {
+        this.container = containerEl;
+        this.cols = [];
+        this.prevValues = [];
+        this.suffix = suffix;
+        this.init(maxDigits);
+      }
+
+      init(maxDigits) {
+        this.container.innerHTML = '';
+        for (let i = 0; i < maxDigits; i++) {
+          const col = document.createElement('div');
+          col.className = 'roller-col';
+          col.style.width = '7.5px';
+          const list = document.createElement('div');
+          list.className = 'roller-list';
+          for (let d = 0; d <= 9; d++) {
+            const s = document.createElement('span');
+            s.textContent = d;
+            s.style.fontSize = '11px';
+            list.appendChild(s);
+          }
+          const wrap0 = document.createElement('span');
+          wrap0.textContent = '0';
+          wrap0.style.fontSize = '11px';
+          list.appendChild(wrap0);
+
+          col.appendChild(list);
+          this.container.appendChild(col);
+          this.cols.push(list);
+          this.prevValues.push(-1);
+        }
+        if (this.suffix) {
+          const suf = document.createElement('span');
+          suf.style.cssText = 'font-size:10px;font-weight:700;margin-left:1px;color:inherit;vertical-align:middle;';
+          suf.textContent = this.suffix;
+          this.container.appendChild(suf);
+        }
+      }
+
+      update(val, instant = false) {
+        const pct = Math.max(0, Math.min(100, Math.round(val)));
+        const str = pct.toString().padStart(this.cols.length, ' ');
+
+        if (instant) this.container.classList.add('instant');
+        else this.container.classList.remove('instant');
+
+        const h = 18;
+        for (let i = 0; i < this.cols.length; i++) {
+          const ch = str[i];
+          const list = this.cols[i];
+          const col = list.parentElement;
+
+          if (ch === ' ') {
+            col.style.display = 'none';
+            this.prevValues[i] = -1;
+          } else {
+            col.style.display = 'inline-block';
+            const d = parseInt(ch, 10);
+            const prev = this.prevValues[i];
+
+            if (d !== prev || instant) {
+              list.style.transform = `translateY(-${d * h}px)`;
+              this.prevValues[i] = d;
+            }
+          }
+        }
+      }
+    }
+
+    const posCounter = new RollingTimeCounter(document.getElementById('pos-counter'));
+    const durCounter = new RollingTimeCounter(document.getElementById('dur-counter'), true);
+    const volCounter = new RollingNumberCounter(document.getElementById('vol-counter'), 3, '%');
+
+    function renderProgress(instant = false) {
+      const pct = (currentPos / videoDuration) * 100;
+      document.getElementById('progress-played').style.width = `${pct}%`;
+      document.getElementById('progress-thumb').style.left = `${pct}%`;
+
+      const miniPlayed = document.getElementById('mini-progress-played');
+      if (miniPlayed) miniPlayed.style.width = `${pct}%`;
+
+      posCounter.update(currentPos, instant);
+      durCounter.update(videoDuration, instant);
+    }
+
+    function handleMiniSeek(e) {
+      e.stopPropagation();
+      const rect = e.currentTarget.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      currentPos = ratio * videoDuration;
+      video.currentTime = currentPos;
+      renderProgress(true);
+    }
+
+    function handleSeek(e) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      currentPos = ratio * videoDuration;
+      video.currentTime = currentPos;
+      renderProgress(true); // 点击快寻时即时到位
+    }
+
+    function seekOffset(offset) {
+      currentPos = Math.max(0, Math.min(videoDuration, currentPos + offset));
+      video.currentTime = currentPos;
+      renderProgress(false);
+    }
+
+    // 4. 垂直音量交互控制 (下方填充蓝色，上方灰色未激活)
+    let isDraggingVol = false;
+    let savedVol = 0.8;
+
+    function toggleVolFlyout(e) {
+      e.stopPropagation();
+      const el = document.getElementById('vol-flyout');
+      el.classList.toggle('open');
+      closeAllExcept('vol-flyout');
+    }
+
+    function updateVolumeFromY(clientY, instant = false) {
+      const track = document.getElementById('vol-track-vertical');
+      if (!track) return;
+      const rect = track.getBoundingClientRect();
+      const offsetY = clientY - rect.top;
+      const ratio = 1 - Math.max(0, Math.min(1, offsetY / rect.height));
+      setVolumeLevel(ratio, instant);
+    }
+
+    function setVolumeLevel(ratio, instant = false) {
+      const vol = Math.max(0, Math.min(1, ratio));
+      video.volume = vol;
+      const pct = Math.round(vol * 100);
+      volCounter.update(pct, instant);
+      document.getElementById('vol-track-fill').style.height = `${pct}%`;
+      document.getElementById('vol-track-thumb').style.bottom = `${pct}%`;
+
+      const volIcon = document.getElementById('vol-icon');
+      const flyoutIcon = document.getElementById('vol-flyout-icon');
+      if (vol === 0) {
+        const muteSvg = '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>';
+        if (volIcon) volIcon.innerHTML = muteSvg;
+        if (flyoutIcon) flyoutIcon.innerHTML = muteSvg;
+      } else {
+        const soundSvg = '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>';
+        if (volIcon) volIcon.innerHTML = soundSvg;
+        if (flyoutIcon) flyoutIcon.innerHTML = soundSvg;
+      }
+    }
+
+    function handleVolClick(e) {
+      e.stopPropagation();
+      updateVolumeFromY(e.clientY);
+    }
+
+    function handleVolPointer(e) {
+      e.stopPropagation();
+      isDraggingVol = true;
+      e.currentTarget.setPointerCapture(e.pointerId);
+      updateVolumeFromY(e.clientY);
+
+      const onMove = (me) => {
+        if (isDraggingVol) updateVolumeFromY(me.clientY);
+      };
+
+      const onUp = (ue) => {
+        isDraggingVol = false;
+        try {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        } catch {}
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+      };
+
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    }
+
+    function toggleMute(e) {
+      if (e) e.stopPropagation();
+      if (video.volume > 0) {
+        savedVol = video.volume;
+        setVolumeLevel(0);
+      } else {
+        setVolumeLevel(savedVol > 0 ? savedVol : 0.8);
+      }
+    }
+
+    function toggleQualityFlyout(e) {
+      e.stopPropagation();
+      const el = document.getElementById('quality-flyout');
+      el.classList.toggle('open');
+      closeAllExcept('quality-flyout');
+    }
+
+    function setQuality(label) {
+      document.getElementById('quality-display').textContent = label;
+      document.querySelectorAll('#quality-flyout .crystal-menu-item').forEach(item => {
+        item.classList.toggle('active', item.textContent.includes(label));
+      });
+      document.getElementById('quality-flyout').classList.remove('open');
+    }
+
+    function toggleSpeedFlyout(e) {
+      e.stopPropagation();
+      const el = document.getElementById('speed-flyout');
+      el.classList.toggle('open');
+      closeAllExcept('speed-flyout');
+    }
+
+    function setSpeed(s) {
+      video.playbackRate = s;
+      document.getElementById('speed-display').textContent = s === 1.0 ? '倍速' : `${s}x`;
+      document.querySelectorAll('#speed-flyout .crystal-menu-item').forEach(item => {
+        item.classList.toggle('active', item.textContent.startsWith(`${s}x`));
+      });
+      document.getElementById('speed-flyout').classList.remove('open');
+    }
+
+    function closeAllExcept(id) {
+      ['vol-flyout', 'quality-flyout', 'speed-flyout'].forEach(menuId => {
+        if (menuId !== id) {
+          document.getElementById(menuId)?.classList.remove('open');
+        }
+      });
+    }
+
+    document.addEventListener('click', () => closeAllExcept(null));
+
+    // 5. 选集抽屉
+    function openDrawer(e) {
+      e.stopPropagation();
+      document.getElementById('drawer-overlay').classList.add('open');
+    }
+
+    function closeDrawer() {
+      document.getElementById('drawer-overlay').classList.remove('open');
+    }
+
+    function selectEpisode(ep) {
+      currentEpisode = ep;
+      document.querySelectorAll('.ep-card-item').forEach((c, i) => {
+        c.classList.toggle('active', i + 1 === ep);
+      });
+      document.getElementById('ep-badge-label').textContent = `第 ${ep} 集`;
+      currentPos = 0;
+      video.currentTime = 0;
+      renderProgress();
+      closeDrawer();
+    }
+
+    function prevEpisode() {
+      selectEpisode(Math.max(1, currentEpisode - 1));
+    }
+
+    function nextEpisode() {
+      selectEpisode(Math.min(80, currentEpisode + 1));
+    }
+
+    // 6. 全屏
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) {
+        document.getElementById('player-stage').requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+
+    // 7. 播放器右侧小锁：展开 / 收起控制器联动
+    let isControlsLocked = false;
+
+    function toggleControlsLock(e) {
+      if (e) e.stopPropagation();
+      isControlsLocked = !isControlsLocked;
+      const stage = document.getElementById('player-stage');
+      const lockBtn = document.getElementById('player-lock-btn');
+      const iconWrap = document.getElementById('lock-icon-wrap');
+
+      if (isControlsLocked) {
+        stage.classList.add('is-locked');
+        lockBtn.classList.add('locked');
+        lockBtn.setAttribute('title', '点击展开播放控制器');
+        // 闭锁图标 (锁定/收起状态)
+        iconWrap.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="width:18px;height:18px;display:block;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>';
+        closeAllExcept(null);
+      } else {
+        stage.classList.remove('is-locked');
+        lockBtn.classList.remove('locked');
+        lockBtn.setAttribute('title', '点击收起播放控制器');
+        // 开锁图标 (展开状态)
+        iconWrap.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="width:18px;height:18px;display:block;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 9.9-1"></path></svg>';
+      }
+    }
+
+    // 8. 下一集连播倒计时交互控制 (Next Episode Countdown Logic)
+    let countdownRemaining = 5;
+    let countdownTotal = 5;
+    let countdownInterval = null;
+    const CIRCLE_CIRCUMFERENCE = 91.1; // 2 * PI * 14.5
+
+    function startCountdown(sec = 5) {
+      if (countdownInterval) clearInterval(countdownInterval);
+      countdownTotal = Math.max(1, sec);
+      countdownRemaining = countdownTotal;
+
+      const card = document.getElementById('next-countdown-card');
+      const textEl = document.getElementById('countdown-sec-text');
+      const meterEl = document.getElementById('countdown-meter');
+      const titleEl = document.getElementById('countdown-ep-title');
+
+      const nextEpNum = Math.min(80, currentEpisode + 1);
+      if (titleEl) titleEl.textContent = `第 ${nextEpNum} 集 · 逆天崛起`;
+
+      card.classList.remove('hidden');
+      textEl.textContent = `${countdownRemaining}s`;
+      meterEl.style.strokeDashoffset = '0';
+
+      countdownInterval = setInterval(() => {
+        countdownRemaining--;
+        if (countdownRemaining < 0) {
+          clearInterval(countdownInterval);
+          triggerNextEpisode();
+          return;
+        }
+        textEl.textContent = `${countdownRemaining}s`;
+        const offset = ((countdownTotal - countdownRemaining) / countdownTotal) * CIRCLE_CIRCUMFERENCE;
+        meterEl.style.strokeDashoffset = `${offset}`;
+      }, 1000);
+    }
+
+    function dismissCountdown() {
+      if (countdownInterval) clearInterval(countdownInterval);
+      document.getElementById('next-countdown-card').classList.add('hidden');
+    }
+
+    function triggerNextEpisode() {
+      dismissCountdown();
+      nextEpisode();
+    }
+
+    // 默认展示倒计时卡片动效供实时检查
+    setTimeout(() => {
+      startCountdown(5);
+    }, 600);
+
+    renderProgress();
+  </script>
+</body>
+</html>

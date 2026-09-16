@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { useSettingsStore } from '../../stores/useSettingsStore';
-import { useEnhancementStore } from '../../stores/useEnhancementStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
@@ -8,7 +7,6 @@ import { FluentSlider } from '../common/FluentSlider';
 import { 
   Settings, 
   Tv, 
-  Sparkles, 
   HardDrive, 
   FileText, 
   Check, 
@@ -18,11 +16,9 @@ import {
   Clock,
   Gauge
 } from 'lucide-react';
-import { EnhancementEngine } from '../../types/enhancement';
 
 export const SettingsView: React.FC = () => {
   const { settings, updateSettings, clearCache, cacheUsage, refreshCacheUsage } = useSettingsStore();
-  const { capabilities, engine, setEngine } = useEnhancementStore();
   const { showToast } = useAppStore();
 
   const [isCleaning, setIsCleaning] = useState(false);
@@ -52,10 +48,7 @@ export const SettingsView: React.FC = () => {
       timestamp: new Date().toISOString(),
       app: 'TTV Short Drama Desktop v1.0.0',
       os: 'Windows 11 (Mica Light)',
-      gpu: capabilities?.gpuName || '未探测',
-      driver: capabilities?.driverVersion || '未探测',
       settings: settings,
-      engine: engine,
     };
     const blob = new Blob([JSON.stringify(logData, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -68,14 +61,6 @@ export const SettingsView: React.FC = () => {
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
     showToast('诊断日志已导出', 'success');
   };
-
-  const engineOptions: { id: EnhancementEngine; name: string; tag: string; desc: string }[] =
-    (capabilities?.supportedEngines ?? []).map(item => ({
-      id: item.id,
-      name: item.name,
-      tag: item.id === 'off' ? '原生' : `${item.targetFps} FPS`,
-      desc: item.description,
-    }));
 
   const qualityOptions = [
     { label: '自动适应', value: 'auto' },
@@ -93,7 +78,7 @@ export const SettingsView: React.FC = () => {
             <span>系统与播放偏好设置</span>
           </h1>
           <p className="text-xs text-slate-400 mt-1">
-            自定义默认清晰度、自动连播参数、画质增强偏好与本地高速缓存
+            自定义默认清晰度、自动连播参数与本地高速缓存
           </p>
         </div>
 
@@ -182,62 +167,6 @@ export const SettingsView: React.FC = () => {
               </div>
             </div>
           )}
-        </MicaCard>
-
-        {/* 2. 补帧增强偏好卡片 */}
-        <MicaCard className="p-6 flex flex-col gap-5 shrink-0 animate-fluent-card-in" style={{ animationDelay: '90ms' }}>
-          <div className="flex items-center justify-between pb-3 border-b border-black/[0.04] flex-wrap gap-2">
-            <div className="flex items-center gap-2 text-sm font-bold text-slate-800">
-              <Sparkles className="w-4 h-4 text-amber-500" />
-              <span>AI 插帧与画质增强</span>
-            </div>
-            <span className="text-[11px] font-medium text-slate-500 bg-slate-100 px-2.5 py-1 rounded-md">
-              硬件环境: {capabilities?.gpuName || '正在探测'}
-            </span>
-          </div>
-
-          {/* 引擎选项网格 (嵌入式凹槽托盘) */}
-          <div className="p-2.5 bg-slate-100/80 rounded-2xl border border-slate-200/70 shadow-inner grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {engineOptions.map((item) => {
-              const isSelected = engine === item.id;
-
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => void setEngine(item.id).catch(error => showToast((error as Error).message, 'error'))}
-                  className={`p-4 rounded-xl border text-left transition-all duration-200 fluent-press cursor-pointer flex flex-col justify-between gap-3 min-h-[96px] ${
-                    isSelected
-                      ? 'fluent-convex-tab border-blue-500 shadow-md ring-1 ring-blue-500/50 -translate-y-1'
-                      : 'fluent-raised-tile hover:border-slate-300'
-                  }`}
-                >
-                  <div className="flex items-center justify-between w-full">
-                    <div className="flex items-center gap-2">
-                      <div className={`w-4 h-4 rounded-full border flex items-center justify-center transition-colors ${
-                        isSelected ? 'border-blue-600 bg-blue-600 text-white' : 'border-slate-300 bg-white'
-                      }`}>
-                        {isSelected && <Check className="w-2.5 h-2.5 stroke-[3]" />}
-                      </div>
-                      <span className={`text-xs font-bold ${isSelected ? 'text-blue-600' : 'text-slate-800'}`}>
-                        {item.name}
-                      </span>
-                    </div>
-
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${
-                      isSelected ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600'
-                    }`}>
-                      {item.tag}
-                    </span>
-                  </div>
-
-                  <p className="text-xs text-slate-500 leading-relaxed pl-6">
-                    {item.desc}
-                  </p>
-                </button>
-              );
-            })}
-          </div>
         </MicaCard>
 
         {/* 3. 本地存储与缓存卡片 */}

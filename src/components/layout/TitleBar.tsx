@@ -1,17 +1,25 @@
 import React from 'react';
-import { 
-  Minus, 
-  Square, 
-  X, 
-  Search, 
-  Clapperboard
+import {
+  Minus,
+  Square,
+  X,
+  Search
 } from 'lucide-react';
 import { useAppStore } from '../../stores/useAppStore';
 import { isTauriEnvironment } from '../../services/ipc';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
 export const TitleBar: React.FC = () => {
-  const { currentView, searchKeyword, setSearchKeyword, navigateTo } = useAppStore();
+  const { currentView, searchKeyword, setSearchKeyword, rememberSearch, navigateTo } = useAppStore();
+
+  // 搜索框是全应用的搜索入口：聚焦即进入搜索页（焦点随后交给页内输入框），
+  // 回车则先记一条历史再跳转。
+  //
+  // 旧实现只是把关键词写进 store、由发现页就地过滤列表——用户看不到"搜索结果
+  // 页"，也没有任何历史，于是误以为搜索没生效。
+  const enterSearch = () => {
+    if (currentView !== 'search') navigateTo('search');
+  };
 
   const handleDragStart = async (event: React.MouseEvent<HTMLElement>) => {
     if (event.button !== 0 || !isTauriEnvironment()) return;
@@ -51,11 +59,13 @@ export const TitleBar: React.FC = () => {
           className="flex items-center gap-2.5 cursor-pointer group py-1 px-1.5 rounded-xl hover:bg-black/[0.03] active:scale-95 transition-all focus:outline-none"
           title="TTV 短剧 - 返回发现精选"
         >
-          {/* 精致立体 Windows 11 Fluent 风格应用图标 */}
-          <div className="relative w-6.5 h-6.5 rounded-lg bg-gradient-to-br from-blue-500 via-blue-600 to-indigo-600 flex items-center justify-center text-white shadow-sm shadow-blue-500/30 border border-white/35 group-hover:scale-105 group-hover:shadow-blue-500/40 transition-all duration-200 overflow-hidden flex-shrink-0">
-            <Clapperboard className="w-3.5 h-3.5 text-white drop-shadow-xs" />
-            <span className="absolute inset-x-0 top-0 h-[1px] bg-white/40" />
-          </div>
+          {/* VidCom 品牌图标（透明底 PNG，来自图标库正方形主图标） */}
+          <img
+            src="/app-icon.png"
+            alt="VidCom"
+            className="w-5 h-5 object-contain group-hover:scale-105 transition-transform duration-200 flex-shrink-0"
+            draggable={false}
+          />
 
           <div className="flex items-center gap-1.5">
             <span className="font-bold text-xs tracking-tight text-slate-800 font-sans group-hover:text-blue-600 transition-colors">
@@ -77,6 +87,18 @@ export const TitleBar: React.FC = () => {
               type="text"
               value={searchKeyword}
               onChange={(e) => setSearchKeyword(e.target.value)}
+              onFocus={enterSearch}
+              onClick={enterSearch}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  const keyword = searchKeyword.trim();
+                  if (keyword) rememberSearch(keyword);
+                  enterSearch();
+                } else if (event.key === 'Escape') {
+                  setSearchKeyword('');
+                }
+              }}
               placeholder="搜索短剧、漫剧、战神逆袭、豪门甜宠..."
               className="w-full h-7 pl-8 pr-7 text-xs bg-white text-slate-800 placeholder-slate-400 rounded-lg border-none focus:outline-none shadow-xs transition-all"
             />

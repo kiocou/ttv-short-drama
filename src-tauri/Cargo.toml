@@ -1,6 +1,6 @@
 [package]
 name = "ttv-short-drama"
-version = "0.2.4"
+version = "0.2.5"
 description = "TTV Short Drama desktop application"
 authors = ["TTV"]
 edition = "2021"
@@ -25,7 +25,11 @@ uuid = { version = "1", features = ["v4"] }
 
 # 仅 Windows 需要：进全屏前"静默解除最大化"要用 GetWindowPlacement /
 # SetWindowPlacement 这对 API 才能不触发系统还原动画（详见 main.rs 的
-# window_prepare_fullscreen）。windows-sys 本就在依赖树里（tao/wry 引入），
-# 这里只是把它提为直接依赖，不新增下载体积。
+# window_prepare_fullscreen）；RTX VSR 的显卡通路要用 Win32_System_Registry
+# 写按进程的 Windows 图形首选项（详见 rtx_vsr.rs 的 apply_windows_gpu_preference）；
+# 补帧引擎要用 Win32_System_LibraryLoader 运行时加载 Lossless.dll
+# （详见 lossless_scaling.rs 的 engine()）。
+# windows-sys 本就在依赖树里（tao/wry 引入），这里只是把它提为直接依赖并声明
+# 用到的 feature，不新增下载体积。
 [target.'cfg(windows)'.dependencies]
-windows-sys = "0.61"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_LibraryLoader"] }

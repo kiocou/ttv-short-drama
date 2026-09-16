@@ -5,13 +5,12 @@ import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { MicaCard } from '../common/MicaCard';
 import { StatusBadge } from '../common/StatusBadge';
 import { FluentButton } from '../common/FluentButton';
-import { 
-  Flame, 
-  Sparkles, 
-  Play, 
-  Clapperboard, 
-  TrendingUp, 
-  Clock, 
+import {
+  Flame,
+  Sparkles,
+  Play,
+  TrendingUp,
+  Clock,
   Star,
   X
 } from 'lucide-react';
@@ -35,10 +34,17 @@ export const ExploreView: React.FC = () => {
     setSort,
     refreshCatalog,
     loadMore,
+    refreshContinueWatching,
   } = useCatalogStore();
 
-  const { searchKeyword, navigateTo, triggerCardTransition } = useAppStore();
+  const { currentView, navigateTo, triggerCardTransition } = useAppStore();
   const { openEpisode } = usePlaybackStore();
+
+  // 回到发现页就刷新"继续观看"：横幅的数据来自历史记录，而目录本身不会因为
+  // 看了几集而变化，不单独刷新就会一直停在启动那一刻的旧进度。
+  useEffect(() => {
+    if (currentView === 'explore') void refreshContinueWatching();
+  }, [currentView, refreshContinueWatching]);
 
   // 允许用户点击叉号隐藏继续观看条，卡片自动顶上去
   const [isContinueDismissed, setIsContinueDismissed] = useState(false);
@@ -54,8 +60,8 @@ export const ExploreView: React.FC = () => {
       searchReadyRef.current = true;
       return;
     }
-    void refreshCatalogRef.current(searchKeyword);
-  }, [searchKeyword]);
+    void refreshCatalogRef.current('');
+  }, []);
 
   useEffect(() => {
     const sentinel = loadMoreSentinelRef.current;
@@ -65,14 +71,14 @@ export const ExploreView: React.FC = () => {
     const observer = new IntersectionObserver(
       entries => {
         if (entries.some(entry => entry.isIntersecting)) {
-          void loadMore(searchKeyword);
+          void loadMore('');
         }
       },
       { root, rootMargin: '640px 0px', threshold: 0.01 },
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [hasMore, isLoading, isLoadingMore, loadMore, searchKeyword]);
+  }, [hasMore, isLoading, isLoadingMore, loadMore]);
 
   const audienceOptions = ['全部', '男频爽剧', '女频爆款'];
 
@@ -93,7 +99,6 @@ export const ExploreView: React.FC = () => {
                   : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
               }`}
             >
-              <Clapperboard className="w-3.5 h-3.5" />
               <span>短剧专区</span>
             </button>
             <button
@@ -203,7 +208,7 @@ export const ExploreView: React.FC = () => {
       </div>
 
       {/* “继续观看”智能断点推荐横幅 (凸起悬浮质感磨砂浮岛，支持点击叉号关闭隐藏) */}
-      {!isContinueDismissed && !searchKeyword && continueWatching && (
+      {!isContinueDismissed && continueWatching && (
         <div 
           onClick={() => {
             navigateTo('player', continueWatching.seriesId);
@@ -298,14 +303,12 @@ export const ExploreView: React.FC = () => {
         ) : error && items.length === 0 ? (
           <div className="py-20 flex flex-col items-center justify-center text-center gap-3">
             <p className="text-sm font-medium text-slate-600">目录加载失败</p>
-            <FluentButton size="sm" onClick={() => refreshCatalog(searchKeyword)}>重试</FluentButton>
+            <FluentButton size="sm" onClick={() => refreshCatalog('')}>重试</FluentButton>
           </div>
         ) : items.length === 0 ? (
           /* 空结果态 */
           <div className="py-20 flex flex-col items-center justify-center text-center gap-3">
-            <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center text-slate-400">
-              <Clapperboard className="w-6 h-6" />
-            </div>
+            <img src="/app-icon.png" alt="" className="w-12 h-12 object-contain opacity-60" draggable={false} />
             <p className="text-sm font-medium text-slate-600">没有找到匹配的{channel === 'comic' ? '漫剧' : '短剧'}</p>
             <p className="text-xs text-slate-400">尝试更换关键词或分类筛选项</p>
           </div>

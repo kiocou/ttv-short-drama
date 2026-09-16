@@ -196,6 +196,7 @@ pub struct UserSettings {
     pub default_quality: String,
     pub auto_next: bool,
     pub countdown_seconds: u32,
+    /// 已废弃：补帧/增强链路已移除，保留字段兼容旧设置库记录，恒为 "off"。
     pub preferred_engine: String,
     pub target_fps: u32,
     pub hardware_acceleration: bool,
@@ -216,50 +217,6 @@ impl Default for UserSettings {
             playback_cache_mb: 0.0,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnhancementEngineInfo {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub target_fps: u32,
-    pub recommended: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnhancementCapabilities {
-    pub supported_engines: Vec<EnhancementEngineInfo>,
-    pub gpu_name: String,
-    pub driver_version: String,
-    pub vram_mb: u32,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnhancementStatus {
-    pub enabled: bool,
-    pub mode: String,
-    pub fallback_active: bool,
-    pub reason: Option<String>,
-    pub actual_fps: Option<f64>,
-    pub display_fps: Option<f64>,
-}
-
-/// 增强播放（交给 mpv 接管）的能力探测结果。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnhancementProbe {
-    pub mpv_available: bool,
-    pub mpv_path: String,
-    pub display_hz: f64,
-    pub min_target_fps: u32,
-    pub max_target_fps: u32,
-    pub running: bool,
-    pub current_target_fps: u32,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

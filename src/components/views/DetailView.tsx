@@ -44,7 +44,7 @@ export const DetailView: React.FC = () => {
     if (!detail || detail.episodes.length === 0) return;
     const anchor = detail.episodes.findIndex(ep => (ep.watchedSeconds || 0) > 0 && !ep.isFinished);
     const start = anchor >= 0 ? anchor : 0;
-    const vids = detail.episodes.slice(start, start + 4).map(ep => ep.id);
+    const vids = detail.episodes.slice(start, start + 6).map(ep => ep.id);
     if (vids.length === 0) return;
     void ipcService.playback.prefetchStream(vids, detail.type === 'comic' ? 1004 : 1);
   }, [detail]);
@@ -100,6 +100,10 @@ export const DetailView: React.FC = () => {
   // 每次都起 worker 会把带宽抢空（store 侧另有并发上限兜底）。
   const schedulePrewarm = (episodeId: string) => {
     if (!detail) return;
+    // 悬停先只做"预签名"：签名是点播链路里最贵的一段固定开销（两次 App API
+    // 往返，实测约 2.4s），但它比整集下载快得多，几十毫秒的悬停就够发起。
+    // 命中之后用户点下去只剩解密那一步，等待时间直接少一半。
+    void ipcService.playback.prefetchStream([episodeId], detail.type === 'comic' ? 1004 : 1);
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = setTimeout(() => {
       if (!detail) return;

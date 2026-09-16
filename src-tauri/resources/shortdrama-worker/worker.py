@@ -655,8 +655,10 @@ def _ffmpeg_direct_decrypt(ffmpeg: str, url: str, key_hex: str | None,
                     "-headers", f"Referer: {DOWNLOAD_REFERER}\r\n"]
     if key_hex:
         command += ["-decryption_key", key_hex]
-    command += ["-i", url, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
-                "-movflags", "+faststart", str(partial)]
+    # 刻意不加 -movflags +faststart：源本身已是 faststart 布局，而重新排布
+    # moov 要整文件二次读写（实测约 0.5s，网络波动时更多），换来的只是把
+    # moov 从尾部挪到头部——本地文件播放器自己会 seek 到尾部读它，不值得。
+    command += ["-i", url, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", str(partial)]
 
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace")
@@ -794,16 +796,92 @@ def search_cmd_placeholder() -> None:
     return None
 
 
-def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: str,
-            content_type: int, aid: int) -> dict:
+def download_prefix(session: requests.Session, real_url: str, out_path: Path,
+                    limit_bytes: int) -> int:
+    """只取源流的前若干字节（HTTP Range）。
+
+    为什么这样可行：这条 CDN 是 faststart 布局，moov 在文件头部（实测 offset 28、
+    约 250KB），所以截断的前缀解密出来是一个**自洽可播的小片段**，不是残片。
+    """
+    headers = download_headers()
+    headers["Range"] = f"bytes=0-{limit_bytes - 1}"
+    response = session.get(real_url, headers=headers, timeout=60, stream=True)
+    if response.status_code not in (200, 206):
+        response.close()
+        raise RuntimeError(f"前缀下载失败：HTTP {response.status_code}")
+    written = 0
+    with response:
+        with out_path.open("wb") as output:
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                output.write(chunk)
+                written += len(chunk)
+                if written >= limit_bytes:
+                    break
+    return written
+
+
+def resolve_prefix(vid: str, out_path: Path, device_id: str, install_id: str,
+                   ffmpeg: str, content_type: int, aid: int) -> dict:
+    """「立刻起播」通道：只取开头一小段并解密成可播片段。
+
+    旧链路必须先下完整集（8.8MB）再解密才能播，首播就得等一次完整下载。这里
+    只取前 2MB（实测约 300ms）解出开头约 40 秒交给播放器立刻出画，完整版由
+    调用方在后台继续解析，就绪后无缝切换。
+    """
     session = http_session()
-    # 预签名直链：Rust 侧已提前调用 stream 并把 (url, key) 缓存下来。命中时
-    # 直接跳过签名链路——实测那两次 App API 往返是固定 2.16s，占未命中总耗时
-    # 的一半以上，而用户从打开详情页到点集通常有足够空档提前做完。
+    stream_info = load_stream_info(session, vid, device_id, install_id, content_type, aid)
+    real_url, key_hex, width, height = pick_stream_variant(stream_info)
+    content_key = None
+    if key_hex:
+        try:
+            content_key = binascii.unhexlify(key_hex)
+        except (binascii.Error, ValueError):
+            content_key = None
+
+    limit_bytes = max(512 * 1024, int(os.getenv("TTV_SD_PREFIX_BYTES", str(2 * 1024 * 1024))))
+    emit({"event": "progress", "stage": "prefix", "message": "正在预取开头片段"})
+    source = out_path.with_name(out_path.name + ".prefix.tmp")
+    source.unlink(missing_ok=True)
+    try:
+        written = download_prefix(session, real_url, source, limit_bytes)
+        if written == 0:
+            raise RuntimeError("前缀下载为空")
+        partial = out_path.with_name(out_path.name + ".part.mp4")
+        partial.unlink(missing_ok=True)
+        command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+        if content_key:
+            command += ["-decryption_key", content_key.hex()]
+        # 截断的输入会让 ffmpeg 在末尾报 packet corrupt，但那几帧之后的完整部分
+        # 全部可用——产物是正常可播的（实测 1.5MB 前缀解出 28.16 秒）。
+        command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                    "-movflags", "+faststart", str(partial)]
+        proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
+            raise RuntimeError("前缀解密失败: " + (proc.stderr or "").strip()[:200])
+        partial.replace(out_path)
+        size = out_path.stat().st_size
+        payload = {"ok": True, "file": str(out_path), "width": width,
+                   "height": height, "size": size, "prefix": True}
+        emit({"event": "done", **payload})
+        return payload
+    finally:
+        source.unlink(missing_ok=True)
+
+
+def load_stream_info(session: requests.Session, vid: str, device_id: str, install_id: str,
+                     content_type: int, aid: int) -> dict:
+    """取播放直链与解密密钥（优先复用 Rust 侧预签名的结果）。
+
+    预签名直链：Rust 已提前调用 stream 并把 (url, key) 缓存下来。命中时直接
+    跳过签名链路——实测那两次 App API 往返是固定 2.16s，占未命中总耗时的
+    一半以上，而用户从打开详情页到点集通常有足够空档提前做完。
+    """
     cached_url = os.getenv("TTV_SD_DIRECT_URL", "").strip()
     if cached_url:
         emit({"event": "progress", "stage": "cache", "message": "复用已预取的播放直链"})
-        stream_info = {
+        return {
             "url": cached_url,
             "content_key": os.getenv("TTV_SD_DIRECT_KEY", "").strip() or None,
             "width": int(os.getenv("TTV_SD_DIRECT_WIDTH", "0") or 0),
@@ -811,10 +889,11 @@ def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: s
             "duration_ms": int(os.getenv("TTV_SD_DIRECT_DURATION", "0") or 0),
             "variants": [],
         }
-    else:
-        stream_info = fetch_stream(session, vid, device_id, install_id, content_type, aid)
-    # Honor the requested quality when the App API returns multiple variants.
-    # Keep auto/unknown on the highest quality selected by fetch_stream.
+    return fetch_stream(session, vid, device_id, install_id, content_type, aid)
+
+
+def pick_stream_variant(stream_info: dict) -> tuple:
+    """按请求的清晰度挑一路流，返回 (url, content_key_hex, width, height)。"""
     requested_quality = os.getenv("TTV_SD_QUALITY", "auto").strip().lower()
     selected = None
     if requested_quality != "auto":
@@ -827,21 +906,25 @@ def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: s
                 default=None,
             )
     if selected:
-        real_url = selected["url"]
-        stream_info = {**stream_info, "url": real_url,
-                       "content_key": selected.get("content_key") or stream_info.get("content_key"),
-                       "width": int(selected.get("width", 0) or 0),
-                       "height": int(selected.get("height", 0) or 0)}
-    else:
-        real_url = stream_info["url"]
+        return (selected["url"],
+                selected.get("content_key") or stream_info.get("content_key"),
+                int(selected.get("width", 0) or 0),
+                int(selected.get("height", 0) or 0))
+    return (stream_info["url"], stream_info["content_key"],
+            stream_info["width"], stream_info["height"])
+
+
+def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: str,
+            content_type: int, aid: int) -> dict:
+    session = http_session()
+    stream_info = load_stream_info(session, vid, device_id, install_id, content_type, aid)
+    real_url, key_hex, width, height = pick_stream_variant(stream_info)
     content_key = None
-    if stream_info["content_key"]:
+    if key_hex:
         try:
-            content_key = binascii.unhexlify(stream_info["content_key"])
+            content_key = binascii.unhexlify(key_hex)
         except (binascii.Error, ValueError):
             content_key = None
-    width = stream_info["width"]
-    height = stream_info["height"]
     # ===== 主路径：ffmpeg 直连，拉流 + 解密 + 转存一步完成 =====
     emit({"event": "progress", "stage": "download",
           "message": f"正在下载并解密源流（{height}p）"})
@@ -1029,7 +1112,7 @@ def main() -> int:
         }) == ["https://a.example/a.mp4", "https://b.example/a.mp4"]
         emit({"ok": True, "event": "done", "hosts": [urlsplit(item).netloc for item in urls]})
         return 0
-    if subcommand not in ("resolve", "stream", "album", "search") or len(argv) < 2:
+    if subcommand not in ("resolve", "resolve-prefix", "stream", "album", "search") or len(argv) < 2:
         emit({"ok": False, "error": f"未知子命令: {subcommand or '(空)'}"})
         return 2
     target = argv[1].strip()
@@ -1046,14 +1129,17 @@ def main() -> int:
         return 2
     try:
         content_type, aid = request_profile()
-        if subcommand == "resolve":
+        if subcommand in ("resolve", "resolve-prefix"):
             if not ffmpeg or not out:
                 emit({"ok": False, "error": "缺少环境变量: TTV_SD_FFMPEG, TTV_SD_OUT"})
                 return 2
             if not Path(ffmpeg).is_file():
                 emit({"ok": False, "error": f"ffmpeg 不存在: {ffmpeg}"})
                 return 2
-            resolve(target, Path(out), device_id, install_id, ffmpeg, content_type, aid)
+            if subcommand == "resolve":
+                resolve(target, Path(out), device_id, install_id, ffmpeg, content_type, aid)
+            else:
+                resolve_prefix(target, Path(out), device_id, install_id, ffmpeg, content_type, aid)
         elif subcommand == "stream":
             stream_cmd(target, device_id, install_id, content_type, aid)
         elif subcommand == "search":
