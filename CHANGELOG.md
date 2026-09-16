@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.5 - 2026-09-16
+
+### 移除
+- **补帧与 RTX VSR 画质增强链路整体移除**（Lossless.dll FFI、mpv+VapourSynth 补帧、VSR 探测/注册表开关、前端全部组件与状态、resources 引擎文件）。应用回归纯 WebView2 原生播放：`<video>` + HEVC 系统解码器。决定依据：全屏钩子方案卡死闪屏（UI 层被当视频帧做光流）；mpv 独立窗口方案可用但交互脱节；WebView2 内嵌补帧需 WebCodecs + WebGPU 重写播放内核。`UserSettings.preferred_engine`/`target_fps` 字段保留以兼容旧设置库记录，恒为 off。
+
+### 修复
+- **连播倒计时：点「立即播放」后倒计时消失几秒又出现，到点再跳一集（一次跳两集）**。根因：`adoptPreparedSource` 为保住旧帧刻意不调 `video.load()`，接管后头 2 秒媒体元素上的 `duration/currentTime` 仍是上一集残留值（还在结尾 8 秒内），这段窗口里的 `timeupdate` 会把刚被取消的倒计时重新武装。修复：武装条件加"源结算期"闸（与 `tryClaimAutoAdvance` 同一逻辑），接管期内的 timeupdate 直接作废。
+- **外部播放器与后台子进程闪终端窗口**。补 `CREATE_NO_WINDOW`（`CommandExt::creation_flags`）。
+
+### 优化
+- **详情页加载失败自动重试 1 次**（600ms 间隔），网络抖动不再白屏一整页；comic 频道空壳重试从 1 次升到 2 次（400ms 间隔）。
+- **reqwest 连接池保活**（空闲 600s、`tcp_nodelay`）：目录翻页与换剧复用已建立的 TLS 连接，省 1-2 RTT。
+- **清晰度探测延后 3 秒**：播放成功后立即探测会与相邻集预取抢同一个 python worker（单实例互斥），两边都慢。
+- **预取队列泵首拍延迟 800ms**：换集瞬间让前台解析先拿 worker，起播不等预取。
+- **NSIS 安装器图标换成应用图标**（此前 `setup.exe` 本身挂的是 NSIS 默认图标）。
+- **mpv.exe（120 MB）入 Git LFS**，超过 GitHub 单文件 100 MB 硬限制。
+- 清理全部编译警告（删除死代码 `RtxVsrCapability`、`Database::kv_get/kv_set`）。
+
 ## 0.2.4 - 2026-09-15
 
 ### 修复
