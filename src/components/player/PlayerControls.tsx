@@ -1,43 +1,50 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { useEnhancementStore } from '../../stores/useEnhancementStore';
+import { useRtxVsrStore } from '../../stores/useRtxVsrStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { ProgressBar } from './ProgressBar';
-import { 
-  Play, 
-  Pause, 
-  SkipBack, 
-  SkipForward, 
-  RotateCcw, 
-  RotateCw, 
-  Volume2, 
-  VolumeX, 
-  Maximize, 
-  Minimize, 
-  ArrowLeft, 
+import { RollingPercent, RollingTime } from './RollingNumber';
+import { EnhancementFlyout } from './EnhancementFlyout';
+import {
+  Play,
+  Pause,
+  SkipBack,
+  SkipForward,
+  RotateCcw,
+  RotateCw,
+  Volume2,
+  VolumeX,
+  Maximize,
+  Minimize,
+  ArrowLeft,
   Layers,
-  Sparkles
+  Sparkles,
+  MonitorUp,
+  Lock,
+  LockOpen,
 } from 'lucide-react';
 
 interface PlayerControlsProps {
   isVisible: boolean;
   isFullscreen: boolean;
+  /** 控制器是否被用户主动收起（锁定）。 */
+  isLocked: boolean;
+  onToggleLock: () => void;
   onToggleFullscreen: () => void;
   onUserActivity: () => void;
-}
-
-function formatTime(seconds: number): string {
-  if (isNaN(seconds) || seconds < 0) return '00:00';
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  /** 指针移动统一入口（带合成事件过滤），容器层已按真实位移过滤后传入。 */
+  onPointerMove?: (e: React.MouseEvent) => void;
 }
 
 export const PlayerControls: React.FC<PlayerControlsProps> = ({
   isVisible,
   isFullscreen,
+  isLocked,
+  onToggleLock,
   onToggleFullscreen,
   onUserActivity,
+  onPointerMove,
 }) => {
   const {
     currentSeries,
@@ -63,13 +70,23 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
     availableQualities,
   } = usePlaybackStore();
 
-  const { goBack } = useAppStore();
+  const { goBack, showToast } = useAppStore();
   const { uiState: enhancementState, currentFps } = useEnhancementStore();
+  const {
+    stage: vsrStage,
+    busy: vsrBusy,
+    statusLabel: vsrStatusLabel,
+    detailLines: vsrDetailLines,
+    notes: vsrNotes,
+    renderProbe: vsrRenderProbe,
+    toggle: toggleVsr,
+  } = useRtxVsrStore();
 
   // 弹窗状态
   const [showVolumeSlider, setShowVolumeSlider] = useState(false);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
+  const [showEnhancement, setShowEnhancement] = useState(false);
 
   const controlsRef = useRef<HTMLDivElement | null>(null);
 
@@ -85,6 +102,26 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  // 收起控制器时把所有浮层一并关掉：留着悬空的气泡既无意义，也会被 .is-hidden 压住
+  useEffect(() => {
+    if (isLocked) {
+      setShowQualityMenu(false);
+      setShowSpeedMenu(false);
+      setShowVolumeSlider(false);
+      setShowEnhancement(false);
+    }
+  }, [isLocked]);
+
+  // Esc 解锁：收起后鼠标若已停住，键盘是唯一的出口
+  useEffect(() => {
+    if (!isLocked) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onToggleLock();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isLocked, onToggleLock]);
 
   const speedOptions = [0.75, 1.0, 1.25, 1.5, 2.0];
   // 清晰度档位以「源流真实提供」为准：优先用后端探测到的 variants，
@@ -103,6 +140,62 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
         ? '增强已降级'
         : '原始播放';
 
+  /**
+   * 「RTX VSR」按钮的点击处理。
+   *
+   * 开启动作本身只写入应用侧偏好——真正的超分请求由 WebView2 内核发给 NVIDIA
+   * 驱动。因此这里按**真实结果**分情况反馈：链路不满足就直说哪一环不满足，
+   * 不回一句笼统的"已开启"让用户误以为超分正在运行。
+   */
+  const handleToggleVsr = useCallback(async () => {
+    if (vsrStage === 'unsupported') {
+      const reason = vsrDetailLines[vsrDetailLines.length - 1] ?? '当前环境不满足 RTX VSR 的前置条件。';
+      showToast(`RTX VSR 不可用：${reason}`, 'error');
+      return;
+    }
+    try {
+      const updated = await toggleVsr();
+      if (!updated) return;
+      if (!updated.enabled) {
+        showToast('RTX VSR 已关闭', 'success');
+        return;
+      }
+      if (!updated.ready) {
+        showToast('RTX VSR 已开启，但当前环境尚不满足超分条件', 'error');
+        return;
+      }
+
+      // 开启成功不等于"已经超分"。按当前渲染条件分三种情况如实反馈——
+      // 否则用户点完看到按钮是「待放大」却不知道为什么，只能干瞪眼。
+      const rendererKnown = vsrRenderProbe.renderer.length > 0;
+      const onRtx = !rendererKnown || vsrRenderProbe.rendererIsRtx;
+
+      if (!onRtx) {
+        // 这条最有价值：用户报的"驱动总闸开着却没反应"就是这种情况。
+        // 注册表首选项按进程路径绑定，只对桌面应用生效——重启的是本应用，
+        // 浏览器里访问开发服务器不受它约束。
+        showToast('RTX VSR 已开启：已写入高性能 GPU 图形首选项，重启本应用后生效', 'success');
+        return;
+      }
+      if (!vsrRenderProbe.scale || vsrRenderProbe.scale <= 1.001) {
+        showToast('RTX VSR 已开启，但当前画面是缩小显示，超分尚未介入', 'warning');
+        return;
+      }
+
+      // 真正具备介入条件时，再把"NVIDIA 侧总闸"这条边界说清楚：应用无法代开
+      // 驱动侧的超分开关，用户若发现画面无变化，需要去 NVIDIA App 确认。
+      const driverGateNote = vsrNotes.find(note => note.startsWith('NVIDIA App'));
+      showToast(
+        driverGateNote
+          ? `RTX VSR 已开启。${driverGateNote}`
+          : 'RTX VSR 已开启：内核将向 NVIDIA 驱动请求视频超分',
+        'success',
+      );
+    } catch (error) {
+      showToast(`RTX VSR 切换失败：${(error as Error).message}`, 'error');
+    }
+  }, [vsrStage, vsrDetailLines, vsrNotes, vsrRenderProbe, toggleVsr, showToast]);
+
   // 集数徽章文案。
   //
   // 后端在缺少真实分集标题时会把 title 填成"第 N 集"（见 provider.rs 的
@@ -115,309 +208,572 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
     return title && title !== base ? `${base} · ${title}` : base;
   })();
 
+  // HUD 显示条件：既没到自动隐藏时间，也没被用户收起。
+  // 锁按钮则多一条——收起后必须始终可见，否则用户没有出口把它叫回来。
+  const hudShown = isVisible && !isLocked;
+  const lockShown = isVisible || isLocked;
+
+  return (
+    <div className="absolute inset-0 z-30 pointer-events-none">
+      {/*
+        收起态的贴边迷你进度条。
+        放在 HUD 之外：HUD 整体淡出时它才刚登场，必须独立于那层透明度。
+      */}
+      <MiniProgress
+        isLocked={isLocked}
+        position={position}
+        duration={duration}
+        buffered={buffered}
+        onSeek={seek}
+      />
+
+      {/*
+        右侧居中小锁：展开 / 收起播放控制器。
+        键盘可达（Enter/Space 都能触发），收起后按 Esc 也能解锁。
+      */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleLock();
+        }}
+        className={`ttv-lock crystal-surface${lockShown ? ' is-shown' : ''}${isLocked ? ' is-locked' : ''}`}
+        title={isLocked ? '展开播放控制器 (Esc)' : '收起播放控制器'}
+        aria-label={isLocked ? '展开播放控制器' : '收起播放控制器'}
+        aria-pressed={isLocked}
+      >
+        {isLocked ? <Lock className="w-[18px] h-[18px]" /> : <LockOpen className="w-[18px] h-[18px]" />}
+      </button>
+
+      {/* HUD 控制层：顶部标题岛 + 底部操控坞 */}
+      <div
+        className={`ttv-hud${hudShown ? '' : ' is-hidden'}`}
+        onMouseMove={(e) => {
+          // HUD 在光标下方时动画会派发合成 mousemove；有过滤版入口就优先用，
+          // 避免合成事件反复重置自动隐藏定时器。
+          if (onPointerMove) {
+            onPointerMove(e);
+          } else {
+            onUserActivity();
+          }
+        }}
+      >
+        {/* 顶部标题岛 */}
+        <div className="ttv-top-bar">
+          <div className="title-crystal-island crystal-surface">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                goBack();
+              }}
+              className="btn-fluent-action"
+              title="返回剧集列表"
+              aria-label="返回剧集列表"
+            >
+              <ArrowLeft className="w-4 h-4" />
+            </button>
+
+            <div className="crystal-divider" />
+
+            <div className="flex items-center gap-2 pr-1.5 min-w-0">
+              <span className="drama-title">{currentSeries?.title || '精彩短剧'}</span>
+              <span className="episode-badge">{episodeBadge}</span>
+            </div>
+          </div>
+
+          {/*
+            右上角：画面增强运行状态。
+
+            设计稿要求把这里"彻底清空"，但这不是装饰——它是后端真实上报的
+            插帧/超分运行状态，删掉用户就无从知道增强到底有没有生效。
+            折中是保留胶囊、改用与其它控件一致的晶体材质，并降低存在感；
+            点击可展开增强引擎选择。若确实要完全清空，删掉本块即可。
+          */}
+          <div className="relative flex-shrink-0">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowEnhancement(prev => !prev);
+                setShowQualityMenu(false);
+                setShowSpeedMenu(false);
+                setShowVolumeSlider(false);
+              }}
+              className={`btn-text-action crystal-surface rounded-full${showEnhancement ? ' is-on' : ''}`}
+              title={`画面增强：${enhancementLabel}（点击切换引擎）`}
+              aria-expanded={showEnhancement}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>{enhancementLabel}</span>
+            </button>
+
+            <EnhancementFlyout isOpen={showEnhancement} onClose={() => setShowEnhancement(false)} />
+          </div>
+        </div>
+
+        {/* 底部操控坞：进度槽与控件同处一张晶体大卡片 */}
+        <div className="ttv-dock" onClick={(e) => e.stopPropagation()}>
+          <div ref={controlsRef} className="mica-crystal-card crystal-surface">
+            {/* 进度槽内嵌于卡片顶部 */}
+            <ProgressBar position={position} duration={duration} buffered={buffered} onSeek={seek} />
+
+            <div className="controls-deck-row">
+              {/* 左侧：集数切换、快进快退、播放主键、滚轮时间读数 */}
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="flex items-center gap-0.5">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      playPrevEpisode();
+                    }}
+                    className="btn-fluent-action"
+                    title="上一集 (快捷键 [ )"
+                    aria-label="上一集"
+                  >
+                    <SkipBack className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      seekRelative(-5);
+                    }}
+                    className="btn-fluent-action"
+                    title="后退 5 秒 (快捷键 ←)"
+                    aria-label="后退 5 秒"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      togglePlay();
+                    }}
+                    className="btn-play-hero"
+                    title={isPlaying ? '暂停 (空格)' : '播放 (空格)'}
+                    aria-label={isPlaying ? '暂停' : '播放'}
+                  >
+                    {isPlaying ? (
+                      <Pause className="w-[18px] h-[18px] fill-current" />
+                    ) : (
+                      <Play className="w-[18px] h-[18px] fill-current ml-0.5" />
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      seekRelative(5);
+                    }}
+                    className="btn-fluent-action"
+                    title="快进 5 秒 (快捷键 →)"
+                    aria-label="快进 5 秒"
+                  >
+                    <RotateCw className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      playNextEpisode();
+                    }}
+                    className="btn-fluent-action"
+                    title="下一集 (快捷键 ] )"
+                    aria-label="下一集"
+                  >
+                    <SkipForward className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="crystal-divider" />
+
+                {/* 机械滚轮时间读数 */}
+                <div className="ttv-time" aria-label={`已播放 ${Math.floor(position)} 秒，共 ${Math.floor(duration)} 秒`}>
+                  <RollingTime value={position} />
+                  <span className="time-sep">/</span>
+                  <RollingTime value={duration} variant="duration" />
+                </div>
+              </div>
+
+              {/* 右侧：音量、清晰度、倍速、超分、选集、全屏 */}
+              <div className="flex items-center gap-0.5">
+                <VolumeControl
+                  isMuted={isMuted}
+                  volume={volume}
+                  open={showVolumeSlider}
+                  onToggle={() => {
+                    setShowVolumeSlider(prev => !prev);
+                    setShowQualityMenu(false);
+                    setShowSpeedMenu(false);
+                    setShowEnhancement(false);
+                  }}
+                  onToggleMute={toggleMute}
+                  onVolumeChange={(v) => setVolume(v)}
+                />
+
+                {/* 清晰度：仅当源真实提供多档时才可切换 */}
+                <div className="relative">
+                  <button
+                    type="button"
+                    disabled={!qualitySelectable}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (!qualitySelectable) return;
+                      setShowQualityMenu(prev => !prev);
+                      setShowSpeedMenu(false);
+                      setShowVolumeSlider(false);
+                      setShowEnhancement(false);
+                    }}
+                    title={qualitySelectable ? '切换清晰度' : '当前播放源仅提供单一画质'}
+                    className="btn-text-action"
+                  >
+                    {qualityOptions.find(q => q.value === currentQuality)?.label.split(' ')[0]
+                      || qualityOptions[0]?.label.split(' ')[0]
+                      || '自动'}
+                  </button>
+
+                  {qualitySelectable && (
+                    <div className={`crystal-flyout crystal-surface${showQualityMenu ? ' open' : ''}`}>
+                      {qualityOptions.map((opt, index) => (
+                        <button
+                          key={`${opt.value}-${index}`}
+                          type="button"
+                          onClick={() => {
+                            setQuality(opt.value);
+                            setShowQualityMenu(false);
+                          }}
+                          className={`crystal-menu-item${currentQuality === opt.value ? ' active' : ''}`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* 倍速 */}
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowSpeedMenu(prev => !prev);
+                      setShowQualityMenu(false);
+                      setShowVolumeSlider(false);
+                      setShowEnhancement(false);
+                    }}
+                    className="btn-text-action"
+                    title="切换播放倍速"
+                  >
+                    {playbackRate === 1 ? '倍速' : `${playbackRate}x`}
+                  </button>
+
+                  <div className={`crystal-flyout crystal-surface${showSpeedMenu ? ' open' : ''}`}>
+                    {speedOptions.map((rate) => (
+                      <button
+                        key={rate}
+                        type="button"
+                        onClick={() => {
+                          setPlaybackRate(rate);
+                          setShowSpeedMenu(false);
+                        }}
+                        className={`crystal-menu-item${playbackRate === rate ? ' active' : ''}`}
+                      >
+                        {rate === 1.0 ? '1.0x 正常' : `${rate}x`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* RTX VSR 开关。
+                    开启后由 WebView2 内核向 NVIDIA 驱动请求 D3D11 视频处理器超分——
+                    应用不能直接调用超分 API，因此按钮的职责是"打开这条链路并如实报告
+                    它现在是否真的具备介入条件"。不满足时仍然可点，点下去会说明原因。 */}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void handleToggleVsr();
+                  }}
+                  disabled={vsrBusy}
+                  title={vsrDetailLines.join('\n')}
+                  className={`btn-text-action${vsrStage === 'enabled' ? ' is-on' : ''}`}
+                >
+                  <MonitorUp className="w-3.5 h-3.5" />
+                  <span>{vsrStatusLabel}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleSideDrawer();
+                  }}
+                  className="btn-text-action"
+                  title="打开选集"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                  <span>选集</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToggleFullscreen();
+                  }}
+                  className="btn-fluent-action"
+                  title={isFullscreen ? '退出全屏 (F / Esc)' : '进入全屏 (F)'}
+                  aria-label={isFullscreen ? '退出全屏' : '进入全屏'}
+                >
+                  {isFullscreen ? (
+                    <Minimize className="w-4 h-4" />
+                  ) : (
+                    <Maximize className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ==========================================================================
+   垂直音量柱（独立成件：拖拽逻辑自带 pointer capture，避免污染主控件的渲染）
+   ========================================================================== */
+
+interface VolumeControlProps {
+  isMuted: boolean;
+  volume: number;
+  open: boolean;
+  onToggle: () => void;
+  onToggleMute: () => void;
+  onVolumeChange: (value: number) => void;
+}
+
+const VolumeControl: React.FC<VolumeControlProps> = ({
+  isMuted,
+  volume,
+  open,
+  onToggle,
+  onToggleMute,
+  onVolumeChange,
+}) => {
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  // 拖拽中的即时读数。父级 volume 要等 store 回写，直接读它会让滚轮数字慢半拍。
+  const [dragValue, setDragValue] = useState<number | null>(null);
+
+  const effective = isMuted ? 0 : (dragValue ?? volume);
+  const percent = Math.max(0, Math.min(100, Math.round(effective * 100)));
+
+  const applyFromClientY = useCallback((clientY: number) => {
+    const el = trackRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const ratio = 1 - Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    setDragValue(ratio);
+    onVolumeChange(ratio);
+  }, [onVolumeChange]);
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    // 用 pointer capture 而不是往 window 上挂监听：
+    // 指针一旦滑出这个 24px 宽的小条，仍能继续拖动，且松手时不残留监听器。
+    e.currentTarget.setPointerCapture(e.pointerId);
+    applyFromClientY(e.clientY);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
+    applyFromClientY(e.clientY);
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // 指针已释放时忽略
+    }
+    setDragValue(null);
+  };
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggle();
+        }}
+        className="btn-fluent-action"
+        title={isMuted || volume === 0 ? '点击调节音量（当前静音）' : '音量调节'}
+        aria-label="音量调节"
+        aria-expanded={open}
+      >
+        {isMuted || volume === 0 ? (
+          <VolumeX className="w-4 h-4" />
+        ) : (
+          <Volume2 className="w-4 h-4" />
+        )}
+      </button>
+
+      <div
+        className={`crystal-volume-bubble crystal-surface${open ? ' open' : ''}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <RollingPercent value={percent} instant={dragValue !== null} />
+
+        {/* 垂直音量轨道：下方蓝色填充，上方灰色未激活 */}
+        <div
+          ref={trackRef}
+          className="vol-track-vertical"
+          role="slider"
+          tabIndex={0}
+          aria-label="音量"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={percent}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              onVolumeChange(Math.min(1, volume + 0.05));
+            } else if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              onVolumeChange(Math.max(0, volume - 0.05));
+            }
+          }}
+        >
+          <div className="vol-track-bg" />
+          {/* 填充条固定满高，用 scaleY 表达比例：逐帧改 height 会触发重排 */}
+          <div className="vol-track-fill" style={{ transform: `scaleY(${percent / 100})` }} />
+          <div className="vol-track-thumb" style={{ bottom: `${percent}%` }} />
+        </div>
+
+        {/* 底部喇叭：静音 / 恢复 */}
+        <button
+          type="button"
+          className="vol-mute-btn"
+          onClick={(e) => {
+            e.stopPropagation();
+            // 静音不是"音量置 0"的等价物：store 里另有 muted 标志，
+            // 拖动音量条会解除静音，而点这里只切换标志。所以复用它自己的开关。
+            onToggleMute();
+          }}
+          title={isMuted || volume === 0 ? '恢复音量' : '静音'}
+          aria-label={isMuted || volume === 0 ? '恢复音量' : '静音'}
+        >
+          {isMuted || volume === 0 ? (
+            <VolumeX className="w-3.5 h-3.5" />
+          ) : (
+            <Volume2 className="w-3.5 h-3.5" />
+          )}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+/* ==========================================================================
+   收起态的贴边迷你进度条
+   ========================================================================== */
+
+interface MiniProgressProps {
+  isLocked: boolean;
+  position: number;
+  duration: number;
+  buffered: number;
+  onSeek: (seconds: number) => void;
+}
+
+/**
+ * 控制器收起后贴着窗口最底部的一条 3.5px 进度条。
+ *
+ * 比设计稿多做了两件事：
+ *   1. 支持按住拖动（稿子里只能点击）——收起态的意图就是"少遮挡、但要能找位置"，
+ *      只能点击等于逼用户一遍遍点。
+ *   2. 进度改用 scaleX 而非宽度：播放中它每 250ms 更新一次，改 width 会带动
+ *      重排，而 transform 只在合成层。
+ */
+const MiniProgress: React.FC<MiniProgressProps> = ({
+  isLocked,
+  position,
+  duration,
+  buffered,
+  onSeek,
+}) => {
+  const barRef = useRef<HTMLDivElement | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const percent = duration > 0 ? Math.max(0, Math.min(100, (position / duration) * 100)) : 0;
+  const bufferPercent = duration > 0 ? Math.max(0, Math.min(100, (buffered / duration) * 100)) : 0;
+
+  const applyFromClientX = useCallback((clientX: number) => {
+    const el = barRef.current;
+    if (!el || duration <= 0) return;
+    const rect = el.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    onSeek(ratio * duration);
+  }, [duration, onSeek]);
+
   return (
     <div
-      onMouseMove={onUserActivity}
-      className={`absolute inset-0 pointer-events-none z-30 flex flex-col justify-between p-6 transition-opacity duration-300 select-none ${
-        isVisible ? 'opacity-100' : 'opacity-0'
-      }`}
+      ref={barRef}
+      role="slider"
+      tabIndex={isLocked ? 0 : -1}
+      aria-label="播放进度"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(percent)}
+      aria-hidden={!isLocked}
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => {
+        if (!isLocked) return;
+        e.stopPropagation();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        setDragging(true);
+        applyFromClientX(e.clientX);
+      }}
+      onPointerMove={(e) => {
+        if (!dragging) return;
+        applyFromClientX(e.clientX);
+      }}
+      onPointerUp={(e) => {
+        if (!dragging) return;
+        try {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        } catch {
+          // 已释放则忽略
+        }
+        setDragging(false);
+      }}
+      onKeyDown={(e) => {
+        if (!isLocked) return;
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          onSeek(Math.max(0, position - 5));
+        } else if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          onSeek(Math.min(duration, position + 5));
+        }
+      }}
+      className="ttv-mini-progress"
     >
-      {/* 顶部悬浮栏：纯净统一扁平化磨砂玻璃标题岛与高画质状态胶囊 */}
-      <div className="flex items-center justify-between pointer-events-auto">
-        <div className="inline-flex items-center gap-2.5 p-1.5 bg-white/90 backdrop-blur-2xl rounded-2xl border border-white/80 shadow-fluent-hud transition-all duration-200">
-          {/* 返回按钮 */}
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              goBack();
-            }}
-            className="w-8 h-8 rounded-xl bg-white hover:bg-blue-50 text-slate-700 hover:text-blue-600 flex items-center justify-center transition-all duration-150 shadow-xs active:scale-95 cursor-pointer"
-            title="返回剧集列表"
-          >
-            <ArrowLeft className="w-4 h-4" />
-          </button>
-
-          {/* 分隔细线 */}
-          <div className="w-[1px] h-5 bg-slate-300/60" />
-
-          {/* 剧集主标题与当前集数徽章 */}
-          <div className="flex items-center gap-2 pr-3">
-            <span className="text-xs font-bold text-slate-900 tracking-tight max-w-[240px] sm:max-w-md truncate">
-              {currentSeries?.title || '精彩短剧'}
-            </span>
-            <span className="text-[11px] font-semibold text-blue-600 bg-blue-50/90 px-2.5 py-0.5 rounded-lg border border-blue-200/60 shadow-xs flex-shrink-0">
-              {episodeBadge}
-            </span>
-          </div>
-        </div>
-
-        {/* 右上角：后端报告的增强运行状态 */}
-        <div className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-white/90 backdrop-blur-2xl rounded-2xl border border-white/80 shadow-fluent-hud text-[11px] font-semibold text-slate-700 shadow-xs transition-all duration-200">
-          <Sparkles className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
-          <span>{enhancementLabel}</span>
-        </div>
-      </div>
-
-      {/* 底部悬浮操控岛 (统一纯净磨砂玻璃 Acrylic HUD) */}
-      <div
-        ref={controlsRef}
-        onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-4xl mx-auto flex flex-col gap-2 pointer-events-auto"
-      >
-        {/* 时间进度条 */}
-        <div className="px-2">
-          <ProgressBar
-            position={position}
-            duration={duration}
-            buffered={buffered}
-            onSeek={seek}
-          />
-        </div>
-
-        {/* 核心控制栏：单一平整通透的磨砂玻璃底色，消除中间空隙凹沉色差 */}
-        <div className="h-15 px-4.5 rounded-2xl bg-white/90 backdrop-blur-2xl border border-white/80 shadow-fluent-hud flex items-center justify-between gap-4">
-          {/* 左侧控制区：播放、上一集、下一集、快进快退 */}
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  playPrevEpisode();
-                }}
-                className="p-2 rounded-xl text-slate-700 hover:text-slate-950 hover:bg-slate-100/80 transition-colors fluent-press cursor-pointer"
-                title="上一集 (快捷键 [ )"
-              >
-                <SkipBack className="w-4 h-4" />
-              </button>
-
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  seekRelative(-5);
-                }}
-                className="p-2 rounded-xl text-slate-700 hover:text-slate-950 hover:bg-slate-100/80 transition-colors fluent-press cursor-pointer"
-                title="后退 5 秒 (快捷键 ←)"
-              >
-                <RotateCcw className="w-4 h-4" />
-              </button>
-
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  togglePlay();
-                }}
-                className="w-9 h-9 rounded-xl bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center shadow-md shadow-blue-500/25 transition-transform active:scale-95 mx-1 cursor-pointer"
-                title={isPlaying ? '暂停 (空格)' : '播放 (空格)'}
-              >
-                {isPlaying ? (
-                  <Pause className="w-4.5 h-4.5 fill-current" />
-                ) : (
-                  <Play className="w-4.5 h-4.5 fill-current ml-0.5" />
-                )}
-              </button>
-
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  seekRelative(5);
-                }}
-                className="p-2 rounded-xl text-slate-700 hover:text-slate-950 hover:bg-slate-100/80 transition-colors fluent-press cursor-pointer"
-                title="快进 5 秒 (快捷键 →)"
-              >
-                <RotateCw className="w-4 h-4" />
-              </button>
-
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  playNextEpisode();
-                }}
-                className="p-2 rounded-xl text-slate-700 hover:text-slate-950 hover:bg-slate-100/80 transition-colors fluent-press cursor-pointer"
-                title="下一集 (快捷键 ] )"
-              >
-                <SkipForward className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* 分隔细线 */}
-            <div className="w-[1px] h-5 bg-slate-300/60" />
-
-            {/* 时间显示 */}
-            <div className="text-xs font-mono font-semibold text-slate-700 select-none px-1">
-              <span>{formatTime(position)}</span>
-              <span className="mx-1 text-slate-400 font-normal">/</span>
-              <span>{formatTime(duration)}</span>
-            </div>
-          </div>
-
-          {/* 右侧控制区：音量、清晰度、倍速、选集、全屏 */}
-          <div className="flex items-center gap-1">
-            {/* 音量控制按钮与向上弹出的垂直滑块气泡 */}
-            <div className="relative">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setShowVolumeSlider(prev => !prev);
-                  setShowQualityMenu(false);
-                  setShowSpeedMenu(false);
-                }}
-                className="p-2 rounded-xl text-slate-700 hover:text-slate-950 hover:bg-slate-100/80 transition-colors fluent-press cursor-pointer"
-                title={isMuted ? '点击取消静音' : '音量调节'}
-              >
-                {isMuted || volume === 0 ? (
-                  <VolumeX className="w-4 h-4 text-rose-500" />
-                ) : (
-                  <Volume2 className="w-4 h-4" />
-                )}
-              </button>
-
-              {/* 严格向上弹出的垂直音量浮层 (Upward Flyout) */}
-              {showVolumeSlider && (
-                <div 
-                  onClick={(e) => e.stopPropagation()}
-                  className="absolute bottom-full mb-3 left-1/2 -translate-x-1/2 p-3 w-12 h-44 bg-white/90 backdrop-blur-2xl border border-white/80 rounded-2xl shadow-fluent-hud flex flex-col items-center justify-between z-50 animate-slide-up"
-                >
-                  <button
-                    onClick={toggleMute}
-                    className="text-[10px] font-mono font-bold text-slate-600 hover:text-blue-600 cursor-pointer"
-                    title="点击静音/恢复"
-                  >
-                    {isMuted ? '0%' : `${Math.round(volume * 100)}%`}
-                  </button>
-                  <div className="h-28 flex items-center justify-center">
-                    <input
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value={isMuted ? 0 : volume}
-                      onChange={(e) => setVolume(parseFloat(e.target.value))}
-                      className="w-24 h-1.5 -rotate-90 accent-blue-600 cursor-pointer"
-                    />
-                  </div>
-                  <Volume2 className="w-3.5 h-3.5 text-slate-400" />
-                </div>
-              )}
-            </div>
-
-            {/* 清晰度：仅当源真实提供多档时才可切换 */}
-            <div className="relative">
-              <button
-                disabled={!qualitySelectable}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (!qualitySelectable) return;
-                  setShowQualityMenu(prev => !prev);
-                  setShowSpeedMenu(false);
-                  setShowVolumeSlider(false);
-                }}
-                title={qualitySelectable ? '切换清晰度' : '当前播放源仅提供单一画质'}
-                className={`px-2.5 py-1.5 rounded-xl text-xs font-semibold transition-colors ${
-                  qualitySelectable
-                    ? 'text-slate-700 hover:text-blue-600 hover:bg-slate-100/80 cursor-pointer'
-                    : 'text-slate-400 cursor-default'
-                }`}
-              >
-                {qualityOptions.find(q => q.value === currentQuality)?.label.split(' ')[0]
-                  || qualityOptions[0]?.label.split(' ')[0]
-                  || '自动'}
-              </button>
-
-              {showQualityMenu && qualitySelectable && (
-                <div 
-                  onClick={(e) => e.stopPropagation()}
-                  className="absolute bottom-full mb-3 left-1/2 -translate-x-1/2 p-1.5 w-28 bg-white/90 backdrop-blur-2xl border border-white/80 rounded-2xl shadow-fluent-hud flex flex-col gap-1 z-50 animate-slide-up"
-                >
-                  {qualityOptions.map((opt, index) => (
-                    <button
-                      key={`${opt.value}-${index}`}
-                      onClick={() => {
-                        setQuality(opt.value);
-                        setShowQualityMenu(false);
-                      }}
-                      className={`px-3 py-1.5 rounded-xl text-xs text-left font-medium transition-colors cursor-pointer ${
-                        currentQuality === opt.value
-                          ? 'bg-blue-600 text-white shadow-xs font-semibold'
-                          : 'text-slate-700 hover:bg-slate-100/80'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* 倍速切换（严格向上弹出） */}
-            <div className="relative">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setShowSpeedMenu(prev => !prev);
-                  setShowQualityMenu(false);
-                  setShowVolumeSlider(false);
-                }}
-                className="px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-700 hover:text-blue-600 hover:bg-slate-100/80 transition-colors cursor-pointer"
-              >
-                {playbackRate === 1 ? '倍速' : `${playbackRate}x`}
-              </button>
-
-              {showSpeedMenu && (
-                <div 
-                  onClick={(e) => e.stopPropagation()}
-                  className="absolute bottom-full mb-3 left-1/2 -translate-x-1/2 p-1.5 w-24 bg-white/90 backdrop-blur-2xl border border-white/80 rounded-2xl shadow-fluent-hud flex flex-col gap-1 z-50 animate-slide-up"
-                >
-                  {speedOptions.map((rate) => (
-                    <button
-                      key={rate}
-                      onClick={() => {
-                        setPlaybackRate(rate);
-                        setShowSpeedMenu(false);
-                      }}
-                      className={`px-3 py-1.5 rounded-xl text-xs text-left font-medium transition-colors cursor-pointer ${
-                        playbackRate === rate
-                          ? 'bg-blue-600 text-white shadow-xs font-semibold'
-                          : 'text-slate-700 hover:bg-slate-100/80'
-                      }`}
-                    >
-                      {rate === 1.0 ? '1.0x 正常' : `${rate}x`}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* 选集弹窗按钮（点击弹出居中选集窗口） */}
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                toggleSideDrawer();
-              }}
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-700 hover:text-blue-600 hover:bg-slate-100/80 transition-colors cursor-pointer"
-              title="打开选集弹窗窗口"
-            >
-              <Layers className="w-3.5 h-3.5" />
-              <span>选集</span>
-            </button>
-
-            {/* 全屏按钮 */}
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggleFullscreen();
-              }}
-              className="p-2 rounded-xl text-slate-700 hover:text-slate-950 hover:bg-slate-100/80 transition-colors fluent-press cursor-pointer"
-              title={isFullscreen ? '退出全屏 (F / Esc)' : '进入全屏 (F)'}
-            >
-              {isFullscreen ? (
-                <Minimize className="w-4 h-4" />
-              ) : (
-                <Maximize className="w-4 h-4" />
-              )}
-            </button>
-          </div>
-        </div>
-      </div>
+      <div className="ttv-mini-buffer" style={{ width: `${bufferPercent}%` }} />
+      <div className="ttv-mini-played" style={{ transform: `scaleX(${percent / 100})` }} />
     </div>
   );
 };
