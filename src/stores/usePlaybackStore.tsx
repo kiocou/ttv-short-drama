@@ -1638,11 +1638,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         && Date.now() - committed.at >= AUTO_ADVANCE_SETTLE_MS,
       );
 
-      // 距离结束 8 秒且还有下一集时触发连播倒计时（尊重用户的自动连播开关）。
+      // 剩余时间等于读秒时长时触发连播倒计时（尊重用户的自动连播开关）。
+      //
+      // 触发点必须与读秒时长**动态对齐**：旧实现固定在剩 8 秒武装、读 5 秒，
+      // 于是每集最后 3 秒被跳过（8 - 5 = 3）——用户永远看不到结尾几秒。
+      // 现在剩余时间一进入读秒窗口（剩 countdownSeconds 秒）就武装，读完秒
+      // 恰好播完。窗口下限 3 秒：再短倒计时数字看不清；上限 8 秒兜底
+      // countdownSeconds 配置异常的情况。
+      const countdownWindow = Math.max(3, Math.min(8, ctx.countdownSeconds || 5));
       if (playerCarriesCurrentEpisode
           && sourceSettled
           && countdownArmedRef.current !== armedKey
-          && dur > 20 && dur - cur <= 8 && !ctx.countdownActive && ctx.autoNext
+          && dur > 20 && dur - cur <= countdownWindow && dur - cur > 0 && !ctx.countdownActive && ctx.autoNext
           && ctx.currentSeries && ctx.currentEpisode) {
         const curIdx = ctx.currentSeries.episodes.findIndex(e => e.id === ctx.currentEpisode!.id);
         if (curIdx >= 0 && curIdx < ctx.currentSeries.episodes.length - 1) {
@@ -1650,7 +1657,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           // 记下这次倒计时是"为哪一集"启动的：读秒期间用户可能手动切集，
           // 那时 nextEpisode 已经是相对旧集算出来的，绝不能照跳。
           const armedEpisodeId = ctx.currentEpisode.id;
-          const total = Math.max(3, Math.min(15, ctx.countdownSeconds || 5));
+          // 读秒时长与剩余时间取小者：剩余比配置短（比如分片 MP4 的时长
+          // 估计偏大）时，读完秒即播完，不能让读秒超过视频本身。
+          const total = Math.max(3, Math.min(
+            Math.max(3, Math.min(15, ctx.countdownSeconds || 5)),
+            Math.ceil(dur - cur),
+          ));
           countdownArmedRef.current = armedKey;
           setCountdown({ active: true, remaining: total, nextEpisode: nextEp, episodeId: armedEpisodeId });
 

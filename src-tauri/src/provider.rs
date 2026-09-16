@@ -634,7 +634,16 @@ fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
                 !value.is_empty() && !value.chars().all(|character| character.is_ascii_digit())
             })
             .collect::<Vec<_>>();
-        let episode_count = article.select(&episode_selector).count() as u32;
+        // 集数优先从卡片文案解析（"全 N 集"/"更新至 N 集"），数 /player/
+        // 链接只做兜底——榜单页每张卡片只渲染前 4 集入口（其余折叠），
+        // 直接 count 会把展示层约定误报成"已公开 4 集"（实测全部卡片都是 4）。
+        let article_text = article.text().collect::<Vec<_>>().join(" ");
+        let episode_re = Regex::new(r"(?:全|更新至)\s*(\d+)\s*集").expect("comic episode regex");
+        let episode_count = episode_re
+            .captures(&article_text)
+            .and_then(|captures| captures.get(1))
+            .and_then(|value| value.as_str().parse::<u32>().ok())
+            .unwrap_or_else(|| article.select(&episode_selector).count() as u32);
         let brief = article
             .select(&description_selector)
             .next()
