@@ -1,0 +1,1157 @@
+/* ==========================================================================
+   TTV Short Drama · 播放器晶体材质系统（方案 D「温润亚克力 2.0」）
+   --------------------------------------------------------------------------
+   设计语言：15% 高透浅白磨砂玻璃 + 22px 高斯模糊 + 1:1 贴合暗衬。
+
+   关于暗衬：白色文字直接压在明亮视频画面上会糊成一片（"泛光"）。这里把
+   暗衬放进 background-color、白玻璃放进 background-image，天然形成
+   「模糊画面 → 暗衬 → 玻璃 → 文字」的正确层序，不需要伪元素 + z-index:-1，
+   既少一个合成层，也不依赖父级是否创建堆叠上下文。
+
+   命名：crystal-* 与设计稿一一对应，便于与 design-proposals 比对；
+   纯播放器结构件用 ttv-* 前缀，避免影响其余视图。
+   ========================================================================== */
+
+:root {
+  /* 晶体材质参数 */
+  --crystal-opacity: 0.15;
+  --crystal-blur: 22px;
+  --crystal-scrim: rgba(0, 0, 0, 0.40);
+  --crystal-scrim-deep: rgba(15, 23, 42, 0.55);
+  --crystal-border: rgba(255, 255, 255, 0.18);
+
+  /* Windows 11 原生 Fluent 配色 */
+  --fluent-blue: #0078d4;
+  --fluent-blue-hover: #005bb5;
+  --fluent-sky: #38bdf8;
+
+  /* 平缓动效曲线 */
+  --curve-fluent: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* 滚动数字单字形高度（JS 侧按同一数值换算位移） */
+  --roller-h: 18px;
+}
+
+/* ==========================================================================
+   1. 晶体材质
+   ========================================================================== */
+
+.crystal-surface {
+  position: relative;
+  background-color: var(--crystal-scrim);
+  background-image: linear-gradient(
+    rgba(255, 255, 255, var(--crystal-opacity)),
+    rgba(255, 255, 255, var(--crystal-opacity))
+  );
+  backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--crystal-blur)) saturate(180%);
+  border: 1px solid var(--crystal-border);
+  box-shadow: 0 8px 30px -4px rgba(0, 0, 0, 0.18);
+}
+
+/* 大面板（选集巨幕）用的更厚実材质：更深的景深暗衬 + 更大的模糊半径 */
+.crystal-surface-deep {
+  background-color: var(--crystal-scrim-deep);
+  background-image: linear-gradient(
+    rgba(255, 255, 255, var(--crystal-opacity)),
+    rgba(255, 255, 255, var(--crystal-opacity))
+  );
+  backdrop-filter: blur(32px) saturate(190%);
+  -webkit-backdrop-filter: blur(32px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow:
+    0 25px 60px -10px rgba(0, 0, 0, 0.55),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+/* ==========================================================================
+   2. 播放器根容器与状态
+   ========================================================================== */
+
+.ttv-player {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+}
+
+/* HUD 层：顶部标题岛 + 底部操控坞 */
+.ttv-hud {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 26px;
+  pointer-events: none;
+  transition: opacity 0.3s ease, transform 0.3s var(--curve-fluent);
+}
+
+/*
+  自动隐藏态（播放中静默 2.5s 后）：整层淡出。
+  该类由 PlayerControls 按 isVisible 直接挂在 HUD 元素上——
+  此前 CSS 里没有这条规则，淡出从未生效。
+*/
+.ttv-hud.is-hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.985);
+}
+
+/* 控制器收起（锁定）态：整层淡出并轻微内缩，画面完全让给视频 */
+.ttv-hud.is-locked,
+.ttv-player.is-locked .ttv-hud {
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.985);
+}
+
+.ttv-player.is-locked .ttv-top-bar,
+.ttv-hud.is-hidden .ttv-top-bar {
+  transform: translateY(-16px);
+}
+
+.ttv-player.is-locked .ttv-dock,
+.ttv-hud.is-hidden .ttv-dock {
+  transform: translateY(20px);
+}
+
+/* ==========================================================================
+   3. 右侧居中小锁（展开 / 收起控制器）
+   ========================================================================== */
+
+.ttv-lock {
+  position: absolute;
+  right: 22px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 45;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.25s var(--curve-fluent),
+    transform 0.25s var(--curve-fluent),
+    right 0.35s var(--curve-fluent),
+    background-color 0.2s,
+    border-color 0.2s,
+    box-shadow 0.2s,
+    color 0.2s;
+}
+
+/* 仅在控制器可见或已收起时露出（播放中静默时与小锁一并隐去，保持沉浸） */
+.ttv-lock.is-shown {
+  opacity: 0.92;
+  pointer-events: auto;
+}
+
+.ttv-lock:hover {
+  opacity: 1;
+  transform: translateY(-50%) scale(1.1);
+  background-color: rgba(255, 255, 255, 0.26);
+  background-image: none;
+  color: var(--fluent-sky);
+  box-shadow: 0 8px 24px rgba(0, 120, 212, 0.35);
+}
+
+.ttv-lock:active {
+  transform: translateY(-50%) scale(0.95);
+}
+
+.ttv-lock svg {
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+}
+
+/* 收起态高亮 */
+.ttv-lock.is-locked {
+  background-color: var(--fluent-blue);
+  background-image: none;
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #fff;
+  box-shadow: 0 0 20px rgba(0, 120, 212, 0.65);
+  opacity: 0.95;
+}
+
+.ttv-lock.is-locked:hover {
+  background-color: var(--fluent-blue-hover);
+  transform: translateY(-50%) scale(1.12);
+}
+
+/*
+  收起后小锁自动贴边半隐藏：只露出小半个弧面与图标，鼠标靠近即平滑弹出。
+  ::before 把悬停热区向左、上下各扩一圈，避免要精确瞄准那半个圆点。
+*/
+.ttv-player.is-locked .ttv-lock {
+  right: 0;
+  transform: translate(26%, -50%);
+  opacity: 0.88;
+  box-shadow: -3px 0 16px rgba(0, 120, 212, 0.45);
+}
+
+.ttv-player.is-locked .ttv-lock::before {
+  content: '';
+  position: absolute;
+  top: -14px;
+  bottom: -14px;
+  left: -32px;
+  right: 0;
+}
+
+.ttv-player.is-locked .ttv-lock:hover,
+.ttv-player.is-locked .ttv-lock:focus-visible {
+  transform: translate(-16px, -50%) scale(1.08);
+  opacity: 1;
+  box-shadow: 0 0 24px rgba(0, 120, 212, 0.7);
+}
+
+/* ==========================================================================
+   4. 收起态的贴边迷你进度条
+   ========================================================================== */
+
+.ttv-mini-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3.5px;
+  background: rgba(255, 255, 255, 0.22);
+  z-index: 35;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(100%);
+  pointer-events: none;
+  touch-action: none;
+  transition:
+    opacity 0.28s var(--curve-fluent),
+    transform 0.28s var(--curve-fluent),
+    height 0.15s ease;
+}
+
+.ttv-player.is-locked .ttv-mini-progress {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.ttv-player.is-locked .ttv-mini-progress:hover {
+  height: 6px;
+}
+
+.ttv-mini-buffer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(255, 255, 255, 0.38);
+  transition: width 0.2s linear;
+}
+
+.ttv-mini-played {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 100%;
+  background: var(--fluent-blue);
+  box-shadow: 0 0 10px rgba(0, 120, 212, 0.8);
+  /* 用 scaleX 而非 width：进度每帧更新时避免触发布局重排 */
+  transform-origin: left center;
+  will-change: transform;
+}
+
+/* ==========================================================================
+   5. 顶部标题岛
+   ========================================================================== */
+
+.ttv-top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  pointer-events: auto;
+  transition: transform 0.3s var(--curve-fluent);
+}
+
+.title-crystal-island {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 6px 8px;
+  border-radius: 14px;
+  min-width: 0;
+}
+
+.crystal-divider {
+  width: 1px;
+  height: 16px;
+  background: rgba(255, 255, 255, 0.22);
+  flex-shrink: 0;
+}
+
+.drama-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: -0.1px;
+  max-width: 260px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.episode-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fluent-sky);
+  background: rgba(0, 120, 212, 0.25);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  padding: 2px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ==========================================================================
+   6. 底部操控坞（统一大卡片：进度槽与控件同处一张晶体卡片内）
+   ========================================================================== */
+
+.ttv-dock {
+  width: 100%;
+  max-width: 880px;
+  margin: 0 auto;
+  pointer-events: auto;
+  transition: transform 0.3s var(--curve-fluent);
+}
+
+.mica-crystal-card {
+  padding: 8px 16px;
+  border-radius: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.controls-deck-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+}
+
+/* ==========================================================================
+   7. 内嵌式进度槽
+   ========================================================================== */
+
+.ttv-progress {
+  position: relative;
+  height: 16px;
+  padding: 0 2px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.progress-track {
+  position: relative;
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 9999px;
+  transition: height 0.15s ease;
+}
+
+.ttv-progress:hover .progress-track,
+.ttv-progress.is-scrubbing .progress-track {
+  height: 6px;
+}
+
+.progress-buffer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(255, 255, 255, 0.38);
+  border-radius: 9999px;
+}
+
+.progress-played {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--fluent-blue);
+  border-radius: 9999px;
+  transform-origin: left center;
+  will-change: transform;
+}
+
+.progress-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border: 2px solid var(--fluent-blue);
+  border-radius: 50%;
+  box-shadow: 0 0 6px rgba(0, 120, 212, 0.5);
+  transform: translate(-50%, -50%) scale(0);
+  transition: transform 0.15s ease;
+  pointer-events: none;
+}
+
+.ttv-progress:hover .progress-thumb,
+.ttv-progress.is-scrubbing .progress-thumb {
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* 悬停时间预览 */
+.ttv-progress-hint {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 7px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   8. 按钮族
+   ========================================================================== */
+
+.btn-fluent-action {
+  background: transparent;
+  border: none;
+  padding: 7px;
+  border-radius: 10px;
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.btn-fluent-action:hover {
+  color: var(--fluent-sky);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.btn-fluent-action:active {
+  transform: scale(0.96);
+}
+
+.btn-fluent-action:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.btn-fluent-action:disabled:hover {
+  color: #fff;
+  background: transparent;
+}
+
+/* 播放主键：纯蓝正圆 */
+.btn-play-hero {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--fluent-blue);
+  border: none;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 6px rgba(0, 120, 212, 0.25);
+  cursor: pointer;
+  margin: 0 2px;
+  transition: background-color 0.15s, transform 0.12s ease, box-shadow 0.15s;
+}
+
+.btn-play-hero:hover {
+  background: var(--fluent-blue-hover);
+  transform: scale(1.04);
+  box-shadow: 0 3px 8px rgba(0, 120, 212, 0.3);
+}
+
+.btn-play-hero:active {
+  transform: scale(0.96);
+}
+
+/* 右侧文字按键（清晰度 / 倍速 / 选集 / 增强状态） */
+.btn-text-action {
+  background: transparent;
+  border: none;
+  padding: 6px 11px;
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.btn-text-action:hover {
+  color: var(--fluent-sky);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.btn-text-action:disabled {
+  color: rgba(255, 255, 255, 0.38);
+  cursor: default;
+}
+
+.btn-text-action:disabled:hover {
+  background: transparent;
+}
+
+.btn-text-action.is-on {
+  color: var(--fluent-sky);
+  background: rgba(56, 189, 248, 0.18);
+}
+
+.svg-icon {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+
+/* ==========================================================================
+   9. 滚动数字读数（ReactBits 风格机械滚轮）
+   ========================================================================== */
+
+.ttv-time {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 2px;
+  font-family: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  flex-shrink: 0;
+}
+
+.rolling-counter {
+  display: inline-flex;
+  align-items: center;
+  height: var(--roller-h);
+  line-height: var(--roller-h);
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.rolling-counter.is-duration {
+  color: rgba(255, 255, 255, 0.72);
+  font-weight: 500;
+}
+
+.roller-col {
+  position: relative;
+  display: inline-block;
+  width: 8.5px;
+  height: var(--roller-h);
+  overflow: hidden;
+  vertical-align: middle;
+  /* 上下羽化遮罩：数字自虚空滑入 / 滑出 */
+  mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 22%, #000 78%, transparent 100%);
+}
+
+.roller-col.is-pct {
+  width: 7.5px;
+}
+
+.roller-list {
+  display: flex;
+  flex-direction: column;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  transition: transform 0.38s var(--curve-fluent);
+  will-change: transform;
+}
+
+.roller-list span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--roller-h);
+  line-height: var(--roller-h);
+  width: 100%;
+  font-size: 13px;
+  font-weight: 600;
+  color: inherit;
+}
+
+.roller-col.is-pct .roller-list span {
+  font-size: 11px;
+}
+
+.roller-colon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 5px;
+  height: var(--roller-h);
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 13px;
+  margin: 0 1px;
+}
+
+.roller-suffix {
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 1px;
+  color: inherit;
+}
+
+.time-sep {
+  margin: 0 6px;
+  color: rgba(255, 255, 255, 0.35);
+  font-weight: 400;
+  font-size: 12px;
+}
+
+/* ==========================================================================
+   10. 上浮气泡（清晰度 / 倍速菜单、垂直音量柱）
+   ========================================================================== */
+
+.crystal-flyout {
+  position: absolute;
+  bottom: calc(100% + 14px);
+  left: 50%;
+  transform: translateX(-50%) translateY(8px) scale(0.96);
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 50;
+  min-width: 112px;
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.crystal-flyout.open {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+
+.crystal-menu-item {
+  background: transparent;
+  border: none;
+  padding: 7px 12px;
+  border-radius: 9px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  color: rgba(255, 255, 255, 0.88);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.crystal-menu-item:hover {
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+}
+
+.crystal-menu-item.active {
+  background: var(--fluent-blue);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(0, 120, 212, 0.4);
+}
+
+/* 垂直音量柱 */
+.crystal-volume-bubble {
+  position: absolute;
+  bottom: calc(100% + 14px);
+  left: 50%;
+  transform: translateX(-50%) translateY(8px) scale(0.96);
+  width: 46px;
+  height: 156px;
+  border-radius: 14px;
+  padding: 10px 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 50;
+  overflow: hidden;
+}
+
+.crystal-volume-bubble.open {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+
+.vol-track-vertical {
+  position: relative;
+  width: 24px;
+  height: 94px;
+  margin: 6px 0;
+  display: flex;
+  justify-content: center;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.vol-track-bg {
+  position: absolute;
+  width: 4px;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 9999px;
+}
+
+.vol-track-fill {
+  position: absolute;
+  bottom: 0;
+  width: 4px;
+  background: var(--fluent-blue);
+  border-radius: 9999px;
+  /* 从底部向上生长：固定 100% 高度用缩放表达，避免逐帧改 height */
+  height: 100%;
+  transform-origin: center bottom;
+  will-change: transform;
+}
+
+.vol-track-thumb {
+  position: absolute;
+  left: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--fluent-blue);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  transform: translate(-50%, 50%);
+  pointer-events: none;
+  transition: transform 0.12s ease;
+}
+
+.vol-track-vertical:hover .vol-track-thumb {
+  transform: translate(-50%, 50%) scale(1.15);
+}
+
+.vol-mute-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: 6px;
+  color: rgba(255, 255, 255, 0.85);
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.vol-mute-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  color: var(--fluent-sky);
+}
+
+/* ==========================================================================
+   11. 下一集连播倒计时卡片
+   ========================================================================== */
+
+.ttv-countdown {
+  position: absolute;
+  bottom: 96px;
+  right: 28px;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px 8px 12px;
+  border-radius: 18px;
+  color: #fff;
+  pointer-events: auto;
+  transition:
+    opacity 0.3s var(--curve-fluent),
+    transform 0.3s var(--curve-fluent),
+    bottom 0.3s var(--curve-fluent);
+}
+
+.ttv-countdown.is-hidden {
+  opacity: 0;
+  transform: translateY(16px) scale(0.95);
+  pointer-events: none;
+}
+
+/* 控制器收起时下沉到贴角位置，避开贴边进度条 */
+.ttv-player.is-locked .ttv-countdown {
+  bottom: 24px;
+}
+
+.countdown-ring-wrap {
+  position: relative;
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.countdown-svg {
+  width: 38px;
+  height: 38px;
+  transform: rotate(-90deg);
+  overflow: visible;
+}
+
+.countdown-ring-bg {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.22);
+  stroke-width: 2.8;
+}
+
+.countdown-ring-meter {
+  fill: none;
+  stroke: var(--fluent-sky);
+  stroke-width: 2.8;
+  stroke-linecap: round;
+  stroke-dasharray: 91.1;
+  transition: stroke-dashoffset 0.95s linear;
+}
+
+.countdown-num {
+  position: absolute;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.2px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+.countdown-info-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 170px;
+  min-width: 0;
+}
+
+.countdown-tag {
+  font-size: 10px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.78);
+  letter-spacing: 0.3px;
+}
+
+.countdown-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn-countdown-play {
+  background: var(--fluent-blue);
+  border: none;
+  color: #fff;
+  padding: 6px 14px;
+  border-radius: 9999px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  box-shadow: 0 2px 10px rgba(0, 120, 212, 0.35);
+  transition: background-color 0.15s, transform 0.15s, box-shadow 0.15s;
+  flex-shrink: 0;
+}
+
+.btn-countdown-play:hover {
+  background: var(--fluent-blue-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(0, 120, 212, 0.5);
+}
+
+.btn-countdown-play:active {
+  transform: scale(0.96);
+}
+
+.btn-countdown-cancel {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s, transform 0.15s;
+  flex-shrink: 0;
+}
+
+.btn-countdown-cancel:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.btn-countdown-cancel:active {
+  transform: scale(0.92);
+}
+
+/* ==========================================================================
+   12. 选集巨幕
+   ========================================================================== */
+
+.ttv-drawer-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 26px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.28s ease;
+}
+
+.ttv-drawer-overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.crystal-drawer-box {
+  position: relative;
+  width: 100%;
+  max-width: 820px;
+  max-height: 84vh;
+  border-radius: 26px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transform: scale(0.96) translateY(12px);
+  transition: transform 0.28s var(--curve-fluent);
+}
+
+.ttv-drawer-overlay.open .crystal-drawer-box {
+  transform: scale(1) translateY(0);
+}
+
+.drawer-top-header {
+  height: 58px;
+  padding: 0 22px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  flex-shrink: 0;
+}
+
+.drawer-ep-grid {
+  padding: 20px 24px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(68px, 1fr));
+  gap: 10px;
+  overflow-y: auto;
+  max-height: 56vh;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
+/* 播放器深色场景下滚动条要比全局浅色版本更亮，否则看不见 */
+.ttv-player ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.ttv-player ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.ep-card-item {
+  position: relative;
+  height: 44px;
+  border-radius: 12px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.88);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+  transition: background-color 0.15s var(--curve-fluent),
+    border-color 0.15s var(--curve-fluent),
+    color 0.15s var(--curve-fluent),
+    transform 0.15s var(--curve-fluent),
+    box-shadow 0.15s var(--curve-fluent);
+}
+
+.ep-card-item:hover {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(56, 189, 248, 0.6);
+  color: var(--fluent-sky);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.ep-card-item.active {
+  background: var(--fluent-blue);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(0, 120, 212, 0.45);
+}
+
+/* 深色播放器内的输入框（选集搜索） */
+.ttv-field {
+  height: 30px;
+  font-family: inherit;
+  font-size: 12px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9px;
+  outline: none;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.ttv-field::placeholder {
+  color: rgba(255, 255, 255, 0.42);
+}
+
+.ttv-field:focus {
+  border-color: rgba(56, 189, 248, 0.65);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* 分组药丸（1-50 / 51-100 ...） */
+.ttv-chips {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.ttv-chip {
+  padding: 4px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.75);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.ttv-chip:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.ttv-chip.is-active {
+  background: var(--fluent-blue);
+  color: #fff;
+}
+
+/* ==========================================================================
+   13. 焦点可见性与动效偏好
+   ========================================================================== */
+
+.ttv-player button:focus-visible {
+  outline: 2px solid var(--fluent-sky);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ttv-hud,
+  .ttv-lock,
+  .ttv-mini-progress,
+  .ttv-countdown,
+  .crystal-flyout,
+  .crystal-volume-bubble,
+  .crystal-drawer-box,
+  .ttv-drawer-overlay,
+  .roller-list,
+  .ep-card-item,
+  .countdown-ring-meter {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ==========================================================================
+   14. 窄窗口适配
+   ========================================================================== */
+
+@media (max-width: 720px) {
+  .ttv-hud {
+    padding: 16px;
+  }
+
+  .drama-title {
+    max-width: 150px;
+  }
+
+  .ttv-dock {
+    max-width: 100%;
+  }
+
+  .ttv-time {
+    display: none;
+  }
+
+  .ttv-countdown {
+    right: 16px;
+    bottom: 88px;
+  }
+}
