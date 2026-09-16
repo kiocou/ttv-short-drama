@@ -74,7 +74,10 @@ export const ExploreView: React.FC = () => {
           void loadMore('');
         }
       },
-      { root, rootMargin: '640px 0px', threshold: 0.01 },
+      // rootMargin 从 640px 放宽到 1200px：首屏一页只有 24 条，640px 的
+      // 预加载窗口在卡片较高的布局里不够——用户中速滚动就会在请求回来前
+      // 滚到底（实测表现为"滚到底才开始加载"）。1200px 约等于提前两屏。
+      { root, rootMargin: '1200px 0px', threshold: 0.01 },
     );
     observer.observe(sentinel);
     return () => observer.disconnect();

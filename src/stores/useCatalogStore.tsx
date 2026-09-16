@@ -55,6 +55,14 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     hasMore: boolean;
     nextCursor?: string;
   }>>({});
+  // 预取的第 2 页缓存（键 = 主缓存键），loadMore 时优先挪用。
+  const nextPageCacheRef = useRef<Record<string, {
+    items: SeriesItem[];
+    hasMore: boolean;
+    nextCursor?: string;
+  }>>({});
+  // 预取去重：同一频道+筛选组合只预取一次。
+  const prefetchPage2Ref = useRef<Record<string, boolean>>({});
   const inflightRef = useRef<Record<string, ReturnType<typeof ipcService.catalog.list>>>({});
   const requestIdRef = useRef(0);
   // 已出现过的剧集 id。用于判定"本次翻页是否真的带来了新内容"：
@@ -179,6 +187,45 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     };
   }, [requestCatalog]);
 
+  // 预取当前频道第 2 页：首屏只有 1 页（24 条），滚动到底才发请求会让
+  // 用户中速滚动就在加载位空等。开页后请求已在途，滚到两屏内直接命中。
+  // 与 sentinel 观察器互不冲突：loadMore 对同一页有 inflight 去重。
+  useEffect(() => {
+    let cancelled = false;
+    const cacheKey = `${channel}_${category}_${audience}_${sort}_`;
+    const page2Key = `${cacheKey}|p2`;
+    if (page2Key in prefetchPage2Ref.current) return;
+    if (!cacheRef.current[cacheKey] || !cacheRef.current[cacheKey].hasMore) return;
+    prefetchPage2Ref.current[page2Key] = true;
+    const filter: CatalogFilter = {
+      channel,
+      category,
+      audience,
+      sort,
+      keyword: undefined,
+      page: 2,
+      pageSize: 30,
+      cursor: cacheRef.current[cacheKey].nextCursor,
+    };
+    void ipcService.catalog.list(filter).then(res => {
+      if (cancelled) return;
+      const key = `${channel}_${category}_${audience}_${sort}_`;
+      // 滚动加载还没消费过这一页（cacheKey 仍是第 1 页）时，先缓存到
+      // 专用槽；loadMore 走正常链路时若发现槽里有数据就直接挪用。
+      if (cacheRef.current[key] && !nextPageCacheRef.current[key]) {
+        nextPageCacheRef.current[key] = {
+          items: res.items,
+          hasMore: res.hasMore,
+          nextCursor: res.nextCursor,
+        };
+      }
+    }).catch(() => {
+      // 预取失败静默：滚动加载照常走网络。
+      delete prefetchPage2Ref.current[page2Key];
+    });
+    return () => { cancelled = true; };
+  }, [channel, category, audience, sort, requestCatalog]);
+
   const setChannel = (newChannel: ChannelType) => {
     setChannelState(newChannel);
     setCategoryState('全部');
@@ -200,6 +247,28 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     setError(null);
     const requestId = requestIdRef.current;
     try {
+      // 预取的第 2 页已就位就直接挪用：网络往返已经完成，这里只剩合并，
+      // 用户滚到加载位时卡片立即出现。
+      const slotKey = `${channel}_${category}_${audience}_${sort}_`;
+      const prefetched = kw ? undefined : nextPageCacheRef.current[slotKey];
+      if (prefetched) {
+        delete nextPageCacheRef.current[slotKey];
+        const fresh: SeriesItem[] = [];
+        for (const item of prefetched.items) {
+          if (seenIdsRef.current.has(item.id)) continue;
+          seenIdsRef.current.add(item.id);
+          fresh.push(item);
+        }
+        if (fresh.length === 0) {
+          setHasMore(false);
+          return;
+        }
+        setItems(prev => [...prev, ...fresh]);
+        setNextPage(nextPage + 1);
+        setNextCursor(prefetched.nextCursor);
+        setHasMore(prefetched.hasMore);
+        return;
+      }
       const res = await ipcService.catalog.list({
         channel,
         category,
