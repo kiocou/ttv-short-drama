@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { useAppStore } from '../../stores/useAppStore';
+import { useRtxVsrStore } from '../../stores/useRtxVsrStore';
 import { isTauriEnvironment } from '../../services/ipc';
 import { enterFullscreen, leaveFullscreen, queryFullscreen } from '../../services/windowFx';
 import { PlayerControls } from './PlayerControls';
@@ -60,14 +61,23 @@ export const VideoSurface: React.FC = () => {
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
   const { isFullscreen, setIsFullscreen, showToast } = useAppStore();
 
+  // RTX VSR 的生效条件里有两项只有页面上量得到：当前画面是放大还是缩小、
+  // 视频源真实分辨率。这里把它们持续上报给 VSR store，用于判定超分是否
+  // 真的具备介入条件（缩小显示时 NVIDIA 驱动不做超分）。
+  const { reportSurface } = useRtxVsrStore();
+
   const [isControlsVisible, setIsControlsVisible] = useState(true);
+  // 控制器锁定（用户主动收起）状态；Esc 可解锁（PlayerControls 内部监听）。
+  const [isLocked, setIsLocked] = useState(false);
   // 平滑倒计时读数：worker 每 10% 才上报一次，直接用上报值会几秒才跳一下。
   const [etaTick, setEtaTick] = useState<number | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
 
-  // 控制条自动隐藏定时器 (2.5s)
+  // 控制条自动隐藏定时器 (2.5s)。锁定时保持可见（HUD 隐藏但锁与迷你条接管），
+  // 这里不需要特判——锁定态 HUD 是否显示由 PlayerControls 内部决定。
   const handleUserActivity = useCallback(() => {
     setIsControlsVisible(true);
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
@@ -78,12 +88,62 @@ export const VideoSurface: React.FC = () => {
     }
   }, [isPlaying]);
 
+  /**
+   * 指针移动 → 自动隐藏的统一入口。
+   *
+   * 不把 handleUserActivity 直接挂 mousemove：播放中进度条与时间读数在光标
+   * 下方持续动画时，Chromium 会派发合成 mousemove，反复重置 2.5s 定时器，
+   * 表现为"控制栏永不收起"。这里按真实位移过滤——不足 4px 的合成事件忽略。
+   */
+  const handlePointerMove = useCallback((e: React.MouseEvent) => {
+    const last = lastPointerRef.current;
+    if (last) {
+      const dx = e.clientX - last.x;
+      const dy = e.clientY - last.y;
+      if (dx * dx + dy * dy < 16) return;
+    }
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
+    handleUserActivity();
+  }, [handleUserActivity]);
+
   useEffect(() => {
     handleUserActivity();
     return () => {
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     };
   }, [isPlaying, handleUserActivity]);
+
+  /**
+   * 上报画面几何读数，供 RTX VSR 判断超分是否具备介入条件。
+   *
+   * 为什么必须在页面上量：`<video>` 以 `object-contain` 呈现，元素框尺寸
+   * 与真实画面尺寸并不相等（竖屏短剧在横屏窗口里两侧留黑边），而超分只关心
+   * **真实画面**的缩放倍数。元数据未到达时 `videoWidth/videoHeight` 为 0，
+   * 此时上报 0 表示"未知"，不会被误判成"未放大"。
+   *
+   * 监听三处：`loadedmetadata`/`loadeddata` 拿到真实分辨率，`ResizeObserver`
+   * 覆盖窗口缩放、进出全屏、拖拽窗口——这些只改变元素框，不触发 video 自身事件。
+   */
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const report = () => {
+      const rect = video.getBoundingClientRect();
+      reportSurface(rect.width, rect.height, video.videoWidth, video.videoHeight);
+    };
+
+    report();
+    video.addEventListener('loadedmetadata', report);
+    video.addEventListener('loadeddata', report);
+    const observer = new ResizeObserver(report);
+    observer.observe(video);
+    return () => {
+      video.removeEventListener('loadedmetadata', report);
+      video.removeEventListener('loadeddata', report);
+      observer.disconnect();
+    };
+  }, [videoRef, reportSurface]);
 
   /**
    * 全屏切换（**只使用原生窗口全屏**）。
@@ -291,7 +351,7 @@ export const VideoSurface: React.FC = () => {
   return (
     <div
       ref={containerRef}
-      onMouseMove={handleUserActivity}
+      onMouseMove={handlePointerMove}
       className="relative w-full h-full bg-black flex items-center justify-center overflow-hidden select-none"
     >
       {/* 核心 HTML5 视频渲染宿主 */}
@@ -446,9 +506,12 @@ export const VideoSurface: React.FC = () => {
       {/* 悬浮云母控制层 HUD */}
       <PlayerControls
         isVisible={isControlsVisible}
+        isLocked={isLocked}
+        onToggleLock={() => setIsLocked((value) => !value)}
         isFullscreen={isFullscreen}
         onToggleFullscreen={toggleFullscreen}
         onUserActivity={handleUserActivity}
+        onPointerMove={handlePointerMove}
       />
 
       {/* 连播倒计时悬浮窗 */}
