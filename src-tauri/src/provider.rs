@@ -22,6 +22,12 @@ impl DramaProvider {
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36")
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(20))
+            // 连接池保活：目录/详情每次翻页与换剧都是同一主机的新请求，
+            // 默认池空闲 90s 就关连接，再次请求要重新 TLS 握手（1-2 RTT）。
+            // 拉长空闲窗口让翻页/换剧复用已建立的连接，首字节快一截。
+            .pool_idle_timeout(Duration::from_secs(600))
+            .pool_max_idle_per_host(4)
+            .tcp_nodelay(true)
             .build()
             .map_err(|error| error.to_string())?;
         Ok(Self { client })

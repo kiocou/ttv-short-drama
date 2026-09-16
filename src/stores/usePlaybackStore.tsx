@@ -881,7 +881,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
     });
     // 交给泵消费。泵会在消费过程中校验会话，用户切走后立即停止。
-    pumpPrefetchQueueForSession(sessionAtRequest);
+    // 首拍延迟 800ms：换集瞬间前台解析正要拉起 worker，预取同时入队会让
+    // 两者抢锁串行（worker 单实例），前台那一集白等一拍。让前台先跑。
+    setTimeout(() => pumpPrefetchQueueForSession(sessionAtRequest), 800);
   };
 
   /// 带会话校验的队列泵入口：用户切走后不再为旧会话继续占用带宽。
@@ -1200,7 +1202,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           if (activeSessionRef.current !== newSessionId) return;
           resolveRetriedRef.current.delete(ep.id);
           // 首次进入该集且播放成功：后台探测真实清晰度档位，不阻塞播放。
-          void probeQualities(ep.id, detail.type === 'comic' ? 1004 : 1);
+          // 延后 3 秒：此刻 warmAdjacentEpisodes 刚把预取队列灌进 worker，
+          // 立即探测会和预取串行抢锁（worker 单实例），两边都慢。放完这一拍
+          // 再探，探测本身不赶时间——清晰度只是附加信息。
+          setTimeout(() => {
+            void probeQualities(ep.id, detail.type === 'comic' ? 1004 : 1);
+          }, 3000);
           warmAdjacentEpisodes(detail, ep.id, newSessionId);
           return;
         }

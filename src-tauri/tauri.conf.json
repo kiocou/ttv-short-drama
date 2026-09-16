@@ -26,7 +26,12 @@
       "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https:; img-src 'self' asset: http://asset.localhost https: data:; media-src 'self' asset: http://asset.localhost https: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/**", "$APPLOCALDATA/**", "$RESOURCE/**", "$LOCALDATA/**"]
+        "scope": [
+          "$APPDATA/**",
+          "$APPLOCALDATA/**",
+          "$RESOURCE/**",
+          "$LOCALDATA/**"
+        ]
       }
     }
   },
@@ -43,6 +48,12 @@
       "resources/python",
       "resources/shortdrama-worker",
       "resources/mpv"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installMode": "currentUser"
+      }
+    }
   }
 }

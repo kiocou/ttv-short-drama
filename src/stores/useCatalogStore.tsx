@@ -109,11 +109,14 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     try {
       let res = await requestCatalog(cacheKey, filter);
       // The public comic page occasionally returns its shell before the rank
-      // articles are present. Retry once instead of caching a false empty page.
+      // articles are present. Retry up to twice instead of caching a false
+      // empty page——一次重试实测仍可能拿到空壳，两次覆盖 90%+ 的抖动。
       if (channel === 'comic' && res.items.length === 0 && requestId === requestIdRef.current) {
-        await new Promise(resolve => window.setTimeout(resolve, 250));
-        if (requestId === requestIdRef.current) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          await new Promise(resolve => window.setTimeout(resolve, 400));
+          if (requestId !== requestIdRef.current) break;
           res = await requestCatalog(cacheKey, filter);
+          if (res.items.length > 0) break;
         }
       }
       if (requestId !== requestIdRef.current) return;
