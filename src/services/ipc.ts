@@ -2,7 +2,6 @@ import { CatalogFilter, CatalogPage } from '../types/catalog';
 import { SeriesDetail } from '../types/series';
 import { PlaybackSession, PlaybackSnapshot } from '../types/playback';
 import { WatchHistoryItem } from '../types/history';
-import { EnhancementCapabilities, EnhancementEngine } from '../types/enhancement';
 import { UserSettings } from '../types/settings';
 import { MOCK_SERIES_LIST, getSeriesDetail, INITIAL_WATCH_HISTORY } from './mockData';
 
@@ -246,29 +245,6 @@ export const ipcService = {
     },
   },
 
-  enhancement: {
-    async getStatus(): Promise<{ enabled: boolean; mode: string; fallbackActive: boolean; reason?: string; actualFps?: number; displayFps?: number } | null> {
-      if (!isTauriEnvironment()) return null;
-      return invokeBackend('enhancement_status');
-    },
-
-    async getCapabilities(): Promise<EnhancementCapabilities> {
-      if (isTauriEnvironment()) return invokeBackend<EnhancementCapabilities>('enhancement_capabilities');
-      return {
-        supportedEngines: [
-          { id: 'off', name: '关闭画质增强', description: '浏览器演示使用原始播放帧率。', targetFps: 60, recommended: true },
-        ],
-        gpuName: '浏览器演示模式',
-        driverVersion: '不适用',
-        vramMb: 0,
-      };
-    },
-
-    async setPreference(engine: EnhancementEngine, targetFps: number): Promise<void> {
-      if (isTauriEnvironment()) await invokeBackend('enhancement_set_preference', { engine, targetFps });
-    },
-  },
-
   settings: {
     async get(): Promise<UserSettings> {
       if (isTauriEnvironment()) return invokeBackend<UserSettings>('settings_get');
@@ -301,3 +277,10 @@ export const ipcService = {
     },
   },
 };
+
+/**
+ * 浏览器（Mock）模式下的 RTX VSR 探测结果。
+ *
+ * 纯浏览器里既读不到 `nvidia-smi`，也读不到 WebView2 运行时版本，因此如实
+ * 报"不可用"并说明原因——不伪造一份看起来可用的能力表。
+ */

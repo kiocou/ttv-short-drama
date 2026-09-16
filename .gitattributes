@@ -29,3 +29,4 @@ package-lock.json  linguist-generated
 # 注意：克隆此仓库前需安装 git-lfs（https://git-lfs.com）；
 # 未安装时拿到的只是文本指针，运行时资源会失效。
 src-tauri/resources/mpv/ffmpeg.exe  filter=lfs diff=lfs merge=lfs -text
+src-tauri/resources/mpv/mpv.exe  filter=lfs diff=lfs merge=lfs -text

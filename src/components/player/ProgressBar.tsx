@@ -14,6 +14,19 @@ function formatTime(seconds: number): string {
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 }
 
+/**
+ * 内嵌于底部大卡片顶部的进度槽。
+ *
+ * 两个刻意的实现选择：
+ *   1. 播放/缓冲两层都用 `transform: scaleX()` 表达比例，而不是改宽度。
+ *      播放中这里每 250ms 刷新一次，改宽度会带动整条卡片的布局重算；
+ *      缩放只走合成层，滚动数字与按钮组不会跟着抖。
+ *   2. 拖拽用 pointer capture。指针滑出这条 16px 高的细槽后仍能继续拖，
+ *      松手即自动结束，不会像 window 监听那样留下悬挂的处理器。
+ *
+ * 键盘不在这里处理：左右方向键已由 VideoSurface 绑定成全局 ±5 秒，
+ * 这里再绑一次会让一次按键跳两次。
+ */
 export const ProgressBar: React.FC<ProgressBarProps> = ({
   position,
   duration,
@@ -22,80 +35,85 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
-  const [hoverPosition, setHoverPosition] = useState<number | null>(null);
+  const [hoverRatio, setHoverRatio] = useState<number | null>(null);
 
-  const calculateSeconds = (clientX: number): number => {
-    if (!containerRef.current || duration <= 0) return 0;
-    const rect = containerRef.current.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(clientX - rect.left, rect.width)) / rect.width;
-    return ratio * duration;
+  const ratioFromClientX = (clientX: number): number | null => {
+    const el = containerRef.current;
+    if (!el || duration <= 0) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
   };
 
-  const handlePointerDown = (e: React.PointerEvent) => {
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (duration <= 0) return;
     setIsScrubbing(true);
     e.currentTarget.setPointerCapture(e.pointerId);
-    const secs = calculateSeconds(e.clientX);
-    onSeek(secs);
+    const ratio = ratioFromClientX(e.clientX);
+    if (ratio !== null) onSeek(ratio * duration);
   };
 
-  const handlePointerMove = (e: React.PointerEvent) => {
-    const secs = calculateSeconds(e.clientX);
-    setHoverPosition(secs);
-    if (isScrubbing) {
-      onSeek(secs);
-    }
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const ratio = ratioFromClientX(e.clientX);
+    setHoverRatio(ratio);
+    if (isScrubbing && ratio !== null) onSeek(ratio * duration);
   };
 
-  const handlePointerUp = (e: React.PointerEvent) => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     setIsScrubbing(false);
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch {
-      // ignore
+      // 指针已被释放时忽略
     }
   };
 
-  const playedPercent = duration > 0 ? (position / duration) * 100 : 0;
-  const bufferedPercent = duration > 0 ? (buffered / duration) * 100 : 0;
-  const hoverPercent = duration > 0 && hoverPosition !== null ? (hoverPosition / duration) * 100 : null;
+  // 未播放时不显示"已播放"层之外的信息：duration 为 0 的进度条只会误导。
+  const playedRatio = duration > 0 ? Math.max(0, Math.min(1, position / duration)) : 0;
+  const bufferedRatio = duration > 0 ? Math.max(0, Math.min(1, buffered / duration)) : 0;
+  const shownRatio = hoverRatio !== null ? hoverRatio : playedRatio;
 
   return (
     <div
       ref={containerRef}
+      role="slider"
+      aria-label="播放进度"
+      aria-valuemin={0}
+      aria-valuemax={Math.max(0, Math.round(duration))}
+      aria-valuenow={Math.max(0, Math.round(position))}
+      onClick={(e) => e.stopPropagation()}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
-      onPointerLeave={() => setHoverPosition(null)}
-      className="group relative w-full h-5 flex items-center cursor-pointer select-none touch-none py-1"
+      onPointerCancel={handlePointerUp}
+      onPointerLeave={() => setHoverRatio(null)}
+      className={`ttv-progress${isScrubbing ? ' is-scrubbing' : ''}`}
     >
-      {/* 进度条轨道基底 */}
-      <div className="relative w-full h-1.5 bg-white/30 hover:bg-white/40 rounded-full overflow-hidden transition-all duration-200 group-hover:h-2.5">
-        {/* 缓冲层 */}
-        <div
-          className="absolute top-0 left-0 h-full bg-white/50 rounded-full transition-[width] duration-200"
-          style={{ width: `${Math.min(100, bufferedPercent)}%` }}
-        />
-
-        {/* 播放进度层 */}
-        <div
-          className="absolute top-0 left-0 h-full bg-blue-600 rounded-full transition-[width] duration-75"
-          style={{ width: `${Math.min(100, playedPercent)}%` }}
-        />
+      <div className="progress-track">
+        <div className="progress-buffer" style={{ width: `${bufferedRatio * 100}%` }} />
+        <div className="progress-played" style={{ transform: `scaleX(${playedRatio})`, width: '100%' }} />
       </div>
 
       {/* 拖动抓手圆点 */}
-      <div
-        className="absolute top-1/2 -translate-y-1/2 w-3.5 h-3.5 bg-white border-2 border-blue-600 rounded-full shadow-md scale-0 group-hover:scale-100 transition-transform duration-150 ease-out -ml-1.5 pointer-events-none"
-        style={{ left: `${Math.min(100, playedPercent)}%` }}
-      />
+      <div className="progress-thumb" style={{ left: `${playedRatio * 100}%` }} />
 
-      {/* 悬停时间预览气泡 */}
-      {hoverPercent !== null && hoverPosition !== null && (
+      {/* 悬停 / 拖拽时的目标时间预览 */}
+      {hoverRatio !== null && duration > 0 && (
+        <div className="ttv-progress-hint" style={{ left: `${Math.min(100, Math.max(0, hoverRatio * 100))}%` }}>
+          {formatTime(hoverRatio * duration)}
+        </div>
+      )}
+
+      {/* 拖拽中显示目标位置，指针移开轨道后仍能看清落点 */}
+      {isScrubbing && duration > 0 && (
         <div
-          className="absolute -top-7 px-2 py-0.5 text-[11px] font-mono font-medium text-slate-800 bg-white/95 backdrop-blur-md rounded-md shadow-lg border border-white/80 -translate-x-1/2 pointer-events-none animate-fade-in"
-          style={{ left: `${Math.min(100, Math.max(0, hoverPercent))}%` }}
+          className="ttv-progress-hint"
+          style={{
+            left: `${shownRatio * 100}%`,
+            opacity: hoverRatio !== null ? 0 : 1,
+          }}
         >
-          {formatTime(hoverPosition)}
+          {formatTime(shownRatio * duration)}
         </div>
       )}
     </div>

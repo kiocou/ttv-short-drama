@@ -1618,9 +1618,22 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       const armedKey = `${liveSession}:${ctx.currentEpisode?.id ?? ''}`;
       const playerCarriesCurrentEpisode = !adoptingRef.current
         && liveSession === activeSessionRef.current;
+      // 画面里的源要经过"结算期"才允许武装倒计时——与 tryClaimAutoAdvance
+      // 同一道闸。cancelCountdown 之后新源接管进来的头 2 秒内，媒体元素上的
+      // duration/currentTime 仍是旧集残留值（adoptPreparedSource 刻意不调
+      // video.load()），这段窗口里的 timeupdate 会让 `dur - cur <= 8` 继续成立，
+      // 把刚被取消的倒计时重新武装起来（实测：点"立即播放"后倒计时消失几秒
+      // 又出现，到点再跳一集）。结算期判断让这次 timeupdate 直接作废。
+      const committed = videoCommittedRef.current;
+      const sourceSettled = Boolean(
+        committed
+        && committed.episodeId === (ctx.currentEpisode?.id ?? '')
+        && Date.now() - committed.at >= AUTO_ADVANCE_SETTLE_MS,
+      );
 
       // 距离结束 8 秒且还有下一集时触发连播倒计时（尊重用户的自动连播开关）。
       if (playerCarriesCurrentEpisode
+          && sourceSettled
           && countdownArmedRef.current !== armedKey
           && dur > 20 && dur - cur <= 8 && !ctx.countdownActive && ctx.autoNext
           && ctx.currentSeries && ctx.currentEpisode) {
@@ -1919,8 +1932,15 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   );
 };
 
-export function usePlaybackStore() {
+export function usePlaybackStore(): PlaybackContextType {
   const ctx = useContext(PlaybackContext);
   if (!ctx) throw new Error('usePlaybackStore must be used within PlaybackProvider');
   return ctx;
+}
+
+/** 仅读取一个字段的选择器版本（避免订阅整个 context 造成无关重渲染）。 */
+export function usePlaybackSelector<T>(selector: (context: PlaybackContextType) => T): T {
+  const ctx = useContext(PlaybackContext);
+  if (!ctx) throw new Error('usePlaybackStore must be used within PlaybackProvider');
+  return selector(ctx);
 }

@@ -1,6 +1,23 @@
 import React, { createContext, useContext, useState, ReactNode } from 'react';
 
-export type AppView = 'explore' | 'detail' | 'player' | 'history' | 'settings';
+export type AppView = 'explore' | 'detail' | 'player' | 'history' | 'settings' | 'search';
+
+/** 搜索历史：最多保留这么多条，最近搜索排在最前。 */
+const MAX_SEARCH_HISTORY = 12;
+const SEARCH_HISTORY_KEY = 'ttv_short_drama_search_history_v1';
+
+function loadSearchHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(SEARCH_HISTORY_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .slice(0, MAX_SEARCH_HISTORY);
+  } catch {
+    return [];
+  }
+}
 
 export interface ToastMessage {
   id: string;
@@ -50,6 +67,11 @@ interface AppContextType {
   clearCardTransition: () => void;
   goBack: () => void;
   setSearchKeyword: (kw: string) => void;
+  /** 搜索历史（最近在前），持久化在 localStorage。 */
+  searchHistory: string[];
+  rememberSearch: (keyword: string) => void;
+  removeSearchHistory: (keyword: string) => void;
+  clearSearchHistory: () => void;
   toggleNavCollapsed: () => void;
   showToast: (message: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
   removeToast: (id: string) => void;
@@ -62,6 +84,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [previousView, setPreviousView] = useState<AppView>('explore');
   const [selectedSeriesId, setSelectedSeriesId] = useState<string | null>(null);
   const [searchKeyword, setSearchKeyword] = useState<string>('');
+  const [searchHistory, setSearchHistory] = useState<string[]>(loadSearchHistory);
   const [isNavCollapsed, setIsNavCollapsed] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -98,6 +121,30 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
+  const persistSearchHistory = (next: string[]) => {
+    setSearchHistory(next);
+    try {
+      localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next));
+    } catch {
+      // 存储配额或隐私模式失败：历史只是便利功能，不该影响搜索本身。
+    }
+  };
+
+  /** 记一条搜索：去重后置顶，超出上限截断。 */
+  const rememberSearch = (keyword: string) => {
+    const trimmed = keyword.trim();
+    if (!trimmed) return;
+    persistSearchHistory(
+      [trimmed, ...searchHistory.filter(item => item !== trimmed)].slice(0, MAX_SEARCH_HISTORY),
+    );
+  };
+
+  const removeSearchHistory = (keyword: string) => {
+    persistSearchHistory(searchHistory.filter(item => item !== keyword));
+  };
+
+  const clearSearchHistory = () => persistSearchHistory([]);
+
   const toggleNavCollapsed = () => {
     setIsNavCollapsed(prev => !prev);
   };
@@ -131,6 +178,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         clearCardTransition,
         goBack,
         setSearchKeyword,
+        searchHistory,
+        rememberSearch,
+        removeSearchHistory,
+        clearSearchHistory,
         toggleNavCollapsed,
         showToast,
         removeToast,

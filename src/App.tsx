@@ -2,9 +2,9 @@ import React, { useEffect } from 'react';
 import { AppProvider, useAppStore } from './stores/useAppStore';
 import { CatalogProvider } from './stores/useCatalogStore';
 import { PlaybackProvider, usePlaybackStore } from './stores/usePlaybackStore';
-import { EnhancementProvider } from './stores/useEnhancementStore';
 import { HistoryProvider } from './stores/useHistoryStore';
 import { SettingsProvider } from './stores/useSettingsStore';
+import { leaveFullscreen } from './services/windowFx';
 
 import { TitleBar } from './components/layout/TitleBar';
 import { NavigationRail } from './components/layout/NavigationRail';
@@ -14,6 +14,7 @@ import { ExploreView } from './components/views/ExploreView';
 import { DetailView } from './components/views/DetailView';
 import { HistoryView } from './components/views/HistoryView';
 import { SettingsView } from './components/views/SettingsView';
+import { SearchView } from './components/views/SearchView';
 import { VideoSurface } from './components/player/VideoSurface';
 
 const AppContent: React.FC = () => {
@@ -40,19 +41,14 @@ const AppContent: React.FC = () => {
   // 否则用户在全屏播放时返回详情页/发现页，窗口仍停在全屏，整个程序看起来
   // 被"卡"在全屏状态（实测现象：返回详情页后程序仍全屏，底部还留一条黑边——
   // 那是被隐藏的播放器容器）。
+  // 走 windowFx.leaveFullscreen：它同时负责还原"进全屏前是否最大化"，
+  // 避免退出后窗口比用户预期更小。
   useEffect(() => {
     if (isPlayer || !isFullscreen) return;
     let cancelled = false;
     void (async () => {
-      try {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        const win = getCurrentWindow();
-        if (await win.isFullscreen()) await win.setFullscreen(false);
-      } catch {
-        // 非 Tauri 环境下无需处理。
-      } finally {
-        if (!cancelled) setIsFullscreen(false);
-      }
+      await leaveFullscreen();
+      if (!cancelled) setIsFullscreen(false);
     })();
     return () => {
       cancelled = true;
@@ -119,6 +115,12 @@ const AppContent: React.FC = () => {
             >
               <SettingsView />
             </div>
+            <div
+              key={currentView === 'search' ? 'view-search' : undefined}
+              className={`h-full w-full ${currentView === 'search' ? 'block animate-fluent-page-in' : 'hidden'}`}
+            >
+              <SearchView />
+            </div>
           </main>
         </div>
       </div>
@@ -135,11 +137,9 @@ export const App: React.FC = () => {
       <SettingsProvider>
         <CatalogProvider>
           <PlaybackProvider>
-            <EnhancementProvider>
-              <HistoryProvider>
-                <AppContent />
-              </HistoryProvider>
-            </EnhancementProvider>
+            <HistoryProvider>
+              <AppContent />
+            </HistoryProvider>
           </PlaybackProvider>
         </CatalogProvider>
       </SettingsProvider>

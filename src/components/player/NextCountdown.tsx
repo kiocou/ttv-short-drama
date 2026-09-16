@@ -2,8 +2,19 @@ import React, { useRef } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { Play, X } from 'lucide-react';
 
+/** 环形进度周长：2πr，r = 14.5（与 CSS 的 stroke-dasharray 一致）。 */
+const RING_CIRCUMFERENCE = 91.1;
+
+/**
+ * 下一集自动连播倒计时卡片。
+ *
+ * 与设计稿的差异：稿子里是"到点才出现"，这里始终保留在 DOM 中、用
+ * .is-hidden 控制显隐。原因是淡出与下沉都需要过渡时间，直接卸载元素
+ * 就没有动画可言；也避免了每次连播都重新挂载一次 SVG 环形进度。
+ */
 export const NextCountdown: React.FC = () => {
   const { countdown, acceptCountdown, cancelCountdown } = usePlaybackStore();
+
   // 记住倒计时起始总秒数：用户可在设置里把等待时间改成 3-15 秒，
   // 硬编码 5 会让圆环进度与秒数严重错位。
   const totalRef = useRef(5);
@@ -14,70 +25,58 @@ export const NextCountdown: React.FC = () => {
     totalRef.current = 5;
   }
 
-  if (!countdown.active || !countdown.nextEpisode) return null;
+  const nextEpisode = countdown.nextEpisode;
+  const active = countdown.active && !!nextEpisode;
 
-  // 计算圆环进度
   const totalSeconds = Math.max(1, totalRef.current);
-  const progressRatio = Math.max(0, Math.min(100, (countdown.remaining / totalSeconds) * 100));
-  const strokeDashoffset = 100 - progressRatio;
+  const elapsedRatio = Math.max(0, Math.min(1, (totalSeconds - countdown.remaining) / totalSeconds));
 
   return (
-    <div 
+    <div
       onClick={(e) => e.stopPropagation()}
-      className="fixed bottom-24 right-8 z-50 flex items-center gap-3 p-3 bg-white/95 backdrop-blur-2xl rounded-2xl border border-white shadow-fluent-lg animate-slide-up select-none"
+      className={`ttv-countdown crystal-surface${active ? '' : ' is-hidden'}`}
+      role="status"
+      aria-live="polite"
+      aria-hidden={!active}
     >
-      {/* 倒计时环形进度 */}
-      <div className="relative w-10 h-10 flex items-center justify-center">
-        <svg className="w-10 h-10 -rotate-90" viewBox="0 0 36 36">
+      {/* 环形倒计时进度 */}
+      <div className="countdown-ring-wrap">
+        <svg className="countdown-svg" viewBox="0 0 36 36">
+          <circle className="countdown-ring-bg" cx="18" cy="18" r="14.5" />
           <circle
+            className="countdown-ring-meter"
             cx="18"
             cy="18"
-            r="15"
-            fill="none"
-            className="stroke-slate-100"
-            strokeWidth="3"
-          />
-          <circle
-            cx="18"
-            cy="18"
-            r="15"
-            fill="none"
-            className="stroke-blue-600 transition-all duration-1000 ease-linear"
-            strokeWidth="3"
-            strokeDasharray="94.2"
-            strokeDashoffset={(strokeDashoffset / 100) * 94.2}
-            strokeLinecap="round"
+            r="14.5"
+            style={{ strokeDashoffset: `${elapsedRatio * RING_CIRCUMFERENCE}` }}
           />
         </svg>
-        <span className="absolute text-xs font-bold text-slate-800">
-          {countdown.remaining}s
-        </span>
+        <span className="countdown-num">{countdown.remaining}s</span>
       </div>
 
       {/* 剧集信息 */}
-      <div className="flex flex-col pr-1 max-w-[200px]">
-        <span className="text-[11px] text-slate-400 font-medium">即将连播</span>
-        <span className="text-xs font-semibold text-slate-800 truncate">
-          {countdown.nextEpisode.title}
+      <div className="countdown-info-group">
+        <span className="countdown-tag">即将连播</span>
+        <span className="countdown-title" title={nextEpisode?.title || ''}>
+          {nextEpisode?.title || '下一集'}
         </span>
       </div>
 
-      {/* 立即播放按钮 */}
-      <button
-        onClick={acceptCountdown}
-        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold shadow-sm transition-transform active:scale-95"
-      >
-        <Play className="w-3 h-3 fill-current" />
+      {/* 立即播放 */}
+      <button type="button" className="btn-countdown-play" onClick={acceptCountdown} title="立即播放下一集">
+        <Play className="w-[11px] h-[11px] fill-current ml-px" />
         <span>立即播放</span>
       </button>
 
-      {/* 取消按钮 */}
+      {/* 取消自动连播 */}
       <button
+        type="button"
+        className="btn-countdown-cancel"
         onClick={cancelCountdown}
-        className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors"
-        title="取消连播"
+        title="取消自动连播"
+        aria-label="取消自动连播"
       >
-        <X className="w-4 h-4" />
+        <X className="w-[13px] h-[13px]" />
       </button>
     </div>
   );

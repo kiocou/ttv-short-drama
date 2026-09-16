@@ -6,8 +6,8 @@ mod short_drama_app;
 mod storage;
 
 use crate::models::{
-    CacheClearResult, CatalogFilter, CatalogPage, EnhancementCapabilities, EnhancementEngineInfo,
-    EnhancementStatus, PlaybackOpenInput, PlaybackSession, PlaybackSnapshot, PlaybackUiState,
+    CacheClearResult, CatalogFilter, CatalogPage, PlaybackOpenInput, PlaybackSession,
+    PlaybackSnapshot, PlaybackUiState,
     SeriesDetail, SeriesItem, UserSettings, WatchHistoryItem,
 };
 use crate::provider::DramaProvider;
@@ -19,6 +19,7 @@ use crate::short_drama_app::{
 use crate::storage::Database;
 use std::collections::HashMap;
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -176,14 +177,19 @@ fn external_player_open(url: String) -> Result<(), String> {
         .find(|path| path.is_file())
         .or_else(|| Some(PathBuf::from("mpv.exe")))
         .ok_or_else(|| "未找到兼容播放器 mpv。".to_string())?;
-    Command::new(player)
-        .args([
-            "--no-config",
-            "--force-window=yes",
-            "--keep-open=no",
-            "--http-header-fields=Referer: https://novel.snssdk.com/,User-Agent: com.phoenix.read/71332",
-            url,
-        ])
+    let mut command = Command::new(player);
+    command.args([
+        "--no-config",
+        "--force-window=yes",
+        "--keep-open=no",
+        "--http-header-fields=Referer: https://novel.snssdk.com/,User-Agent: com.phoenix.read/71332",
+        url,
+    ]);
+    // CREATE_NO_WINDOW：外部播放器由用户手势触发，但 GUI 子系统下 mpv.com
+    // 兼容层与宿主仍可能闪终端窗口，后台创建标志一并抑制。
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    command
         .spawn()
         .map_err(|error| format!("启动兼容播放器失败：{error}"))?;
     Ok(())
@@ -309,43 +315,6 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
     settings.catalog_cache_mb = 0.0;
     settings.playback_cache_mb = 0.0;
     state.database.settings_save(&settings)
-}
-
-#[tauri::command]
-fn enhancement_capabilities() -> EnhancementCapabilities {
-    EnhancementCapabilities {
-        supported_engines: vec![EnhancementEngineInfo {
-            id: "off".into(),
-            name: "关闭画质增强".into(),
-            description: "本项目尚未接入真实补帧 SDK，使用原始播放链路。".into(),
-            target_fps: 60,
-            recommended: true,
-        }],
-        gpu_name: "未探测（未接入补帧运行时）".into(),
-        driver_version: "不适用".into(),
-        vram_mb: 0,
-    }
-}
-
-#[tauri::command]
-fn enhancement_status() -> EnhancementStatus {
-    EnhancementStatus {
-        enabled: false,
-        mode: "off".into(),
-        fallback_active: false,
-        reason: Some("真实补帧 SDK 尚未集成。".into()),
-        actual_fps: None,
-        display_fps: None,
-    }
-}
-
-#[tauri::command]
-fn enhancement_set_preference(engine: String, _target_fps: u32) -> Result<(), String> {
-    if engine == "off" {
-        Ok(())
-    } else {
-        Err("当前后端未提供该增强引擎。".into())
-    }
 }
 
 /// 清空缓存（设置页按钮）。
@@ -533,9 +502,6 @@ fn main() {
             window_prepare_fullscreen,
             settings_get,
             settings_save,
-            enhancement_capabilities,
-            enhancement_status,
-            enhancement_set_preference,
             cache_clear,
         ])
         .run(tauri::generate_context!())
