@@ -214,7 +214,11 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
   const lockShown = isVisible || isLocked;
 
   return (
-    <div className={`absolute inset-0 z-30 pointer-events-none${isLocked ? ' is-locked' : ''}`}>
+    <div
+      className={`absolute inset-0 z-30 pointer-events-none${
+        isLocked ? ' is-locked' : ''
+      }${!hudShown && !isLocked ? ' is-auto-hidden' : ''}`}
+    >
       {/*
         收起态的贴边迷你进度条。
         放在 HUD 之外：HUD 整体淡出时它才刚登场，必须独立于那层透明度。
