@@ -190,6 +190,7 @@
   收起后小锁自动贴边半隐藏：只露出小半个弧面与图标，鼠标靠近即平滑弹出。
   ::before 把悬停热区向左、上下各扩一圈，避免要精确瞄准那半个圆点。
 */
+.is-locked .ttv-lock,
 .ttv-player.is-locked .ttv-lock {
   right: 0;
   transform: translate(26%, -50%);
@@ -197,6 +198,7 @@
   box-shadow: -3px 0 16px rgba(0, 120, 212, 0.45);
 }
 
+.is-locked .ttv-lock::before,
 .ttv-player.is-locked .ttv-lock::before {
   content: '';
   position: absolute;
@@ -206,6 +208,8 @@
   right: 0;
 }
 
+.is-locked .ttv-lock:hover,
+.is-locked .ttv-lock:focus-visible,
 .ttv-player.is-locked .ttv-lock:hover,
 .ttv-player.is-locked .ttv-lock:focus-visible {
   transform: translate(-16px, -50%) scale(1.08);
@@ -236,12 +240,18 @@
     height 0.15s ease;
 }
 
+/*
+  收起（锁定）态。is-locked 由 PlayerControls 挂在 HUD 容器上；
+  .ttv-player.is-locked 前缀是历史遗留写法，一并保留兼容。
+*/
+.is-locked .ttv-mini-progress,
 .ttv-player.is-locked .ttv-mini-progress {
   opacity: 1;
   transform: translateY(0);
   pointer-events: auto;
 }
 
+.is-locked .ttv-mini-progress:hover,
 .ttv-player.is-locked .ttv-mini-progress:hover {
   height: 6px;
 }
