@@ -66,17 +66,25 @@ export const DetailView: React.FC = () => {
     let active = true;
     setDetail(null);
 
-    ipcService.series.getDetail(selectedSeriesId)
-      .then((res) => {
-        if (!active) return;
-        detailCacheRef.current[selectedSeriesId] = res;
-        setDetail(res);
-      })
-      .catch(() => {
-        if (active) {
+    // 失败自动重试一次：详情页是单次网络往返，抖动一次就白屏一整页。
+    // 重试仍失败才提示，且保留"重试"入口（点刷新重新拉）。
+    const loadDetail = (attempt: number) => {
+      ipcService.series.getDetail(selectedSeriesId)
+        .then((res) => {
+          if (!active) return;
+          detailCacheRef.current[selectedSeriesId] = res;
+          setDetail(res);
+        })
+        .catch(() => {
+          if (!active) return;
+          if (attempt < 2) {
+            setTimeout(() => { if (active) loadDetail(attempt + 1); }, 600);
+            return;
+          }
           showToast('获取剧集详情失败', 'error');
-        }
-      });
+        });
+    };
+    loadDetail(1);
 
     return () => {
       active = false;
