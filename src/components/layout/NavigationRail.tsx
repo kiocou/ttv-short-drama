@@ -5,7 +5,8 @@ import {
   Settings, 
   PanelLeftClose, 
   PanelLeftOpen, 
-  Film
+  Film,
+  Heart
 } from 'lucide-react';
 import { useAppStore, AppView } from '../../stores/useAppStore';
 
@@ -20,6 +21,7 @@ export const NavigationRail: React.FC = () => {
 
   const navItems: NavItem[] = [
     { id: 'explore', label: '短剧发现', icon: Compass },
+    { id: 'favorites', label: '我的追剧', icon: Heart },
     { id: 'history', label: '观看历史', icon: History },
     { id: 'settings', label: '系统设置', icon: Settings },
   ];

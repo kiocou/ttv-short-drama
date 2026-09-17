@@ -6,7 +6,7 @@ mod short_drama_app;
 mod storage;
 
 use crate::models::{
-    CacheClearResult, CatalogFilter, CatalogPage, PlaybackOpenInput, PlaybackSession,
+    CacheClearResult, CatalogFilter, CatalogPage, FavoriteItem, PlaybackOpenInput, PlaybackSession,
     PlaybackSnapshot, PlaybackUiState,
     SeriesDetail, SeriesItem, UserSettings, WatchHistoryItem,
 };
@@ -296,6 +296,21 @@ fn history_clear(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn favorites_list(mark: Option<String>, state: State<'_, AppState>) -> Result<Vec<FavoriteItem>, String> {
+    state.database.list_favorites(mark.as_deref())
+}
+
+#[tauri::command]
+fn favorites_save(item: FavoriteItem, state: State<'_, AppState>) -> Result<(), String> {
+    state.database.save_favorite(&item)
+}
+
+#[tauri::command]
+fn favorites_remove(series_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.database.remove_favorite(&series_id)
+}
+
+#[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> Result<UserSettings, String> {
     state.database.settings_get()
 }
@@ -499,6 +514,9 @@ fn main() {
             history_save,
             history_remove,
             history_clear,
+            favorites_list,
+            favorites_save,
+            favorites_remove,
             window_prepare_fullscreen,
             settings_get,
             settings_save,

@@ -11,7 +11,9 @@ import {
   Play,
   Clock,
   CheckCircle2,
-  AlertTriangle
+  AlertTriangle,
+  Search,
+  X
 } from 'lucide-react';
 
 function formatDuration(seconds: number): string {
@@ -35,6 +37,9 @@ export const HistoryView: React.FC = () => {
   const { currentView, navigateTo, showToast } = useAppStore();
 
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  // 即时筛选：历史条数多了以后，翻找某部剧只能从头扫到尾。
+  // 只在前端过滤，不额外打后端。
+  const [filterKeyword, setFilterKeyword] = useState('');
 
   // 每次进入历史页都重新拉取一次。
   //
@@ -57,6 +62,11 @@ export const HistoryView: React.FC = () => {
     showToast('观看历史已全部清空', 'info');
   };
 
+  const keyword = filterKeyword.trim().toLowerCase();
+  const visibleRecords = keyword
+    ? records.filter(item => item.title.toLowerCase().includes(keyword))
+    : records;
+
   return (
     <div className="flex-1 h-full overflow-y-auto p-8 max-w-5xl mx-auto flex flex-col gap-6 select-none">
       {/* 头部：标题与清空按钮 */}
@@ -72,16 +82,41 @@ export const HistoryView: React.FC = () => {
         </div>
 
         {records.length > 0 && (
-          <div className="p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner inline-flex">
-            <FluentButton
-              variant="danger"
-              size="sm"
-              icon={<Trash2 className="w-3.5 h-3.5" />}
-              onClick={() => setShowClearConfirm(true)}
-              className="shadow-sm"
-            >
-              清空历史
-            </FluentButton>
+          <div className="flex items-center gap-3">
+            {/* 即时搜索：按剧名筛选历史记录 */}
+            <div className="relative w-52">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+              <input
+                type="text"
+                value={filterKeyword}
+                onChange={(e) => setFilterKeyword(e.target.value)}
+                placeholder="搜索看过的剧..."
+                aria-label="搜索历史记录"
+                className="w-full h-8 pl-8 pr-7 text-xs bg-white rounded-lg border border-slate-200/80 focus:outline-none focus:border-blue-500 shadow-xs"
+              />
+              {filterKeyword && (
+                <button
+                  type="button"
+                  onClick={() => setFilterKeyword('')}
+                  aria-label="清除搜索"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            <div className="p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner inline-flex">
+              <FluentButton
+                variant="danger"
+                size="sm"
+                icon={<Trash2 className="w-3.5 h-3.5" />}
+                onClick={() => setShowClearConfirm(true)}
+                className="shadow-sm"
+              >
+                清空历史
+              </FluentButton>
+            </div>
           </div>
         )}
       </div>
@@ -103,9 +138,31 @@ export const HistoryView: React.FC = () => {
             </FluentButton>
           </div>
         </div>
+      ) : visibleRecords.length === 0 ? (
+        <div className="py-24 flex flex-col items-center justify-center text-center gap-3">
+          <img src="/app-icon.png" alt="" className="w-14 h-14 object-contain opacity-60" draggable={false} />
+          <p className="text-sm font-semibold text-slate-700">
+            {keyword ? `没有匹配「${filterKeyword.trim()}」的历史记录` : '暂无观看历史'}
+          </p>
+          <p className="text-xs text-slate-400">
+            {keyword ? '换个关键词试试，或清除筛选查看全部' : '在发现页寻找心仪短剧开启追剧体验吧'}
+          </p>
+          {!keyword && (
+            <div className="p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner inline-flex mt-2">
+              <FluentButton
+                variant="primary"
+                size="sm"
+                onClick={() => navigateTo('explore')}
+                className="shadow-sm"
+              >
+                前往发现精选
+              </FluentButton>
+            </div>
+          )}
+        </div>
       ) : (
         <div className="flex flex-col gap-3">
-          {records.map((item, index) => (
+          {visibleRecords.map((item, index) => (
             <MicaCard
               key={`${item.seriesId}-${item.episodeId}`}
               hoverable

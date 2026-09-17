@@ -236,17 +236,61 @@ def decrypt_spade_url(b64_str: str, key_seed: bytes) -> str:
     return plaintext.rstrip(b"\x00").decode("utf-8", errors="replace")
 
 
+def variant_codec(item: dict) -> str:
+    """取该档源流的编码标识（video_meta.codec_type 或 gear_des_key）。"""
+    meta = item.get("video_meta") if isinstance(item.get("video_meta"), dict) else {}
+    codec = str(meta.get("codec_type") or "").lower()
+    if codec:
+        return codec
+    gear = str(item.get("gear_des_key") or item.get("gear_name") or "").lower()
+    if "bytevc2" in gear:
+        return "bytevc2"
+    return codec or gear
+
+
+def is_compatible_codec(item: dict) -> bool:
+    """该档能否被 WebView2 / ffmpeg 解码。
+
+    参考果果剧库的做法：bytevc2（H.266）源流本机解码链路不支持，选中它
+    会出现"下载成功但解不出画面"。这些档直接跳过，只留 H.264/HEVC 兼容档。
+    """
+    codec = variant_codec(item)
+    if not codec:
+        return True
+    return "bytevc2" not in codec
+
+
 def select_best_quality(video_list: dict) -> tuple[str, dict]:
-    best_key, best_item, best_height = "", {}, 0
+    """挑最高可用档。
+
+    评分与果果 selectHongguoAppMedia 一致：先跳过 bytevc2 等不兼容编码，
+    再按像素高度取最高；同高度比码率；同分时 H.264(avc1) 优先——它比
+    HEVC 兼容面更广，WebView2 直解成功率更高。
+    """
+    best_key, best_item, best_score = "", {}, -1
     for key, item in video_list.items():
         if not isinstance(item, dict):
             continue
+        if not is_compatible_codec(item):
+            continue
         height = int(item.get("vheight", 0) or 0)
-        if height > best_height:
-            best_key, best_item, best_height = key, item, height
-        elif height == best_height and best_item:
-            if int(item.get("bitrate", 0) or 0) > int(best_item.get("bitrate", 0) or 0):
-                best_key, best_item = key, item
+        score = height * 10
+        if int(item.get("bitrate", 0) or 0) > 0:
+            score += 1
+        meta = item.get("video_meta") if isinstance(item.get("video_meta"), dict) else {}
+        codec = str(meta.get("codec_type") or "").lower()
+        if codec in ("h264", "avc1"):
+            score += 1
+        if score > best_score:
+            best_key, best_item, best_score = key, item, score
+    if not best_item:
+        # 兼容档全空时才回退到不检查编码的旧逻辑——宁可给一条可能播不了的，
+        # 也不能直接报"没有清晰度"，那样整个错误提示会误导排查方向。
+        for key, item in video_list.items():
+            if isinstance(item, dict):
+                height = int(item.get("vheight", 0) or 0)
+                if height > 0 and not best_item:
+                    best_key, best_item = key, item
     return best_key, best_item
 
 
@@ -321,10 +365,16 @@ def decode_quality_variant(key: str, item: dict, key_seed: bytes) -> dict | None
 
 
 def collect_quality_variants(video_list: dict, key_seed: bytes) -> list[dict]:
-    """返回所有不同源流，最高像素/码率排在首位，便于默认顶档播放。"""
+    """返回所有不同源流，最高像素/码率排在首位，便于默认顶档播放。
+
+    不兼容编码（bytevc2 等）的档位不进列表：放进画质菜单只会让用户切到
+    一个解不出画面的档位。
+    """
     variants = []
     seen_urls = set()
     for key, item in video_list.items():
+        if not is_compatible_codec(item):
+            continue
         variant = decode_quality_variant(str(key), item, key_seed)
         if not variant or not variant["url"] or variant["url"] in seen_urls:
             continue
@@ -475,7 +525,12 @@ def hongguo_business_error(payload: dict) -> str | None:
 
 def signed_post(session: requests.Session, url: str, payload: dict,
                 device_id: str, install_id: str) -> dict:
-    """liushen 六代签名 + POST，返回响应 JSON。"""
+    """liushen 六代签名 + POST，返回响应 JSON。
+
+    网络失败带退避重试（参考果果 hongguoAppRequest：1s/2s 递增，最多 3 次）。
+    与果果一致，4xx 业务性失败不重试——重跑同样的请求只会得到同样的拒绝，
+    白白拖慢失败结论。
+    """
     body_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     body_bytes = body_text.encode("utf-8")
     parts = urlsplit(url)
@@ -490,21 +545,37 @@ def signed_post(session: requests.Session, url: str, payload: dict,
         "passport-sdk-version": "50561",
         "x-vc-bdturing-sdk-version": "3.7.2.cn",
     }
-    signed_headers, signed_url = core_sixgod(
-        surl=f"{parts.scheme}://{parts.netloc}{parts.path}",
-        params=dict(parse_qsl(parts.query, keep_blank_values=True)),
-        data=json.loads(body_text),
-        devices=device_keys(device_id, install_id),
-        header=base_headers,
-        log=False,
-    )
-    response = session.post(signed_url, headers=signed_headers, data=body_bytes, timeout=10)
-    response.raise_for_status()
-    data = response.json()
-    error = hongguo_business_error(data)
-    if error:
-        raise PermissionError(error)
-    return data
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt > 0:
+            time.sleep(attempt)  # 1s / 2s 递增退避
+        try:
+            signed_headers, signed_url = core_sixgod(
+                surl=f"{parts.scheme}://{parts.netloc}{parts.path}",
+                params=dict(parse_qsl(parts.query, keep_blank_values=True)),
+                data=json.loads(body_text),
+                devices=device_keys(device_id, install_id),
+                header=base_headers,
+                log=False,
+            )
+            # x-ss-req-ticket 每次重试都要重新生成：过期的 ticket 会被网关直接拒绝。
+            signed_headers["x-ss-req-ticket"] = str(int(time.time() * 1000))
+            response = session.post(signed_url, headers=signed_headers, data=body_bytes, timeout=10)
+            if 400 <= response.status_code < 500:
+                # 4xx 是请求本身被拒（签名/参数/权限），重试无意义。
+                response.raise_for_status()
+            response.raise_for_status()
+            data = response.json()
+            error = hongguo_business_error(data)
+            if error:
+                raise PermissionError(error)
+            return data
+        except PermissionError:
+            raise
+        except (requests.RequestException, ValueError, json.JSONDecodeError) as error:
+            last_error = error
+            continue
+    raise last_error or RuntimeError("红果播放接口重试耗尽")
 
 
 def signed_post_failover(session: requests.Session, urls: list[str], payload: dict,
@@ -771,17 +842,24 @@ def search_cmd(keyword: str, device_id: str, install_id: str, aid: int) -> dict:
             # sub_title_list 形如 [{"第11季"}, {"传统玄幻"}, {"391万热度"}]：
             # 只取题材，季数与热度不是标签。
             tags = []
+            episode_count = int(video.get("episode_cnt") or 0)
             for sub in (entry.get("sub_title_list") or []):
                 if not isinstance(sub, dict):
                     continue
                 name = str(sub.get("content") or "").strip()
                 if name and not name.startswith("第") and "热度" not in name:
                     tags.append(name)
+            # 实测大多数联想条目的 video_data.cover 直接为空——只有"首位主条目"
+            # 带签名封面。空封面又没有集数的条目是纯联想（用户点进去什么都没有，
+            # 历史上正是"下载了错误的卡片"的来源），直接丢弃。
+            cover = str(video.get("cover") or "").strip()
+            if not cover and episode_count <= 0:
+                continue
             items.append({
                 "id": series_id,
                 "title": title,
-                "cover": str(video.get("cover") or "").strip(),
-                "episodeCount": int(video.get("episode_cnt") or 0),
+                "cover": cover,
+                "episodeCount": episode_count,
                 "tags": tags[:3],
             })
         if items:
@@ -1110,7 +1188,23 @@ def main() -> int:
             "main_url": "https://a.example/a.mp4",
             "backup_url": "https://b.example/a.mp4",
         }) == ["https://a.example/a.mp4", "https://b.example/a.mp4"]
-        emit({"ok": True, "event": "done", "hosts": [urlsplit(item).netloc for item in urls]})
+        # 编码感知画质挑选：bytevc2 跳过，H.264 同分优先（参考果果）。
+        video_list = {
+            "origin": {"vheight": 1080, "bitrate": 2000,
+                       "video_meta": {"codec_type": "bytevc2"}},
+            "main": {"vheight": 1080, "bitrate": 2000,
+                     "video_meta": {"codec_type": "h264"}},
+            "low": {"vheight": 540, "bitrate": 800,
+                    "video_meta": {"codec_type": "h264"}},
+        }
+        key, item = select_best_quality(video_list)
+        assert key == "main", f"bytevc2 必须被跳过，选中 {key}"
+        assert is_compatible_codec(video_list["origin"]) is False
+        assert is_compatible_codec(video_list["main"]) is True
+        filtered = [k for k, v in video_list.items()
+                    if is_compatible_codec(v)]
+        assert filtered == ["main", "low"], f"bytevc2 档不进画质列表: {filtered}"
+        emit({"ok": True, "event": "done", "hosts": [urlsplit(item2).netloc for item2 in urls]})
         return 0
     if subcommand not in ("resolve", "resolve-prefix", "stream", "album", "search") or len(argv) < 2:
         emit({"ok": False, "error": f"未知子命令: {subcommand or '(空)'}"})

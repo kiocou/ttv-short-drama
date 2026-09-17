@@ -1,4 +1,4 @@
-use crate::models::{UserSettings, WatchHistoryItem};
+use crate::models::{FavoriteItem, UserSettings, WatchHistoryItem};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
@@ -35,6 +35,16 @@ impl Database {
                     key TEXT PRIMARY KEY NOT NULL,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS favorites (
+                    series_id TEXT PRIMARY KEY NOT NULL,
+                    title TEXT NOT NULL,
+                    cover TEXT NOT NULL,
+                    mark TEXT NOT NULL,
+                    channel TEXT,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_favorites_updated_at
+                    ON favorites(updated_at DESC);
                 ",
             )
             .map_err(|error| error.to_string())?;
@@ -192,6 +202,102 @@ impl Database {
                 "INSERT INTO settings(key, value) VALUES ('user_settings', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![value],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_favorites(&self, mark: Option<&str>) -> Result<Vec<FavoriteItem>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "收藏数据库锁不可用。".to_string())?;
+        let read_rows = |statement: &mut rusqlite::Statement,
+                         params: &[&dyn rusqlite::ToSql]|
+         -> Result<Vec<FavoriteItem>, String> {
+            let mapped = statement
+                .query_map(params, |row| {
+                    Ok(FavoriteItem {
+                        series_id: row.get(0)?,
+                        title: row.get(1)?,
+                        cover: row.get(2)?,
+                        mark: row.get(3)?,
+                        channel: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())
+        };
+        let records = match mark {
+            Some(value) => {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT series_id, title, cover, mark, channel, updated_at
+                         FROM favorites WHERE mark = ?1 ORDER BY updated_at DESC",
+                    )
+                    .map_err(|error| error.to_string())?;
+                read_rows(&mut statement, &[&value])?
+            }
+            None => {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT series_id, title, cover, mark, channel, updated_at
+                         FROM favorites ORDER BY updated_at DESC",
+                    )
+                    .map_err(|error| error.to_string())?;
+                read_rows(&mut statement, &[])?
+            }
+        };
+        Ok(records)
+    }
+
+    pub fn save_favorite(&self, item: &FavoriteItem) -> Result<(), String> {
+        if item.series_id.trim().is_empty() {
+            return Err("收藏条目缺少剧集标识。".into());
+        }
+        // 状态只有三种：未知值是前端 bug 的信号，报错而不是静默改写。
+        if !matches!(item.mark.as_str(), "want" | "watching" | "done") {
+            return Err(format!("未知的收藏状态：{}", item.mark));
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "收藏数据库锁不可用。".to_string())?;
+        connection
+            .execute(
+                "INSERT INTO favorites (series_id, title, cover, mark, channel, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(series_id) DO UPDATE SET
+                    title = excluded.title,
+                    cover = excluded.cover,
+                    mark = excluded.mark,
+                    channel = excluded.channel,
+                    updated_at = excluded.updated_at",
+                params![
+                    item.series_id,
+                    item.title,
+                    item.cover,
+                    item.mark,
+                    item.channel,
+                    item.updated_at,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn remove_favorite(&self, series_id: &str) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "收藏数据库锁不可用。".to_string())?;
+        connection
+            .execute(
+                "DELETE FROM favorites WHERE series_id = ?1",
+                params![series_id],
             )
             .map_err(|error| error.to_string())?;
         Ok(())

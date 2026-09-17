@@ -6,6 +6,10 @@ import { Search, X, Trash2, Clock, Play, ArrowLeft } from 'lucide-react';
 
 type Channel = 'drama' | 'comic';
 
+/** 搜索默认频道：站点搜索接口不做频道过滤（实测所有结果都是 doc_type:23 的剧集），
+ *  固定 drama 让 card 的 type 标记一致，避免两个频道搜出同一批结果的假象。 */
+const SEARCH_CHANNEL: Channel = 'drama';
+
 /**
  * 独立搜索页。
  *
@@ -25,7 +29,7 @@ export const SearchView: React.FC = () => {
     navigateTo,
   } = useAppStore();
 
-  const [channel, setChannel] = useState<Channel>('drama');
+  const [channel] = useState<Channel>(SEARCH_CHANNEL);
   const [items, setItems] = useState<SeriesItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -187,22 +191,9 @@ export const SearchView: React.FC = () => {
         {hasKeyword && (
           <>
             <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2">
-                {(['drama', 'comic'] as Channel[]).map(item => (
-                  <button
-                    key={item}
-                    type="button"
-                    onClick={() => setChannel(item)}
-                    className={`px-3.5 py-1.5 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
-                      channel === item
-                        ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
-                        : 'bg-white/90 text-slate-600 border-slate-200/80 hover:border-slate-300'
-                    }`}
-                  >
-                    {item === 'drama' ? '短剧' : '漫剧'}
-                  </button>
-                ))}
-              </div>
+              <span className="text-xs text-slate-500">
+                按相关度排序 · 精确匹配在前
+              </span>
               <span className="text-xs text-slate-500">
                 {isLoading ? '搜索中…' : `找到 ${items.length} 部`}
               </span>
@@ -249,7 +240,17 @@ export const SearchView: React.FC = () => {
                         loading={index < 8 ? 'eager' : 'lazy'}
                         decoding="async"
                         onError={event => {
-                          event.currentTarget.style.opacity = '0';
+                          // 封面加载失败重试一次：CDN 抖动一次就让图永久消失
+                          // 等于"封面下载不出来"。带 cache-bust 绕过失败的缓存，
+                          // 仍失败才退回剧名首字占位。
+                          const img = event.currentTarget;
+                          const retried = img.dataset.retried === '1';
+                          if (!retried && series.cover) {
+                            img.dataset.retried = '1';
+                            img.src = `${series.cover}${series.cover.includes('?') ? '&' : '?'}r=1`;
+                            return;
+                          }
+                          img.style.opacity = '0';
                         }}
                       />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
