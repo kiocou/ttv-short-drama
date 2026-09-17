@@ -348,7 +348,16 @@ export const ExploreView: React.FC = () => {
                     decoding="async"
                     fetchPriority={index < 4 ? 'high' : 'auto'}
                     onError={(event) => {
-                      event.currentTarget.style.opacity = '0';
+                      // 封面加载失败重试一次（带 cache-bust）：CDN 抖动一次就
+                      // 让图永久消失等于"封面下载不出来"，仍失败才退回首字占位。
+                      const img = event.currentTarget;
+                      const retried = img.dataset.retried === '1';
+                      if (!retried && series.cover) {
+                        img.dataset.retried = '1';
+                        img.src = `${series.cover}${series.cover.includes('?') ? '&' : '?'}r=1`;
+                        return;
+                      }
+                      img.style.opacity = '0';
                     }}
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />

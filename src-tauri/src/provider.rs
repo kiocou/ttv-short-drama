@@ -136,6 +136,14 @@ impl DramaProvider {
                 return Err(error);
             }
         }
+        // 按与关键词的相关度重排，再交给站点顺序兜底。
+        //
+        // 站点搜索是模糊匹配：实测搜"战神"返回的第一条是"我只想找死，却被奉为
+        // 九州战神了"，而"特级战龙""大将军扛楼养活百万大军"这类标题完全不含
+        // 关键词的联想条目也混在里面。用户看到的就是"搜出来的第一张卡片不是
+        // 我要的那部"，点进详情自然像"下载了错误的剧"。
+        // 精确子串（含完整关键词）排最前，其次按命中词数，站点原始顺序兜底。
+        rank_search_items(&mut items, keyword);
         // 刻意不再叠加列表页的题材/受众筛选：站点返回的本就是按相关度排序的
         // 搜索结果，再用"当前选中的题材"剪一刀就会出现"明明搜得到却显示不全"。
         // 筛选器服务于浏览目录，不该作用于搜索。
@@ -468,6 +476,28 @@ fn parse_search_items(data: &Value, channel: &str) -> Vec<SeriesItem> {
     items
 }
 
+/// 按与关键词的相关度给搜索结果重排（稳定排序，同分保持站点原始顺序）。
+///
+/// 分级：标题含完整关键词（不区分大小写）> 标题含关键词逐字命中 > 其余。
+/// 排序只影响展示顺序，不丢弃任何条目——联想补齐仍然可用。
+fn rank_search_items(items: &mut [SeriesItem], keyword: &str) {
+    let keyword_lower = keyword.to_lowercase();
+    let chars: Vec<char> = keyword_lower.chars().collect();
+    items.sort_by_key(|item| {
+        let title_lower = item.title.to_lowercase();
+        // 0 = 精确子串；其余按"未命中字数"升序（命中越多未命中越少，排越前），
+        // 站点原始顺序由 sort_by_key 的稳定性兜底。
+        if title_lower.contains(&keyword_lower) {
+            return 0usize;
+        }
+        let misses = chars
+            .iter()
+            .filter(|ch| !title_lower.contains(**ch))
+            .count();
+        misses + 1
+    });
+}
+
 /// 按形状查找 searchList，不写死 loaderData 的键名——那是随路由命名的
 /// （实测为 "search_(keyword)/page"），站点改版就会变。
 fn find_search_list(value: &Value) -> Option<&Vec<Value>> {
@@ -593,7 +623,7 @@ fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
         Selector::parse("p[class*='pc-categories'] span").expect("comic category selector");
     let description_selector =
         Selector::parse("p[class*='pc-description']").expect("comic description selector");
-    let episode_selector = Selector::parse("a[href*='/player/']").expect("comic episode selector");
+    let _episode_selector = Selector::parse("a[href*='/player/']").expect("comic episode selector");
     let id_re = Regex::new(r"series_id=(\d+)").expect("comic id regex");
     let mut seen = HashSet::new();
     let mut cards = Vec::new();
@@ -634,16 +664,12 @@ fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
                 !value.is_empty() && !value.chars().all(|character| character.is_ascii_digit())
             })
             .collect::<Vec<_>>();
-        // 集数优先从卡片文案解析（"全 N 集"/"更新至 N 集"），数 /player/
-        // 链接只做兜底——榜单页每张卡片只渲染前 4 集入口（其余折叠），
-        // 直接 count 会把展示层约定误报成"已公开 4 集"（实测全部卡片都是 4）。
-        let article_text = article.text().collect::<Vec<_>>().join(" ");
-        let episode_re = Regex::new(r"(?:全|更新至)\s*(\d+)\s*集").expect("comic episode regex");
-        let episode_count = episode_re
-            .captures(&article_text)
-            .and_then(|captures| captures.get(1))
-            .and_then(|value| value.as_str().parse::<u32>().ok())
-            .unwrap_or_else(|| article.select(&episode_selector).count() as u32);
+        // 榜单页**没有**任何集数文案（实测抓取：全/更新至/共 N 集全为 0 命中），
+        // 卡片里恒定渲染前 4 集 /player/ 入口（页面展示约定，抓取验证 20/20 张
+        // 卡片都是 4），直接 count 会把展示约定误报成"已公开 4 集"。
+        // 真实集数只有详情页的 vid_list 可信——列表页如实报 0（前端显示
+        // "集数未知"），不编造数字。
+        let episode_count = 0u32;
         let brief = article
             .select(&description_selector)
             .next()
@@ -986,9 +1012,34 @@ fn unique(items: Vec<String>) -> Vec<String> {
 mod tests {
     use super::{
         detect_total_pages, find_pagination_value, normalize_playback_url, parse_router_script,
-        DramaProvider, Value,
+        rank_search_items, DramaProvider, Value,
     };
-    use crate::models::CatalogFilter;
+    use crate::models::{CatalogFilter, SeriesItem};
+
+    /// 搜索结果按关键词相关度重排：含完整关键词的排最前，
+    /// 标题完全不含关键词的联想条目排最后（"搜出来的第一张不是我要的"）。
+    #[test]
+    fn ranks_search_items_by_keyword_relevance() {
+        let make = |id: &str, title: &str| SeriesItem {
+            id: id.into(),
+            title: title.into(),
+            cover: String::new(),
+            item_type: "drama".into(),
+            episodes_count: 0,
+            latest_episode_title: None,
+            tags: vec![],
+            origin: String::new(),
+            brief: None,
+        };
+        let mut items = vec![
+            make("1", "大将军扛楼养活百万大军"),
+            make("2", "特级战龙"),
+            make("3", "我只想找死，却被奉为九州战神了"),
+        ];
+        rank_search_items(&mut items, "战神");
+        assert_eq!(items[0].title, "我只想找死，却被奉为九州战神了");
+        assert_eq!(items[2].title, "大将军扛楼养活百万大军");
+    }
 
     #[test]
     fn detects_comic_pagination() {

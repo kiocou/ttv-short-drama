@@ -3,6 +3,7 @@ import { AppProvider, useAppStore } from './stores/useAppStore';
 import { CatalogProvider } from './stores/useCatalogStore';
 import { PlaybackProvider, usePlaybackStore } from './stores/usePlaybackStore';
 import { HistoryProvider } from './stores/useHistoryStore';
+import { FavoritesProvider } from './stores/useFavoritesStore';
 import { SettingsProvider } from './stores/useSettingsStore';
 import { leaveFullscreen } from './services/windowFx';
 
@@ -13,6 +14,7 @@ import { ToastContainer } from './components/layout/ToastContainer';
 import { ExploreView } from './components/views/ExploreView';
 import { DetailView } from './components/views/DetailView';
 import { HistoryView } from './components/views/HistoryView';
+import { FavoritesView } from './components/views/FavoritesView';
 import { SettingsView } from './components/views/SettingsView';
 import { SearchView } from './components/views/SearchView';
 import { VideoSurface } from './components/player/VideoSurface';
@@ -110,6 +112,12 @@ const AppContent: React.FC = () => {
               <HistoryView />
             </div>
             <div
+              key={currentView === 'favorites' ? 'view-favorites' : undefined}
+              className={`h-full w-full ${currentView === 'favorites' ? 'block animate-fluent-page-in' : 'hidden'}`}
+            >
+              <FavoritesView />
+            </div>
+            <div
               key={currentView === 'settings' ? 'view-settings' : undefined}
               className={`h-full w-full ${currentView === 'settings' ? 'block animate-fluent-page-in' : 'hidden'}`}
             >
@@ -138,7 +146,9 @@ export const App: React.FC = () => {
         <CatalogProvider>
           <PlaybackProvider>
             <HistoryProvider>
-              <AppContent />
+              <FavoritesProvider>
+                <AppContent />
+              </FavoritesProvider>
             </HistoryProvider>
           </PlaybackProvider>
         </CatalogProvider>

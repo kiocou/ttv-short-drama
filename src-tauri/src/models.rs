@@ -225,6 +225,27 @@ pub struct CacheClearResult {
     pub freed_mb: f64,
 }
 
+/// 追剧收藏条目（想看 / 在看 / 已看）。
+///
+/// 状态语义与历史记录独立：收藏是用户主动标记，`mark` 只有三种取值，
+/// 由存储层校验，未知值入库时报错而不是静默改写。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteItem {
+    pub series_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub cover: String,
+    /// want / watching / done
+    pub mark: String,
+    /// 漫剧 comic / 短剧 drama，用于收藏页分组筛选。
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default, deserialize_with = "de_i64_lenient")]
+    pub updated_at: i64,
+}
+
 #[cfg(test)]
 mod history_payload_tests {
     use super::WatchHistoryItem;

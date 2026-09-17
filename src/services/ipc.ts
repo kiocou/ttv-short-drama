@@ -2,6 +2,7 @@ import { CatalogFilter, CatalogPage } from '../types/catalog';
 import { SeriesDetail } from '../types/series';
 import { PlaybackSession, PlaybackSnapshot } from '../types/playback';
 import { WatchHistoryItem } from '../types/history';
+import { FavoriteItem } from '../types/favorite';
 import { UserSettings } from '../types/settings';
 import { MOCK_SERIES_LIST, getSeriesDetail, INITIAL_WATCH_HISTORY } from './mockData';
 
@@ -34,6 +35,7 @@ export function generateNextSessionId(): number {
 const STORAGE_KEYS = {
   HISTORY: 'ttv_short_drama_history_v1',
   SETTINGS: 'ttv_short_drama_settings_v1',
+  FAVORITES: 'ttv_short_drama_favorites_v1',
 };
 
 export const DEFAULT_SETTINGS: UserSettings = {
@@ -242,6 +244,34 @@ export const ipcService = {
         return;
       }
       saveStorage(STORAGE_KEYS.HISTORY, []);
+    },
+  },
+
+  favorites: {
+    async list(mark?: string): Promise<FavoriteItem[]> {
+      if (isTauriEnvironment()) {
+        return invokeBackend<FavoriteItem[]>('favorites_list', { mark: mark ?? null });
+      }
+      const list = loadStorage<FavoriteItem[]>(STORAGE_KEYS.FAVORITES, []);
+      return mark ? list.filter(item => item.mark === mark) : list;
+    },
+
+    async save(item: FavoriteItem): Promise<void> {
+      if (isTauriEnvironment()) {
+        await invokeBackend('favorites_save', { item });
+        return;
+      }
+      const list = loadStorage<FavoriteItem[]>(STORAGE_KEYS.FAVORITES, []);
+      saveStorage(STORAGE_KEYS.FAVORITES, [item, ...list.filter(existing => existing.seriesId !== item.seriesId)]);
+    },
+
+    async remove(seriesId: string): Promise<void> {
+      if (isTauriEnvironment()) {
+        await invokeBackend('favorites_remove', { seriesId });
+        return;
+      }
+      const list = loadStorage<FavoriteItem[]>(STORAGE_KEYS.FAVORITES, []);
+      saveStorage(STORAGE_KEYS.FAVORITES, list.filter(item => item.seriesId !== seriesId));
     },
   },
 

@@ -52,6 +52,7 @@ export const VideoSurface: React.FC = () => {
     currentEpisode,
     position,
     isMuted,
+    playbackRate,
     prepareStatus,
     isSwitching,
     errorDetail,
@@ -203,6 +204,57 @@ export const VideoSurface: React.FC = () => {
     }
   };
 
+  /**
+   * 长按临时 3 倍速（参考红果/果果的快捷操作）。
+   *
+   * 按住 350ms 起效，松开、失焦或指针滑出画面后恢复原速。临时倍速只改
+   * video.playbackRate，不动 store 里的用户倍速设定——恢复时永远回到
+   * 播放器菜单里选的那个值。拖动进度、多指触控不算长按。
+   */
+  const LONG_PRESS_MS = 350;
+  const TEMP_BOOST_RATE = 3;
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const boostedRef = useRef(false);
+
+  const cancelLongPressBoost = useCallback(() => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+    if (boostedRef.current) {
+      boostedRef.current = false;
+      if (videoRef.current) {
+        videoRef.current.playbackRate = playbackRate;
+      }
+    }
+  }, [playbackRate, videoRef]);
+
+  const handleSurfacePointerDown = (e: React.PointerEvent<HTMLVideoElement>) => {
+    // 鼠标只认左键；多指触控不触发长按。
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (!e.isPrimary) return;
+    cancelLongPressBoost();
+    longPressTimerRef.current = setTimeout(() => {
+      longPressTimerRef.current = null;
+      const video = videoRef.current;
+      // 只在真正播放中临时加速：暂停时长按没有意义，还容易误触。
+      if (video && !video.paused) {
+        boostedRef.current = true;
+        video.playbackRate = TEMP_BOOST_RATE;
+      }
+    }, LONG_PRESS_MS);
+  };
+
+  // 长按期间也要喂自动隐藏定时器：按下本身算一次用户活动。
+  const handleSurfacePointerUp = () => {
+    handleUserActivity();
+    cancelLongPressBoost();
+  };
+
+  // 卸载与倍速变更时收掉长按加速：卸载不清理会留下一个悬空定时器，
+  // 而用户在按住期间改了倍速设定的话，恢复值也要跟着变。
+  useEffect(() => cancelLongPressBoost, [cancelLongPressBoost]);
+
   // 键盘全局快捷键
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -323,6 +375,10 @@ export const VideoSurface: React.FC = () => {
         playsInline
         className="w-full h-full object-contain cursor-pointer"
         onClick={handleVideoSurfaceClick}
+        onPointerDown={handleSurfacePointerDown}
+        onPointerUp={handleSurfacePointerUp}
+        onPointerCancel={handleSurfacePointerUp}
+        onPointerLeave={handleSurfacePointerUp}
       />
 
       {/* 全屏退出提示：纯原生全屏没有浏览器自带的提示条，短暂告知 Esc 可用。 */}

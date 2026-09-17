@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { useFavorites } from '../../stores/useFavoritesStore';
 import { ipcService } from '../../services/ipc';
 import { SeriesDetail, EpisodeItem } from '../../types/series';
 import { MicaCard } from '../common/MicaCard';
@@ -17,12 +18,14 @@ import {
   X,
   Search,
   Layers,
-  Check
+  Check,
+  Heart
 } from 'lucide-react';
 
 export const DetailView: React.FC = () => {
   const { selectedSeriesId, navigateTo, goBack, showToast } = useAppStore();
   const { openEpisode, prewarmEpisode } = usePlaybackStore();
+  const { markBySeriesId, setMark } = useFavorites();
   const detailCacheRef = useRef<Record<string, SeriesDetail>>({});
   // 供 effect 读取最新实现，避免把 prewarmEpisode 放进依赖数组导致每次渲染重跑。
   const prewarmEpisodeRef = useRef(prewarmEpisode);
@@ -249,6 +252,36 @@ export const DetailView: React.FC = () => {
                   {lastWatchedEp?.watchedSeconds
                     ? `继续观看 (第 ${lastWatchedEp.episodeNumber} 集)`
                     : '立即播放第 1 集'}
+                </span>
+              </button>
+
+              <button
+                onClick={() => {
+                  // 收藏三态轮转：未收藏 → 想看 → 在看 → 已看 → 取消。
+                  // 与观看历史相互独立：取消收藏不删历史。
+                  const current = detail ? markBySeriesId.get(detail.id) : undefined;
+                  const next = current === 'want' ? 'watching' : current === 'watching' ? 'done' : current === 'done' ? null : 'want';
+                  if (detail) {
+                    void setMark(detail.id, detail.title, detail.cover, next, detail.type);
+                  }
+                }}
+                className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-semibold shadow-xs active:scale-95 transition-all cursor-pointer border ${
+                  detail && markBySeriesId.get(detail.id)
+                    ? 'bg-rose-50 hover:bg-rose-100 text-rose-600 border-rose-200/80'
+                    : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200/80'
+                }`}
+                title="点击切换追剧状态：想看 → 在看 → 已看"
+              >
+                <Heart
+                  className={`w-4 h-4 ${
+                    detail && markBySeriesId.get(detail.id) ? 'fill-current text-rose-500' : 'text-slate-500'
+                  }`}
+                />
+                <span>
+                  {(() => {
+                    const current = detail ? markBySeriesId.get(detail.id) : undefined;
+                    return current ? `已标「${current === 'want' ? '想看' : current === 'watching' ? '在看' : '已看'}」` : '加入追剧';
+                  })()}
                 </span>
               </button>
 
