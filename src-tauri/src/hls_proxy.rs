@@ -262,10 +262,28 @@ async fn handle(mut socket: tokio::net::TcpStream) {
         return;
     }
     if method != "HEAD" {
-        // 分片通常几百 KB～几 MB，全量读取转发足够；读失败时连接已声明长度，
-        // 直接断开让播放器按失败重试分片。
-        if let Ok(bytes) = response.bytes().await {
-            let _ = socket.write_all(&bytes).await;
+        // **流式**转发，绝不 `response.bytes()` 全量读进内存。
+        //
+        // 动漫源的直链既有几百 KB 的 ts 分片，也有 **200MB+ 的完整 MP4**
+        // （preview.ndcsk.com/ndcyx.com）。旧实现把整个响应体读进内存再写：
+        // 大 MP4 会在这里等几分钟、内存峰值几百 MB，WebView2 侧表现为
+        // `ERR_CONNECTION_CLOSED`（连接被拖死），动漫第 1、2 集就是这样播不
+        // 出来的。分块边读边写后，首帧数据立刻抵达播放器。
+        let mut stream = response;
+        loop {
+            match stream.chunk().await {
+                Ok(Some(chunk)) => {
+                    if socket.write_all(&chunk).await.is_err() {
+                        // 播放器已主动断开（换集/关闭）：停读上游即可。
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    // 上游中途断开：连接已声明长度，直接关闭让播放器重试分片。
+                    break;
+                }
+            }
         }
     }
     let _ = socket.flush().await;

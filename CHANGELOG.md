@@ -11,6 +11,8 @@
 - **漫剧预热/播放全线失败**（"预签名跳过"+"网络失败"刷屏）：服务端已静默拒绝漫剧旧 `aid=8704`（HTTP 200 空 body，无错误码）。实测漫剧 vid 用 `aid=8662` 在 v1/v2 端点都能取到播放模型，`CONTENT_PROFILES` 与 Rust 侧同步更新。
 - 换集加载中"线路失败，切换备用域名"提示文案改为"主线路波动，已自动切换备用线路"——它是自动换线进度而非错误。
 - **启动不再显示控制台窗口**：`windows_subsystem = "windows"` 改为无条件生效（此前仅 release 生效，debug 双击 exe 带黑色终端）。
+- **动漫部分集完全播不出（"播放源连接受阻"）**：dmghg 源的选集**格式不统一**——同一部剧里，有的集是 http m3u8，有的集是 `preview.ndcsk.com`/`ndcyx.com` 的 **200MB+ https MP4 直链**。两个叠加问题：① 这些 https MP4 直链连接不稳定（实测 Range 探测间歇性 SSL EOF）；② 本地 HLS 代理转发大文件时用 `response.bytes()` **全量读进内存**再下发，268MB 的 MP4 直接把连接拖死（WebView2 报 `ERR_CONNECTION_CLOSED`）。现在动漫所有直链**一律走本地代理**，且代理改为**分块流式转发**（边读边写，首帧立刻抵达）。实测《炼气十万年》第 1/2 集（MP4）与第 38 集（m3u8）均 1920x1080 正常起播。
+- **播放窗口在后台时被 WebView 省电暂停，误报"播放源连接受阻"**：WebView2 会把后台窗口里的纯视频媒体暂停以省电（`play()` 抛 `AbortError: video-only background media was paused to save power`），源本身已就绪。现在静默重试一次，仍失败回到缓冲态等播放手势，不再误判为播放源问题。
 
 ## Unreleased
 
