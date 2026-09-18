@@ -226,17 +226,17 @@ impl AnimeProvider {
                 quality.to_string(),
             )
             .await?;
-            // 不同选集线路回来的格式不一样（实测）：
-            //   仙逆 cn 线          -> https MP4 直链，原生 <video src> 可播
+            // 不同选集线路回来的格式不一样（实测 2026-09-18）：
+            //   凡人修仙传/炼气十万年 cn 线 -> **部分集是 https MP4 直链
+            //   （preview.ndcsk.com 等），部分集是 http m3u8**
             //   恋爱与选举 newup-jp -> http 明文 m3u8
             // http 明文会被 CSP 的 media-src/connect-src 拦掉（只放行 https 与
             // 127.0.0.1），而且这些 CDN 不给 CORS 头，hls.js 直拉同样过不了。
-            // 所以 m3u8 与非 https 一律走本地代理：一次解决 CSP、CORS 与分片重写。
-            let url = if url.contains(".m3u8") || !url.starts_with("https://") {
-                crate::hls_proxy::proxied_url(&url).unwrap_or(url)
-            } else {
-                url
-            };
+            // 另实测：preview.ndcsk.com/ndcyx.com 的 https MP4 直链**连接不稳定**
+            // （Range 探测间歇性 SSL EOF / ERR_CONNECTION_CLOSED，WebView2 播放
+            // 时直接失败）。所以**一律走本地代理**：解决 CSP、CORS、TLS 抖动与
+            // 分片重写（代理对 Range 的透传已在 hls_proxy 中实现）。
+            let url = crate::hls_proxy::proxied_url(&url).unwrap_or(url);
             return Ok(PlaybackSession {
                 session_id,
                 series_id: series_id.to_string(),
