@@ -1,6 +1,6 @@
 [package]
 name = "ttv-short-drama"
-version = "0.2.5"
+version = "0.2.6"
 description = "TTV Short Drama desktop application"
 authors = ["TTV"]
 edition = "2021"
@@ -33,3 +33,5 @@ uuid = { version = "1", features = ["v4"] }
 # 用到的 feature，不新增下载体积。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_LibraryLoader"] }
+
+
