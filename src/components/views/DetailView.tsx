@@ -194,12 +194,12 @@ export const DetailView: React.FC = () => {
             {/* 顶部分类与来源元数据徽章 */}
             <div className="flex items-center gap-2 flex-wrap">
               <StatusBadge
-                label={detail.type === 'drama' ? '短剧爆款' : '漫剧专享'}
+                label={detail.type === 'drama' ? '短剧爆款' : detail.type === 'anime' ? '动漫专区' : '漫剧专享'}
                 variant="blue"
                 dot
               />
               <span className="text-xs text-slate-600 font-semibold bg-white/85 px-2.5 py-0.5 rounded-lg border border-slate-200/60 shadow-xs">
-                共 {detail.episodesCount} 集全
+                {detail.type === 'anime' && detail.episodesCount === 0 ? '单集/已完结' : `共 ${detail.episodesCount} 集全`}
               </span>
               <span className="text-xs text-slate-300">|</span>
               <span className="text-xs text-slate-500 font-medium">{detail.origin}</span>

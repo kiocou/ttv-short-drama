@@ -95,6 +95,41 @@ export const ipcService = {
         categories: ['全部', ...[...new Set(list.flatMap(item => item.tags))].slice(0, 12)],
       };
     },
+    /**
+     * 批量补齐真实集数（实际上只有漫剧需要）。
+     *
+     * 漫剧列表来自公开榜单页 HTML，而该页（含内嵌 router data）不含任何集数文案
+     * ——实测整页 `episode_cnt` 出现 0 次，所以卡片只能显示"集数未知"。真实集数
+     * 在 App 侧：album_detail 支持一次传多个 series_ids，一次可覆盖整页卡片。
+     * 失败返回空对象——集数未知不该影响目录可用性。
+     */
+    async episodeCounts(seriesIds: string[]): Promise<Record<string, number>> {
+      if (seriesIds.length === 0 || !isTauriEnvironment()) return {};
+      try {
+        return await invokeBackend<Record<string, number>>(
+          'short_drama_app_episode_counts',
+          { seriesIds },
+        );
+      } catch {
+        return {};
+      }
+    },
+    /**
+     * 全站题材词表。
+     *
+     * 目录分页一次只有 24 条，按页取词表会让题材栏随翻页/筛选变来变去，也拿不到
+     * 全站的题材。这里由后端汇总全站目录后给出稳定全集（首次调用要建索引，约数秒），
+     * 所以调用方应在首屏渲染完成后后台调用。失败返回空数组——题材栏保留原有内容，
+     * 不该因为一次抖动而空掉。
+     */
+    async categories(channel: CatalogFilter['channel']): Promise<string[]> {
+      if (!isTauriEnvironment()) return [];
+      try {
+        return await invokeBackend<string[]>('catalog_categories', { channel });
+      } catch {
+        return [];
+      }
+    },
   },
 
   series: {
@@ -114,10 +149,10 @@ export const ipcService = {
   },
 
   playback: {
-    async open(seriesId: string, episodeId: string, quality = 'auto', position = 0, sessionId = generateNextSessionId()): Promise<PlaybackSession> {
+    async open(seriesId: string, episodeId: string, quality = 'auto', position = 0, sessionId = generateNextSessionId(), isAnime = false): Promise<PlaybackSession> {
       if (isTauriEnvironment()) {
         return invokeBackend<PlaybackSession>('playback_open', {
-          input: { sessionId, seriesId, episodeId, quality, position },
+          input: { sessionId, seriesId, episodeId, quality, position, isAnime },
         });
       }
       const detail = getSeriesDetail(seriesId);
@@ -177,6 +212,29 @@ export const ipcService = {
           { input: { vid, contentType } },
         );
         return variants ?? [];
+      } catch {
+        return [];
+      }
+    },
+
+    /**
+     * 动漫专区的清晰度档位。
+     *
+     * 与 `listNativeQualities` 的区别：那条走的是红果 worker，对动漫源无效；
+     * 动漫的档位藏在播放解析里，必须由后端解析一次才能拿到（1~2 档）。
+     * 失败返回空数组——清晰度是附加信息，不该阻塞播放。
+     */
+    async animeQualities(
+      seriesId: string,
+      episodeId: string,
+    ): Promise<Array<{ label: string; value: string; resolution: string }>> {
+      if (!isTauriEnvironment()) return [];
+      try {
+        const options = await invokeBackend<Array<{ label: string; value: string; resolution: string }>>(
+          'anime_qualities',
+          { seriesId, episodeId },
+        );
+        return options ?? [];
       } catch {
         return [];
       }
@@ -307,10 +365,3 @@ export const ipcService = {
     },
   },
 };
-
-/**
- * 浏览器（Mock）模式下的 RTX VSR 探测结果。
- *
- * 纯浏览器里既读不到 `nvidia-smi`，也读不到 WebView2 运行时版本，因此如实
- * 报"不可用"并说明原因——不伪造一份看起来可用的能力表。
- */

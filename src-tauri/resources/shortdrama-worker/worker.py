@@ -96,10 +96,14 @@ def download_source(session: requests.Session, real_url: str, source: Path) -> N
 
 # 红果短剧和红果漫剧共用 seriessdk 播放端点，但在 APK 中注册为不同模型/aids。
 # 只保留逆向报告确认的值，避免让 UI 传入任意请求模型。
+#
+# 2026-09-18 实测：服务端策略已变——漫剧 vid 用 aid=8662（短剧 aid）在
+# v1/v2 端点都能取到播放模型；旧的 1004/1007 → aid=8704 现在被网关
+# 静默拒绝（HTTP 200 空 body，无错误码），表现为"网络失败"重试耗尽。
 CONTENT_PROFILES = {
     1: {"aid": 8662, "name": "short-series"},
-    1004: {"aid": 8704, "name": "motion-comic"},
-    1007: {"aid": 8704, "name": "unreal-motion-comic"},
+    1004: {"aid": 8662, "name": "motion-comic"},
+    1007: {"aid": 8662, "name": "unreal-motion-comic"},
 }
 
 # 放映厅/播放域名：sinfonlineb 为现网主路径，sinfonlinea 与 lf 为实测对照备线。
@@ -236,6 +240,30 @@ def decrypt_spade_url(b64_str: str, key_seed: bytes) -> str:
     return plaintext.rstrip(b"\x00").decode("utf-8", errors="replace")
 
 
+def variant_height(item: dict) -> int:
+    """该档的真实像素高度。
+
+    优先级与参考实现（provider_hongguo_native_media.go）一致：
+    definition 里的数字 → vheight → vwidth（竖屏源会把宽度当高度用）。
+    只读 vheight 会让不带该字段的档位高度恒为 0，进而被选流与画质菜单整体剔除
+    （Rust 侧也会丢弃高度 0 的档），表现成"画质菜单为空"。
+    """
+    if not isinstance(item, dict):
+        return 0
+    digits = "".join(ch for ch in str(item.get("definition") or "") if ch.isdigit())
+    if digits:
+        value = int(digits)
+        if value > 0:
+            return value
+    height = int(item.get("vheight", 0) or 0)
+    if height > 0:
+        return height
+    width = int(item.get("vwidth", 0) or 0)
+    if width > 0:
+        return width
+    return 0
+
+
 def variant_codec(item: dict) -> str:
     """取该档源流的编码标识（video_meta.codec_type 或 gear_des_key）。"""
     meta = item.get("video_meta") if isinstance(item.get("video_meta"), dict) else {}
@@ -273,7 +301,7 @@ def select_best_quality(video_list: dict) -> tuple[str, dict]:
             continue
         if not is_compatible_codec(item):
             continue
-        height = int(item.get("vheight", 0) or 0)
+        height = variant_height(item)
         score = height * 10
         if int(item.get("bitrate", 0) or 0) > 0:
             score += 1
@@ -288,7 +316,7 @@ def select_best_quality(video_list: dict) -> tuple[str, dict]:
         # 也不能直接报"没有清晰度"，那样整个错误提示会误导排查方向。
         for key, item in video_list.items():
             if isinstance(item, dict):
-                height = int(item.get("vheight", 0) or 0)
+                height = variant_height(item)
                 if height > 0 and not best_item:
                     best_key, best_item = key, item
     return best_key, best_item
@@ -296,10 +324,10 @@ def select_best_quality(video_list: dict) -> tuple[str, dict]:
 
 def quality_label(key: str, item: dict) -> str:
     """统一档位展示；优先使用真实像素高度，避免显示成笼统的“高清”。"""
-    width = int(item.get("vwidth", 0) or 0)
-    height = int(item.get("vheight", 0) or 0)
+    height = variant_height(item)
     if height > 0:
         return f"{height}P"
+    width = int(item.get("vwidth", 0) or 0)
     if width > 0:
         return f"{width}P"
     for field in ("definition", "resolution", "quality", "quality_name"):
@@ -347,19 +375,33 @@ def decode_quality_variant(key: str, item: dict, key_seed: bytes) -> dict | None
     if not real_url:
         return None
     content_key = ""
-    spade_a = str(item.get("spade_a") or "").strip()
+    content_key = ""
+    # 密钥优先取 encrypt_info.spade_a：把加密信息放在这一层是参考实现
+    # （provider_hongguo_native_media.go）读到的形状，顶层 spade_a 作兼容兜底。
+    encryption = item.get("encrypt_info") if isinstance(item.get("encrypt_info"), dict) else {}
+    spade_a = str(encryption.get("spade_a") or item.get("spade_a") or "").strip()
     if spade_a:
         try:
             content_key = derive_content_key(spade_a).hex()
         except Exception:
             content_key = ""
+    elif bool(encryption.get("encrypt")) or str(
+        encryption.get("encryption_method") or ""
+    ).strip().lower() == "cenc-aes-ctr":
+        # 声明加密却拿不到密钥：不静默降级，否则症状会表现成
+        # "起播成功但解不出画面"，极难定位到密钥这一层。
+        emit({
+            "event": "progress",
+            "stage": "fallback",
+            "message": f"{key} 声明为加密流但未取到 spade_a 密钥",
+        })
     return {
         "id": str(key),
         "label": quality_label(str(key), item),
         "url": real_url,
         "content_key": content_key,
         "width": int(item.get("vwidth", 0) or 0),
-        "height": int(item.get("vheight", 0) or 0),
+        "height": variant_height(item),
         "bitrate": int(item.get("bitrate", 0) or 0),
     }
 
@@ -482,7 +524,7 @@ def get_with_host_failover(session: requests.Session, url: str, headers: dict[st
                 emit({
                     "event": "progress",
                     "stage": "fallback",
-                    "message": f"线路失败，切换备用域名（{urlsplit(candidate).netloc}）",
+                    "message": f"主线路波动，已自动切换备用线路（{urlsplit(candidate).netloc}）",
                 })
                 continue
             response.raise_for_status()
@@ -493,7 +535,7 @@ def get_with_host_failover(session: requests.Session, url: str, headers: dict[st
                 emit({
                     "event": "progress",
                     "stage": "fallback",
-                    "message": f"线路失败，切换备用域名（{urlsplit(candidate).netloc}）",
+                    "message": f"主线路波动，已自动切换备用线路（{urlsplit(candidate).netloc}）",
                 })
                 continue
             raise
@@ -501,25 +543,46 @@ def get_with_host_failover(session: requests.Session, url: str, headers: dict[st
 
 
 def hongguo_business_error(payload: dict) -> str | None:
+    """业务错误判定：**任何**非 0 业务码都算失败（参考果果 provider_hongguo_app.go）。
+
+    旧判据是"code 非 0 **且** data 为空"才算错，于是两类失败会被放行成成功：
+    一是"非 0 但响应里夹带了 data"，二是"code 是字符串型错误码（如 E1001，
+    int() 抛异常后被吞成 None）"。放行的后果是调用方随后只会在"找不到 vid"
+    之类的地方抛出与真实原因无关的错误，真实错误码当场丢失。
+
+    "成功但 data 为空"不在这里放行——那属于调用方的结构校验职责。
+    """
     if not isinstance(payload, dict):
         return None
     raw = payload.get("code")
-    if raw in (None, 0, "0", ""):
-        return None
+    base_resp = payload.get("BaseResp")
+    if not isinstance(base_resp, dict):
+        base_resp = {}
+    status = base_resp.get("StatusCode")
+    message = str(
+        payload.get("message")
+        or payload.get("msg")
+        or base_resp.get("StatusMessage")
+        or raw
+        or ""
+    ).strip()
     try:
-        code = int(raw)
+        numeric: int | None = int(raw)
     except (TypeError, ValueError):
-        code = None
-    message = str(payload.get("message") or payload.get("msg") or raw).strip()
-    if code == 111104:
+        numeric = None
+    if numeric == 111104:
         return (
             "设备身份无效（111104）。请用真机抓包更新 deviceId / installId，"
             "并写入服务端下发的 deviceToken（x-tt-dt），不要本地编造。"
         )
-    if code == 110001:
+    if numeric == 110001:
         return "播放模型未知异常（110001）。漫剧请走 V2 端点，或更换设备凭据后重试。"
-    if payload.get("data") is None and code not in (None, 0):
-        return f"红果接口错误 {code}：{message or 'SERVICE_ERROR'}"
+    if raw not in (None, 0, "0", ""):
+        label = numeric if numeric is not None else raw
+        return f"红果接口错误 {label}：{message or 'SERVICE_ERROR'}"
+    # code 为 0 时仍要看 BaseResp.StatusCode（部分接口把错误只写在这里）。
+    if status not in (None, 0, "0", ""):
+        return f"红果接口错误 {status}：{message or 'SERVICE_ERROR'}"
     return None
 
 
@@ -562,8 +625,13 @@ def signed_post(session: requests.Session, url: str, payload: dict,
             signed_headers["x-ss-req-ticket"] = str(int(time.time() * 1000))
             response = session.post(signed_url, headers=signed_headers, data=body_bytes, timeout=10)
             if 400 <= response.status_code < 500:
-                # 4xx 是请求本身被拒（签名/参数/权限），重试无意义。
-                response.raise_for_status()
+                # 4xx 是请求本身被拒（签名/参数/权限），重试无意义——直接转成
+                # PermissionError 结束整个重试循环。旧写法在这里 raise_for_status 后
+                # 落进了下面的通用重试分支，等于把同一个被拒的请求又打了两遍
+                # （与参考实现 provider_hongguo_app.go 的"4xx 直接返回"相反）。
+                raise PermissionError(
+                    f"红果接口拒绝请求（HTTP {response.status_code}）：{response.text[:200]}"
+                )
             response.raise_for_status()
             data = response.json()
             error = hongguo_business_error(data)
@@ -593,7 +661,7 @@ def signed_post_failover(session: requests.Session, urls: list[str], payload: di
                 emit({
                     "event": "progress",
                     "stage": "sign",
-                    "message": f"线路失败，切换备用域名（{urlsplit(url).netloc}）",
+                    "message": f"主线路波动，已自动切换备用线路（{urlsplit(url).netloc}）",
                 })
             continue
     raise last_error or RuntimeError("红果播放接口无可用线路")
@@ -791,6 +859,10 @@ def signed_get(session: requests.Session, url: str, extra_params: dict,
     base_headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json; charset=utf-8",
+        # 与 signed_post 保持一致：网关对这些头敏感，少一个就可能被判成非法客户端
+        # （参考实现 provider_hongguo_app.go 对每个请求都设这两项）。
+        "x-xs-from-web": "0",
+        "sdk-version": "2",
     }
     signed_headers, signed_url = core_sixgod(
         surl=f"{parts.scheme}://{parts.netloc}{parts.path}",
@@ -802,7 +874,12 @@ def signed_get(session: requests.Session, url: str, extra_params: dict,
     )
     response = session.get(signed_url, headers=signed_headers, timeout=10)
     response.raise_for_status()
-    return response.json()
+    text = response.text.strip()
+    if not text:
+        # 部分档位（实测 aid=8704）会回 HTTP 200 + **空 body** 而不是错误码。
+        # 直接 response.json() 会抛 JSONDecodeError，被上层误当成网络故障重试。
+        raise ValueError("红果接口返回空响应（该 aid 可能不服务此接口）")
+    return json.loads(text)
 
 
 def search_cmd(keyword: str, device_id: str, install_id: str, aid: int) -> dict:
@@ -819,7 +896,7 @@ def search_cmd(keyword: str, device_id: str, install_id: str, aid: int) -> dict:
         try:
             payload = signed_get(session, url, {"q": keyword, "count": "20"},
                                  device_id, install_id)
-        except requests.RequestException as error:
+        except (requests.RequestException, ValueError) as error:
             last_error = error
             continue
         if not isinstance(payload, dict) or payload.get("code") != 0:
@@ -970,18 +1047,48 @@ def load_stream_info(session: requests.Session, vid: str, device_id: str, instal
     return fetch_stream(session, vid, device_id, install_id, content_type, aid)
 
 
+def preferred_quality_height(requested: str, variants: list) -> int | None:
+    """目标清晰度 → 实际选中高度（缺档回退，与果果 preferredDownloadQuality 一致）。
+
+    回退规则：优先不高于目标的最接近档；全部比目标高时保留其中最低档。
+    0/auto 表示跟随默认最高档。高度夹在 1-4320（果果 parsePlaybackQuality 的范围）。
+    """
+    raw = (requested or "auto").strip().lower()
+    target = {"4k": 2160, "1080p": 1080, "720p": 720, "480p": 480}.get(raw)
+    if not target:
+        # 前端画质菜单报的是源流真实高度，实测会出现 540、360 这类固定档位之外的
+        # 值。只认 4 个字面量会把它们静默降级成"跟随默认最高档"，用户切了等于没切。
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        target = int(digits) if digits else 0
+    if not target:
+        return None
+    heights = sorted({int(item.get("height", 0) or 0) for item in variants
+                      if int(item.get("height", 0) or 0) > 0 and int(item.get("height", 0) or 0) <= 4320})
+    if not heights:
+        return None
+    below = [h for h in heights if h <= target]
+    if below:
+        return below[-1]
+    return heights[0]
+
+
 def pick_stream_variant(stream_info: dict) -> tuple:
-    """按请求的清晰度挑一路流，返回 (url, content_key_hex, width, height)。"""
+    """按请求的清晰度挑一路流，返回 (url, content_key_hex, width, height)。
+
+    指定档位优先该档；缺档时选择不高于目标的最高档（若全部更高则保留其中
+    最低档）——与果果 preferredDownloadQuality 的回退规则一致，而不是旧版
+    的"取绝对值最近的档"（那会选到比目标更高的档，下载体积凭空变大）。
+    """
     requested_quality = os.getenv("TTV_SD_QUALITY", "auto").strip().lower()
     selected = None
     if requested_quality != "auto":
-        target_height = {"4k": 2160, "1080p": 1080, "720p": 720}.get(requested_quality)
         variants = stream_info.get("variants") or []
+        target_height = preferred_quality_height(requested_quality, variants)
         if target_height:
-            selected = min(
-                (item for item in variants if int(item.get("height", 0) or 0) > 0),
-                key=lambda item: abs(int(item.get("height", 0) or 0) - target_height),
-                default=None,
+            selected = next(
+                (item for item in variants
+                 if int(item.get("height", 0) or 0) == target_height),
+                None,
             )
     if selected:
         return (selected["url"],
@@ -1156,10 +1263,76 @@ def album_cmd(series_id: str, device_id: str, install_id: str, aid: int) -> dict
     return payload
 
 
+def extract_episode_counts(data) -> dict:
+    """从 album_detail 的 data 里取出 {series_id: 集数}。
+
+    实测结构为 `data.video_detail_data.<series_id>.video_data.episode_cnt`；
+    少数条目会把 video_data 摊平在上一层，两种形状都认。
+    """
+    details = data.get("video_detail_data") if isinstance(data, dict) else None
+    if not isinstance(details, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for key, entry in details.items():
+        if not isinstance(entry, dict):
+            continue
+        video = entry.get("video_data")
+        if not isinstance(video, dict):
+            video = entry
+        series_id = str(video.get("series_id") or video.get("series_id_str") or key).strip()
+        raw_total = video.get("episode_total_cnt") or video.get("episode_cnt")
+        try:
+            total = int(raw_total or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if series_id.isdigit() and total > 0:
+            counts[series_id] = total
+    return counts
+
+
+def counts_cmd(series_ids: list[str], device_id: str, install_id: str, aid: int) -> dict:
+    """批量取真实集数（漫剧列表卡片"集数未知"的修复）。
+
+    为什么必须走 App：漫剧列表来自公开榜单页 HTML，而整页（含内嵌 router data）
+    都不含任何集数文案——实测 `episode_cnt` 在榜单页出现 0 次，所以卡片只能显示
+    "集数未知"。真实集数在 App 侧，且 album_detail 支持一次传多个 series_ids：
+    实测整页 20 部一次命中 20/20，冷启 337ms / 热 117ms；逐部详情页则要 N 次往返
+    （N × 0.6s，且会和播放解析抢同一个单实例 worker）。
+    """
+    unique: list[str] = []
+    seen: set[str] = set()
+    for raw in series_ids:
+        value = str(raw).strip()
+        if value.isdigit() and value not in seen:
+            seen.add(value)
+            unique.append(value)
+    if not unique:
+        raise ValueError("counts 需要至少一个有效的 series_id")
+    session = http_session()
+    emit({"event": "progress", "stage": "counts", "message": "正在获取真实集数"})
+    payload = {
+        "album_id": unique[0],
+        "series_ids": [int(value) for value in unique],
+        # 必须为 True：实测 False 时响应只剩单个 album_data，没有逐剧的 video_data，
+        # 一个集数都拿不到。
+        "need_video_detail_info": True,
+        "biz_param": dict(BIZ_PARAM),
+    }
+    response = signed_post_failover(
+        session,
+        player_urls(ALBUM_PATH, install_id, device_id, aid),
+        payload,
+        device_id,
+        install_id,
+    )
+    counts = extract_episode_counts(response.get("data") if isinstance(response, dict) else None)
+    result = {"ok": True, "counts": counts}
+    emit({"event": "done", **result})
+    return result
 def main() -> int:
     argv = sys.argv[1:]
     if not argv:
-        emit({"ok": False, "error": "用法: worker.py resolve|stream <vid> / album <series_id>"})
+        emit({"ok": False, "error": "用法: worker.py resolve|stream <vid> / album <series_id> / counts <id,id,...>"})
         return 2
     subcommand = argv[0]
     if subcommand == "selftest":
@@ -1169,6 +1342,23 @@ def main() -> int:
         assert "aid=8662" in urls[0] and "app_name=novelread" in urls[0]
         assert "111104" in (hongguo_business_error({"code": 111104, "data": None}) or "")
         assert hongguo_business_error({"code": 0, "data": {}}) is None
+        # 业务错误判定：任何非 0 码都算失败。"非 0 但夹带 data"与字符串型错误码
+        # 都不能被放行——旧判据把这两种情况判成了成功，真实错误码当场丢失。
+        assert hongguo_business_error({"code": "0", "data": {}}) is None
+        assert hongguo_business_error({"code": None, "data": {}}) is None
+        assert hongguo_business_error({"code": 100001, "data": {"series": 1}}) is not None
+        assert hongguo_business_error({"code": "E1001", "data": None}) is not None
+        assert hongguo_business_error({"code": 0, "BaseResp": {"StatusCode": 7}}) is not None
+        assert hongguo_business_error({"code": 0, "BaseResp": {"StatusCode": 0}}) is None
+        assert hongguo_business_error(None) is None
+        # 画质高度回退顺序（参考实现）：definition → vheight → vwidth。
+        assert variant_height({"vheight": 720}) == 720
+        assert variant_height({"definition": "1080P"}) == 1080
+        assert variant_height({"vwidth": 480}) == 480
+        # definition 覆盖 vheight（与参考实现一致，不是取较大值）
+        assert variant_height({"definition": "720P", "vheight": 1080}) == 720
+        assert variant_height({}) == 0
+        assert quality_label("low", {"definition": "540P"}) == "540P"
         failover = player_failover_urls(
             "https://api5-normal-sinfonlineb.fqnovel.com/video/play?x=1"
         )
@@ -1204,14 +1394,37 @@ def main() -> int:
         filtered = [k for k, v in video_list.items()
                     if is_compatible_codec(v)]
         assert filtered == ["main", "low"], f"bytevc2 档不进画质列表: {filtered}"
+        # 缺档回退（果果 preferredDownloadQuality）：请求 720p、只有 1080p/540p
+        # 时选 540p（不高于目标的最高档），而不是旧版的"绝对值最近"（会选 1080p）。
+        variants = [{"height": 1080}, {"height": 540}]
+        assert preferred_quality_height("720p", variants) == 540
+        assert preferred_quality_height("1080p", variants) == 1080
+        # 全部比目标高：保留最低档。
+        assert preferred_quality_height("480p", [{"height": 1080}, {"height": 720}]) == 720
+        # auto / 无有效高度：返回 None，跟随默认最高档。
+        assert preferred_quality_height("auto", variants) is None
+        assert preferred_quality_height("720p", [{"height": 0}]) is None
+        # 超范围高度（>4320）被夹掉。
+        assert preferred_quality_height("720p", [{"height": 8640}, {"height": 540}]) == 540
+        # counts 解析：只认 video_detail_data 下的真实集数，缺集数的条目丢弃。
+        assert extract_episode_counts({
+            "video_detail_data": {
+                "111": {"video_data": {"series_id": "111", "episode_cnt": 153}},
+                "222": {"video_data": {"series_id": "222", "episode_total_cnt": 528}},
+                "333": {"video_data": {"series_id": "333", "episode_cnt": 0}},
+                "444": {"series_id": "444", "episode_cnt": 12},
+            }
+        }) == {"111": 153, "222": 528, "444": 12}
+        assert extract_episode_counts(None) == {}
+        assert extract_episode_counts({"video_detail_data": []}) == {}
         emit({"ok": True, "event": "done", "hosts": [urlsplit(item2).netloc for item2 in urls]})
         return 0
-    if subcommand not in ("resolve", "resolve-prefix", "stream", "album", "search") or len(argv) < 2:
+    if subcommand not in ("resolve", "resolve-prefix", "stream", "album", "search", "counts") or len(argv) < 2:
         emit({"ok": False, "error": f"未知子命令: {subcommand or '(空)'}"})
         return 2
     target = argv[1].strip()
     # search 的目标是关键词（可含中文），其余子命令要求是纯数字 ID。
-    if not target or (subcommand != "search" and not target.isdigit()):
+    if not target or (subcommand not in ("search", "counts") and not target.isdigit()):
         emit({"ok": False, "error": f"缺少有效的 {subcommand} 目标。"})
         return 2
     device_id = os.getenv("TTV_SD_DEVICE_ID", "").strip()
@@ -1238,6 +1451,8 @@ def main() -> int:
             stream_cmd(target, device_id, install_id, content_type, aid)
         elif subcommand == "search":
             search_cmd(target, device_id, install_id, aid)
+        elif subcommand == "counts":
+            counts_cmd(target.split(","), device_id, install_id, aid)
         else:
             album_cmd(target, device_id, install_id, aid)
         return 0

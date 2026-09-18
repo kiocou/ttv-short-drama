@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anime_provider;
+mod dmghg_bridge;
+mod hls_proxy;
 mod models;
 mod provider;
 mod short_drama_app;
@@ -7,14 +10,14 @@ mod storage;
 
 use crate::models::{
     CacheClearResult, CatalogFilter, CatalogPage, FavoriteItem, PlaybackOpenInput, PlaybackSession,
-    PlaybackSnapshot, PlaybackUiState,
-    SeriesDetail, SeriesItem, UserSettings, WatchHistoryItem,
+    PlaybackSnapshot, PlaybackUiState, SeriesDetail, SeriesItem, UserSettings, WatchHistoryItem,
 };
 use crate::provider::DramaProvider;
 use crate::short_drama_app::{
     short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
-    short_drama_app_prefetch_stream, short_drama_app_qualities, short_drama_app_resolve,
-    short_drama_app_set_device, short_drama_app_status, short_drama_app_stream,
+    short_drama_app_episode_counts, short_drama_app_prefetch_stream, short_drama_app_qualities,
+    short_drama_app_resolve, short_drama_app_set_device, short_drama_app_status,
+    short_drama_app_stream,
 };
 use crate::storage::Database;
 use std::collections::HashMap;
@@ -27,6 +30,7 @@ use tauri::{Manager, State};
 
 struct AppState {
     provider: DramaProvider,
+    anime_provider: crate::anime_provider::AnimeProvider,
     database: Database,
     sessions: Mutex<HashMap<u64, PlaybackSession>>,
     cache_dir: PathBuf,
@@ -44,6 +48,10 @@ async fn catalog_list(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
+    // 动漫专区走独立数据源（暴风资源），不与短剧目录共享链路。
+    if filter.channel == "anime" {
+        return state.anime_provider.catalog(&filter).await;
+    }
     let Some(keyword) = keyword else {
         return state.provider.catalog(&filter).await;
     };
@@ -83,12 +91,46 @@ async fn catalog_list(
     Ok(page)
 }
 
+/// 全站题材词表：题材栏的完整来源。
+///
+/// 目录分页只有一页 24 条，按页取词表会让题材栏随翻页/筛选变来变去，也拿不到
+/// 全站题材。这里由后端汇总全站索引后给出稳定全集；首次调用要建索引（约数秒），
+/// 前端应在首屏渲染完成后后台调用，不要挡住卡片。
+#[tauri::command]
+async fn catalog_categories(
+    channel: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    // 动漫专区是独立数据源，不参与红果目录索引。
+    if channel == "anime" {
+        return Ok(Vec::new());
+    }
+    state.provider.catalog_categories(&channel).await
+}
+
+#[tauri::command]
+async fn anime_qualities(
+    series_id: String,
+    episode_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::VideoQualityOption>, String> {
+    state.anime_provider.qualities(&series_id, &episode_id).await
+}
+
 #[tauri::command]
 async fn series_detail(
     series_id: String,
     channel: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<SeriesDetail, String> {
+    // 动漫项按 id 前缀判定，而不是只看 channel：前端的 channelBySeriesId 是内存
+    // Map，页面重载 / HMR 后为空（从收藏、历史进入时也不会填），此时 channel 缺失，
+    // `dmghg:` 开头的 id 会掉进普通短剧链路，被 provider 的数字 id 校验拒掉，
+    // 表现为「剧集 ID 无效。」。id 本身已经携带来源，用它判定最稳。
+    if channel.as_deref() == Some("anime") || series_id.starts_with(crate::dmghg_bridge::ID_PREFIX)
+    {
+        return state.anime_provider.detail(&series_id).await;
+    }
     state.provider.detail(&series_id, channel.as_deref()).await
 }
 
@@ -97,6 +139,27 @@ async fn playback_open(
     input: PlaybackOpenInput,
     state: State<'_, AppState>,
 ) -> Result<PlaybackSession, String> {
+    // 动漫播放走动漫源直链（m3u8 与非 https 经本地 HLS 代理），不经红果 worker。
+    // 同样按 id 前缀兜底：前端 isAnime 来自 detail.type，链条上任一环缺失就会漏判。
+    if input.is_anime || input.series_id.starts_with(crate::dmghg_bridge::ID_PREFIX) {
+        let session = state
+            .anime_provider
+            .open_episode(
+                input.session_id,
+                &input.series_id,
+                &input.episode_id,
+                input.position,
+                &input.quality,
+            )
+            .await?;
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "播放会话锁不可用。".to_string())?;
+        sessions.retain(|id, _| *id >= session.session_id.saturating_sub(8));
+        sessions.insert(session.session_id, session.clone());
+        return Ok(session);
+    }
     let session = state
         .provider
         .open_episode(
@@ -296,7 +359,10 @@ fn history_clear(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn favorites_list(mark: Option<String>, state: State<'_, AppState>) -> Result<Vec<FavoriteItem>, String> {
+fn favorites_list(
+    mark: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<FavoriteItem>, String> {
     state.database.list_favorites(mark.as_deref())
 }
 
@@ -469,12 +535,22 @@ fn main() {
             let cache_dir = app_dir.join("cache");
             fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
             let provider = DramaProvider::new()?;
+            let anime_provider = crate::anime_provider::AnimeProvider::new()?;
             let database = Database::open(&app_dir.join("short-drama.sqlite3"))?;
             app.manage(AppState {
                 provider,
+                anime_provider,
                 database,
                 sessions: Mutex::new(HashMap::new()),
                 cache_dir,
+            });
+
+            // 动漫专区 HLS 本地代理：随应用启动（幂等），m3u8/ts 全部经它转发。
+            tauri::async_runtime::spawn(async {
+                match crate::hls_proxy::start().await {
+                    Ok(port) => eprintln!("[ttv] HLS 代理已启动: 127.0.0.1:{port}"),
+                    Err(error) => eprintln!("[ttv] HLS 代理启动失败: {error}"),
+                }
             });
 
             // 启动即自动整理缓存，无需用户确认。
@@ -496,6 +572,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             catalog_list,
+            catalog_categories,
+            anime_qualities,
             series_detail,
             playback_open,
             playback_command,
@@ -510,6 +588,7 @@ fn main() {
             short_drama_app_qualities,
             short_drama_app_album,
             short_drama_app_prefetch_stream,
+            short_drama_app_episode_counts,
             history_list,
             history_save,
             history_remove,

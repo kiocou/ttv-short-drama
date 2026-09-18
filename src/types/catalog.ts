@@ -1,4 +1,4 @@
-export type ChannelType = 'drama' | 'comic';
+export type ChannelType = 'drama' | 'comic' | 'anime';
 
 export interface SeriesItem {
   id: string;

@@ -13,7 +13,7 @@
 | 历史 | `history_*` | 使用本应用数据目录中的 SQLite/WAL。 |
 | 设置 | `settings_get`、`settings_save` | 使用本应用 SQLite，不与任何其他应用共享。 |
 | 缓存 | `cache_clear` | 仅清理 `com.ttv.shortdrama` 自己的缓存目录。 |
-| 增强 | `enhancement_*` | 诚实报告未接入补帧 SDK，只提供关闭状态。 |
+| 增强 | `enhancement_*` | 已于 v0.2.5 整体移除（见 `CHANGELOG.md` 0.2.5 条目）。重新接入方案见 [`docs/design-proposals/magpie-video-enhancement-integration.md`](./design-proposals/magpie-video-enhancement-integration.md) |
 
 ## 运行方式
 

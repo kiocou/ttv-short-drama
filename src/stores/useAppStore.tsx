@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, ReactNode } from 'react';
 
-export type AppView = 'explore' | 'detail' | 'player' | 'history' | 'favorites' | 'settings' | 'search';
+export type AppView = 'explore' | 'anime' | 'detail' | 'player' | 'history' | 'favorites' | 'settings' | 'search';
 
 /** 搜索历史：最多保留这么多条，最近搜索排在最前。 */
 const MAX_SEARCH_HISTORY = 12;

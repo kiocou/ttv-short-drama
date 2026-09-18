@@ -19,7 +19,6 @@ export const ExploreView: React.FC = () => {
   const {
     channel,
     category,
-    audience,
     sort,
     categories,
     items,
@@ -30,7 +29,6 @@ export const ExploreView: React.FC = () => {
     error,
     setChannel,
     setCategory,
-    setAudience,
     setSort,
     refreshCatalog,
     loadMore,
@@ -83,7 +81,6 @@ export const ExploreView: React.FC = () => {
     return () => observer.disconnect();
   }, [hasMore, isLoading, isLoadingMore, loadMore]);
 
-  const audienceOptions = ['全部', '男频爽剧', '女频爆款'];
 
   return (
     <div ref={scrollContainerRef} className="flex-1 h-full overflow-y-auto p-5 flex flex-col gap-5 select-none">
@@ -159,7 +156,7 @@ export const ExploreView: React.FC = () => {
           </div>
         </div>
 
-        {/* 题材与受众分类标签栏 (整体嵌入式卡槽面板) */}
+        {/* 题材分类标签栏（站点官方题材；点击走服务端题材路由，结果完整可分页） */}
         <div className="flex flex-col gap-2 p-2.5 bg-slate-100/80 rounded-2xl border border-slate-200/70 shadow-inner">
           {/* 题材分类 */}
           <div className="flex items-center gap-1.5 flex-wrap text-xs">
@@ -182,31 +179,6 @@ export const ExploreView: React.FC = () => {
             </div>
           </div>
 
-          {/* 受众筛选 (嵌入式小药丸) */}
-          <div className="flex items-center gap-1.5 flex-wrap text-xs pt-1 border-t border-slate-200/60">
-            <span className="text-slate-400 font-semibold mr-1 text-[11px]">受众:</span>
-            <div className="p-0.5 bg-white/60 rounded-xl border border-slate-200/60 shadow-inner inline-flex items-center gap-1">
-              {audienceOptions.map((aud) => {
-                const audVal = aud === '全部' ? '全部' : aud.slice(0, 2);
-                const isSelected = audience === audVal || (audience === '全部' && aud === '全部');
-
-                return (
-                  <button
-                    key={aud}
-                    type="button"
-                    onClick={() => setAudience(audVal)}
-                    className={`px-3 py-1 rounded-lg transition-all text-[11px] cursor-pointer ${
-                      isSelected
-                        ? 'fluent-convex-tab text-blue-600 font-bold'
-                        : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
-                    }`}
-                  >
-                    {aud}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
         </div>
       </div>
 

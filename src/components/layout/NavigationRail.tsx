@@ -1,12 +1,13 @@
 import React from 'react';
-import { 
-  Compass, 
-  History, 
-  Settings, 
-  PanelLeftClose, 
-  PanelLeftOpen, 
+import {
+  Compass,
+  History,
+  Settings,
+  PanelLeftClose,
+  PanelLeftOpen,
   Film,
-  Heart
+  Heart,
+  Clapperboard
 } from 'lucide-react';
 import { useAppStore, AppView } from '../../stores/useAppStore';
 
@@ -21,6 +22,7 @@ export const NavigationRail: React.FC = () => {
 
   const navItems: NavItem[] = [
     { id: 'explore', label: '短剧发现', icon: Compass },
+    { id: 'anime', label: '动漫专区', icon: Clapperboard },
     { id: 'favorites', label: '我的追剧', icon: Heart },
     { id: 'history', label: '观看历史', icon: History },
     { id: 'settings', label: '系统设置', icon: Settings },

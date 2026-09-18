@@ -12,6 +12,7 @@ import { NavigationRail } from './components/layout/NavigationRail';
 import { ToastContainer } from './components/layout/ToastContainer';
 
 import { ExploreView } from './components/views/ExploreView';
+import { AnimeView } from './components/views/AnimeView';
 import { DetailView } from './components/views/DetailView';
 import { HistoryView } from './components/views/HistoryView';
 import { FavoritesView } from './components/views/FavoritesView';
@@ -98,6 +99,12 @@ const AppContent: React.FC = () => {
               className={`h-full w-full ${currentView === 'explore' ? 'block animate-fluent-page-in' : 'hidden'}`}
             >
               <ExploreView />
+            </div>
+            <div
+              key={currentView === 'anime' ? 'view-anime' : undefined}
+              className={`h-full w-full ${currentView === 'anime' ? 'block animate-fluent-page-in' : 'hidden'}`}
+            >
+              <AnimeView />
             </div>
             <div
               key={currentView === 'detail' ? `view-detail-${selectedSeriesId}` : undefined}

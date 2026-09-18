@@ -31,10 +31,25 @@ interface CatalogContextType {
   refreshContinueWatching: () => Promise<void>;
 }
 
+/**
+ * 合并题材词表：`全部` 恒在首位，保序去重（新增词追加在后面）。
+ *
+ * 题材栏必须"只增不减"——后端一次只给一页的题材，直接覆盖会让栏位随筛选/翻页
+ * 忽明忽暗。
+ */
+function mergeCategories(base: string[], extra: string[]): string[] {
+  const merged = ['全部'];
+  for (const name of [...base, ...extra]) {
+    const value = name.trim();
+    if (value && value !== '全部' && !merged.includes(value)) merged.push(value);
+  }
+  return merged;
+}
+
 const CatalogContext = createContext<CatalogContextType | null>(null);
 
 export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [channel, setChannelState] = useState<ChannelType>('drama');
+  const [channel, setChannelState] = useState<ChannelType>('comic');
   const [category, setCategoryState] = useState<string>('全部');
   const [audience, setAudienceState] = useState<string>('全部');
   const [sort, setSortState] = useState<'recommend' | 'latest' | 'heat'>('recommend');
@@ -47,6 +62,13 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
   const [nextCursor, setNextCursor] = useState<string | undefined>();
   const [nextPage, setNextPage] = useState<number>(2);
   const [error, setError] = useState<string | null>(null);
+
+  // 每个频道一份"已知题材词表"，跨筛选/翻页保持稳定。
+  // 旧实现每次缓存未命中都把 categories 重置成 ['全部']，响应回来才恢复——
+  // 用户看到的就是"题材全部消失，过一会又出来"。
+  const categoryVocabularyRef = useRef<Record<string, string[]>>({});
+  // 每个频道只汇总一次全站词表，避免反复触发后端建索引。
+  const refreshCategoriesRef = useRef<Record<string, boolean>>({});
 
   // 内存缓存字典，彻底消除频道与筛选切换时的闪烁
   const cacheRef = useRef<Record<string, {
@@ -82,23 +104,76 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     return request;
   }, []);
 
+  /**
+   * 漫剧集数补齐。
+   *
+   * 漫剧列表来自公开榜单页 HTML，而该页 HTML 与内嵌 router data 都不含任何集数
+   * 文案（实测整页 `episode_cnt` 出现 0 次），所以卡片本来只能显示"集数未知"。
+   * 真实集数由 App 侧 album_detail 批量给出，一次可覆盖整页卡片。
+   *
+   * 刻意不 await：端到端（含 Python 启动）实测 0.6-1.9s，且 worker 是单实例、
+   * 会和播放解析互斥，为这个数字挡住首屏不值得。卡片先出现，集数随后补上；
+   * 失败就保持"集数未知"，不影响目录可用性。
+   */
+  const fillEpisodeCounts = useCallback(
+    async (cacheKey: string, source: SeriesItem[], requestId: number) => {
+      const pending = source.filter(item => item.episodesCount <= 0).map(item => item.id);
+      if (pending.length === 0) return;
+      const counts = await ipcService.catalog.episodeCounts(pending);
+      // 期间用户可能已切频道/筛选，此时结果不再属于当前视图，直接丢弃。
+      if (requestId !== requestIdRef.current) return;
+      const patch = (list: SeriesItem[]) => list.map(item => {
+        const total = counts[item.id];
+        return total && total > 0 && total !== item.episodesCount
+          ? { ...item, episodesCount: total }
+          : item;
+      });
+      // 缓存也要一起打补丁，否则切走频道再回来会退回"集数未知"。
+      const cached = cacheRef.current[cacheKey];
+      if (cached) cached.items = patch(cached.items);
+      setItems(previous => patch(previous));
+    },
+    [],
+  );
+
+  /**
+   * 后台汇总"全站题材词表"。
+   *
+   * 目录分页一次只有 24 条：按页取词表既拿不到全站题材，词表本身也会随翻页/筛选
+   * 漂移。后端汇总全站目录后给出稳定全集（首次约数秒），完成后题材栏补齐。
+   *
+   * 刻意不 await：它不该挡住首屏卡片。每个频道只发一次；失败保持原有题材栏。
+   */
+  const refreshCategoryVocabulary = useCallback(async (target: ChannelType, requestId: number) => {
+    if (refreshCategoriesRef.current[target]) return;
+    refreshCategoriesRef.current[target] = true;
+    const full = await ipcService.catalog.categories(target);
+    if (full.length === 0) return;
+    const merged = mergeCategories(categoryVocabularyRef.current[target] ?? [], full);
+    categoryVocabularyRef.current[target] = merged;
+    // 期间可能已切频道：只在仍是当前视图时刷新界面，词表本身照常记下来。
+    if (requestId === requestIdRef.current) setCategories(merged);
+  }, []);
+
   const loadData = useCallback(async (kw?: string) => {
     const requestId = ++requestIdRef.current;
     const cacheKey = `${channel}_${category}_${audience}_${sort}_${kw || ''}`;
     const cached = cacheRef.current[cacheKey];
 
+    const knownCategories = categoryVocabularyRef.current[channel] ?? [];
     if (cached) {
       seenIdsRef.current = new Set(cached.items.map(item => item.id));
       setItems(cached.items);
-      setCategories(cached.categories);
+      setCategories(mergeCategories(knownCategories, cached.categories));
       setHasMore(cached.hasMore);
       setNextCursor(cached.nextCursor);
       setNextPage(2);
       setIsLoading(false);
     } else {
       setIsLoading(true);
-      // 切换频道或关键词时，不展示上一频道遗留的分类标签。
-      setCategories(['全部']);
+      // 只有切频道才需要换词表；同一频道内切题材/受众/排序必须保留题材栏，
+      // 否则每点一次题材，题材栏都会先空掉再长回来（旧实现就是这样）。
+      setCategories(mergeCategories(knownCategories, []));
     }
 
     setError(null);
@@ -119,27 +194,43 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
       // The public comic page occasionally returns its shell before the rank
       // articles are present. Retry up to twice instead of caching a false
       // empty page——一次重试实测仍可能拿到空壳，两次覆盖 90%+ 的抖动。
+      // 每次重试都必须绕过 inflight 去重：上一轮请求失败/超时后，同键的旧
+      // Promise 若还在途中（Rust 端 20s 超时），复用它会让三次重试实际只等
+      // 同一个请求，用户看到的就是"骨架屏转了很久也不出卡片"。
       if (channel === 'comic' && res.items.length === 0 && requestId === requestIdRef.current) {
+        delete inflightRef.current[cacheKey];
         for (let attempt = 0; attempt < 2; attempt += 1) {
           await new Promise(resolve => window.setTimeout(resolve, 400));
           if (requestId !== requestIdRef.current) break;
+          delete inflightRef.current[cacheKey];
           res = await requestCatalog(cacheKey, filter);
           if (res.items.length > 0) break;
         }
       }
       if (requestId !== requestIdRef.current) return;
+      const mergedCategories = mergeCategories(
+        categoryVocabularyRef.current[channel] ?? [],
+        res.categories,
+      );
+      categoryVocabularyRef.current[channel] = mergedCategories;
       cacheRef.current[cacheKey] = {
         items: res.items,
-        categories: res.categories,
+        categories: mergedCategories,
         hasMore: res.hasMore,
         nextCursor: res.nextCursor,
       };
       seenIdsRef.current = new Set(res.items.map(item => item.id));
       setItems(res.items);
-      setCategories(res.categories);
+      setCategories(mergedCategories);
       setHasMore(res.hasMore);
       setNextCursor(res.nextCursor);
       setNextPage(2);
+      // 漫剧卡片先出，集数随后补齐（原因见 fillEpisodeCounts）。
+      if (channel === 'comic') {
+        void fillEpisodeCounts(cacheKey, res.items, requestId);
+      }
+      // 首屏已渲染，后台再汇总全站题材词表（不 await，见 refreshCategoryVocabulary）。
+      void refreshCategoryVocabulary(channel, requestId);
     } catch (err) {
       setError((err as Error).message || '目录数据加载失败');
     } finally {
@@ -229,7 +320,9 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
   const setChannel = (newChannel: ChannelType) => {
     setChannelState(newChannel);
     setCategoryState('全部');
-    setCategories(['全部']);
+    // 切频道时换成新频道"已知"的词表；未知就先只留"全部"，等目录响应或后台
+    // 汇总补齐。刻意不无条件清空——那正是"题材消失又出现"的来源之一。
+    setCategories(mergeCategories(categoryVocabularyRef.current[newChannel] ?? [], []));
   };
 
   const refreshContinueWatching = useCallback(async () => {
@@ -264,6 +357,9 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
           return;
         }
         setItems(prev => [...prev, ...fresh]);
+        if (channel === 'comic') {
+          void fillEpisodeCounts(slotKey, fresh, requestId);
+        }
         setNextPage(nextPage + 1);
         setNextCursor(prefetched.nextCursor);
         setHasMore(prefetched.hasMore);
@@ -293,8 +389,16 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
       }
       if (fresh.length > 0) {
         setItems(previous => [...previous, ...fresh]);
+        if (channel === 'comic') {
+          void fillEpisodeCounts(slotKey, fresh, requestId);
+        }
       }
-      setCategories(previous => [...new Set([...previous, ...res.categories])]);
+      const mergedCategories = mergeCategories(
+        categoryVocabularyRef.current[channel] ?? [],
+        res.categories,
+      );
+      categoryVocabularyRef.current[channel] = mergedCategories;
+      setCategories(mergedCategories);
       setHasMore(res.hasMore && fresh.length > 0);
       setNextCursor(res.nextCursor);
       setNextPage(page => page + 1);

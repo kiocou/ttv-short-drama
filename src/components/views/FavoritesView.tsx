@@ -137,7 +137,7 @@ export const FavoritesView: React.FC = () => {
                       </span>
                     </div>
                     <span className="text-xs text-slate-400">
-                      {item.channel === 'comic' ? '漫剧专享' : '短剧爆款'}
+                      {item.channel === 'comic' ? '漫剧专享' : item.channel === 'anime' ? '动漫专区' : '短剧爆款'}
                     </span>
                   </div>
                 </div>
