@@ -468,7 +468,7 @@ impl DmghgBridge {
     /// 按选定清晰度取播放地址。
     ///
     /// `quality` 是前端传的档位字面量（形如 `1080p`）；`auto` / 空 / 认不出的值
-    /// 一律回落到最高档。
+    /// 优先回落到 **2160p 以外的最高档**（见函数体里的 HEVC 兼容说明）。
     pub fn resolve_play_url(
         &self,
         series_id: &str,
@@ -476,15 +476,21 @@ impl DmghgBridge {
         quality: &str,
     ) -> Result<String, String> {
         let variants = self.play_variants(series_id, episode_id)?;
-
         let wanted = parse_quality_value(quality);
         if wanted > 0 {
             if let Some(hit) = variants.iter().find(|variant| variant.height == wanted) {
                 return Ok(hit.url.clone());
             }
         }
-        // auto / 未匹配：最高档（variants 已按高度降序）
-        Ok(variants[0].url.clone())
+        // WebView2 的 HEVC 支持不可靠（PlatformHEVCDecoderSupport + 零售扩展都
+        // 就位时 153 版仍经常解不出视频轨，表现为黑屏但有声音）。实测这批源里
+        // "4K" 档是 HEVC、1080P 及以下是 H.264。所以 auto 优先选 **2160p 以外的
+        // 最高档**；4K 仅当用户显式要求时才给。
+        let best = variants
+            .iter()
+            .find(|variant| variant.height < 2160)
+            .unwrap_or(&variants[0]);
+        Ok(best.url.clone())
     }
 
     /// 拼出可在规则引擎里跑的脚本。
