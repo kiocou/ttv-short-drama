@@ -59,7 +59,7 @@ export const VideoSurface: React.FC = () => {
   } = usePlaybackStore();
 
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
-  const { isFullscreen, setIsFullscreen, showToast } = useAppStore();
+  const { isFullscreen, setIsFullscreen, showToast, currentView } = useAppStore();
 
   const [isControlsVisible, setIsControlsVisible] = useState(true);
   // 控制器锁定（用户主动收起）状态；Esc 可解锁（PlayerControls 内部监听）。
@@ -259,6 +259,10 @@ export const VideoSurface: React.FC = () => {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return;
+      // 播放器宿主常驻 DOM（离开页面只是隐藏），而这里的监听挂在 window 上：
+      // 不挡住的话，在发现/详情页按空格会"操控看不见的视频"——暂停/续播、
+      // [] 换集都会在后台真实生效。
+      if (currentView !== 'player') return;
 
       switch (e.code) {
         case 'Space':
@@ -310,7 +314,7 @@ export const VideoSurface: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity]);
+  }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity, currentView]);
 
   // 全屏时给一个短暂的退出提示：纯原生全屏没有浏览器自带的全屏提示条，
   // 用户不一定会想到 Esc。

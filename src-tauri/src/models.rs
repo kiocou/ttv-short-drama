@@ -95,6 +95,9 @@ pub struct PlaybackOpenInput {
     pub episode_id: String,
     pub quality: String,
     pub position: f64,
+    /// 动漫专区标记：动漫播放走暴风源直链（m3u8 经本地 HLS 代理），不经红果 worker。
+    #[serde(default)]
+    pub is_anime: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,7 +158,9 @@ fn de_u8_lenient<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<u8>::deserialize(deserializer)?.unwrap_or(0).min(100))
+    Ok(Option::<u8>::deserialize(deserializer)?
+        .unwrap_or(0)
+        .min(100))
 }
 
 fn de_i64_lenient<'de, D>(deserializer: D) -> Result<i64, D::Error>
@@ -302,7 +307,10 @@ mod history_payload_tests {
         assert_eq!(item.episode_number, 7);
         assert_eq!(item.total_episodes, 80);
         assert!((item.position_seconds - 42.5).abs() < f64::EPSILON);
-        assert_eq!(item.progress_percent, 100, "百分比必须夹在 0-100，否则 u8 会溢出");
+        assert_eq!(
+            item.progress_percent, 100,
+            "百分比必须夹在 0-100，否则 u8 会溢出"
+        );
         assert!(item.channel.is_none());
     }
 }

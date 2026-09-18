@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### 修复
+- **退出播放器后偶尔"只闻其声"**。播放器宿主常驻 DOM（离开页面只是 `display:none` 隐藏），而换集链路在最后一次会话守卫之后还有长时间 await（首帧等待最长 8 秒、HLS 挂载、`play()` 本身）：期间用户返回主界面、慢解析再完成的话，旧会话照常 `setSrc + play()`，隐藏的视频就在后台放完（实测：换集长期卡在切线重试 → 退出 → worker 稍后成功 → 后台出声）。现在 `stopPlayback()` 作废当前会话（session 号 +1，所有在途换集续体按 stale 处理、在途 open 任务移出复用池）；所有起播点在 `play()` 前后复查会话、stale 即暂停（新增 `pauseIfStale`）；错误兜底链（备用直链 → Blob → 本地解析）在会话作废后整条不再启动；隐藏播放器时全局键盘快捷键（空格/方向键/`[]`）不再操控"看不见的视频"。
+- 换集加载中"线路失败，切换备用域名"的提示文案改为"主线路波动，已自动切换备用线路"——它是 worker 的自动换线进度而非错误，旧文案让用户误以为播放出错。
+
+### 诊断记录
+- 复现验证：三个播放域名（`api5-normal-sinfonlineb/sinfonlinea/lf.fqnovel.com`）连通正常（TLS ~30ms），`search → album → stream` 全链路约 1 秒成功；`fallback_api` 取直链域名由服务端下发且每次可能不同（实测见过 `api5-normal-sinfonline.fqnovel.com` 与 `vas-lf-x.snssdk.com`）；`/video/fplay/` 直链接口只在下发的业务域上有效，内置三播放域名对其返回 404。
+
 ## 0.2.5 - 2026-09-16
 
 ### 移除

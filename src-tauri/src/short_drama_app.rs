@@ -11,6 +11,7 @@
 //! 已有凭据不会被覆盖。deviceToken（x-tt-dt）只在文件里已有时使用，不会本地编造。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -119,10 +120,9 @@ pub struct ShortDramaAppResolveInput {
     #[allow(dead_code)]
     pub series_id: String,
     pub vid: String,
-    /// 兼容旧前端调用签名。真实清晰度已归一为单一源流，此字段不再参与
-    /// 缓存寻址（避免产生 {vid}-4k.mp4 这类重复副本）。
+    /// 真实画质请求。worker 按 preferred_quality_height 缺档回退选流，
+    /// 指定档位的产物缓存在 {vid}-{quality}.mp4，与 auto 副本分开。
     #[serde(default)]
-    #[allow(dead_code)]
     pub quality: Option<String>,
     #[serde(default)]
     pub content_type: Option<u16>,
@@ -142,6 +142,8 @@ struct HongguoAppProfile {
 impl HongguoAppProfile {
     fn from_input(content_type: Option<u16>, app_id: Option<u32>) -> Result<Self, String> {
         let content_type = content_type.unwrap_or(1);
+        // 2026-09-18 实测：漫剧 vid 用 aid=8662 即可取到播放模型（v1/v2 端点
+        // 都通）；旧的 1004/1007 → 8704 已被网关静默拒绝（200 空 body）。
         let profile = match content_type {
             1 => Self {
                 content_type,
@@ -150,7 +152,7 @@ impl HongguoAppProfile {
             },
             1004 | 1007 => Self {
                 content_type,
-                app_id: 8704,
+                app_id: 8662,
                 cache_namespace: "motion-comic",
             },
             _ => {
@@ -649,21 +651,10 @@ fn sweep_cache_dir(dir: &std::path::Path, stale_after: Duration, now: std::time:
             continue;
         };
         let is_partial = name.ends_with(".part.mp4") || name.ends_with(".source.tmp");
-        // 幻影清晰度副本：{数字}-{quality}.mp4，其中 quality 非空且不含数字开头。
-        let is_phantom_quality = name.ends_with(".mp4")
-            && !name.ends_with(".part.mp4")
-            && name
-                .strip_suffix(".mp4")
-                .and_then(|stem| stem.split_once('-'))
-                .map(|(vid, quality)| {
-                    !vid.is_empty()
-                        && vid.chars().all(|c| c.is_ascii_digit())
-                        && !quality.is_empty()
-                })
-                .unwrap_or(false);
-        // 幻影清晰度副本是旧版遗留（`{vid}-4k.mp4` 之类），新代码不会再产生，
-        // 不存在并发写入，可以直接删。
-        // 半成品则必须过了门槛才删；mtime 读不到时按"正在写"处理，保守不删。
+        // 半成品必须过了门槛才删；mtime 读不到时按"正在写"处理，保守不删。
+        // `{vid}-{quality}.mp4` 是真实画质副本（resolve 按 requested_quality 产
+        // 缓存），不再作为"幻影副本"清理——旧版那段逻辑会删掉刚下载的画质副本，
+        // 导致画质切换永远无效。
         let partial_is_stale = is_partial
             && entry
                 .metadata()
@@ -672,7 +663,7 @@ fn sweep_cache_dir(dir: &std::path::Path, stale_after: Duration, now: std::time:
                 .and_then(|mtime| now.duration_since(mtime).ok())
                 .map(|age| age >= stale_after)
                 .unwrap_or(false);
-        if partial_is_stale || is_phantom_quality {
+        if partial_is_stale {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -941,6 +932,30 @@ pub fn auto_clean_cache_on_start() -> CacheSweepReport {
     )
 }
 
+/// 把前端传来的画质串归一成 worker 认得的档位：`auto` / `4k` / `{digits}p`。
+///
+/// 前端画质菜单报的是**源流真实高度**，实测会出现 540、360 这类固定档位之外的
+/// 值，所以这里不能只白名单 4 个字面量——旧写法把未知档位一律降级成 `auto`，
+/// 于是用户点了 540P 之后仍然拿默认最高档，表现成"画质菜单点了没反应"。
+fn normalize_requested_quality(raw: &str) -> String {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() || trimmed == "auto" {
+        return "auto".into();
+    }
+    if trimmed == "4k" {
+        return "4k".into();
+    }
+    let digits: String = trimmed
+        .chars()
+        .filter(|value| value.is_ascii_digit())
+        .collect();
+    match digits.as_str() {
+        "" => "auto".into(),
+        "2160" => "4k".into(),
+        value => format!("{value}p"),
+    }
+}
+
 /// 解析一集：命中缓存直接返回；否则拉起 worker.py（下载+解密+转存）并转发进度。
 ///
 /// 同 (vid, quality) 的并发请求（预取 + 前台换集几乎同时发生）只允许一个
@@ -957,17 +972,29 @@ pub async fn short_drama_app_resolve<R: Runtime>(
         return Err("缺少有效的集 vid。".into());
     }
     let profile = HongguoAppProfile::from_input(input.content_type, input.app_id)?;
-    // 清晰度归一：源流实际只有有限档位，"4k/1080p/720p" 这类前端档位并不存在。
-    // 之前按清晰度拼缓存文件名，导致同一集被反复下载（4k 与 auto 产物字节数
-    // 完全相同，纯属重复下载）。这里把所有请求统一归一到 auto 这一条真实路径，
-    // 不再产生 `{vid}-4k.mp4` / `{vid}-1080p.mp4` 这类幻影副本。
-    let requested_quality = "auto";
+    // 真实画质请求：worker 按 preferred_quality_height 缺档回退选流。
+    // 档位串由 normalize_requested_quality 归一（auto / 4k / {digits}p），
+    // 它接受任意真实高度，不再把非固定档位静默降级成 auto。
+    let raw_quality = input
+        .quality
+        .as_deref()
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase();
+    let requested_quality = normalize_requested_quality(&raw_quality);
     let (python, worker, ffmpeg) = worker_paths()?;
     let credentials = ensure_credentials()?;
 
-    let namespace_path = cache_dir()
-        .join(profile.cache_namespace)
-        .join(format!("{vid}.mp4"));
+    // 缓存寻址：auto 用 {vid}.mp4（默认主副本）；指定档位用 {vid}-{quality}.mp4。
+    // 旧版把所有请求归一成 auto，画质切换在 Rust 侧被丢弃，前端切了也无效。
+    let namespace_path =
+        cache_dir()
+            .join(profile.cache_namespace)
+            .join(if requested_quality == "auto" {
+                format!("{vid}.mp4")
+            } else {
+                format!("{vid}-{requested_quality}.mp4")
+            });
     // TTV Box stored short-drama files directly under short-drama-cache before
     // the per-channel namespaces were added. Reuse those files instead of
     // downloading the same episode again after an upgrade.
@@ -998,11 +1025,12 @@ pub async fn short_drama_app_resolve<R: Runtime>(
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建缓存目录失败：{error}"))?;
     }
-    // 缓存卫生：清理上次异常退出留下的半成品与幻影清晰度副本。
-    // - `*.part.mp4` / `*.source.tmp` 是 worker 中断的残留，永远不会被任何路径
-    //   读取，只会占盘（实测残留过 0 字节的 xxx-1080p.mp4.part.mp4）。
-    // - `{vid}-{quality}.mp4` 是旧版按清晰度拼文件的产物，现已统一到 `{vid}.mp4`，
-    //   保留只会白占空间。
+    // 缓存卫生：清理上次异常退出留下的半成品。
+    // `*.part.mp4` / `*.source.tmp` 是 worker 中断的残留，永远不会被任何路径
+    // 读取，只会占盘（实测残留过 0 字节的 xxx-1080p.mp4.part.mp4）。
+    // `{vid}-{quality}.mp4` 是**真实画质副本**（resolve 现按 requested_quality
+    // 产缓存），绝不能删——旧版把它当幻影副本清掉的逻辑已随画质切换的恢复
+    // 一并移除。
     // 保留 mtime 很新的半成品：那很可能是并发预取 worker 正在写的那一集。
     sweep_cache_dir(
         out_path.parent().unwrap_or(&cache_dir()),
@@ -1068,7 +1096,9 @@ pub async fn short_drama_app_resolve<R: Runtime>(
     // 预签名直链让 worker 跳过签名链路，代价是直链可能已过期（带时间戳签名）。
     // 因此失败且用过预签名时清掉缓存重跑一次：这一轮 worker 会重新签名，
     // 用户既不会看到过期直链导致的错误，也不必自己手动重试。
-    let had_prefetched = peek_stream(&vid).is_some();
+    // 只有请求 auto 且确实复用了预签名直链时，失败才需要清缓存重跑；
+    // 指定档位走的是现场解析，缓存与这一轮的成败无关。
+    let had_prefetched = requested_quality == "auto" && peek_stream(&vid).is_some();
     let mut attempt = 0;
     let result = loop {
         attempt += 1;
@@ -1080,7 +1110,7 @@ pub async fn short_drama_app_resolve<R: Runtime>(
             credentials.clone(),
             profile,
             vid.clone(),
-            requested_quality,
+            &requested_quality,
             out_path.clone(),
         )
         .await;
@@ -1128,13 +1158,20 @@ async fn run_resolve_worker<R: Runtime>(
     // 命中预签名缓存时把直链与解密密钥直接交给 worker，跳过两次 App API 往返
     // （实测固定 2.16s）。直链过期会让 ffmpeg 拉流失败，调用方
     // short_drama_app_resolve 会在失败后清掉缓存并重跑一次。
-    if let Some(cached) = peek_stream(&vid) {
-        command
-            .env("TTV_SD_DIRECT_URL", &cached.url)
-            .env("TTV_SD_DIRECT_KEY", &cached.content_key)
-            .env("TTV_SD_DIRECT_WIDTH", cached.width.to_string())
-            .env("TTV_SD_DIRECT_HEIGHT", cached.height.to_string())
-            .env("TTV_SD_DIRECT_DURATION", cached.duration_ms.to_string());
+    //
+    // 只在请求 auto 时复用：缓存里存的是**默认最高档**那一条，指定档位必须让
+    // worker 重新解析、按 preferred_quality_height 现场选流，否则会把顶档流写进
+    // `{vid}-{quality}.mp4`，之后该档位永远返回错的文件（参考实现每次都按
+    // task.DownloadQuality 现场选流，不存在"跨档复用同一份实体"的设计）。
+    if requested_quality == "auto" {
+        if let Some(cached) = peek_stream(&vid) {
+            command
+                .env("TTV_SD_DIRECT_URL", &cached.url)
+                .env("TTV_SD_DIRECT_KEY", &cached.content_key)
+                .env("TTV_SD_DIRECT_WIDTH", cached.width.to_string())
+                .env("TTV_SD_DIRECT_HEIGHT", cached.height.to_string())
+                .env("TTV_SD_DIRECT_DURATION", cached.duration_ms.to_string());
+        }
     }
     command
         .env("TTV_SD_FFMPEG", &ffmpeg)
@@ -1359,9 +1396,16 @@ pub struct SearchSuggestion {
 pub async fn search_suggest<R: Runtime>(
     app: &AppHandle<R>,
     keyword: &str,
-    comic: bool,
+    _comic: bool,
 ) -> Vec<SearchSuggestion> {
-    let profile = match HongguoAppProfile::from_input(Some(if comic { 1004 } else { 1 }), None) {
+    // 恒用短剧档（content_type 1 / aid 8662），不随频道切 aid：
+    // 搜索联想接口实测只由 aid=8662 服务，传漫剧档的 aid=8704 会回 HTTP 200 +
+    // **空 body**（`signed_get` 随即抛 JSONDecodeError，整条联想补齐静默失效，
+    // 而它正是为了补齐"网页搜索只返回前 10 条、分季条目跳着出现"才存在的）。
+    // 而 aid=8662 的搜索索引本身是全局的——实测搜"反派亲妈"返回的条目
+    // content_type 同时包含 1（短剧）与 1004/1007（漫剧）。
+    // `_comic` 保留只为调用点稳定。
+    let profile = match HongguoAppProfile::from_input(Some(1), None) {
         Ok(profile) => profile,
         Err(_) => return Vec::new(),
     };
@@ -1414,6 +1458,71 @@ pub async fn search_suggest<R: Runtime>(
         .unwrap_or_default()
 }
 
+/// 批量取真实集数（漫剧列表卡片"集数未知"的修复）。
+///
+/// 漫剧列表来自公开榜单页 HTML，但该页 HTML 与内嵌 router data 都不含任何集数
+/// 文案（实测整页 `episode_cnt` 出现 0 次），所以列表卡片只能显示"集数未知"，
+/// 真实集数只有 App 侧有。`album_detail` 支持一次传多个 `series_ids`，返回
+/// `data.video_detail_data.<series_id>.video_data.episode_cnt`——实测整页 20 部
+/// 一次命中 20/20，网络耗时冷启 337ms / 热 117ms，远优于逐部详情页的 N 次往返。
+///
+/// 端到端（含 Python 启动）实测 0.6-1.9s，且 worker 是单实例、会和播放解析互斥，
+/// 因此调用方应把它当成**可选的锦上添花**：先出卡片，集数随后补上。
+/// 失败一律返回空表，不影响目录可用性。
+pub async fn episode_counts<R: Runtime>(
+    app: &AppHandle<R>,
+    series_ids: &[String],
+) -> HashMap<String, u32> {
+    let mut unique: Vec<String> = Vec::new();
+    for candidate in series_ids.iter().map(|value| value.trim()) {
+        if candidate.is_empty() || !candidate.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        if !unique.iter().any(|existing| existing.as_str() == candidate) {
+            unique.push(candidate.to_owned());
+        }
+    }
+    if unique.is_empty() {
+        return HashMap::new();
+    }
+    // 目录一页最多 60 条（见 catalog_comic 的 page_size 夹取）；一次请求带过多 id
+    // 会让 argv 过长且上游可能截断，这里按同一上限收口。
+    unique.truncate(60);
+    // 漫剧档位：content_type 1004 / aid 8662（2026-09-18 起 8704 被网关静默拒绝）。
+    let Ok(profile) = HongguoAppProfile::from_input(Some(1004), None) else {
+        return HashMap::new();
+    };
+    let target = unique.join(",");
+    let payload = match run_worker_subcommand(app, "counts", &target, "counts", profile).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("[ttv] 集数批量补齐不可用：{error}");
+            return HashMap::new();
+        }
+    };
+    payload
+        .get("counts")
+        .and_then(serde_json::Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(key, value)| {
+                    let total = value.as_u64()? as u32;
+                    (total > 0).then(|| (key.clone(), total))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 前端按页调用：把当前可见卡片的 series_id 一次性补齐真实集数。
+#[tauri::command]
+pub async fn short_drama_app_episode_counts<R: Runtime>(
+    app: AppHandle<R>,
+    series_ids: Vec<String>,
+) -> Result<HashMap<String, u32>, String> {
+    Ok(episode_counts(&app, &series_ids).await)
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrefetchStreamInput {
@@ -1465,7 +1574,8 @@ pub async fn short_drama_app_prefetch_stream<R: Runtime>(
             let app_handle = app.clone();
             let target = vid.clone();
             handles.push(tokio::spawn(async move {
-                match run_worker_subcommand(&app_handle, "stream", &target, "prefetch", profile).await
+                match run_worker_subcommand(&app_handle, "stream", &target, "prefetch", profile)
+                    .await
                 {
                     Ok(payload) => {
                         store_stream(&target, &payload);
@@ -1671,6 +1781,16 @@ pub async fn short_drama_app_qualities<R: Runtime>(
                     if url.is_empty() {
                         return None;
                     }
+                    // 高度夹在 1-4320（与果果 parsePlaybackQuality 的清晰度范围
+                    // 一致）：异常档位（worker 解析出 0 或超高分）不进画质菜单。
+                    let height = value
+                        .get("height")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        .min(4320);
+                    if height == 0 {
+                        return None;
+                    }
                     Some(ShortDramaAppVariant {
                         id: value
                             .get("id")
@@ -1692,11 +1812,9 @@ pub async fn short_drama_app_qualities<R: Runtime>(
                         width: value
                             .get("width")
                             .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0) as u32,
-                        height: value
-                            .get("height")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0) as u32,
+                            .unwrap_or(0)
+                            .min(8640) as u32,
+                        height: height as u32,
                         bitrate: value
                             .get("bitrate")
                             .and_then(serde_json::Value::as_u64)
@@ -1749,6 +1867,16 @@ pub async fn short_drama_app_stream<R: Runtime>(
                     if url.is_empty() {
                         return None;
                     }
+                    // 高度夹在 1-4320（与果果 parsePlaybackQuality 的清晰度范围
+                    // 一致）：异常档位（worker 解析出 0 或超高分）不进画质菜单。
+                    let height = value
+                        .get("height")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        .min(4320);
+                    if height == 0 {
+                        return None;
+                    }
                     Some(ShortDramaAppVariant {
                         id: value
                             .get("id")
@@ -1770,11 +1898,9 @@ pub async fn short_drama_app_stream<R: Runtime>(
                         width: value
                             .get("width")
                             .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0) as u32,
-                        height: value
-                            .get("height")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0) as u32,
+                            .unwrap_or(0)
+                            .min(8640) as u32,
+                        height: height as u32,
                         bitrate: value
                             .get("bitrate")
                             .and_then(serde_json::Value::as_u64)
@@ -1922,7 +2048,7 @@ pub async fn short_drama_app_album<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::HongguoAppProfile;
+    use super::{normalize_requested_quality, HongguoAppProfile};
 
     #[test]
     fn reads_device_token_aliases_from_credentials_json() {
@@ -1970,11 +2096,13 @@ mod tests {
         assert_eq!(short.app_id, 8662);
         assert_eq!(short.cache_namespace, "short-series");
 
-        let comic = HongguoAppProfile::from_input(Some(1004), Some(8704)).unwrap();
-        assert_eq!(comic.app_id, 8704);
+        let comic = HongguoAppProfile::from_input(Some(1004), Some(8662)).unwrap();
+        assert_eq!(comic.app_id, 8662);
         assert_eq!(comic.cache_namespace, "motion-comic");
 
         assert!(HongguoAppProfile::from_input(Some(1), Some(8704)).is_err());
+        assert!(HongguoAppProfile::from_input(Some(1004), Some(8704)).is_err());
+        assert!(HongguoAppProfile::from_input(Some(999), None).is_err());
         assert!(HongguoAppProfile::from_input(Some(999), None).is_err());
     }
 
@@ -2192,5 +2320,23 @@ mod tests {
             report.removed_files, 2,
             "400 - 250 需淘汰 2 个 100 字节文件"
         );
+    }
+    #[test]
+    fn normalizes_requested_quality_into_worker_literals() {
+        // 固定档位（历史取值）必须保持原样。
+        assert_eq!(normalize_requested_quality("auto"), "auto");
+        assert_eq!(normalize_requested_quality(""), "auto");
+        assert_eq!(normalize_requested_quality("4k"), "4k");
+        assert_eq!(normalize_requested_quality("1080p"), "1080p");
+        assert_eq!(normalize_requested_quality("720p"), "720p");
+        // 前端画质菜单报的是源流真实高度：带 p 与不带 p 都要落到 {digits}p，
+        // 否则真实档位会被静默降级成 auto（表现成画质轴点了没反应）。
+        assert_eq!(normalize_requested_quality("1080"), "1080p");
+        assert_eq!(normalize_requested_quality("2160"), "4k");
+        assert_eq!(normalize_requested_quality("540p"), "540p");
+        assert_eq!(normalize_requested_quality("360P"), "360p");
+        assert_eq!(normalize_requested_quality(" 1080P "), "1080p");
+        // 认不出来的串退回 auto，而不是去打一个并不存在的档位。
+        assert_eq!(normalize_requested_quality("高清"), "auto");
     }
 }

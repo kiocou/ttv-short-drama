@@ -2,19 +2,21 @@ import React, { createContext, useContext, useState, useRef, useEffect, useCallb
 import { PlaybackUiState } from '../types/playback';
 import { SeriesDetail, EpisodeItem } from '../types/series';
 import { ipcService, isTauriEnvironment } from '../services/ipc';
+import { attachSource, isHlsUrl, detachSource } from '../services/hlsAttach';
 import { useSettingsStore } from './useSettingsStore';
 
 /**
  * 整集缓存的统一 key。
  *
- * 关键决策：**不再把清晰度拼进 key**。源流实际只有有限档位（红果短剧实测仅
- * 540p / 1080p 两档），而前端菜单曾硬编码 4K/1080P/720P 三档，结果同一集被
- * 按三个名字反复下载，产物还完全重复（4k 与 auto 字节数一模一样）。
- * 现在后端已把清晰度归一到 auto 单一路径，key 也必须跟着去掉清晰度维度，
- * 否则前端缓存永远 miss、每次都重下。
+ * 关键决策：**把清晰度拼进 key**。后端按 requested_quality 产出不同实体
+ * （auto → `{vid}.mp4`，指定档位 → `{vid}-{quality}.mp4`），键也必须带档位，
+ * 否则切换清晰度后快路径会把上一档的本地文件当作本档结果秒开，表现成"切了没反应"。
+ *
+ * 历史：曾有一版把清晰度从 key 里去掉，理由是"后端已把清晰度归一成 auto"——
+ * 那正是画质切换完全失效的那一版。后端恢复按档落盘后，该前提已不成立。
  */
-function episodeCacheKey(seriesId: string, episodeId: string): string {
-  return `${seriesId}:${episodeId}`;
+function episodeCacheKey(seriesId: string, episodeId: string, quality: string): string {
+  return `${seriesId}:${episodeId}:${quality || 'auto'}`;
 }
 
 /**
@@ -526,6 +528,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       return 'error';
     }
   };
+  /**
+   * 会话已作废（用户离开播放器 / 已有更新的切换接管）时立即暂停。
+   * 返回 true 表示已 stale。背景：播放器宿主常驻 DOM，离开页面只是隐藏；
+   * 异步起播链（首帧等待、play() 本身）可能在最后一次守卫检查之后才 resolve，
+   * 不在这里补暂停，就会出现"人已退出、声音照放"。
+   */
+  const pauseIfStale = (sessionId: number, video: HTMLVideoElement): boolean => {
+    if (activeSessionRef.current === sessionId) return false;
+    if (!video.paused) video.pause();
+    return true;
+  };
 
   /**
    * 把主播放器切换到已预载好的源。
@@ -592,7 +605,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
       const started = await startPlayback(video);
       if (started !== 'ok') return started;
-      if (activeSessionRef.current !== sessionId) return 'stale';
+      if (pauseIfStale(sessionId, video)) return 'stale';
       setIsPlaying(true);
       setUiState({ kind: 'playing', sessionId, position: video.currentTime });
       return 'ok';
@@ -663,7 +676,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
       const started = await startPlayback(video);
       if (started !== 'ok') return started;
-      if (activeSessionRef.current !== sessionId) return 'stale';
+      if (pauseIfStale(sessionId, video)) return 'stale';
       setIsPlaying(true);
       setUiState({ kind: 'playing', sessionId, position: video.currentTime });
       return 'ok';
@@ -693,14 +706,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       );
       // 解析成功立刻登记本地文件路径：换集/切清晰度第二次进入同一集时秒开。
       if (resolved.cached || resolved.sizeBytes > 0) {
-        resolvedFileByVidRef.current.set(episodeCacheKey(seriesId, episodeId), resolved.playUrl);
+        resolvedFileByVidRef.current.set(
+          episodeCacheKey(seriesId, episodeId, quality),
+          resolved.playUrl,
+        );
       }
       if (activeSessionRef.current !== sessionId) return 'stale';
       const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition, episodeId);
       // 只有"源本身有问题"才撤掉登记。自动播放被拦（autoplay-blocked）时
       // 文件是完好的，撤掉会导致下次重下一整集——白等 7 秒。
       if (outcome === 'error' && activeSessionRef.current === sessionId) {
-        resolvedFileByVidRef.current.delete(episodeCacheKey(seriesId, episodeId));
+        resolvedFileByVidRef.current.delete(episodeCacheKey(seriesId, episodeId, quality));
       }
       return outcome;
     } catch (error) {
@@ -762,6 +778,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 探测要额外拉起一次 worker，成本不低，因此按 vid 记忆结果，同一集只探一次。
    */
   const probedVidsRef = useRef<Set<string>>(new Set());
+  // 动漫档位探测的"已探过"键（`seriesId::episodeId`）。与短剧的 probedVidsRef
+  // 分开：那条记的是红果 vid，这里是动漫集 id，混用会互相顶掉。
+  const animeProbedRef = useRef<string>('');
   const probeQualities = async (episodeId: string, contentType: number) => {
     if (probedVidsRef.current.has(episodeId)) return;
     probedVidsRef.current.add(episodeId);
@@ -782,7 +801,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         })
         .map(item => ({
           label: `${item.height}P`,
-          value: 'auto',
+          // 必须是 worker / Rust 认得的档位字面量（`{digits}p`）。此前这里硬编码
+          // 'auto'，于是每个选项都等价于"自动"：点击后 setQuality('auto') 与
+          // currentQuality 相等，在守卫处直接 return——画质这条轴整条是死的
+          // （菜单能开、能显示真实档位，但点了没有任何效果）。
+          value: `${item.height}p`,
           resolution: `${item.width}x${item.height}`,
         }));
       setAvailableQualities(options);
@@ -803,7 +826,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const startPrewarmResolve = (seriesId: string, episodeId: string, contentType: number): boolean => {
     if (!isTauriEnvironment()) return false;
     if (prewarmInflightRef.current >= MAX_PREWARM_INFLIGHT) return false;
-    const key = episodeCacheKey(seriesId, episodeId);
+    const key = episodeCacheKey(seriesId, episodeId, 'auto');
     if (resolvedFileByVidRef.current.has(key)) return false; // 已缓存或已在途
     resolvedFileByVidRef.current.set(key, '__prefetching__');
     prewarmInflightRef.current += 1;
@@ -871,7 +894,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 悬停预热又对同一集发起第二次解析（后端虽有 leader/follower 去重，
     // 但前端这一层多打一次请求同样浪费）。
     targets.forEach(target => {
-      const key = episodeCacheKey(series.id, target.id);
+      const key = episodeCacheKey(series.id, target.id, 'auto');
       if (!resolvedFileByVidRef.current.has(key)) {
         prefetchQueueRef.current.push({
           seriesId: series.id,
@@ -933,6 +956,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 才开始预取，等于白白丢掉这段本可以利用的时间。
    */
   const prewarmEpisode = (seriesId: string, episodeId: string, contentType = 1) => {
+    // 动漫源是流式 m3u8，没有"本地文件"可预热；起 worker 只会白跑一遍
+    // 签名链路再失败（worker 只认红果 vid）。动漫的加载靠 openEpisode 直连。
+    if (currentSeries?.type === 'anime' || seriesId.startsWith('anime_')) return;
     startPrewarmResolve(seriesId, episodeId, contentType);
   };
 
@@ -1115,10 +1141,121 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
 
       const selectedQuality = qualityOverride || currentQuality;
 
+      // ===== 动漫专区：直连播放链路 =====
+      // 动漫源（暴风资源）的播放地址是 m3u8，经本地 HLS 代理转流后直接喂
+      // <video>，全程不经红果 worker（worker 的签名/下载/解密链路对动漫源
+      // 无意义，跑一遍只会白等 3-10 秒再失败）。也不走预取快路径——m3u8
+      // 是流式的，没有"本地文件"可缓存，缓存快路径对它不适用。
+      if (detail.type === 'anime') {
+        // 动漫的清晰度档位藏在播放解析里，与短剧那条 `probeQualities`
+        // （走红果 worker）完全不通用，这里单独探一次。探测有网络成本，
+        // 所以按"剧+集"记忆：同一集重复进入不重探。
+        const qualityKey = `${seriesId}::${ep.id}`;
+        if (animeProbedRef.current !== qualityKey) {
+          animeProbedRef.current = qualityKey;
+          void ipcService.playback.animeQualities(seriesId, ep.id)
+            .then(options => {
+              if (activeSessionRef.current !== newSessionId) return;
+              setAvailableQualities(options);
+            })
+            .catch(() => {
+              if (activeSessionRef.current !== newSessionId) return;
+              setAvailableQualities([]);
+            });
+        }
+        let session;
+        try {
+          session = await ipcService.playback.open(seriesId, ep.id, selectedQuality, startPosition, newSessionId, true);
+        } catch (animeError) {
+          if (activeSessionRef.current !== newSessionId) return;
+          throw animeError;
+        }
+        if (activeSessionRef.current !== newSessionId) return;
+        if (!videoRef.current) return;
+        const animeVideo = videoRef.current;
+        animeVideo.dataset.sessionId = String(newSessionId);
+        backupUrlRef.current = '';
+        hasTriedBackupRef.current = true;
+        hasTriedBlobRef.current = true;
+        hasTriedNativeResolveRef.current = true;
+        if (objectUrlRef.current) {
+          URL.revokeObjectURL(objectUrlRef.current);
+          objectUrlRef.current = '';
+        }
+        animeVideo.preload = 'auto';
+        animeVideo.playbackRate = playbackRate;
+        animeVideo.volume = isMuted ? 0 : volume;
+        animeVideo.muted = isMuted;
+        // m3u8（本地代理流）经 hls.js 挂载；mp4 直链仍走普通 src。
+        if (isHlsUrl(session.url)) {
+          await attachSource(animeVideo, session.url);
+        } else {
+          detachSource(animeVideo);
+          animeVideo.src = session.url;
+        }
+        // HLS 挂载（attachSource）是长时间 await：期间用户可能已离开播放器。
+        if (pauseIfStale(newSessionId, animeVideo)) return;
+        markSourceCommitted(newSessionId, ep.id);
+        if (startPosition > 0) {
+          const handleAnimeMetadata = () => {
+            try {
+              animeVideo.currentTime = startPosition;
+            } catch {
+              // ignore
+            }
+            animeVideo.removeEventListener('loadedmetadata', handleAnimeMetadata);
+          };
+          if (animeVideo.readyState >= 1) {
+            animeVideo.currentTime = startPosition;
+          } else {
+            animeVideo.addEventListener('loadedmetadata', handleAnimeMetadata);
+          }
+        }
+        try {
+          await animeVideo.play();
+          if (pauseIfStale(newSessionId, animeVideo)) return;
+          setIsPlaying(true);
+          setUiState({ kind: 'playing', sessionId: newSessionId, position: animeVideo.currentTime || startPosition });
+        } catch (playError) {
+          if (activeSessionRef.current !== newSessionId) return; // 会话已作废：不静音重试、不弹错误卡
+          if (playError instanceof DOMException && playError.name === 'NotAllowedError' && !animeVideo.muted) {
+            // WebView 拒绝带声音自动播放：静音起播，让用户手动恢复声音。
+            animeVideo.muted = true;
+            setIsMuted(true);
+            try {
+              await animeVideo.play();
+              if (pauseIfStale(newSessionId, animeVideo)) return;
+              setIsPlaying(true);
+              setUiState({ kind: 'playing', sessionId: newSessionId, position: animeVideo.currentTime });
+            } catch {
+              setIsPlaying(false);
+              setUiState({ kind: 'error', sessionId: newSessionId, code: 'MEDIA_AUTOPLAY_FAILED', recoverable: true });
+            }
+          } else {
+            setIsPlaying(false);
+            setUiState({ kind: 'error', sessionId: newSessionId, code: 'MEDIA_LOAD_FAILED', recoverable: true });
+          }
+        }
+        return;
+      }
+
+      // ===== 复位三级兜底开关（跨源/跨会话污染修复）=====
+      //
+      // 这三个开关（备用直链 / Blob / 本地解析）的语义是"本会话已试过、别再试"，
+      // 但原实现**没有任何路径在新会话开始时复位它们**：
+      //   - 动漫分支（上方）置 true 后直接 return；
+      //   - 短剧主链路（下方）自己也置 true。
+      // 于是"播过一次动漫/短剧之后，其它源就再也播不了"——三条兜底腿全被
+      // 上一会话的残留顶掉，这正是"播完动漫后漫剧/短剧播不了"的根因。
+      // 在进入非动漫路径前统一复位，恢复"每次打开都从干净的兜底状态开始"。
+      // （快路径若命中会在下面自己置 true，不受影响。）
+      hasTriedBackupRef.current = false;
+      hasTriedBlobRef.current = false;
+      hasTriedNativeResolveRef.current = false;
       // 快路径：该集此前已解析出本地文件（首次播放成功或预取完成）。
       // 直接秒开本地 mp4，跳过注定失败的公开直链试探（省 3-10 秒）。
       const video = videoRef.current;
-      const cachedKey = episodeCacheKey(seriesId, ep.id);
+      const cachedKey = episodeCacheKey(seriesId, ep.id, selectedQuality);
       const cachedPlayUrl = resolvedFileByVidRef.current.get(cachedKey);
       if (video && cachedPlayUrl && cachedPlayUrl !== '__prefetching__') {
         video.dataset.sessionId = String(newSessionId);
@@ -1182,7 +1319,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           await new Promise(resolve => setTimeout(resolve, 700));
           if (activeSessionRef.current === newSessionId) {
             // 撤掉登记，确保这一轮是真正的重新解析而不是再读一次坏文件。
-            resolvedFileByVidRef.current.delete(episodeCacheKey(seriesId, ep.id));
+            resolvedFileByVidRef.current.delete(episodeCacheKey(seriesId, ep.id, selectedQuality));
             setUiState({ kind: 'opening', sessionId: newSessionId, episodeId: ep.id });
             outcome = await startNativeResolve(
               seriesId,
@@ -1225,6 +1362,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // 本地解析也失败（API 拒绝/网络断）：最后再试公开网页直链兜底。
       }
 
+      // 本地解析失败后的公开直链兜底：会话已作废（用户已离开）就直接放弃——
+      // open 会白跑 Rust/worker，其进度事件还会污染下一会话的加载提示卡。
+      if (activeSessionRef.current !== newSessionId) return;
       let session;
       try {
         session = await ipcService.playback.open(seriesId, ep.id, selectedQuality, startPosition, newSessionId);
@@ -1273,6 +1413,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         video.src = session.url;
         markSourceCommitted(newSessionId, ep.id);
         await webFirstFrame;
+        // 首帧等待是本段链路里唯一的长时间 await：期间用户可能已离开播放器
+        // （会话已作废）。不复查就 play()，正是"退出后声音照放"的主通道。
+        if (pauseIfStale(newSessionId, video)) return;
 
         if (startPosition > 0) {
           const handleMetadata = () => {
@@ -1291,19 +1434,23 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         }
 
         video.play().then(() => {
+          if (pauseIfStale(newSessionId, video)) return;
           video.muted = preferredMuted;
           setIsPlaying(true);
           setUiState({ kind: 'playing', sessionId: newSessionId, position: startPosition });
         }).catch((error: unknown) => {
+          if (activeSessionRef.current !== newSessionId) return; // 会话已作废：不补播、不弹错误卡
           // WebView2 may reject the first gesture-less attempt only because it has audio.
           // Retry muted so the episode starts, then let the user restore sound explicitly.
           if (error instanceof DOMException && error.name === 'NotAllowedError' && !video.muted) {
             video.muted = true;
             setIsMuted(true);
             void video.play().then(() => {
+              if (pauseIfStale(newSessionId, video)) return;
               setIsPlaying(true);
               setUiState({ kind: 'playing', sessionId: newSessionId, position: video.currentTime });
             }).catch(() => {
+              if (activeSessionRef.current !== newSessionId) return; // 会话已作废
               setIsPlaying(false);
               setUiState({ kind: 'error', sessionId: newSessionId, code: 'MEDIA_AUTOPLAY_FAILED', recoverable: true });
             });
@@ -1549,6 +1696,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 同时强制落盘进度，避免"看了半集、退出后进度丢失"。
    */
   const stopPlayback = useCallback(() => {
+    // 离开播放器 = 当前会话作废：在途的 openEpisode/预热续体全部按 stale 处理。
+    // 不作废的后果（实测）：换集长期卡在切线重试 → 用户返回主界面 → worker
+    // 稍后成功 → 旧会话续体照常 setSrc/play()，常驻 <video> 被隐藏着出声。
+    activeSessionRef.current += 1;
+    // 在途 open 任务绑定的是刚作废的会话，不能留在复用池：重进播放器再点
+    // 同一集若复用到这条"所有续体都会 stale"的死任务，会表现为点了没反应。
+    openInFlightRef.current.clear();
     if (countdownIntervalRef.current) {
       clearInterval(countdownIntervalRef.current);
       countdownIntervalRef.current = null;
@@ -1758,10 +1912,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 本地解析已在途（openEpisode 或 play() 拒绝分支已启动 worker）：
       // 直链失败不代表应用内播不了，保持 opening 状态等待结果，禁止弹错误页或降级。
       if (nativeResolveInFlightRef.current) return;
+      // 会话已作废（用户已离开播放器 / 已有更新的切换接管）：整条兜底链
+      // （备用直链 → Blob → 本地解析）都不再启动——它们的续体最终都会
+      // play()，等于人已退出却隐形开播。
+      if (activeSessionRef.current !== Number(video.dataset.sessionId)) return;
       const ctx = handlerCtxRef.current;
       const backupUrl = backupUrlRef.current;
       if (backupUrl && !hasTriedBackupRef.current) {
         hasTriedBackupRef.current = true;
+        // 用户已离开播放器（会话已作废）：不再补播备用直链，避免隐形出声。
+        if (activeSessionRef.current !== Number(video.dataset.sessionId)) return;
+        const sessionAtBackup = activeSessionRef.current;
         setUiState({ kind: 'opening', sessionId: activeSessionRef.current, episodeId: ctx.currentEpisode?.id || '' });
         video.pause();
         const preferredMuted = ctx.isMuted;
@@ -1771,6 +1932,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         video.load();
         void video.play()
           .then(() => {
+            if (pauseIfStale(sessionAtBackup, video)) return;
             video.muted = preferredMuted;
             setIsPlaying(true);
             setUiState({ kind: 'playing', sessionId: activeSessionRef.current, position: video.currentTime });
@@ -1803,6 +1965,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             return video.play();
           })
           .then(() => {
+            if (pauseIfStale(Number(video.dataset.sessionId), video)) return;
             setIsPlaying(true);
             setUiState({ kind: 'playing', sessionId: activeSessionRef.current, position: video.currentTime });
           })

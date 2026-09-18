@@ -6,11 +6,187 @@ use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const HONGGUO_BASE: &str = "https://hongguoduanju.com";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// 全站卡片索引：把公开目录逐页抓全、按 id 去重后缓存。
+///
+/// 为什么必须要有它：站点**没有题材级路由**（分类 slug 只有频道级的
+/// `real-drama` / `comic-drama` / `ai-drama` / `comic`），页面里也不存在任何
+/// `?theme=` 之类的筛选参数——题材只是卡片上的文本标签。旧实现是"抓一页，再在
+/// 这一页的 24 条里过滤题材"，于是点任一题材都只剩那 24 条里匹配的几张卡
+/// （实测冷门题材整页只有 0-2 张），用户看到的就是"一个个别"。
+///
+/// 实测全站 34 页 × 24 = 816 部，并发抓完约 3.4s（每页约 280KB），之后按题材
+/// 过滤与分页都是纯内存操作。索引带 TTL，过期后下次过滤时重建。
+struct CatalogIndex {
+    items: Vec<SeriesItem>,
+    built_at: Instant,
+}
+
+const INDEX_TTL: Duration = Duration::from_secs(30 * 60);
+/// 并发抓页上限：每页约 280KB，开太多会挤占同一连接池（保活只有 4 条）。
+const INDEX_FETCH_CONCURRENCY: usize = 6;
+/// 目录翻页上限：站点实测 34 页，给足余量但别无限翻。
+const INDEX_MAX_PAGES: u32 = 60;
+
+static CATALOG_INDEX: OnceLock<Mutex<HashMap<String, CatalogIndex>>> = OnceLock::new();
+
+fn index_cache() -> &'static Mutex<HashMap<String, CatalogIndex>> {
+    CATALOG_INDEX.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_catalog_index(channel: &str) -> Option<Vec<SeriesItem>> {
+    let guard = index_cache().lock().ok()?;
+    let entry = guard.get(channel)?;
+    if entry.built_at.elapsed() > INDEX_TTL {
+        return None;
+    }
+    Some(entry.items.clone())
+}
+
+fn store_catalog_index(channel: &str, items: &[SeriesItem]) {
+    if let Ok(mut guard) = index_cache().lock() {
+        guard.insert(
+            channel.to_owned(),
+            CatalogIndex {
+                items: items.to_vec(),
+                built_at: Instant::now(),
+            },
+        );
+    }
+}
+
+/// 目录分页路径（与站点实际路由一致）。
+///
+/// 漫剧此前用 `/rank/hot-comic-drama`（热播榜），那个源**只有 5 页 / 约 100 部**：
+/// 按题材过滤后经常只剩 1-10 条，前端表现为"点了题材只有一张、也不再继续加载"。
+/// `/category/comic-drama` 是同一频道的完整目录（实测 34 页 × 24 部，卡片结构、
+/// 封面格式、集数文案都与真人剧一致），因此改用它。
+fn catalog_page_path(channel: &str, page: u32) -> String {
+    let page = page.max(1);
+    let Some(segment) = site_channel_segment(channel) else {
+        return if page <= 1 {
+            "/category".to_string()
+        } else {
+            format!("/category?page={page}")
+        };
+    };
+    if page <= 1 {
+        format!("/category/{segment}")
+    } else {
+        format!("/category/{segment}?page={page}")
+    }
+}
+
+fn has_active_filter(filter: &CatalogFilter) -> bool {
+    filter.category != "全部" || filter.audience != "全部"
+}
+
+/// 把全站索引按筛选条件过滤后切页（题材筛选走这条路）。
+fn paginate_filtered(
+    items: Vec<SeriesItem>,
+    filter: &CatalogFilter,
+    requested_page: u32,
+) -> CatalogPage {
+    // 词表取过滤前的全集：点题材不该让题材栏跟着缩水。
+    let categories = categories_for(&items);
+    let page_size = filter.page_size.clamp(1, 60) as usize;
+    let filtered = items
+        .into_iter()
+        .filter(|item| matches_filter(item, filter))
+        .collect::<Vec<_>>();
+    let total = filtered.len();
+    let start = ((requested_page.saturating_sub(1)) as usize * page_size).min(total);
+    let page_items = filtered[start..]
+        .iter()
+        .take(page_size)
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_more = start + page_items.len() < total;
+    CatalogPage {
+        total,
+        items: page_items,
+        has_more,
+        page: requested_page,
+        categories,
+        next_cursor: has_more.then(|| (requested_page + 1).to_string()),
+        source: format!(
+            "红果公开目录 · 题材「{}」全站筛选 · 共 {total} 部",
+            filter.category
+        ),
+    }
+}
+
+/// 站点频道段：官方题材子路由挂在 `<频道段>/<题材 slug>` 下。
+///
+/// 实测真人剧（real-drama，24 个题材）与漫剧（comic-drama，8 个题材）都提供，
+/// 且题材页服务端分页、结果完整——这是"点题材只剩几张卡"的正解。
+fn site_channel_segment(channel: &str) -> Option<&'static str> {
+    match channel {
+        "drama" => Some("real-drama"),
+        "comic" => Some("comic-drama"),
+        _ => None,
+    }
+}
+
+/// 官方题材路由表：频道 → [(题材名, slug)]。
+type ThemeRoutes = Vec<(String, String)>;
+
+static THEME_ROUTES: OnceLock<Mutex<HashMap<String, ThemeRoutes>>> = OnceLock::new();
+
+fn theme_route_cache() -> &'static Mutex<HashMap<String, ThemeRoutes>> {
+    THEME_ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_theme_routes(channel: &str) -> Option<ThemeRoutes> {
+    let guard = theme_route_cache().lock().ok()?;
+    guard.get(channel).cloned()
+}
+
+fn store_theme_routes(channel: &str, routes: &[(String, String)]) {
+    if let Ok(mut guard) = theme_route_cache().lock() {
+        guard.insert(channel.to_owned(), routes.to_vec());
+    }
+}
+
+/// 从 `/category` 的导航里解析某频道的**官方题材**（名称 → slug，保序去重）。
+///
+/// 实测真人剧有 24 个官方题材（爱情/都市/古装/玄幻…），且官方题材就是卡片上的
+/// 第一个标签——所以用官方题材做筛选既能走服务端路由，也与卡片展示一致。
+fn parse_theme_routes(html: &str, channel: &str) -> Vec<(String, String)> {
+    let Some(segment) = site_channel_segment(channel) else {
+        return Vec::new();
+    };
+    let Ok(pattern) = Regex::new(&format!(
+        r#"href=["']/category/{segment}/([A-Za-z0-9_\-]+)[^"']*["'][^>]*>([^<]{{1,16}})<"#
+    )) else {
+        return Vec::new();
+    };
+    let mut routes: Vec<(String, String)> = Vec::new();
+    for captures in pattern.captures_iter(html) {
+        let slug = captures
+            .get(1)
+            .map(|value| value.as_str())
+            .unwrap_or_default();
+        let name = captures
+            .get(2)
+            .map(|value| value.as_str())
+            .unwrap_or_default()
+            .trim();
+        if slug.is_empty() || name.is_empty() || name == "全部" {
+            continue;
+        }
+        if !routes.iter().any(|(existing, _)| existing == name) {
+            routes.push((name.to_owned(), slug.to_owned()));
+        }
+    }
+    routes
+}
 
 pub struct DramaProvider {
     client: Client,
@@ -48,18 +224,35 @@ impl DramaProvider {
         {
             return self.search_catalog(filter, keyword, requested_page).await;
         }
-        if filter.channel == "comic" {
-            return self.catalog_comic(filter, requested_page).await;
+        // ① 官方题材路由优先：真人剧 24 个、漫剧 8 个题材都有子路由
+        //    （/category/real-drama/romance、/category/comic-drama/fantasy 等），
+        //    服务端分页、结果完整，不必扫描全站——这是"点题材只剩几张卡"的正解。
+        if filter.category != "全部" {
+            if let Ok(routes) = self.theme_routes(filter.channel.as_str()).await {
+                if let Some((_, slug)) = routes.iter().find(|(name, _)| name == &filter.category) {
+                    return self.catalog_theme(filter, slug, requested_page).await;
+                }
+            }
         }
-        let path = if requested_page <= 1 {
-            "/category".to_string()
-        } else {
-            format!("/category?page={requested_page}")
-        };
+        // ② 走到这里说明筛选条件里没有命中官方题材（频道题材之外的标签，或只按受众筛）。
+        //    这种只能靠全站索引过滤：只抓一页再在这一页里过滤，只会剩那 24 条中匹配的
+        //    几张卡（实测冷门题材整页 0-2 张）——用户看到的就是"一个个别"。
+        //    刻意不再按频道是否有子路由分流：漫剧官方题材只有 8 个，用户手上的其余
+        //    标签同样需要索引兜底，否则又会退回"单页后置过滤"。
+        if has_active_filter(filter) {
+            let items = self.catalog_index(filter.channel.as_str()).await?;
+            return Ok(paginate_filtered(items, filter, requested_page));
+        }
+        let path = catalog_page_path(filter.channel.as_str(), requested_page);
         let html = self.fetch_page(&path).await?;
         let router_data = parse_router_data(&html);
         let raw_items = parse_catalog_cards(&html, filter.channel.as_str());
-        let categories = categories_for(&raw_items);
+        // 题材词表优先用全站索引：一页只有 24 条，词表会随翻页/筛选变来变去；
+        // 索引就绪后给出的是全站题材的稳定全集。
+        let categories = match cached_catalog_index(filter.channel.as_str()) {
+            Some(indexed) if !indexed.is_empty() => categories_for(&indexed),
+            _ => categories_for(&raw_items),
+        };
         let mut items = raw_items
             .into_iter()
             .filter(|item| matches_filter(item, filter))
@@ -92,6 +285,145 @@ impl DramaProvider {
                 format!("红果短剧公开目录 · {}", sort_label(&filter.sort))
             },
         })
+    }
+
+    /// 取该频道的官方题材路由（缓存；没有题材子路由的频道返回空表）。
+    pub async fn theme_routes(&self, channel: &str) -> Result<Vec<(String, String)>, String> {
+        if let Some(routes) = cached_theme_routes(channel) {
+            return Ok(routes);
+        }
+        if site_channel_segment(channel).is_none() {
+            // 明确记住"该频道没有题材路由"，避免每次筛选都重新抓 /category。
+            store_theme_routes(channel, &[]);
+            return Ok(Vec::new());
+        }
+        // 题材导航挂在**频道自己的页面**上：漫剧的 8 个题材只在 /category/comic-drama
+        // 上出现，总目录 /category 只有真人剧的。取错页会让漫剧拿不到官方题材，
+        // 白白退回到"扫全站索引"那条慢路。
+        let html = self.fetch_page(&catalog_page_path(channel, 1)).await?;
+        let mut routes = parse_theme_routes(&html, channel);
+        if routes.is_empty() {
+            // 兼容：若站点某天把导航收回总目录页，仍能解析出来。
+            if let Ok(fallback) = self.fetch_page("/category").await {
+                routes = parse_theme_routes(&fallback, channel);
+            }
+        }
+        store_theme_routes(channel, &routes);
+        Ok(routes)
+    }
+
+    /// 官方题材浏览：`/category/{segment}/{slug}?page=N`（服务端分页，结果完整）。
+    async fn catalog_theme(
+        &self,
+        filter: &CatalogFilter,
+        slug: &str,
+        requested_page: u32,
+    ) -> Result<CatalogPage, String> {
+        let Some(segment) = site_channel_segment(filter.channel.as_str()) else {
+            return Err("该频道没有官方题材路由。".to_string());
+        };
+        let path = if requested_page <= 1 {
+            format!("/category/{segment}/{slug}")
+        } else {
+            format!("/category/{segment}/{slug}?page={requested_page}")
+        };
+        let html = self.fetch_page(&path).await?;
+        let router_data = parse_router_data(&html);
+        let mut items = parse_catalog_cards(&html, filter.channel.as_str());
+        items.truncate(filter.page_size.clamp(1, 60) as usize);
+        let total_pages = router_data
+            .as_ref()
+            .and_then(|value| find_pagination_value(value, &["totalPages", "total_pages"]))
+            .unwrap_or_else(|| detect_total_pages(&html, filter.channel.as_str()))
+            .max(requested_page);
+        let total = router_data
+            .as_ref()
+            .and_then(|value| find_pagination_value(value, &["total"]))
+            .map(|value| value as usize)
+            .unwrap_or(items.len());
+        // 空页即到底：即使页码估算偏大，也不会让无限滚动空转。
+        let has_more = !items.is_empty() && requested_page < total_pages;
+        let categories = self
+            .catalog_categories(filter.channel.as_str())
+            .await
+            .unwrap_or_default();
+        Ok(CatalogPage {
+            total,
+            items,
+            has_more,
+            page: requested_page,
+            categories,
+            next_cursor: has_more.then(|| (requested_page + 1).to_string()),
+            source: format!(
+                "红果公开目录 · 题材「{}」· {}",
+                filter.category,
+                sort_label(&filter.sort)
+            ),
+        })
+    }
+
+    /// 取全站卡片索引（带 TTL 缓存）。题材/受众过滤必须走它。
+    ///
+    /// 首页用来拿总页数，其余页并发抓取后按 id 去重合并。实测 34 页约 3.4s；
+    /// 索引缓存在进程内，TTL 内重复调用是纯内存操作。
+    pub async fn catalog_index(&self, channel: &str) -> Result<Vec<SeriesItem>, String> {
+        if let Some(items) = cached_catalog_index(channel) {
+            return Ok(items);
+        }
+        let first = self.fetch_page(&catalog_page_path(channel, 1)).await?;
+        let total_pages = router_data_total_pages(&first, channel).clamp(1, INDEX_MAX_PAGES);
+        let mut items = parse_catalog_cards(&first, channel);
+        let mut seen: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
+
+        let mut next_page = 2u32;
+        while next_page <= total_pages {
+            let mut join = tokio::task::JoinSet::new();
+            let mut scheduled = 0usize;
+            while scheduled < INDEX_FETCH_CONCURRENCY && next_page <= total_pages {
+                let client = self.client.clone();
+                let path = catalog_page_path(channel, next_page);
+                join.spawn(async move { fetch_page_with_client(client, path).await });
+                next_page += 1;
+                scheduled += 1;
+            }
+            if scheduled == 0 {
+                break;
+            }
+            // 单页失败不整体失败：索引少一两页仍能提供完整的题材过滤，
+            // 比因为一次抖动就让用户点不了题材要好。
+            while let Some(joined) = join.join_next().await {
+                let Ok(Ok(html)) = joined else {
+                    continue;
+                };
+                for item in parse_catalog_cards(&html, channel) {
+                    if seen.insert(item.id.clone()) {
+                        items.push(item);
+                    }
+                }
+            }
+        }
+        store_catalog_index(channel, &items);
+        Ok(items)
+    }
+
+    /// 题材词表（供前端题材栏使用）。
+    ///
+    /// 有官方题材路由的频道直接给出官方 24 个题材：稳定、完整，且点击时走服务端
+    /// 路由过滤，不需要扫描全站。没有路由的频道（漫剧）才退回"汇总目录卡片标签"，
+    /// 那条路要建索引（约数秒），所以前端只应在首屏之后后台调用。
+    pub async fn catalog_categories(&self, channel: &str) -> Result<Vec<String>, String> {
+        let routes = self.theme_routes(channel).await.unwrap_or_default();
+        if !routes.is_empty() {
+            let mut names = Vec::with_capacity(routes.len() + 1);
+            names.push("全部".to_string());
+            names.extend(routes.into_iter().map(|(name, _)| name));
+            return Ok(names);
+        }
+        let items = self.catalog_index(channel).await?;
+        if items.is_empty() {
+            return Err("目录索引为空，未能汇总题材。".to_string());
+        }
+        Ok(categories_for(&items))
     }
 
     /// 全站搜索：走站点自己的 `/search/{keyword}` 路由。
@@ -161,41 +493,6 @@ impl DramaProvider {
             categories,
             next_cursor: has_more.then(|| (requested_page + 1).to_string()),
             source: format!("红果官网搜索 · {keyword}"),
-        })
-    }
-
-    async fn catalog_comic(
-        &self,
-        filter: &CatalogFilter,
-        requested_page: u32,
-    ) -> Result<CatalogPage, String> {
-        // 首屏只取当前公开分页，后续由前端滚动加载继续请求，避免打开漫剧页时等待整榜。
-        let path = if requested_page <= 1 {
-            "/rank/hot-comic-drama".to_string()
-        } else {
-            format!("/rank/hot-comic-drama?page={requested_page}")
-        };
-        let html = self.fetch_page(&path).await?;
-        let page_items = parse_catalog_cards(&html, "comic");
-        let categories = categories_for(&page_items);
-        // 漫剧榜单页没有 pagination 元数据，只靠分页链接推算（实测分页链接到 5）。
-        let total_pages = router_data_total_pages(&html, "comic").max(requested_page);
-        let filtered = page_items
-            .into_iter()
-            .filter(|item| matches_filter(item, filter))
-            .collect::<Vec<_>>();
-        let page_size = filter.page_size.clamp(1, 60) as usize;
-        let items = filtered.into_iter().take(page_size).collect::<Vec<_>>();
-        let has_more = !items.is_empty() && requested_page < total_pages;
-
-        Ok(CatalogPage {
-            total: items.len(),
-            items,
-            has_more,
-            page: requested_page,
-            categories,
-            next_cursor: has_more.then(|| (requested_page + 1).to_string()),
-            source: format!("红果漫剧公开榜单 · {}", sort_label(&filter.sort)),
         })
     }
 
@@ -278,20 +575,44 @@ impl DramaProvider {
     ) -> Result<PlaybackSession, String> {
         validate_numeric_id(series_id, "剧集")?;
         validate_numeric_id(episode_id, "剧集分集")?;
-        // 站点路由是 /player/{series_id}（实测 200），整部剧的播放数据都在这张
-        // 页上。旧实现拼成 /player/{series}/{episode}，实测恒定返回 404 —— 这条
-        // 兜底链路从来没有成功过，只会把本地解析的真实失败原因盖成"HTTP 404"。
-        let html = self.fetch_page(&format!("/player/{series_id}")).await?;
+        // 站点路由是 /player/{series_id}/{episode_id}：带集号才会返回那一集的播放数据。
+        // 不带集号恒为第一集——实测两页的 duration 与 main_url 各不相同。此前注释称
+        // "带集号恒定 404"，实为过期结论：该形态实测 200，且正确指向请求的那一集。
+        let html = self
+            .fetch_page(&format!("/player/{series_id}/{episode_id}"))
+            .await?;
         let data =
             parse_router_data(&html).ok_or_else(|| "播放页未包含可读取的公开数据。".to_string())?;
-        // 公开页只带"默认集"的播放数据，所以必须确认它确实属于请求的这一集。
-        // 拿别的集的地址去播比播不出来更糟：用户会看到完全不相干的内容。
-        let mut page_vids = Vec::new();
-        collect_vids(&data, &mut page_vids);
-        if !page_vids.iter().any(|candidate| candidate == episode_id) {
-            return Err("该集没有公开网页直链（公开页仅提供默认集）。".into());
+        let scope = find_player_scope(&data)
+            .ok_or_else(|| "该集没有公开网页播放信息，可能仅限官方 App。".to_string())?;
+        // 播放数据对象**自身**声明了哪一集就按哪一集核验。拿别的集的地址去播比播不出来
+        // 更糟：用户会看到完全不相干的内容（参考实现果果剧库 provider_hongguo.go 亦然）。
+        let declared_vid = scope
+            .get("vid")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if declared_vid.is_empty() {
+            // 对象未声明 vid 时退回弱校验：该 vid 至少要在页面里出现过。
+            let mut page_vids = Vec::new();
+            collect_vids(&data, &mut page_vids);
+            if !page_vids.iter().any(|candidate| candidate == episode_id) {
+                return Err("该集没有公开网页直链（公开页仅提供默认集）。".into());
+            }
+        } else if declared_vid != episode_id {
+            return Err("该集没有公开网页直链（公开页返回了别的分集）。".into());
         }
-        let player = find_player_info(&data)
+        let declared_series = scope
+            .get("series_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if !declared_series.is_empty() && declared_series != series_id {
+            return Err("播放页返回了其他剧集的播放信息。".into());
+        }
+        let player = scope
+            .get("video_player_info")
+            .and_then(Value::as_object)
             .ok_or_else(|| "该集没有公开网页播放信息，可能仅限官方 App。".to_string())?;
         let mut urls = Vec::new();
         for key in ["main_url", "play_url", "video_url", "url", "backup_url"] {
@@ -528,10 +849,6 @@ fn encode_uri_component(input: &str) -> String {
 }
 
 fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
-    if channel == "comic" {
-        return parse_comic_rank_cards(html);
-    }
-
     let document = Html::parse_document(html);
     let anchor_selector = Selector::parse("a[href*='detail?series_id=']").expect("anchor selector");
     let image_selector = Selector::parse("img").expect("image selector");
@@ -601,7 +918,7 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
             latest_episode_title: (episodes_count > 0).then(|| format!("全 {episodes_count} 集")),
             tags: unique(tags),
             origin: if channel == "comic" {
-                "红果漫剧公开榜单".into()
+                "红果漫剧公开目录".into()
             } else {
                 "红果短剧公开目录".into()
             },
@@ -611,96 +928,19 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
     cards
 }
 
-fn parse_comic_rank_cards(html: &str) -> Vec<SeriesItem> {
-    let document = Html::parse_document(html);
-    let article_selector =
-        Selector::parse("article[aria-labelledby]").expect("comic article selector");
-    let detail_selector =
-        Selector::parse("a[href*='detail?series_id=']").expect("comic detail selector");
-    let title_selector = Selector::parse("h2[id^='rank-title-']").expect("comic title selector");
-    let image_selector = Selector::parse("img").expect("comic image selector");
-    let category_selector =
-        Selector::parse("p[class*='pc-categories'] span").expect("comic category selector");
-    let description_selector =
-        Selector::parse("p[class*='pc-description']").expect("comic description selector");
-    let _episode_selector = Selector::parse("a[href*='/player/']").expect("comic episode selector");
-    let id_re = Regex::new(r"series_id=(\d+)").expect("comic id regex");
-    let mut seen = HashSet::new();
-    let mut cards = Vec::new();
-
-    for article in document.select(&article_selector) {
-        let Some(detail_anchor) = article.select(&detail_selector).next() else {
-            continue;
-        };
-        let href = detail_anchor.value().attr("href").unwrap_or_default();
-        let Some(id) = id_re
-            .captures(href)
-            .and_then(|captures| captures.get(1))
-            .map(|value| value.as_str().to_string())
-        else {
-            continue;
-        };
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-
-        let title = article
-            .select(&title_selector)
-            .next()
-            .map(|node| node.text().collect::<String>())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "未命名漫剧".into());
-        let cover = article
-            .select(&image_selector)
-            .filter_map(|image| image.value().attr("src"))
-            .find(|value| value.starts_with("https://"))
-            .map(str::to_string)
-            .unwrap_or_default();
-        let tags = article
-            .select(&category_selector)
-            .map(|node| node.text().collect::<String>().trim().to_string())
-            .filter(|value| {
-                !value.is_empty() && !value.chars().all(|character| character.is_ascii_digit())
-            })
-            .collect::<Vec<_>>();
-        // 榜单页**没有**任何集数文案（实测抓取：全/更新至/共 N 集全为 0 命中），
-        // 卡片里恒定渲染前 4 集 /player/ 入口（页面展示约定，抓取验证 20/20 张
-        // 卡片都是 4），直接 count 会把展示约定误报成"已公开 4 集"。
-        // 真实集数只有详情页的 vid_list 可信——列表页如实报 0（前端显示
-        // "集数未知"），不编造数字。
-        let episode_count = 0u32;
-        let brief = article
-            .select(&description_selector)
-            .next()
-            .map(|node| node.text().collect::<Vec<_>>().join(" "))
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-
-        cards.push(SeriesItem {
-            id,
-            title,
-            cover,
-            item_type: "comic".into(),
-            episodes_count: episode_count,
-            latest_episode_title: (episode_count > 0)
-                .then(|| format!("已公开 {} 集", episode_count)),
-            tags: unique(tags),
-            origin: "红果漫剧公开榜单".into(),
-            brief,
-        });
-    }
-    cards
-}
-
 fn detect_total_pages(html: &str, channel: &str) -> u32 {
-    // 站点把分类分页链接写成带 slug 的形式：/category/real-drama?page=2。
-    // 旧正则只匹配 `/category?page=N`，被中间多出来的 slug 段挡住而永远失配，
+    // 站点把分页链接写成带 slug 的形式，且官方题材页再多一层：
+    //   /category/real-drama?page=2        （频道）
+    //   /category/real-drama/romance?page=2（官方题材）
+    // 旧正则只匹配 `/category?page=N`，被多出来的 slug 段挡住而永远失配，
     // 于是 total_pages 恒为 1、has_more 恒为 false —— 这正是"首页无限流消失"的根因。
+    // 这里放宽到最多两层 slug，三种形态都能命中。
+    // 漫画频道现在也走 `/category/comic-drama`，与真人剧同一形态；rank 形态仍保留
+    // 匹配，避免站点某个入口回退到榜单页时页码失配。
     let route_pattern = if channel == "comic" {
-        r#"href=[\"'](?:https?://[^\"']*)?/rank/hot-comic-drama\?page=(\d+)"#
+        r#"href=["'](?:https?://[^"']*)?/(?:rank/hot-comic-drama|category(?:/[A-Za-z0-9_\-]+){0,2})\?page=(\d+)"#
     } else {
-        r#"href=[\"'](?:https?://[^\"']*)?/category(?:/[A-Za-z0-9_\-]+)?\?page=(\d+)"#
+        r#"href=["'](?:https?://[^"']*)?/category(?:/[A-Za-z0-9_\-]+){0,2}\?page=(\d+)"#
     };
     let Ok(regex) = Regex::new(route_pattern) else {
         return 1;
@@ -804,15 +1044,21 @@ fn find_series<'a>(value: &'a Value, expected_id: &str) -> Option<&'a Map<String
     }
 }
 
-fn find_player_info(value: &Value) -> Option<&Map<String, Value>> {
+/// 找到承载播放数据的对象：既含 `video_player_info`，同层还带 `vid` / `series_id`。
+///
+/// 实测结构（`/player/{series_id}/{episode_id}` 页）：
+/// `{ …, "isSuccess":true, "series_id":"…", "vid":"…", "video_player_info":{ duration, main_url, … } }`
+/// ——`vid` 与 `series_id` 是 `video_player_info` 的**同层兄弟**，并不在它内部。
+/// 参考实现（果果剧库 provider_hongguo.go）同样是在这个外层对象上比对 vid/series_id。
+fn find_player_scope(value: &Value) -> Option<&Map<String, Value>> {
     match value {
         Value::Object(object) => {
-            if let Some(Value::Object(player)) = object.get("video_player_info") {
-                return Some(player);
+            if object.contains_key("video_player_info") {
+                return Some(object);
             }
-            object.values().find_map(find_player_info)
+            object.values().find_map(find_player_scope)
         }
-        Value::Array(values) => values.iter().find_map(find_player_info),
+        Value::Array(values) => values.iter().find_map(find_player_scope),
         _ => None,
     }
 }
@@ -1011,8 +1257,8 @@ fn unique(items: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_total_pages, find_pagination_value, normalize_playback_url, parse_router_script,
-        rank_search_items, DramaProvider, Value,
+        catalog_page_path, detect_total_pages, find_pagination_value, normalize_playback_url,
+        parse_router_script, parse_theme_routes, rank_search_items, DramaProvider, Value,
     };
     use crate::models::{CatalogFilter, SeriesItem};
 
@@ -1041,6 +1287,28 @@ mod tests {
         assert_eq!(items[2].title, "大将军扛楼养活百万大军");
     }
 
+    /// 漫剧现在走完整目录 `/category/comic-drama`，不再是只有 5 页的热播榜。
+    /// 这条锁住数据源：排行榜那个源按题材过滤后经常只剩 1-10 条（"只有一个、
+    /// 也不继续加载"的根因），换回去会立刻复发。
+    #[test]
+    fn comic_catalog_uses_full_category_route() {
+        assert_eq!(catalog_page_path("comic", 1), "/category/comic-drama");
+        assert_eq!(
+            catalog_page_path("comic", 2),
+            "/category/comic-drama?page=2"
+        );
+        assert_eq!(catalog_page_path("drama", 1), "/category/real-drama");
+        assert_eq!(catalog_page_path("drama", 7), "/category/real-drama?page=7");
+        // 漫剧完整目录同样带两层 slug 的官方题材页。
+        let html = r#"
+            <a href="/category/comic-drama?page=2">2</a>
+            <a href="/category/comic-drama/fantasy?page=34">34</a>
+        "#;
+        assert_eq!(detect_total_pages(html, "comic"), 34);
+    }
+
+    /// 榜单形态的分页链接仍要能识别：数据源虽已换成完整目录，但站点某个入口
+    /// 若回退到榜单页，页码也不该失配。
     #[test]
     fn detects_comic_pagination() {
         let html = r#"
@@ -1091,6 +1359,40 @@ mod tests {
     fn detects_category_total_pages_without_slug() {
         let html = r#"<a href="/category?page=2">2</a><a href="https://hongguoduanju.com/category?page=7">7</a>"#;
         assert_eq!(detect_total_pages(html, "drama"), 7);
+    }
+
+    /// 官方题材页比频道页多一层 slug（`/category/real-drama/romance?page=2`）。
+    /// 旧正则只允许一层 slug，题材页的 total_pages 会退化成 1、has_more 恒为 false
+    /// ——点题材后就再也翻不出第二页。
+    #[test]
+    fn detects_official_theme_total_pages() {
+        let html = r#"
+            <a href="/category/real-drama/romance?page=2">2</a>
+            <a href="/category/real-drama/romance?page=34">34</a>
+        "#;
+        assert_eq!(detect_total_pages(html, "drama"), 34);
+    }
+
+    /// 从 `/category` 导航解析官方题材（名称 → slug）：跳过频道级链接与"全部"，
+    /// 保序去重；没有题材子路由的频道返回空表。
+    #[test]
+    fn parses_official_theme_routes() {
+        let html = r#"
+            <a href="/category/real-drama">全部</a>
+            <a href="/category/real-drama/romance">爱情</a>
+            <a href="/category/real-drama/urban">都市</a>
+            <a href="/category/real-drama/romance">爱情</a>
+            <a href="/category/comic-drama">漫剧</a>
+        "#;
+        assert_eq!(
+            parse_theme_routes(html, "drama"),
+            vec![
+                ("爱情".to_string(), "romance".to_string()),
+                ("都市".to_string(), "urban".to_string()),
+            ]
+        );
+        // 漫剧/AI 剧没有官方题材子路由。
+        assert!(parse_theme_routes(html, "comic").is_empty());
     }
 
     /// 回归：分页元数据挂在 `category_$` 这类随路由命名的键下，而不是 `category_page`。
@@ -1154,6 +1456,207 @@ mod tests {
             assert!(!second.items.is_empty(), "{channel} 第二页为空");
             assert_eq!(overlap, 0, "{channel} 第二页与第一页重叠，翻页无进展");
         }
+    }
+
+    /// 联网端到端验证：官方题材路由必须给出完整、可分页的结果。
+    ///
+    /// 这是"点题材只剩几张卡"的回归护栏：旧实现只抓一页再在这一页里后置过滤，
+    /// 实测冷门题材整页只有 0-2 张。默认忽略（避免离线环境跑失败），需要时手动执行：
+    ///   cargo test --bins -- --ignored --nocapture theme_catalog_live
+    #[tokio::test]
+    #[ignore = "需要联网，手动运行"]
+    async fn theme_catalog_live() {
+        let provider = DramaProvider::new().expect("provider");
+        let routes = provider.theme_routes("drama").await.expect("theme routes");
+        println!(
+            "官方题材 {} 个: {:?}",
+            routes.len(),
+            routes
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(routes.len() >= 20, "官方题材数量异常: {}", routes.len());
+        // 漫剧也有自己的官方题材（8 个）：这些题材只在 /category/comic-drama 页面上
+        // 出现，所以取题材导航必须抓频道自己的页面，而不是总目录 /category。
+        let comic_routes = provider.theme_routes("comic").await.expect("comic routes");
+        println!(
+            "漫剧官方题材 {} 个: {:?}",
+            comic_routes.len(),
+            comic_routes
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            comic_routes.len() >= 5,
+            "漫剧官方题材数量异常: {}",
+            comic_routes.len()
+        );
+
+        let filter = |page: u32| CatalogFilter {
+            channel: "drama".to_string(),
+            category: "都市".into(),
+            audience: "全部".into(),
+            sort: "recommend".into(),
+            keyword: None,
+            page,
+            page_size: 30,
+            cursor: None,
+        };
+        let first = provider.catalog(&filter(1)).await.expect("theme page 1");
+        println!(
+            "题材「都市」第 1 页: {} 条 has_more={} source={:?}",
+            first.items.len(),
+            first.has_more,
+            first.source
+        );
+        assert!(
+            first.items.len() >= 20,
+            "题材过滤只剩 {} 条——后置过滤的老问题回来了",
+            first.items.len()
+        );
+        assert!(first.has_more, "题材页应当还能翻页");
+        // 官方题材就是卡片的第一个标签：每条都必须带它，不能混入别的题材。
+        assert!(
+            first
+                .items
+                .iter()
+                .all(|item| item.tags.iter().any(|tag| tag == "都市")),
+            "题材页混入了非该题材的卡片"
+        );
+        // 题材词表应是稳定的官方全集，而不是随页漂移的卡片标签。
+        assert!(first.categories.contains(&"都市".to_string()));
+        assert!(
+            first.categories.len() >= 20,
+            "题材词表不完整: {}",
+            first.categories.len()
+        );
+
+        let second = provider.catalog(&filter(2)).await.expect("theme page 2");
+        let overlap = second
+            .items
+            .iter()
+            .filter(|item| first.items.iter().any(|prev| prev.id == item.id))
+            .count();
+        println!(
+            "题材「都市」第 2 页: {} 条 与第 1 页重叠={overlap}",
+            second.items.len()
+        );
+        assert!(!second.items.is_empty(), "题材第 2 页为空");
+        assert_eq!(overlap, 0, "题材翻页无进展");
+        // 漫剧：官方题材路由（8 个）+ 完整目录，正是"点题材只有一个、也不再继续
+        // 加载"的修复点。漫剧是应用默认落地频道，这条路径必须出满页。
+        // 官方题材本身已在上文断言过，这里只验证"题材栏 + 题材页"是否完整。
+        let _ = &comic_routes;
+        let comic_categories = provider
+            .catalog_categories("comic")
+            .await
+            .expect("comic categories");
+        println!(
+            "漫剧题材栏 {} 项，前 8 个: {:?}",
+            comic_categories.len(),
+            comic_categories.iter().take(8).collect::<Vec<_>>()
+        );
+        // 直接验证第一个官方题材：题材页必须出满一页且还能继续加载。
+        // （修复前的症状：只抓一页再后置过滤 → 常常只剩 1-10 条、has_more=false，
+        //   用户看到的就是"点题材只有一个、也不再继续加载"。）
+        for theme in comic_categories.iter().skip(1).take(1) {
+            let comic_filter = CatalogFilter {
+                channel: "comic".to_string(),
+                category: theme.clone(),
+                audience: "全部".into(),
+                sort: "recommend".into(),
+                keyword: None,
+                page: 1,
+                page_size: 30,
+                cursor: None,
+            };
+            let comic_page = provider
+                .catalog(&comic_filter)
+                .await
+                .expect("comic theme page");
+            println!("漫剧题材「{theme}」: {} 条", comic_page.items.len());
+            // 关键回归：题材页必须出满一页且还能继续加载。
+            // 全量记录前修复前的症状：只抓一页再后置过滤 → 常常 1-10 条、has_more=false。
+            assert!(
+                comic_page.items.len() >= 20,
+                "漫剧题材「{theme}」只剩 {} 条——题材过滤没有走完整目录",
+                comic_page.items.len()
+            );
+            assert!(comic_page.has_more, "漫剧题材「{theme}」应当还能继续加载");
+            assert!(
+                comic_page
+                    .items
+                    .iter()
+                    .all(|item| item.tags.iter().any(|tag| tag == theme)),
+                "漫剧题材页混入了非该题材的卡片"
+            );
+            let comic_second = provider
+                .catalog(&CatalogFilter {
+                    channel: "comic".to_string(),
+                    category: theme.clone(),
+                    audience: "全部".into(),
+                    sort: "recommend".into(),
+                    keyword: None,
+                    page: 2,
+                    page_size: 30,
+                    cursor: None,
+                })
+                .await
+                .expect("comic theme page 2");
+            let overlap = comic_second
+                .items
+                .iter()
+                .filter(|item| comic_page.items.iter().any(|prev| prev.id == item.id))
+                .count();
+            println!(
+                "漫剧题材「{theme}」第 2 页: {} 条 与第 1 页重叠={overlap}",
+                comic_second.items.len()
+            );
+            assert!(!comic_second.items.is_empty(), "漫剧题材第 2 页为空");
+            assert_eq!(overlap, 0, "漫剧题材翻页无进展");
+        }
+        assert!(
+            comic_categories.len() > 1,
+            "漫剧题材栏除「全部」外应当还有官方题材"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "临时诊断：需要联网"]
+    async fn debug_comic_cards_live() {
+        let provider = DramaProvider::new().expect("provider");
+        let page = provider
+            .catalog(&CatalogFilter {
+                channel: "comic".into(),
+                category: "全部".into(),
+                audience: "全部".into(),
+                sort: "recommend".into(),
+                keyword: None,
+                page: 1,
+                page_size: 30,
+                cursor: None,
+            })
+            .await
+            .expect("comic page");
+        for item in page.items.iter().take(4) {
+            println!(
+                "title={} | eps={} | cover={} | tags={:?}",
+                item.title, item.episodes_count, item.cover, item.tags
+            );
+        }
+        let empty = page
+            .items
+            .iter()
+            .filter(|item| item.cover.is_empty())
+            .count();
+        println!(
+            "TOTAL items={} empty_covers={} total_field={}",
+            page.items.len(),
+            empty,
+            page.total
+        );
     }
 
     /// 没有任何分页元数据时必须返回 None，由调用方退回扫描分页链接。
