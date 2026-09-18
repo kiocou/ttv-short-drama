@@ -55,37 +55,60 @@ async fn catalog_list(
     let Some(keyword) = keyword else {
         return state.provider.catalog(&filter).await;
     };
-    // 两个来源并发：网页搜索（结构化、带集数与题材）与 App 联想（分季齐全）。
-    // 串行会让搜索凭空多等一次往返，而两者互不依赖。
+    // 三个来源并发：红果网页搜索（结构化、带集数与题材）+ App 联想（分季齐全）
+    // + 动漫共和国 dmghg（anime 频道的正式源）。串行会让搜索凭空多等一次往返，
+    // 而三者互不依赖。
+    //
+    // 为什么在后端合并：搜索页此前只搜红果（channel 硬编码 drama），动漫共和国
+    // 的视频永远搜不到。dmghg 搜索失败只静默跳过——它是补充来源，不该让
+    // 红果结果陪葬。
     let comic = filter.channel == "comic";
-    let (web, suggestions) = tokio::join!(
+    let dmghg_filter = CatalogFilter {
+        keyword: Some(keyword.clone()),
+        channel: "anime".into(),
+        category: "全部".into(),
+        ..filter.clone()
+    };
+    let (web, suggestions, anime) = tokio::join!(
         state.provider.catalog(&filter),
         crate::short_drama_app::search_suggest(&app, &keyword, comic),
+        async { state.anime_provider.catalog(&dmghg_filter).await },
     );
     let mut page = web?;
-    if suggestions.is_empty() {
-        return Ok(page);
-    }
-    // 联想结果排在后面：网页结果的排序更贴关键词，联想只用于补齐缺项。
-    let existing: std::collections::HashSet<String> =
+    // 动漫结果排在 App 联想之后：主关键词命中优先，动漫是补充来源。
+    let mut existing: std::collections::HashSet<String> =
         page.items.iter().map(|item| item.id.clone()).collect();
     let mut added = 0usize;
-    for suggestion in suggestions {
-        if existing.contains(&suggestion.id) {
-            continue;
+    if let Ok(anime_page) = anime {
+        for item in anime_page.items {
+            if existing.contains(&item.id) {
+                continue;
+            }
+            existing.insert(item.id.clone());
+            page.items.push(item);
+            added += 1;
         }
-        page.items.push(SeriesItem {
-            id: suggestion.id,
-            title: suggestion.title,
-            cover: suggestion.cover,
-            item_type: filter.channel.clone(),
-            episodes_count: suggestion.episode_count,
-            latest_episode_title: None,
-            tags: suggestion.tags,
-            origin: "红果 App 联想".into(),
-            brief: None,
-        });
-        added += 1;
+    }
+    if !suggestions.is_empty() {
+        for suggestion in suggestions {
+            let sid = suggestion.id.clone();
+            if existing.contains(&sid) {
+                continue;
+            }
+            page.items.push(SeriesItem {
+                id: suggestion.id,
+                title: suggestion.title,
+                cover: suggestion.cover,
+                item_type: filter.channel.clone(),
+                episodes_count: suggestion.episode_count,
+                latest_episode_title: None,
+                tags: suggestion.tags,
+                origin: "红果 App 联想".into(),
+                brief: None,
+            });
+            existing.insert(sid);
+            added += 1;
+        }
     }
     page.total += added;
     Ok(page)
