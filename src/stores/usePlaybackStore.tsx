@@ -1231,6 +1231,32 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
               setIsPlaying(false);
               setUiState({ kind: 'error', sessionId: newSessionId, code: 'MEDIA_AUTOPLAY_FAILED', recoverable: true });
             }
+          } else if (
+            playError instanceof DOMException &&
+            playError.name === 'AbortError'
+          ) {
+            // "video-only background media was paused to save power"：WebView 把
+            // 被判定为后台的窗口里的视频暂停以省电——**源已就绪**（loadeddata 已
+            // 触发），这不是播放源问题。实测窗口未聚焦/被遮挡时就会出现，弹
+            // "播放源连接受阻"完全误导。此时静默重试一次：窗口回前台后 play()
+            // 就能成功；仍 Abort 则回到"可播"的暂停态，等用户的播放手势。
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            if (activeSessionRef.current !== newSessionId) return;
+            try {
+              await animeVideo.play();
+              if (pauseIfStale(newSessionId, animeVideo)) return;
+              setIsPlaying(true);
+              setUiState({ kind: 'playing', sessionId: newSessionId, position: animeVideo.currentTime });
+            } catch (retryError) {
+              if (retryError instanceof DOMException && retryError.name === 'NotAllowedError') {
+                setIsPlaying(false);
+                setUiState({ kind: 'error', sessionId: newSessionId, code: 'MEDIA_AUTOPLAY_FAILED', recoverable: true });
+                return;
+              }
+              // 源已就绪（不是连接受阻）：显示缓冲/暂停态而不是错误页。
+              setIsPlaying(false);
+              setUiState({ kind: 'buffering', sessionId: newSessionId });
+            }
           } else {
             setIsPlaying(false);
             setUiState({ kind: 'error', sessionId: newSessionId, code: 'MEDIA_LOAD_FAILED', recoverable: true });
