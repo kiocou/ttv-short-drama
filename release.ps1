@@ -127,8 +127,12 @@ if (-not $section.Success) {
     throw '缺少 CHANGELOG 段落'
 }
 $notesPath = Join-Path $TmpDir ("release-notes-" + $tag + ".md")
-$header = @("> 提交 " + $commit + " ｜ 产物：" + $setup.Name + "（NSIS, x64）", "") -join $nl
-Set-Content -Path $notesPath -Value ($header + $section.Value.Trim()) -Encoding utf8
+# 用显式拼接 + WriteAllText，不要用 Set-Content 拼接字符串：
+# 后者会把 header 与正文并成同一行，GitHub 上那一整行会被当成引用块，
+# 版本标题不再渲染成标题（0.2.8 发布时踩过）。
+$headerLine = "> 提交 " + $commit + " ｜ 产物：" + $setup.Name + "（NSIS, x64）"
+$notesText = $headerLine + $nl + $nl + $section.Value.Trim() + $nl
+[System.IO.File]::WriteAllText($notesPath, $notesText, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host ("notes: " + $notesPath)
 
 if ($NoPublish) {
