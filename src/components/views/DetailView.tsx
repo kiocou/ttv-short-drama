@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useFavorites } from '../../stores/useFavoritesStore';
 import { ipcService } from '../../services/ipc';
 import { SeriesDetail, EpisodeItem } from '../../types/series';
@@ -25,6 +26,7 @@ import {
 export const DetailView: React.FC = () => {
   const { selectedSeriesId, navigateTo, goBack, showToast } = useAppStore();
   const { openEpisode, prewarmEpisode } = usePlaybackStore();
+  const { open: openAnimeEpisode } = useAnimePlayer();
   const { markBySeriesId, setMark } = useFavorites();
   const detailCacheRef = useRef<Record<string, SeriesDetail>>({});
   // 供 effect 读取最新实现，避免把 prewarmEpisode 放进依赖数组导致每次渲染重跑。
@@ -153,6 +155,17 @@ export const DetailView: React.FC = () => {
 
   const handleStartPlay = (ep: EpisodeItem) => {
     setShowAllEpisodesModal(false);
+    // 动漫专区走**独立播放器**（AnimeVideoSurface + useAnimePlayerStore）。
+    //
+    // 为什么必须分流：动漫源与短剧源在三个维度上不同——① 同一部剧的不同集回来
+    // 的是 m3u8 或整段 MP4；② WebView2 的 canPlayType 对 HLS 谎报 "maybe"，
+    // 照它判就会把 m3u8 交给原生 <video>（15 秒后仍无画面，只有声音）；
+    // ③ dmghg 的档位里混着 HEVC。这套判定与看门狗只对动漫有意义，短剧/漫剧
+    // 继续走原来的链路，互不影响。
+    if (detail.type === 'anime') {
+      void openAnimeEpisode(detail.id, ep.id, ep.watchedSeconds || 0);
+      return;
+    }
     navigateTo('player', detail.id);
     openEpisode(detail.id, ep.id, ep.watchedSeconds || 0);
   };

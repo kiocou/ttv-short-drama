@@ -647,6 +647,8 @@ impl DramaProvider {
             },
             url,
             backup_url,
+            // 短剧/漫剧链路不受动漫的源形态标记影响：保持 None，前端沿用原有分支。
+            stream_kind: None,
         })
     }
 

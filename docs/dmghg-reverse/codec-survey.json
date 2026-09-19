@@ -1,0 +1,374 @@
+[
+  {
+    "series_id": "dmghg:181655",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191300/75c49b3fc656e8d3b5b3ad2a72d4a508/temp/m3u8/15/21f8e65a07cbbf941494072bd83e1519.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 271,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://p4-plat.wskwai.com/udata/pkg/2afe7515f08a4d27aee5884a5c39b5ed.pdf",
+        "segment_ext": ".pdf",
+        "segment_content_type": "application/pdf",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 816,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264",
+    "title": "仙逆"
+  },
+  {
+    "series_id": "dmghg:181631",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://sns-video-hs.xhscdn.com/1040g2so321mhb5qhnk0g5prdj18m3n9plfref38",
+        "selected_by_auto": true,
+        "host": "sns-video-hs.xhscdn.com",
+        "content_type": "video/mp4",
+        "bytes_read": 4194304,
+        "ok": false,
+        "error": "未解析出视频轨",
+        "container": "mp4",
+        "acodec": null
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": null,
+    "title": "凡人修仙传 年番"
+  },
+  {
+    "series_id": "dmghg:181632",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://growth-img.xhscdn.com/ditto/104000n031jqtleve3q032jbu20",
+        "selected_by_auto": true,
+        "host": "growth-img.xhscdn.com",
+        "content_type": "application/octet-stream",
+        "bytes_read": 4194304,
+        "ok": true,
+        "container": "mp4",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264",
+    "title": "吞噬星空"
+  },
+  {
+    "series_id": "dmghg:181964",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191256/7c6b2f83bcd33d41c0057d09b08529fe/temp/m3u8/33/0891ea8577d0960bcce53c8d796e76af.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 229,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://h2.static.yximgs.com/kos/nlav111379/poify/54db165a34a3b96f0cf1bacbb",
+        "segment_ext": "",
+        "segment_content_type": "application/octet-stream",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "hevc",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "hevc",
+    "title": "牧神记"
+  },
+  {
+    "series_id": "dmghg:181599",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://sns-video-hw.xhscdn.com/1040000g31p05a4o32a20j1qpk8",
+        "selected_by_auto": true,
+        "host": "sns-video-hw.xhscdn.com",
+        "ok": false,
+        "error": "直链读取失败: The read operation timed out"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": null,
+    "title": "斗破苍穹 年番"
+  },
+  {
+    "series_id": "dmghg:181598",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://v4-kling.kechuangai.com/bs2/upload-locallife-merchant-sensitive/dXBsb2FkLWxvY2FsbGlmZS1tZXJjaGFudC1zZW5zaXRpdmU6bG9jYWxsaWZlX21lcmNoYW50X2ludmVzdF9zZW5zaXRpdmU6MTAwMDQwMTUzNTY4NTpMT0NBTExJRkVfTUVSQ0hBTlQ6W0JAM2Y4MzYyZTQ6NTc5NTc1MDY5MTY4NQ==.png",
+        "selected_by_auto": true,
+        "host": "v4-kling.kechuangai.com",
+        "content_type": "image/png",
+        "bytes_read": 4194304,
+        "ok": true,
+        "container": "mp4",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 816,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264",
+    "title": "完美世界"
+  },
+  {
+    "series_id": "dmghg:182152",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191256/0e8726ccf6873582a3ac7a09fac2741c/temp/m3u8/21/feb21ecce131991f14272ea8c58403ef.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 283,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://ali2.a.yximgs.com/bs2/mmu-vtuber/wav_prefix8a990b87-cfa8-4857-b2d3-3e689ec24913e8294dc679ec4d8e5ae73d92276a11ea.wav",
+        "segment_ext": ".wav",
+        "segment_content_type": "audio/wav",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264",
+    "title": "沧元图"
+  },
+  {
+    "series_id": "dmghg:181722",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191257/3b4883b5a3f2f154f1ac7007555d712d/temp/m3u8/1/47e074f18722658060fdc2f9f6bc1f54.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 249,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://h23.static.yximgs.com/bs2/imageGameZone/image/d82e21df76c3d51491087cc3f43cf3f3.png",
+        "segment_ext": ".png",
+        "segment_content_type": "image/png",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264",
+    "title": "遮天"
+  },
+  {
+    "series_id": "dmghg:182425",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://sns-video-hw.xhscdn.com/104002so31qggicitn217is5dag",
+        "selected_by_auto": true,
+        "host": "sns-video-hw.xhscdn.com",
+        "content_type": "video/mp4",
+        "bytes_read": 4194304,
+        "ok": true,
+        "container": "mp4",
+        "vcodec": "hevc",
+        "width": 1920,
+        "height": 804,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "hevc",
+    "title": "剑来 第二季"
+  },
+  {
+    "series_id": "dmghg:180858",
+    "part": "第01集",
+    "line": "newup-jp",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191259/1070faaf5e42421a653c137815faa302/temp/m3u8/1/33d54079fc49e08450caca5a7d6c9529.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 300,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://v4-kling.kechuangai.com/bs2/imageGameZone/image/63dcf59735bd1f2de22d98bdfc213e3d.png",
+        "segment_ext": ".png",
+        "segment_content_type": "image/png",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "hevc",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "hevc",
+    "title": "海贼王"
+  },
+  {
+    "series_id": "dmghg:181638",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://growth-img.xhscdn.com/ditto/104000n031jqror1fjq052qtktk",
+        "selected_by_auto": true,
+        "host": "growth-img.xhscdn.com",
+        "content_type": "application/octet-stream",
+        "bytes_read": 4194304,
+        "ok": true,
+        "container": "mp4",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264",
+    "title": "斗罗大陆2绝世唐门"
+  },
+  {
+    "series_id": "dmghg:181983",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://sns-video-hs.xhscdn.com/1040000g31oqu4spi141apne0hg",
+        "selected_by_auto": true,
+        "host": "sns-video-hs.xhscdn.com",
+        "content_type": "video/mp4",
+        "bytes_read": 4194304,
+        "ok": false,
+        "error": "未解析出视频轨",
+        "container": "mp4",
+        "acodec": null
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": null,
+    "title": "斗罗大陆"
+  },
+  {
+    "series_id": "dmghg:195149",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://sns-music.xhscdn.com/104002e031qkbpmov7402cbn2bc",
+        "selected_by_auto": true,
+        "host": "sns-music.xhscdn.com",
+        "content_type": "application/octet-stream",
+        "bytes_read": 4194304,
+        "ok": false,
+        "error": "未解析出视频轨",
+        "container": "mp4",
+        "acodec": null
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": null,
+    "title": "光阴之外"
+  },
+  {
+    "series_id": "dmghg:182153",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191254/2fc8faa3c21b267998d867f818e9378b/temp/m3u8/15/4b58ac90d8245b2d7b234faab566125d.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 242,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://hw2.a.kwimgs.com/udata/pkg/98474e957a104dac8f1337900eef4596.pdf",
+        "segment_ext": ".pdf",
+        "segment_content_type": "application/pdf",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264",
+    "title": "师兄啊师兄"
+  }
+]

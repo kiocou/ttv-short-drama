@@ -1,0 +1,232 @@
+[
+  {
+    "series_id": "dmghg:181666",
+    "part": "第36集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191249/26809a0e8cada1e21fa38e0d20467438/temp/m3u8/1/f8b90df63f21bec360ccf1dac652b87f.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 115,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://p2-kling.klingai.com/bs2/imageGameZone/image/0c68c17c7b558d7adcdbcb8041c9f12e.png",
+        "segment_ext": ".png",
+        "segment_content_type": "image/png",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264"
+  },
+  {
+    "series_id": "dmghg:181599",
+    "part": "第06集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191249/7fee5318f33a14302709927a62f0fdaf/temp/m3u8/14/be863006800cc5119b53e1306fc9ecca.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 235,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://ali2.a.yximgs.com/bs2/live-mcn-data-export/live_mcn_settled_2152c74f-9ea9-4d85-9b74-cb5254867cfa_1745666931275.png",
+        "segment_ext": ".png",
+        "segment_content_type": "image/png",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 804,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264"
+  },
+  {
+    "series_id": "dmghg:181656",
+    "part": "第03集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191249/585c9d71493f7d6e35789927c07eaca9/temp/m3u8/41/1062cb416634190ab8914ed6a0680502.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 134,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://edu-cloud-os.oss-accelerate.aliyuncs.com/img/45/2025/V1TeZODV9BuuyWZNEWTSNlwnWOsFbDc6.png",
+        "segment_ext": ".png",
+        "segment_content_type": "image/png",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264"
+  },
+  {
+    "series_id": "dmghg:181467",
+    "part": "第01集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191245/c47dc4145bca5ace2d35a1de62f8cea7/temp/m3u8/1/8063b6aa6e9329594696007ec66dd5ac.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 277,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://v4-kling.kechuangai.com/bs2/imageGameZone/image/46df5bf91ccfae6ad71739e03b945cce.png",
+        "segment_ext": ".png",
+        "segment_content_type": "image/png",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 888,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264"
+  },
+  {
+    "series_id": "dmghg:181598",
+    "part": "第285集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://v2-ad.video.yximgs.com/bs2/adVideoLp/YWQtYWRWaWRlb0xwOmFkX2FsbGlhbmNlX3NzcDo1NjU3NDU4ODA1Ok1FUkNIQU5UOltCQDQ0ZDczNDkxOjIzMTM4ODI4NTU2ODA1.mp4",
+        "selected_by_auto": true,
+        "host": "v2-ad.video.yximgs.com",
+        "content_type": "video/mp4",
+        "bytes_read": 4194304,
+        "ok": false,
+        "error": "未解析出视频轨",
+        "container": "mp4",
+        "acodec": null
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": null
+  },
+  {
+    "series_id": "dmghg:180190",
+    "part": "第03集",
+    "line": "newup-jp",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "https://v4-kling.kechuangai.com/bs2/upload-locallife-merchant-sensitive/dXBsb2FkLWxvY2FsbGlmZS1tZXJjaGFudC1zZW5zaXRpdmU6bG9jYWxsaWZlX21lcmNoYW50X2ludmVzdF9zZW5zaXRpdmU6MTAwMDQwMTUzNTY4NTpMT0NBTExJRkVfTUVSQ0hBTlQ6W0JANjQ5ZjA0MGY6NTc0NzQ4NTQxNjY4NQ==.png",
+        "selected_by_auto": true,
+        "host": "v4-kling.kechuangai.com",
+        "content_type": "image/png",
+        "bytes_read": 4194304,
+        "ok": true,
+        "container": "mp4",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264"
+  },
+  {
+    "series_id": "dmghg:180167",
+    "part": "第01集",
+    "line": "newup-jp",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191249/a9ee32b4cad35e8dd115047340ebf761/temp/m3u8/15/7398e4cae4f3ad0a547b5c84251d76d5.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 271,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://hw2.a.kwimgs.com/udata/pkg/6153d446baba4ef7b5e91d00706ee2eb.pdf",
+        "segment_ext": ".pdf",
+        "segment_content_type": "application/pdf",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264"
+  },
+  {
+    "series_id": "dmghg:181412",
+    "part": "第17集",
+    "line": "cn",
+    "variants": [
+      {
+        "name": "1080P 高清",
+        "url": "http://img.nxjunyu.asia/202609191244/0e90a1db64bce23979c2da1164cda398/temp/m3u8/15/315911cf2323b369055490aee7730026.m3u8",
+        "selected_by_auto": true,
+        "host": "img.nxjunyu.asia",
+        "playlist": {
+          "kind": "media",
+          "codecs": [],
+          "encrypted": false,
+          "segment_count": 259,
+          "content_type": "application/vnd.apple.mpegurl; charset=utf-8"
+        },
+        "segment_url": "https://hw2.a.kwimgs.com/udata/pkg/0964b8ad948f4b3298f0fd017b57398a.pdf",
+        "segment_ext": ".pdf",
+        "segment_content_type": "application/pdf",
+        "ok": true,
+        "container": "mpegts",
+        "vcodec": "h264",
+        "width": 1920,
+        "height": 804,
+        "acodec": "aac"
+      }
+    ],
+    "auto_name": "1080P 高清",
+    "auto_codec": "h264"
+  }
+]

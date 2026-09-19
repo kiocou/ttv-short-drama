@@ -76,6 +76,46 @@
   overflow: hidden;
 }
 
+/*
+ * **动漫播放器**舞台内禁用一切背景模糊（backdrop-filter）—— 为 RTX 视频增强让路。
+ *
+ * 为什么必须这么做：`backdrop-filter` 要求合成器把**该元素背后的像素**取样出来
+ * 做高斯模糊，一旦视频被这个区域盖住，Chromium 就必须把视频内容复制成普通纹理
+ * 参与合成——视频不再是独立的呈现平面。而 NVIDIA 的 RTX 视频增强（VSR）正是
+ * 挂在视频呈现链路上，视频一旦被合成器接管，整条链路就失效（表现为"RTX 视频增强
+ * 在这个播放器里不起作用"，但同一个驱动设置在其他播放器里照常生效）。
+ *
+ * 实测对照：动漫播放器最初自绘的控制条是纯半透明底（无 backdrop-filter），VSR
+ * 正常；改用时下的 crystal 材质 HUD（标题岛与控制坞都是 .crystal-surface，
+ * 带 blur(32px)）之后，同样的机器、同样的驱动设置，VSR 不再生效。去掉这批背景
+ * 模糊后 VSR 恢复——这条规则就是那次修复。
+ *
+ * **作用范围只限动漫播放器。** 短剧/漫剧的宿主 `VideoSurface` 刻意**不加**
+ * `.ttv-player`：它俩共用同一套 HUD，曾顺手给它加过同一个类，实机确认短剧页面
+ * 并不会因此让 RTX 视频增强生效（原因不在这层——短剧源是竖屏 1080x1920，在横屏
+ * 输出上属于**缩小**显示，与 VSR 生效所需的放大场景不符，是可查方向之一，但未
+ * 确证）。拿不到收益就不该牺牲那层玻璃质感，故已还原。以后想"让短剧也用 VSR"，
+ * 先确证根因，别把这个类直接加回去。
+ *
+ * 视觉代价可控：面板本身的半透明底色、边框与阴影都保留，只是不再模糊画面。
+ * 播放场景下"看清视频"优先于"玻璃质感"，而列表/详情等页面不受这条规则影响。
+ *
+ * **一个如实记录的副作用**：`.ttv-player` 这个类名同时还承载着本文件下面那一整组
+ * 锁定/收起态规则（`.ttv-player.is-locked .ttv-hud` / `.ttv-lock` /
+ * `.ttv-mini-progress` / `.ttv-countdown`）。短剧宿主不带它，那组规则对短剧就
+ * 不生效——**这不是本次改动引入的**：改动前它就是一个没有任何宿主的遗留写法
+ * （全仓库只有本文件在写这个类名）。想吃回短剧的锁定态样式，正确做法是把
+ * "布局/锁定态"与"关闭背景模糊"拆成两个类名，而不是把这个类整体加回去。
+ */
+.ttv-player .crystal-surface,
+.ttv-player .crystal-surface-deep,
+.ttv-player .ttv-drawer-overlay,
+.ttv-player .crystal-drawer-box,
+.ttv-player [class*='backdrop-blur'] {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
 /* HUD 层：顶部标题岛 + 底部操控坞 */
 .ttv-hud {
   position: absolute;

@@ -59,7 +59,11 @@ static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[link(name = "kernel32")]
 extern "system" {
-    fn LoadLibraryExW(file_name: *const u16, file: *mut std::ffi::c_void, flags: u32) -> *mut std::ffi::c_void;
+    fn LoadLibraryExW(
+        file_name: *const u16,
+        file: *mut std::ffi::c_void,
+        flags: u32,
+    ) -> *mut std::ffi::c_void;
     fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
     fn AddDllDirectory(path: *const u16) -> *mut std::ffi::c_void;
 }
@@ -70,7 +74,10 @@ const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
 
 fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// 加载 DLL：先试"用户目录 + 默认目录"（配合 `AddDllDirectory`），失败再试
@@ -118,7 +125,8 @@ fn symbol(module: *mut std::ffi::c_void, name: &str) -> Result<*mut std::ffi::c_
 // rcx/rdx 原样透传，所以直接按真身签名调用即可。
 // ---------------------------------------------------------------------------
 
-type ServiceNewFn = unsafe extern "system" fn(*const u8, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type ServiceNewFn =
+    unsafe extern "system" fn(*const u8, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 type HandleCommandFn = unsafe extern "system" fn(*mut std::ffi::c_void, *const u8) -> *mut u8;
 type StringFreeFn = unsafe extern "system" fn(*mut u8);
 type ServiceFreeFn = unsafe extern "system" fn(*mut std::ffi::c_void);
@@ -202,8 +210,8 @@ impl DmghgBridge {
             "payload": payload,
             "protocol_version": PROTOCOL_VERSION,
         });
-        let text = CString::new(request.to_string())
-            .map_err(|_| "dmghg 请求含 NUL 字符".to_string())?;
+        let text =
+            CString::new(request.to_string()).map_err(|_| "dmghg 请求含 NUL 字符".to_string())?;
 
         let ptr = unsafe { (self.handle_command)(self.service, text.as_ptr() as *const u8) };
         if ptr.is_null() {
@@ -225,10 +233,19 @@ impl DmghgBridge {
             return Ok(response.get("data").cloned().unwrap_or(Value::Null));
         }
         let error = response.get("error").cloned().unwrap_or(Value::Null);
-        let code = error.get("code").and_then(Value::as_str).unwrap_or("unknown");
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let message = error.get("message").and_then(Value::as_str).unwrap_or("");
-        let detail = error.get("detail").map(|d| d.to_string()).unwrap_or_default();
-        Err(format!("dmghg `{command}` 失败: {code} {message} {}", truncate(&detail, 200)))
+        let detail = error
+            .get("detail")
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        Err(format!(
+            "dmghg `{command}` 失败: {code} {message} {}",
+            truncate(&detail, 200)
+        ))
     }
 
     // -- 目录 -------------------------------------------------------------
@@ -263,7 +280,10 @@ impl DmghgBridge {
 
         if let Some(keyword) = keyword {
             let data = self.call("catalog.search_video", json!({ "key": keyword }))?;
-            let items = collect_items(&data).iter().filter_map(parse_series_item).collect::<Vec<_>>();
+            let items = collect_items(&data)
+                .iter()
+                .filter_map(parse_series_item)
+                .collect::<Vec<_>>();
             return Ok(CatalogPage {
                 total: items.len(),
                 has_more: false,
@@ -306,7 +326,10 @@ impl DmghgBridge {
         )?;
 
         let total = data.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let items = collect_items(&data).iter().filter_map(parse_series_item).collect::<Vec<_>>();
+        let items = collect_items(&data)
+            .iter()
+            .filter_map(parse_series_item)
+            .collect::<Vec<_>>();
         let has_more = total > 0 && (page as usize) * (page_size as usize) < total;
 
         Ok(CatalogPage {
@@ -331,7 +354,11 @@ impl DmghgBridge {
             .and_then(Value::as_str)
             .unwrap_or("未命名动漫")
             .to_string();
-        let cover = data.get("pic").and_then(Value::as_str).unwrap_or("").to_string();
+        let cover = data
+            .get("pic")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let description = data
             .get("content")
             .and_then(Value::as_str)
@@ -381,7 +408,11 @@ impl DmghgBridge {
     ///
     /// `episode_id` 形如 `cn|第01集`。返回按分辨率从高到低排序；
     /// 档位数取决于源的线路（实测有的作品只有 1 档，有的给 2 档）。
-    pub fn play_variants(&self, series_id: &str, episode_id: &str) -> Result<Vec<PlayVariant>, String> {
+    pub fn play_variants(
+        &self,
+        series_id: &str,
+        episode_id: &str,
+    ) -> Result<Vec<PlayVariant>, String> {
         let raw_id = strip_prefix(series_id);
         let (line, part) = episode_id
             .split_once(EPISODE_SEP)
@@ -423,7 +454,10 @@ impl DmghgBridge {
             .and_then(|result| result.get("json_value"))
             .cloned()
             .unwrap_or(Value::Null);
-        let state = json_value.get("state").and_then(Value::as_str).unwrap_or("");
+        let state = json_value
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if state != "OK" {
             return Err(format!("dmghg 解析未成功: state={state}"));
         }
@@ -461,7 +495,7 @@ impl DmghgBridge {
             return Err("dmghg 解析结果里没有播放地址".into());
         }
         // 源按"高→低"给，但不依赖它的顺序；同高度保持原有先后。
-        variants.sort_by(|a, b| b.height.cmp(&a.height));
+        variants.sort_by_key(|variant| std::cmp::Reverse(variant.height));
         Ok(variants)
     }
 
@@ -500,7 +534,11 @@ impl DmghgBridge {
     /// 2. 脚本开头有版本白名单 —— 覆盖 `device_info`，否则返回"引导视频"；
     /// 3. 脚本会调 UI 的 `toast` —— 给个空桩。
     fn build_parser_script(&self, parse_lua: &str) -> Result<String, String> {
-        let dkjson_path = self.install_dir.join("resources").join("lua").join("dkjson.lua");
+        let dkjson_path = self
+            .install_dir
+            .join("resources")
+            .join("lua")
+            .join("dkjson.lua");
         let dkjson = std::fs::read_to_string(&dkjson_path)
             .map_err(|error| format!("读取 dkjson 失败 ({}): {error}", dkjson_path.display()))?;
 
@@ -567,10 +605,7 @@ fn source_mode() -> String {
 
 /// dmghg 是否应当作为动漫源。
 pub fn preferred() -> bool {
-    match source_mode().as_str() {
-        "bfzy" | "fallback" | "off" => false,
-        _ => true,
-    }
+    !matches!(source_mode().as_str(), "bfzy" | "fallback" | "off")
 }
 
 /// 懒加载单例。首次调用时尝试加载 DLL，失败返回 None 并记下原因。
@@ -609,7 +644,9 @@ pub fn init_error() -> Option<&'static str> {
 
 fn lock(bridge: &'static Mutex<DmghgBridge>) -> MutexGuard<'static, DmghgBridge> {
     // 调用方 panic 会污染锁，但 DLL 句柄本身仍然有效，直接取回内部值继续用。
-    bridge.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    bridge
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn log_line(message: &str) {
@@ -778,7 +815,11 @@ fn collect_items(data: &Value) -> Vec<Value> {
 fn parse_series_item(item: &Value) -> Option<SeriesItem> {
     let id = item.get("id").and_then(Value::as_i64)?;
     let title = item.get("name").and_then(Value::as_str)?.to_string();
-    let cover = item.get("pic").and_then(Value::as_str).unwrap_or("").to_string();
+    let cover = item
+        .get("pic")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // continu 形如 "158|周日18:40更"：竖线前是已更新集数。
     let continu = item.get("continu").and_then(Value::as_str).unwrap_or("");
     let episodes_count = continu
@@ -914,7 +955,10 @@ mod tests {
         assert_eq!(series.id, "dmghg:181655");
         assert_eq!(series.episodes_count, 158);
         assert_eq!(series.tags, vec!["玄幻", "战斗", "大陆"]);
-        assert_eq!(series.latest_episode_title.as_deref(), Some("158|周日18:40更"));
+        assert_eq!(
+            series.latest_episode_title.as_deref(),
+            Some("158|周日18:40更")
+        );
     }
 
     #[test]
@@ -959,7 +1003,11 @@ mod tests {
             cursor: None,
         };
         let page = guard.catalog(&filter).expect("列表应成功");
-        println!("[冒烟] 列表 total={} items={}", page.total, page.items.len());
+        println!(
+            "[冒烟] 列表 total={} items={}",
+            page.total,
+            page.items.len()
+        );
         assert!(!page.items.is_empty(), "列表不应为空");
 
         let first = &page.items[0];
@@ -967,7 +1015,10 @@ mod tests {
         println!("[冒烟] 首条 {} ({})", first.title, first.id);
 
         let detail = guard.detail(&first.id).expect("详情应成功");
-        println!("[冒烟] 详情 {} 共 {} 集", detail.title, detail.episodes_count);
+        println!(
+            "[冒烟] 详情 {} 共 {} 集",
+            detail.title, detail.episodes_count
+        );
         assert!(!detail.episodes.is_empty(), "选集不应为空");
 
         let episode = &detail.episodes[0];
@@ -978,7 +1029,10 @@ mod tests {
             .expect("档位解析应成功");
         println!("[冒烟] 档位 {} 个:", variants.len());
         for variant in &variants {
-            println!("[冒烟]   {} (height={}) -> {}", variant.name, variant.height, variant.url);
+            println!(
+                "[冒烟]   {} (height={}) -> {}",
+                variant.name, variant.height, variant.url
+            );
         }
         assert!(!variants.is_empty(), "至少应有一档");
         // 高度按降序（最高档在前）
@@ -1011,7 +1065,10 @@ mod tests {
                 );
             }
         }
-        println!("[冒烟] 选项: {:?}", options.iter().map(|o| &o.value).collect::<Vec<_>>());
+        println!(
+            "[冒烟] 选项: {:?}",
+            options.iter().map(|o| &o.value).collect::<Vec<_>>()
+        );
     }
     #[test]
     fn variant_height_parses_chinese_labels() {
@@ -1044,8 +1101,16 @@ mod tests {
     #[test]
     fn variant_options_use_digits_p_values() {
         let variants = vec![
-            PlayVariant { name: "4K 超清".into(), url: "http://a/1".into(), height: 2160 },
-            PlayVariant { name: "1080P 高清".into(), url: "http://a/2".into(), height: 1080 },
+            PlayVariant {
+                name: "4K 超清".into(),
+                url: "http://a/1".into(),
+                height: 2160,
+            },
+            PlayVariant {
+                name: "1080P 高清".into(),
+                url: "http://a/2".into(),
+                height: 1080,
+            },
         ];
         let options = variants_to_options(&variants);
         assert_eq!(options[0].value, "2160p");
@@ -1065,5 +1130,4 @@ mod tests {
         assert_eq!(options[0].value, "auto");
         assert_eq!(options[0].label, "默认");
     }
-
 }

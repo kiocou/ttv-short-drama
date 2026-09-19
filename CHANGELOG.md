@@ -14,14 +14,68 @@
 - **动漫部分集完全播不出（"播放源连接受阻"）**：dmghg 源的选集**格式不统一**——同一部剧里，有的集是 http m3u8，有的集是 `preview.ndcsk.com`/`ndcyx.com` 的 **200MB+ https MP4 直链**。两个叠加问题：① 这些 https MP4 直链连接不稳定（实测 Range 探测间歇性 SSL EOF）；② 本地 HLS 代理转发大文件时用 `response.bytes()` **全量读进内存**再下发，268MB 的 MP4 直接把连接拖死（WebView2 报 `ERR_CONNECTION_CLOSED`）。现在动漫所有直链**一律走本地代理**，且代理改为**分块流式转发**（边读边写，首帧立刻抵达）。实测《炼气十万年》第 1/2 集（MP4）与第 38 集（m3u8）均 1920x1080 正常起播。
 - **播放窗口在后台时被 WebView 省电暂停，误报"播放源连接受阻"**：WebView2 会把后台窗口里的纯视频媒体暂停以省电（`play()` 抛 `AbortError: video-only background media was paused to save power`），源本身已就绪。现在静默重试一次，仍失败回到缓冲态等播放手势，不再误判为播放源问题。
 
-## Unreleased
+## 0.2.8 - 2026-09-19
 
 ### 修复
+- **动漫专区的"切清晰度"此前是空操作（静态可判定）**。前端把**中文档位名**当档位字面量传给后端：`AnimeVideoSurface` 调 `setQuality(option.label)`（"1080P 高清"），而 Rust 的 `parse_quality_value` 只认 `{digits}p`（`trim_end_matches(['p','P'])` 之后必须全是数字），拿到中文名一律返回 0 —— 那是"由源决定"，于是静默回落到 auto 档（`height < 2160` 的最高档）。结果是点"4K 超清"和点"1080P 高清"都回到同一路地址，用户看到的是"切了没反应"；而**显式选 4K 恰好是唯一能绕开 auto 避开 HEVC 的路径**，这条路径等于被堵死。后端 `variants_to_options` 下发的 `value` 本来就是 `2160p`/`1080p`（与短剧链路同一套字面量），前端却用了 `label`。现在档位恒以 `value` 为准（含"同档位不重复解析"的短路），与短剧 `setQuality` 的语义一致。
+- **两个播放器统一到同一套外观**：动漫专区原来的控制条是自绘的紫色圆角样式，与短剧的晶体材质（`crystal.css` 的 `ttv-*` / `crystal-*`）是两套视觉语言、两处维护。现在把外观抽成**纯 props 驱动**的 `PlayerHud`，短剧链路与其共用（`PlayerControls` 退化为读 store 的适配层，行为逐条对齐无改动）。动漫因此免费获得原来没有的一整套交互：右侧小锁的**收起态**与贴边迷你进度条、进度条的**缓冲层**读数（新增 `progress` 采样）、全屏状态与原生窗口同步（`onResized`）及"已进入全屏 · 按 Esc 退出"提示、`F` / `[` / `]` 快捷键、与短剧同款的加载卡片/错误卡片（错误卡补了"复制诊断信息"，并保留动漫特有的"下一集"出口——坏档位/坏线路在这批源里是常态）。选集改为同一个晶体巨幕；起播音量也对齐 0.85。
+  **刻意保留的差异**：动漫仍是独立状态机 + **按需挂载**的 `<video>`（源形态在 hls.js(MSE) 与原生 src 之间来回切，销毁重建比"复用同一元素并小心清理"少一类事故）；缓冲态只给一个小胶囊而不用全屏遮罩——动漫是在线流，中途卡顿会反复出现，每次把画面盖住是倒退。
+- **动漫链路不读设置页的"自动连播"开关**：`ended` 监听器只在媒体元素挂载时绑一次，闭包里读不到最新的 `settings`，于是用户关掉开关后仍在自动跳集。改用 ref 取最新值（短剧链路一直有这道判断）。
+- **退出动漫播放器会丢掉播放进度**：`close()` 先 `haltCurrent(true)`（清 `src` + `load()`）再 `persistHistory(true)`，而落盘要读 `video.currentTime` / `video.duration` —— 媒体加载算法执行后这两个读数已经归零，历史里只会留下"看到 0 秒"。改为先落盘再拆源。
+- **动漫会话号与短剧撞号段**：动漫播放器用自己从 1 开始的私有计数当会话号，短剧从 100 起。`playback_open` 按 `session_id` 保留最近 8 条（`retain(|id, _| *id >= session_id - 8)`），动漫的小号段会让 `playback_command` / `playback_snapshot` 永远匹配到已废弃的旧会话，也可能与会话上限互相顶替。现在动漫统一走 `generateNextSessionId()`，本地只留一个仅用于 stale 判定的守卫计数。
+- **动漫专区有了自己的播放器：修掉"有声音、无画面、黑屏"**。根因是 `hlsAttach.ts` 的 `nativeHlsSupported()` —— 它用 `video.canPlayType('application/vnd.apple.mpegurl')` 判断浏览器是否原生支持 HLS，而 **WebView2 对这个 MIME 返回 `"maybe"`**，于是判真，动漫**全部绕过 hls.js 直接 `video.src = <m3u8>`**。实测这条原生通路 15 秒后仍 `videoWidth === 0`、`totalVideoFrames === 0`（只有声音在走、`currentTime` 正常推进，截图确认整屏黑），20 秒后才可能出帧；同一集改由 hls.js 挂 MSE 后 **13 秒稳定出 326 帧**。这也是"有的能看、有的黑屏"的来源——源形态本就是 m3u8 与整段 MP4 混合，而所有地址都被本地代理改写成 `/stream?u=…`，旧代码里的 `isHlsUrl()` 因此恒为 true。
+  现在动漫走一条**独立链路**（`animePlayback.ts` + `useAnimePlayerStore` + `AnimeVideoSurface`；**短剧/漫剧一行未改**）：由 Rust 在改写地址**之前**判定源形态并随 `PlaybackSession.streamKind` 下发（`hls` / `file`），m3u8 恒走 hls.js、整段文件才走原生 `<video>`，**永不再采信 `canPlayType`**。同时挂了**出帧看门狗**：起播 9 秒内没有视频帧就如实报"这集的画面解不出来（源是 HEVC）"并停止播放，而不是让用户对着黑屏把一集听完——实测 dmghg 的 1080P 档有相当比例是 HEVC（牧神记 181964、无尽神域 181652、食草老龙 181468、虎鹤妖师录 181637；4K 档恒为 HEVC）。
+  验证（生产 CSP 构建、真实窗口、CDP 采集）：动漫专区 → 点卡片 → 点「立即播放」→ 8 秒时 `videoWidth=1920 / readyState=4 / totalVideoFrames=177`，元素上存在 `__ttv_anime_hls__`，截图有画面；同一流程在修复前是 `videoWidth=0 / frames=0` 的全黑界面。短剧回归：红果漫剧仍走原链路，`asset.localhost` 本地文件、`1882x1080`、无错误。
+- **打包安装后动漫封面大面积空白、视频黑屏无声（开发态却一切正常）**。根因是 `tauri.conf.json` 的 CSP——**它只在生产构建里注入**：开发态窗口直接加载 Vite dev server，响应头不归 Tauri 管，所以 CSP 完全不生效。而这条 CSP 有两处白名单太窄：
+  ① `img-src` 没有 `http:`，而 dmghg 返回的 `pic` 实测全是 `http://p{2,4,5}-ad.adukwai.com/udata/pkg/*.jpg`，封面被整批拦掉（实测 `naturalWidth=0`，`AnimeView` 的失败重试 `?r=1` 同样被拒），表现就是"只有少数 https 封面能显示"；
+  ② 全局没有 `worker-src`，回落到 `default-src 'self'`，hls.js 的 blob 转封装 worker 被拒（`Creating a worker from 'blob:...' violates the following Content Security Policy directive: "script-src 'self' 'sha256-...'"`）。CSP 拒 worker 走的是**异步 error 事件**而不是构造异常，hls.js 的 `try/catch` 兜不住，转封装从此永不产出——播放器停在"源已就绪但拿不到数据"，就是黑屏且无声音。
+  现在 `img-src` 补 `http:`/`blob:`，`media-src`/`connect-src` 补 `http:`，并显式声明 `worker-src 'self' blob:`。实测打包态（生产 CSP）：封面 315x450 正常解码、`new Worker(blob:)` 回 `worker-ok`、动漫第 1 集 hls.js 报 `MANIFEST_PARSED`+`FRAG_LOADED`、`videoWidth=1920`/`readyState=4`，CSP 违规 0 条。
+- **打包安装后数据被写到 `%APPDATA%` 的上一级**。`app_storage_root()` 无条件从 exe 向上回退两级，注释假设 exe 位于 `<crate>/target/debug`，但真实布局是 `<crate>/src-tauri/target/debug`，而打包后 exe 又在安装目录——于是 SQLite、剧集缓存、WebView2 用户数据全被塞进那个位置凭空创建的 `.app-data`（实测落在 `C:\Users\<用户>\AppData\.app-data`，而非 Tauri 标准的 `%APPDATA%\com.ttv.shortdrama`）。现在只在 exe 确实位于 cargo 的 `target/{debug,release}` 时才使用项目内的 `.app-data`（开发态行为不变），其余一律返回 `None` 交给调用方回退 `app_data_dir()`。
 - **退出播放器后偶尔"只闻其声"**。播放器宿主常驻 DOM（离开页面只是 `display:none` 隐藏），而换集链路在最后一次会话守卫之后还有长时间 await（首帧等待最长 8 秒、HLS 挂载、`play()` 本身）：期间用户返回主界面、慢解析再完成的话，旧会话照常 `setSrc + play()`，隐藏的视频就在后台放完（实测：换集长期卡在切线重试 → 退出 → worker 稍后成功 → 后台出声）。现在 `stopPlayback()` 作废当前会话（session 号 +1，所有在途换集续体按 stale 处理、在途 open 任务移出复用池）；所有起播点在 `play()` 前后复查会话、stale 即暂停（新增 `pauseIfStale`）；错误兜底链（备用直链 → Blob → 本地解析）在会话作废后整条不再启动；隐藏播放器时全局键盘快捷键（空格/方向键/`[]`）不再操控"看不见的视频"。
 - 换集加载中"线路失败，切换备用域名"的提示文案改为"主线路波动，已自动切换备用线路"——它是 worker 的自动换线进度而非错误，旧文案让用户误以为播放出错。
 
 ### 诊断记录
 - 复现验证：三个播放域名（`api5-normal-sinfonlineb/sinfonlinea/lf.fqnovel.com`）连通正常（TLS ~30ms），`search → album → stream` 全链路约 1 秒成功；`fallback_api` 取直链域名由服务端下发且每次可能不同（实测见过 `api5-normal-sinfonline.fqnovel.com` 与 `vas-lf-x.snssdk.com`）；`/video/fplay/` 直链接口只在下发的业务域上有效，内置三播放域名对其返回 404。
+
+#### 动漫「有声音、无画面、黑屏」根因（2026-09-19，真实窗口内实测）
+
+现象：动漫专区部分集播放时**音频正常、画面全黑，且不弹任何错误**，界面照常显示进度在走。
+
+取证手段：给 WebView2 加 `--remote-debugging-port=9222`（`configure_webview_browser_arguments` 会保留外部传入参数，只追加 HEVC 特性位），再用 CDP 读播放器真实状态；同时把**应用当时真正在播的那条地址**（从 `video.src` 代理参数的 `u=` 解出来）交给随包 ffmpeg 探真实编码。
+
+实测数据（牧神记 第01集，稳定复现两次，两次地址一致）：
+
+| 项 | 值 |
+| --- | --- |
+| 应用内档位 | `1080P` |
+| 应用内 `video.src` 解出的真实地址 | `img.nxjunyu.asia/.../dd4795f9...m3u8` |
+| 该地址的真实流 | **HEVC** 1920x1080 + AAC，MPEG-TS（分片伪装成 `.png`，实体在 `p2-kling.klingai.com`） |
+| `readyState` / `paused` | `4` / `false`（应用认为正在播） |
+| `currentTime` | 15.05s → 28.94s（持续前进，音频可闻） |
+| `videoWidth` / `videoHeight` | **0 / 0** |
+| `getVideoPlaybackQuality().totalVideoFrames` | **0** |
+| `video.error` | **null**（无错，所以界面上不会有错误卡片） |
+| `MediaSource.isTypeSupported('video/mp4;codecs="hvc1.1.6.L120.90"')` | `true` |
+| `video.canPlayType('video/mp4;codecs="hvc1..."')` | `probably` |
+| 本机 `Microsoft.HEVCVideoExtension` | 已安装 2.5.33.0 |
+
+对照实验（同一 WebView2、同一窗口）：
+
+| 用例 | 编码 / 通路 | 结果 |
+| --- | --- | --- |
+| 本机生成的测试片（libx265，`-tag:v hvc1`） | HEVC，**原生 `<video src>`** | 正常：640x360、150 帧 |
+| 同上（libx264） | H.264，原生 `<video src>` | 正常：640x360、150 帧 |
+| 斩神之凡尘神域 第1集 | H.264，**hls.js + MSE** | 正常：1920x888、728 帧 |
+| 凡人修仙传 年番 第1集 | H.264，hls.js + MSE | 正常：1920x1080、780 帧 |
+| 牧神记 第1集 | **HEVC，hls.js + MSE** | **黑屏有声音：videoWidth=0、0 帧、无 error** |
+
+结论：
+1. **平台 HEVC 解码器本身没问题**——HEVC 走原生 `<video src=渐进式 MP4>` 能正常解码出 150 帧。坏的是 **HEVC 经 hls.js 转封装后走 MSE 这条通路**：`isTypeSupported` 与 `canPlayType` 都回「支持」，MSE 不报错，`play()` 也成功（音频可解），但视频轨永远产不出帧——于是应用停在「源已就绪、正在播放」，用户看到的是黑屏。
+2. **档位名与编码无关**。源只给中文档位名（`4K 超清` / `1080P 高清`），`width`/`height` 字段恒为 0。抽样热门榜前 14 部的第 1 集，自动档真实编码为 H.264 8 部、**HEVC 3 部（牧神记 / 剑来 第二季 / 海贼王）**，其余 3 部是 moov 在尾部的非 faststart MP4。`dmghg_bridge.rs` 里「这批源里 4K 档是 HEVC、1080P 及以下是 H.264」的假设**已被实测推翻**：HEVC 就出现在 `1080P 高清` 档，且 mpegts 与 mp4 两种容器都有。所以「auto 避开 2160p」这条规避手段治不了根。
+3. **同一集的解析结果不稳定**：同一 `(剧, 集, 档)` 不同次调用可能回不同 CDN——实测凡人修仙传 年番 第01集一次给 `sns-video-hs.xhscdn.com` 的 701MB MP4（头尾 512KB 都取不到 moov），另一次给 `img.nxjunyu.asia` 的 m3u8（应用里 1920x1080、780 帧正常播放）。所以「事前探一次」不能当作「这一集能不能播」的依据，判定只能放在播放通路上做。
+4. 源还会把非剧集内容当档位返回：实测见到 `v2-ad.video.yximgs.com/bs2/adVideoLp/...`（路径字面就是广告落地页，base64 解出 `ad_alliance_ssp:MERCHANT`）与 `sns-music.xhscdn.com`。这类地址即使能解码也不是剧集内容。
+
+附带结论：批量采样分片时不能用 ffmpeg 直接吃 HLS 地址——该源把 TS 分片伪装成 `.png`/`.pdf`/`.wav` 扩展名，ffmpeg 的 HLS 解复用器按扩展名白名单直接拒绝（`URL ... is not in allowed_segment_extensions`），会把好源误判成坏源。采样脚本改为自己按内容嗅探容器后再交给 ffmpeg（见 `docs/dmghg-reverse/sample_codecs.py`）。
 
 ## 0.2.5 - 2026-09-16
 
