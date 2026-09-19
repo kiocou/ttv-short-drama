@@ -11,6 +11,7 @@ import {
   Volume2,
   VolumeX,
   Maximize,
+  PictureInPicture2,
   Minimize,
   ArrowLeft,
   Layers,
@@ -75,6 +76,8 @@ export interface PlayerHudProps {
   qualityOptions: PlayerQualityOption[];
 
   onToggleLock: () => void;
+  /** 交给画中画小窗播放（独立置顶窗口，可拖动、可拉伸改大小）。 */
+  onEnterPip: () => void;
   onToggleFullscreen: () => void;
   onUserActivity: () => void;
   /** 指针移动统一入口（带合成事件过滤），容器层已过滤后传入。 */
@@ -110,6 +113,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   currentQuality,
   qualityOptions,
   onToggleLock,
+  onEnterPip,
   onToggleFullscreen,
   onUserActivity,
   onPointerMove,
@@ -437,6 +441,19 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                 >
                   <Layers className="w-3.5 h-3.5" />
                   <span>选集</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEnterPip();
+                  }}
+                  className="btn-fluent-action"
+                  title="画中画小窗播放（可拖动、可拉伸改大小）"
+                  aria-label="画中画小窗播放"
+                >
+                  <PictureInPicture2 className="w-4 h-4" />
                 </button>
 
                 <button

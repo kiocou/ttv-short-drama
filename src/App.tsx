@@ -21,6 +21,7 @@ import { SettingsView } from './components/views/SettingsView';
 import { SearchView } from './components/views/SearchView';
 import { VideoSurface } from './components/player/VideoSurface';
 import { AnimeVideoSurface } from './components/player/AnimeVideoSurface';
+import { PipReturnBridge } from './components/player/PipReturnBridge';
 
 const AppContent: React.FC = () => {
   const { currentView, selectedSeriesId, isFullscreen, setIsFullscreen } = useAppStore();
@@ -160,6 +161,9 @@ const AppContent: React.FC = () => {
       </div>
 
       {/* 全局 Toast 通知容器 */}
+
+      {/* 画中画小窗回流：小窗关闭时接回播放/落历史（不渲染任何界面） */}
+      <PipReturnBridge />
       <ToastContainer />
     </div>
   );

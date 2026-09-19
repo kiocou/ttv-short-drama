@@ -5,6 +5,7 @@ import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
+import { CoverImage } from '../common/CoverImage';
 import { StatusBadge } from '../common/StatusBadge';
 import {
   History,
@@ -174,7 +175,6 @@ export const HistoryView: React.FC = () => {
             <MicaCard
               key={`${item.seriesId}-${item.episodeId}`}
               hoverable
-              style={{ animationDelay: `${Math.min(index * 30, 240)}ms` }}
               className="p-4 flex items-center justify-between gap-4 animate-fluent-card-in group"
             >
               <div className="flex items-center gap-4 min-w-0">
@@ -183,10 +183,12 @@ export const HistoryView: React.FC = () => {
                   onClick={() => handleResume(item.seriesId, item.episodeId, item.positionSeconds, item.channel)}
                   className="relative w-16 h-22 rounded-xl overflow-hidden shadow-sm flex-shrink-0 cursor-pointer group-hover:scale-105 transition-transform duration-300"
                 >
-                  <img
+                  <CoverImage
                     src={item.seriesCover}
-                    alt={item.title}
-                    className="w-full h-full object-cover"
+                    title={item.title}
+                    fallbackChar="剧"
+                    placeholderTextClassName="text-base"
+                    loading="eager"
                   />
                   <div className="absolute inset-0 bg-black/20 group-hover:bg-black/40 flex items-center justify-center transition-colors">
                     <Play className="w-5 h-5 text-white fill-current opacity-80 group-hover:opacity-100 transform group-hover:scale-110 transition-transform" />

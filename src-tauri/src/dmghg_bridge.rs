@@ -1070,6 +1070,45 @@ mod tests {
             options.iter().map(|o| &o.value).collect::<Vec<_>>()
         );
     }
+
+    /// 诊断用：打印 dmghg 详情里的**全部图片类字段**，确认封面是不是只有 `pic` 一个来源。
+    ///
+    /// 起因：个别条目的 `pic` 指向与源站无关的第三方图床（实测
+    /// `spore-mall.cdn.bcebos.com/...` 返回 404、`p3-aio.ecombdimg.com/...` 是电商 CDN），
+    /// 需要在“源站脏数据”这个前提下确认还有没有别的字段可以兑封面。
+    /// 默认忽略（需要本机客户端 + 联网）。
+    /// 跑法：`cargo test --bins -- --ignored --nocapture dmghg_dump_raw_detail`
+    #[test]
+    #[ignore = "诊断用：需要本机安装动漫共和国客户端"]
+    fn dmghg_dump_raw_detail() {
+        let bridge = shared().expect("dmghg 桥接应可用（需要本机安装客户端）");
+        let guard = lock(bridge);
+        // 184574 / 194837 是实测封面为第三方脏图床的两条，181412 作为正常样本对照。
+        for id in [184574_i64, 194837, 181412] {
+            // 源要求 id 是**字符串**：传整数会报 `invalid type: integer ... expected a string`。
+            match guard.call("catalog.get_video_detail", json!({ "id": id.to_string() })) {
+                Ok(data) => {
+                    println!("=== id={id} ===");
+                    let Some(object) = data.as_object() else {
+                        println!("  非对象响应");
+                        continue;
+                    };
+                    println!("  字段名: {:?}", object.keys().collect::<Vec<_>>());
+                    for (key, value) in object {
+                        let lower = key.to_ascii_lowercase();
+                        if lower.contains("pic")
+                            || lower.contains("img")
+                            || lower.contains("cover")
+                            || lower.contains("image")
+                        {
+                            println!("  {key} = {value}");
+                        }
+                    }
+                }
+                Err(error) => println!("=== id={id} === 失败: {error}"),
+            }
+        }
+    }
     #[test]
     fn variant_height_parses_chinese_labels() {
         // 源实际给的就是这些

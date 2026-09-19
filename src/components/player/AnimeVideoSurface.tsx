@@ -73,8 +73,23 @@ export const AnimeVideoSurface: React.FC = () => {
     playNext,
     playPrev,
     dismissNotice,
+    enterPip,
   } = useAnimePlayer();
-  const { isFullscreen, setIsFullscreen, navigateTo, showToast } = useAppStore();
+  const { isFullscreen, setIsFullscreen, navigateTo, previousView, showToast } = useAppStore();
+
+  /**
+   * 进入画中画。
+   *
+   * 顺序不能反：`enterPip` 要读 `video.currentTime` 交接进度，而 `close()` 会走
+   * `haltCurrent` 清掉 src——清完再读就只剩 0 秒了。交接失败则什么都不动。
+   * 最后离开播放器视图，让用户在主界面继续浏览。
+   */
+  const handleEnterPip = async () => {
+    const handed = await enterPip();
+    if (!handed) return;
+    close();
+    navigateTo(previousView === 'player' ? 'anime' : previousView);
+  };
 
   const [isControlsVisible, setIsControlsVisible] = useState(true);
   const [isLocked, setIsLocked] = useState(false);
@@ -492,6 +507,7 @@ export const AnimeVideoSurface: React.FC = () => {
         onPlayNext={playNext}
         onOpenEpisodes={() => setShowEpisodes(true)}
         onBack={exitToDetail}
+        onEnterPip={handleEnterPip}
       />
 
       {/* 选集巨幕：与短剧选集抽屉同一个晶体面板（此处只需列出剧集，无需分页/搜索） */}

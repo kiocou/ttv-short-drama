@@ -5,6 +5,7 @@ import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { MicaCard } from '../common/MicaCard';
 import { StatusBadge } from '../common/StatusBadge';
 import { FluentButton } from '../common/FluentButton';
+import { CoverImage } from '../common/CoverImage';
 import {
   Flame,
   Sparkles,
@@ -194,13 +195,12 @@ export const ExploreView: React.FC = () => {
           <div className="flex items-center gap-3.5 min-w-0">
             {/* 核心海报：3:4 黄金竖屏比例 (48px x 64px 固定尺寸，坚决防止压缩变形) */}
             <div className="relative w-12 h-16 rounded-xl overflow-hidden shadow-xs flex-shrink-0 border border-white/90 bg-slate-100">
-              <img
+              <CoverImage
                 src={continueWatching.seriesCover}
-                alt={continueWatching.title}
-                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                onError={(e) => {
-                  (e.target as HTMLElement).style.display = 'none';
-                }}
+                title={continueWatching.title}
+                placeholderTextClassName="text-base"
+                className="group-hover:scale-105 transition-transform duration-300"
+                loading="eager"
               />
               <div className="absolute inset-0 bg-black/10 group-hover:bg-black/0 transition-colors" />
             </div>
@@ -290,8 +290,19 @@ export const ExploreView: React.FC = () => {
         ) : (
           /* 舒展大气的剧集卡片网格 (带级联入场动画与平滑交互) */
           <>
-          {isLoading && <div className="mb-2 text-[11px] text-slate-400">正在更新目录…</div>}
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 sm:gap-4.5">
+          {isLoading && (
+            <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold text-blue-600">
+              <span className="w-3 h-3 rounded-full border-2 border-blue-500/25 border-t-blue-600 animate-spin" />
+              <span>正在切换，卡片马上回来…</span>
+            </div>
+          )}
+          {/* 切换题材/排序时保留旧卡片并压暗：清空会让整页闪白，而单纯保留旧
+              内容又会让用户以为"点了没反应"（旧实现只挂一行 11px 小字，几乎
+              看不见）。压暗 + 屏蔽点击同时表达"正在加载"和"这张卡不再属于
+              当前筛选"，避免用户点进一个已经不属于该题材的剧。 */}
+          <div className={`grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 sm:gap-4.5 transition-opacity duration-150 ${
+            isLoading ? 'opacity-40 saturate-50 pointer-events-none' : ''
+          }`}>
             {items.map((series, index) => (
               <MicaCard
                 key={series.id}
@@ -300,37 +311,19 @@ export const ExploreView: React.FC = () => {
                   navigateTo('detail', series.id);
                 }}
                 className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
-                style={{ animationDelay: `${Math.min(index * 20, 240)}ms` }}
               >
                 {/* 海报封面 (3:4 黄金竖屏比例) */}
                 <div className="relative w-full aspect-[3/4] overflow-hidden bg-slate-100 rounded-t-2xl">
                   {/* 封面缺失时露出剧名首字，而不是留一个空框。
                       App 联想结果里有部分条目不带封面（其 video_data 为空），
                       onError 也统一走这里——图片 403/超时同样会退回占位。 */}
-                  <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-slate-100 to-slate-200">
-                    <span className="text-3xl font-bold text-slate-300 select-none">
-                      {(series.title || '剧').trim().slice(0, 1)}
-                    </span>
-                  </div>
-                  <img
+                  <CoverImage
                     src={series.cover}
-                    alt={series.title}
-                    className="relative w-full h-full object-cover transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
+                    title={series.title}
+                    fallbackChar="剧"
+                    className="transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
                     loading={index < 8 ? 'eager' : 'lazy'}
-                    decoding="async"
                     fetchPriority={index < 4 ? 'high' : 'auto'}
-                    onError={(event) => {
-                      // 封面加载失败重试一次（带 cache-bust）：CDN 抖动一次就
-                      // 让图永久消失等于"封面下载不出来"，仍失败才退回首字占位。
-                      const img = event.currentTarget;
-                      const retried = img.dataset.retried === '1';
-                      if (!retried && series.cover) {
-                        img.dataset.retried = '1';
-                        img.src = `${series.cover}${series.cover.includes('?') ? '&' : '?'}r=1`;
-                        return;
-                      }
-                      img.style.opacity = '0';
-                    }}
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
 

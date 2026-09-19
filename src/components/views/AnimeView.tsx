@@ -4,6 +4,7 @@ import { MicaCard } from '../common/MicaCard';
 import { ipcService } from '../../services/ipc';
 import type { SeriesItem } from '../../types/catalog';
 import { Clapperboard, Play, Star, RefreshCw, Tv } from 'lucide-react';
+import { CoverImage } from '../common/CoverImage';
 
 const PAGE_SIZE = 30;
 
@@ -200,31 +201,16 @@ export const AnimeView: React.FC = () => {
                   navigateTo('detail', series.id);
                 }}
                 className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
-                style={{ animationDelay: `${Math.min(index * 20, 240)}ms` }}
               >
                 <div className="relative w-full aspect-[3/4] overflow-hidden bg-slate-100 rounded-t-2xl">
-                  <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-violet-50 to-slate-200">
-                    <span className="text-3xl font-bold text-slate-300 select-none">
-                      {(series.title || '漫').trim().slice(0, 1)}
-                    </span>
-                  </div>
-                  <img
+                  <CoverImage
                     src={series.cover}
-                    alt={series.title}
-                    className="relative w-full h-full object-cover transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
+                    title={series.title}
+                    fallbackChar="漫"
+                    placeholderClassName="bg-gradient-to-br from-violet-50 to-slate-200"
+                    className="transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
                     loading={index < 8 ? 'eager' : 'lazy'}
-                    decoding="async"
                     fetchPriority={index < 4 ? 'high' : 'auto'}
-                    onError={(event) => {
-                      const img = event.currentTarget;
-                      const retried = img.dataset.retried === '1';
-                      if (!retried && series.cover) {
-                        img.dataset.retried = '1';
-                        img.src = `${series.cover}${series.cover.includes('?') ? '&' : '?'}r=1`;
-                        return;
-                      }
-                      img.style.opacity = '0';
-                    }}
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
 
