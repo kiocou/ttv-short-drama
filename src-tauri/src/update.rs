@@ -194,10 +194,14 @@ pub async fn update_check() -> Result<UpdateInfo, String> {
         return Err(format!("GitHub 返回 {status}：{detail}"));
     }
 
+    // 版本号做一次归一化：tag 是 `v0.2.9`，而界面统一用 `v{版本}` 渲染，
+    // 不处理就会显示成 `vv0.2.9`（实测确实如此）。发布标签的 v 前缀是习惯，
+    // 不该泄漏到展示层。
     let latest_version = body
         .get("tag_name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
+        .trim_start_matches(['v', 'V'])
         .to_string();
     if latest_version.trim().is_empty() {
         return Err("GitHub 的最新发布里没有版本号。".to_string());
