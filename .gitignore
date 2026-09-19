@@ -21,8 +21,13 @@ src-tauri/.app-data/
 *.sqlite3-wal
 short-drama-device.json
 
-# ---- 临时目录（build.bat / start-dev-safe.bat 使用）----
+# ---- 工作目录与 AI / 编辑器工具产物（不属于项目内容）----
+# `build.bat` / `start-dev-safe.bat` 把临时目录指向 .tmp；后三个是 AI 工具自己写的
+# 工作区——`.zcode/plans/` 曾经因为漏了规则而被误提交（里面有一份含逆向计划的会话文档），
+# 公开仓库里不应该出现它们。
 .tmp/
+.zcode/
+.agents/
 .workbuddy-ai/
 .serena/
 

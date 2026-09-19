@@ -16,6 +16,7 @@ import {
   streamKindOf,
   type AnimeStreamKind,
 } from '../services/animePlayback';
+import { dismissPip, openPip } from '../services/pip';
 import type { EpisodeItem, SeriesDetail } from '../types/series';
 import { useAppStore } from './useAppStore';
 import { useSettingsStore } from './useSettingsStore';
@@ -92,6 +93,12 @@ interface AnimePlayerContextValue {
   setQuality: (value: string) => void;
   playNext: () => void;
   playPrev: () => void;
+  /** 显式设置静音（从小窗回播放器时接回音频状态用）。 */
+  setMuted: (value: boolean) => void;
+  /**
+   * 把当前这一集交给画中画小窗继续播（返回 false 表示没交出去，调用方应留在播放器）。
+   */
+  enterPip: () => Promise<boolean>;
   dismissNotice: () => void;
 }
 
@@ -281,6 +288,9 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
     // 传给后端的是另一套**全局递增**的会话号：后端按 session_id 保留最近 8 条
     // 会话，动漫用自己从 1 开始的私有号段会与短剧号段撞车，也会让
     // `sessions.retain(|id, _| *id >= session_id - 8)` 永远删不掉旧条目。
+    // 播放权同一时刻只能属于一个窗口：小窗开着时用户又点了某一集，主窗口这边
+    // 必须先收掉小窗，否则两路声音会同时响。从小窗"回到播放器"时这一步是空操作。
+    dismissPip();
     const sessionId = ++sessionRef.current;
     const wireSessionId = generateNextSessionId();
     const keepPlaying = qualityOverride !== undefined && episodeRef.current?.id === episodeId;
@@ -574,6 +584,19 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
     if (video) video.muted = next;
   }, []);
 
+  /**
+   * 显式设置静音（`toggleMute` 做不到：它要先知道当前值）。
+   *
+   * 从小窗回播放器时用它接回静音状态：小窗里用户可能已经按成静音，只接回音量
+   * 而不接回静音，回到播放器的第一声会与用户预期相反。
+   */
+  const setMuted = useCallback((value: boolean) => {
+    setMutedState(value);
+    mutedRef.current = value;
+    const video = videoRef.current;
+    if (video) video.muted = value;
+  }, []);
+
   const setPlaybackRate = useCallback((rate: number) => {
     setPlaybackRateState(rate);
     rateRef.current = rate;
@@ -626,6 +649,57 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
     }
     void open(currentSeries.id, prev.id, 0);
   }, [open, showToast]);
+
+  /**
+   * 把当前这一集交给画中画小窗继续播。
+   *
+   * 与短剧链路同一套约定：交接的是"身份 + 播放参数"，不是播放地址——动漫在这里
+   * 尤其不可能交出地址：主窗口上挂的是 hls.js 的 MSE `blob:`，换个窗口根本用不了。
+   * 小窗拿 seriesId / episodeId 自己重新解析一次直链。
+   *
+   * 交接前先 `pause()`：两块 `<video>` 同时出声是这块功能最典型的故障。真正的
+   * 拆源与落盘由调用方紧接着调 `close()` 完成（`haltCurrent` 会清 src，之后再读
+   * `currentTime` 就只剩 0 了，所以顺序不能反）。
+   */
+  const enterPip = useCallback(async (): Promise<boolean> => {
+    const video = videoRef.current;
+    const currentSeries = seriesRef.current;
+    const currentEpisode = episodeRef.current;
+    if (!video || !currentSeries || !currentEpisode) return false;
+    const position = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    if (!video.paused) video.pause();
+    try {
+      await openPip({
+        kind: 'anime',
+        seriesId: currentSeries.id,
+        episodeId: currentEpisode.id,
+        title: currentSeries.title,
+        cover: currentSeries.cover,
+        channel: 'anime',
+        totalEpisodes: currentSeries.episodesCount,
+        episodeNumber: currentEpisode.episodeNumber,
+        quality: qualityRef.current || 'auto',
+        position,
+        volume: volumeRef.current,
+        muted: mutedRef.current,
+        rate: rateRef.current,
+        // 动漫走 dmghg 直链，没有红果 worker 的内容类型。
+        contentType: null,
+        autoNext: autoNextRef.current,
+        countdownSeconds: settings.countdownSeconds,
+        episodes: currentSeries.episodes.map(item => ({
+          id: item.id,
+          episodeNumber: item.episodeNumber,
+          title: item.title,
+        })),
+      });
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      showToast(`进入画中画失败：${detail}`, 'error');
+      return false;
+    }
+  }, [settings.countdownSeconds, showToast]);
 
   /** 自动连播：动漫没有倒计时（与短剧不同），播完直接进下一集。 */
   useEffect(() => {
@@ -687,16 +761,18 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
     seekRelative,
     setVolume,
     toggleMute,
+    setMuted,
     setPlaybackRate,
     setQuality,
     playNext,
     playPrev,
+    enterPip,
     dismissNotice: clearNotice,
   }), [
     bindVideo, isOpen, series, episode, uiState, isPlaying, position, duration, buffered, volume,
     muted, playbackRate, quality, qualities, isSwitching, notice, streamKind, open, close,
     togglePlay, seekTo, seekRelative, setVolume, toggleMute, setPlaybackRate, setQuality,
-    playNext, playPrev, clearNotice,
+    playNext, playPrev, setMuted, enterPip, clearNotice,
   ]);
 
   return <AnimePlayerContext.Provider value={value}>{children}</AnimePlayerContext.Provider>;

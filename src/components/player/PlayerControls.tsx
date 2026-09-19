@@ -54,9 +54,23 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
     playPrevEpisode,
     toggleSideDrawer,
     availableQualities,
+    enterPip,
   } = usePlaybackStore();
 
   const { goBack } = useAppStore();
+
+  /**
+   * 进入画中画。
+   *
+   * 交接成功后主窗口离开播放器视图——App 的 effect 随即调 stopPlayback（作废会话
+   * + 落盘进度），主窗口这边就彻底停手了，用户可以在主界面继续浏览。交接失败
+   * （后端拒绝、非桌面环境）则留在原地：把用户扔到一个空页面上更糟。
+   */
+  const handleEnterPip = async () => {
+    const handed = await enterPip();
+    if (!handed) return;
+    goBack();
+  };
 
   // 集数徽章文案。
   //
@@ -101,6 +115,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
       onPlayNext={playNextEpisode}
       onOpenEpisodes={() => toggleSideDrawer()}
       onBack={goBack}
+      onEnterPip={handleEnterPip}
     />
   );
 };

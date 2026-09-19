@@ -3,6 +3,7 @@ import { PlaybackUiState } from '../types/playback';
 import { SeriesDetail, EpisodeItem } from '../types/series';
 import { ipcService, isTauriEnvironment } from '../services/ipc';
 import { attachSource, isHlsUrl, detachSource } from '../services/hlsAttach';
+import { dismissPip, openPip } from '../services/pip';
 import { useSettingsStore } from './useSettingsStore';
 
 /**
@@ -92,6 +93,12 @@ interface PlaybackContextType {
   acceptCountdown: () => void;
   /** 离开播放器工作区时调用：暂停画面、取消后台连播并落盘进度。 */
   stopPlayback: () => void;
+  /** 显式设置静音（从小窗回播放器时接回音频状态用）。 */
+  setMuted: (value: boolean) => void;
+  /**
+   * 把当前这一集交给画中画小窗继续播（返回 false 表示没交出去，调用方应留在播放器）。
+   */
+  enterPip: () => Promise<boolean>;
   /**
    * 是否正在"切换"到另一部剧/另一集（而非首次进入播放器）。
    *
@@ -221,6 +228,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const [volume, setVolumeState] = useState<number>(0.85);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [playbackRate, setPlaybackRateState] = useState<number>(1.0);
+  /**
+   * 音量 / 静音 / 倍速的"最新值"镜像。
+   *
+   * 起播链路（adoptPreparedSource、兜底直链、公开直链兜底）是在**异步续体**里把
+   * 这三个值写进媒体元素的，那时读到的 state 是发起这次起播时的那份快照。日常操作
+   * 没有差别，但"从小窗回到播放器"是同一 tick 里先 setVolume/setMuted 再 openEpisode：
+   * 读快照会把元素写回旧值，表现为"在小窗里静音了，回到播放器第一声却是外放的"。
+   */
+  const volumeRef = useRef(volume);
+  const isMutedRef = useRef(isMuted);
+  const playbackRateRef = useRef(playbackRate);
   // 真实清晰度档位：来自后端 variants，不再硬编码。空数组表示尚未探测，
   // 此时只显示"自动"，绝不虚构 4K/1080P 这类源里根本不存在的档位。
   const [availableQualities, setAvailableQualities] = useState<Array<{ label: string; value: string; resolution: string }>>([]);
@@ -516,6 +534,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         if (!video.muted) {
           video.muted = true;
           setIsMuted(true);
+          // 镜像同步：这条兜底路径绕过 setMuted，起播链路读的是 ref。
+          isMutedRef.current = true;
           try {
             await video.play();
             return 'ok';
@@ -564,9 +584,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         objectUrlRef.current = '';
       }
       video.dataset.sessionId = String(sessionId);
-      video.playbackRate = playbackRate;
-      video.volume = isMuted ? 0 : volume;
-      video.muted = isMuted;
+      video.playbackRate = playbackRateRef.current;
+      video.volume = isMutedRef.current ? 0 : volumeRef.current;
+      video.muted = isMutedRef.current;
 
       // 等首批可绘制数据到位再切入：旧帧一直保留到这一刻。
       const firstFrameReady = new Promise<void>(resolve => {
@@ -639,9 +659,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         objectUrlRef.current = '';
       }
       video.dataset.sessionId = String(sessionId);
-      video.playbackRate = playbackRate;
-      video.volume = isMuted ? 0 : volume;
-      video.muted = isMuted;
+      video.playbackRate = playbackRateRef.current;
+      video.volume = isMutedRef.current ? 0 : volumeRef.current;
+      video.muted = isMutedRef.current;
 
       const ready = new Promise<void>(resolve => {
         let settled = false;
@@ -1071,7 +1091,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   saveProgressThrottledRef.current = saveProgressThrottled;
 
   // 打开剧集与换集核心（实现体；对外暴露的 openEpisode 只做同键去重）
+  //
+  // 入口先收掉画中画小窗：播放权同一时刻只能属于一个窗口。用户在小窗开着的时候
+  // 又点了一集，主窗口这边必须先把小窗拆掉，否则两路声音会同时响。同理，从小窗
+  // "回到播放器"时这一步是空操作（窗口已经关掉了）。
   const runOpenEpisode = async (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string) => {
+    dismissPip();
     const qualitySwitchRequested = Boolean(
       qualityOverride
       && currentSeries?.id === seriesId
@@ -1222,6 +1247,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             // WebView 拒绝带声音自动播放：静音起播，让用户手动恢复声音。
             animeVideo.muted = true;
             setIsMuted(true);
+            isMutedRef.current = true;
             try {
               await animeVideo.play();
               if (pauseIfStale(newSessionId, animeVideo)) return;
@@ -1410,15 +1436,15 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
 
       if (videoRef.current) {
         const video = videoRef.current;
-        const preferredMuted = isMuted;
+        const preferredMuted = isMutedRef.current;
         video.dataset.sessionId = String(newSessionId);
         if (objectUrlRef.current) {
           URL.revokeObjectURL(objectUrlRef.current);
           objectUrlRef.current = '';
         }
         video.preload = 'auto';
-        video.playbackRate = playbackRate;
-        video.volume = isMuted ? 0 : volume;
+        video.playbackRate = playbackRateRef.current;
+        video.volume = isMutedRef.current ? 0 : volumeRef.current;
         // 优先保留用户音量。若 WebView 拒绝带声音自动播放，再在 catch 中静音重试。
         video.muted = preferredMuted;
         // 不 pause()、不 load()：旧帧保留到新源首批数据就绪，避免兜底路径又黑一次。
@@ -1471,6 +1497,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           if (error instanceof DOMException && error.name === 'NotAllowedError' && !video.muted) {
             video.muted = true;
             setIsMuted(true);
+            isMutedRef.current = true;
             void video.play().then(() => {
               if (pauseIfStale(newSessionId, video)) return;
               setIsPlaying(true);
@@ -1632,27 +1659,46 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const setVolume = (vol: number) => {
     const clamped = Math.max(0, Math.min(1, vol));
     setVolumeState(clamped);
+    volumeRef.current = clamped;
     if (videoRef.current) {
       videoRef.current.volume = clamped;
-      if (clamped > 0 && isMuted) {
+      // 是否顺带解除静音读 ref：同一 tick 里先 setMuted(true) 再 setVolume 时
+      // state 还没提交，读 `isMuted` 会误判成"本来就没静音"，音量调上去却没声音。
+      if (clamped > 0 && isMutedRef.current) {
         setIsMuted(false);
+        isMutedRef.current = false;
         videoRef.current.muted = false;
       }
     }
   };
 
   const toggleMute = () => {
-    setIsMuted(prev => {
-      const next = !prev;
-      if (videoRef.current) {
-        videoRef.current.muted = next;
-      }
-      return next;
-    });
+    // 与动漫播放器同一算法：先读 ref 求反，保证连点两次的结果可预期。
+    const next = !isMutedRef.current;
+    setIsMuted(next);
+    isMutedRef.current = next;
+    if (videoRef.current) {
+      videoRef.current.muted = next;
+    }
+  };
+
+  /**
+   * 显式设置静音（`toggleMute` 做不到：它要先知道当前值）。
+   *
+   * 从小窗回播放器时用它接回静音状态：小窗里用户可能已经按成静音，只接回音量
+   * 而不接回静音，回到播放器的第一声会与用户预期相反。
+   */
+  const setMuted = (value: boolean) => {
+    setIsMuted(value);
+    isMutedRef.current = value;
+    if (videoRef.current) {
+      videoRef.current.muted = value;
+    }
   };
 
   const setPlaybackRate = (rate: number) => {
     setPlaybackRateState(rate);
+    playbackRateRef.current = rate;
     if (videoRef.current) {
       videoRef.current.playbackRate = rate;
     }
@@ -1750,6 +1796,61 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 界面会先闪一下上一集的加载遮罩。
     setUiState(prev => (prev.kind === 'idle' ? prev : { kind: 'idle' }));
   }, []);
+
+  /**
+   * 把当前这一集交给画中画小窗继续播。
+   *
+   * 交接的是"身份 + 播放参数"，**不是播放地址**：小窗会用同一条链路自行解析
+   * （理由见 services/pip.ts 的文件头）。这里只有两件事必须做对：
+   *   1. 交接前先 `pause()`——常驻的 `<video>` 不会因为小窗打开就自己停，两路
+   *      同时出声是这块功能最典型的故障；
+   *   2. 交接后调用方要离开播放器视图，App 会随之走 `stopPlayback()`（作废会话
+   *      + 落盘进度），主窗口这边就彻底交干净了。
+   *
+   * 返回 false 表示没能交出去（非桌面环境、没有正在播的集、或后端拒绝）：
+   * 调用方应当留在播放器里，而不是把用户扔到一个空白页。
+   */
+  const enterPip = useCallback(async (): Promise<boolean> => {
+    const video = videoRef.current;
+    const series = currentSeries;
+    const episode = currentEpisode;
+    if (!video || !series || !episode) return false;
+    const position = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    if (!video.paused) video.pause();
+    try {
+      await openPip({
+        kind: 'drama',
+        seriesId: series.id,
+        episodeId: episode.id,
+        title: series.title,
+        cover: series.cover,
+        channel: series.type,
+        totalEpisodes: series.episodesCount,
+        episodeNumber: episode.episodeNumber,
+        quality: currentQuality || 'auto',
+        position,
+        volume,
+        muted: isMuted,
+        rate: playbackRate,
+        // worker 的内容类型：漫剧与短剧在 App-API 上是两套参数（1004 / 1）。
+        contentType: series.type === 'comic' ? 1004 : 1,
+        autoNext: settings.autoNext,
+        countdownSeconds: settings.countdownSeconds,
+        episodes: series.episodes.map(item => ({
+          id: item.id,
+          episodeNumber: item.episodeNumber,
+          title: item.title,
+        })),
+      });
+      return true;
+    } catch (error) {
+      noteFailure('进入画中画失败', error);
+      return false;
+    }
+  }, [
+    currentSeries, currentEpisode, currentQuality, volume, isMuted, playbackRate,
+    settings.autoNext, settings.countdownSeconds,
+  ]);
 
   /**
    * 事件处理器上下文。
@@ -2129,10 +2230,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         cancelCountdown,
         acceptCountdown,
         stopPlayback,
+        setMuted,
         isSwitching,
         prepareStatus,
         errorDetail,
         prewarmEpisode,
+        enterPip,
       }}
     >
       {children}

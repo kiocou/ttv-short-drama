@@ -1,4 +1,4 @@
-import { CatalogFilter, CatalogPage } from '../types/catalog';
+import { CatalogFilter, CatalogPage, SeriesItem } from '../types/catalog';
 import { SeriesDetail } from '../types/series';
 import { PlaybackSession, PlaybackSnapshot } from '../types/playback';
 import { WatchHistoryItem } from '../types/history';
@@ -65,6 +65,35 @@ function saveStorage<T>(key: string, value: T): void {
   }
 }
 
+/**
+ * Web/演示模式的目录分页（含关键词本地过滤）。
+ *
+ * 真实链路的搜索在 Rust 侧（红果网页 + 动漫源 + App 联想），这里只是让浏览器
+ * 预览态仍能走通"输入关键词 → 出卡片"这条交互。
+ */
+async function mockCatalogList(filter: CatalogFilter): Promise<CatalogPage> {
+  await new Promise(resolve => setTimeout(resolve, 120));
+  let list = MOCK_SERIES_LIST.filter(item => item.type === filter.channel);
+  if (filter.category !== '全部') list = list.filter(item => item.tags.includes(filter.category));
+  if (filter.audience !== '全部') list = list.filter(item => item.tags.some(tag => tag.includes(filter.audience)));
+  if (filter.keyword?.trim()) {
+    const keyword = filter.keyword.trim().toLocaleLowerCase();
+    list = list.filter(item => item.title.toLocaleLowerCase().includes(keyword)
+      || item.tags.some(tag => tag.toLocaleLowerCase().includes(keyword)));
+  }
+  if (filter.sort === 'heat') list = [...list].sort((a, b) => (b.heat || 0) - (a.heat || 0));
+  if (filter.sort === 'latest') list = [...list].reverse();
+  const start = (filter.page - 1) * filter.pageSize;
+  const items = list.slice(start, start + filter.pageSize);
+  return {
+    items,
+    total: list.length,
+    hasMore: start + items.length < list.length,
+    page: filter.page,
+    categories: ['全部', ...[...new Set(list.flatMap(item => item.tags))].slice(0, 12)],
+  };
+}
+
 export const ipcService = {
   catalog: {
     async list(filter: CatalogFilter): Promise<CatalogPage> {
@@ -74,26 +103,7 @@ export const ipcService = {
         return page;
       }
 
-      await new Promise(resolve => setTimeout(resolve, 120));
-      let list = MOCK_SERIES_LIST.filter(item => item.type === filter.channel);
-      if (filter.category !== '全部') list = list.filter(item => item.tags.includes(filter.category));
-      if (filter.audience !== '全部') list = list.filter(item => item.tags.some(tag => tag.includes(filter.audience)));
-      if (filter.keyword?.trim()) {
-        const keyword = filter.keyword.trim().toLocaleLowerCase();
-        list = list.filter(item => item.title.toLocaleLowerCase().includes(keyword)
-          || item.tags.some(tag => tag.toLocaleLowerCase().includes(keyword)));
-      }
-      if (filter.sort === 'heat') list = [...list].sort((a, b) => (b.heat || 0) - (a.heat || 0));
-      if (filter.sort === 'latest') list = [...list].reverse();
-      const start = (filter.page - 1) * filter.pageSize;
-      const items = list.slice(start, start + filter.pageSize);
-      return {
-        items,
-        total: list.length,
-        hasMore: start + items.length < list.length,
-        page: filter.page,
-        categories: ['全部', ...[...new Set(list.flatMap(item => item.tags))].slice(0, 12)],
-      };
+      return mockCatalogList(filter);
     },
     /**
      * 批量补齐真实集数（实际上只有漫剧需要）。
@@ -112,6 +122,36 @@ export const ipcService = {
         );
       } catch {
         return {};
+      }
+    },
+    /**
+     * 搜索的"快速首屏"：只跑结构化来源（红果网页 + 动漫源），不等 App 联想。
+     *
+     * 联想要冷启动一个 Python 进程（实测端到端 0.6-1.9s），把它留在首屏链路上
+     * 会让网页结果 0.3s 就绪也得陪等到一秒以后——那是"搜索慢"的主因。调用方
+     * 拿到首屏后再调 `searchSuggest` 把联想追加到尾部。
+     */
+    async searchFast(filter: CatalogFilter): Promise<CatalogPage> {
+      if (isTauriEnvironment()) {
+        const page = await invokeBackend<CatalogPage>('catalog_fast_search', { filter });
+        page.items.forEach(item => channelBySeriesId.set(item.id, item.type));
+        return page;
+      }
+      return mockCatalogList(filter);
+    },
+    /**
+     * App 搜索联想：补齐网页搜索只返回前 10 条时漏掉的分季条目。
+     *
+     * 失败返回空数组——它是补充来源，不该让整次搜索报错。
+     */
+    async searchSuggest(keyword: string, channel: CatalogFilter['channel']): Promise<SeriesItem[]> {
+      if (!isTauriEnvironment()) return [];
+      try {
+        const items = await invokeBackend<SeriesItem[]>('catalog_suggest', { keyword, channel });
+        items.forEach(item => channelBySeriesId.set(item.id, item.type));
+        return items;
+      } catch {
+        return [];
       }
     },
     /**

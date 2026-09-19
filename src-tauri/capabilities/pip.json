@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pip",
+  "description": "画中画小窗（label: mini）的能力：无边框窗口自己拖动与缩放，事件用于与主窗口交接播放状态。",
+  "windows": ["mini"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging"
+  ]
+}

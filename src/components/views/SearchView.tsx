@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
 import { ipcService } from '../../services/ipc';
-import { SeriesItem } from '../../types/catalog';
+import { CatalogFilter, SeriesItem } from '../../types/catalog';
 import { Search, X, Trash2, Clock, Play, ArrowLeft } from 'lucide-react';
+import { CoverImage } from '../common/CoverImage';
 
 type Channel = 'drama' | 'comic';
 
@@ -46,17 +47,21 @@ export const SearchView: React.FC = () => {
 
   useEffect(() => {
     const keyword = searchKeyword.trim();
+    // 每次关键词变化立即作废在途请求：防抖窗口内用户又敲了一个字时，
+    // 上一次的响应回来不该再往屏幕上画。
+    const requestId = ++requestIdRef.current;
     if (!keyword) {
       setItems([]);
       setError(null);
       setIsLoading(false);
       return;
     }
-    const requestId = ++requestIdRef.current;
-    setIsLoading(true);
-    setError(null);
-    ipcService.catalog
-      .list({
+    // 防抖 300ms：旧实现每敲一个字就发一次全量搜索，而每一发在后端都要
+    // 冷启动一个 Python 进程跑 App 联想，打字快时等于连开好几个进程。
+    const timer = window.setTimeout(() => {
+      setIsLoading(true);
+      setError(null);
+      const filter: CatalogFilter = {
         channel,
         category: '全部',
         audience: '全部',
@@ -64,19 +69,41 @@ export const SearchView: React.FC = () => {
         keyword,
         page: 1,
         pageSize: 40,
-      })
-      .then(page => {
-        if (requestId !== requestIdRef.current) return;
-        setItems(page.items);
-      })
-      .catch((err: unknown) => {
-        if (requestId !== requestIdRef.current) return;
-        setError((err as Error).message || '搜索失败，请稍后重试。');
-        setItems([]);
-      })
-      .finally(() => {
-        if (requestId === requestIdRef.current) setIsLoading(false);
-      });
+      };
+      // 两段式：先出结构化来源（红果网页 + 动漫源，实测 0.3-0.6s），
+      // 再把慢的 App 联想追加到尾部。
+      //
+      // 旧实现把三者放进同一个 join! 里等，首屏被 Python 冷启动（0.6-1.9s）
+      // 拖住——网页结果早就就绪了，用户却要盯着"搜索中…"。
+      ipcService.catalog
+        .searchFast(filter)
+        .then(page => {
+          if (requestId !== requestIdRef.current) return undefined;
+          setItems(page.items);
+          // 首屏已可用，先收掉 loading 再等联想，用户不用为补充来源继续等。
+          setIsLoading(false);
+          return ipcService.catalog.searchSuggest(keyword, channel);
+        })
+        .then(suggestions => {
+          if (!suggestions || requestId !== requestIdRef.current) return;
+          // 联想按 id 去重后追加：它只是补齐网页漏掉的分季条目，
+          // 不打断用户已经在看的首屏结果。
+          setItems(previous => {
+            const seen = new Set(previous.map(item => item.id));
+            const extra = suggestions.filter(item => !seen.has(item.id));
+            return extra.length > 0 ? [...previous, ...extra] : previous;
+          });
+        })
+        .catch((err: unknown) => {
+          if (requestId !== requestIdRef.current) return;
+          setError((err as Error).message || '搜索失败，请稍后重试。');
+          setItems([]);
+        })
+        .finally(() => {
+          if (requestId === requestIdRef.current) setIsLoading(false);
+        });
+    }, 300);
+    return () => window.clearTimeout(timer);
   }, [searchKeyword, channel]);
 
   const runSearch = (keyword: string) => {
@@ -224,34 +251,15 @@ export const SearchView: React.FC = () => {
                       navigateTo('detail', series.id);
                     }}
                     className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
-                    style={{ animationDelay: `${Math.min(index * 20, 240)}ms` }}
                   >
                     <div className="relative w-full aspect-[3/4] overflow-hidden bg-slate-100 rounded-t-2xl">
                       {/* 无封面时露出剧名首字：App 联想结果里有些条目不带封面。 */}
-                      <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-slate-100 to-slate-200">
-                        <span className="text-3xl font-bold text-slate-300 select-none">
-                          {(series.title || '剧').trim().slice(0, 1)}
-                        </span>
-                      </div>
-                      <img
+                      <CoverImage
                         src={series.cover}
-                        alt={series.title}
-                        className="relative w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                        title={series.title}
+                        fallbackChar="剧"
+                        className="group-hover:scale-105 transition-transform duration-500"
                         loading={index < 8 ? 'eager' : 'lazy'}
-                        decoding="async"
-                        onError={event => {
-                          // 封面加载失败重试一次：CDN 抖动一次就让图永久消失
-                          // 等于"封面下载不出来"。带 cache-bust 绕过失败的缓存，
-                          // 仍失败才退回剧名首字占位。
-                          const img = event.currentTarget;
-                          const retried = img.dataset.retried === '1';
-                          if (!retried && series.cover) {
-                            img.dataset.retried = '1';
-                            img.src = `${series.cover}${series.cover.includes('?') ? '&' : '?'}r=1`;
-                            return;
-                          }
-                          img.style.opacity = '0';
-                        }}
                       />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
                       <div className="absolute top-2 left-2 flex gap-1">

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
+import { CoverImage } from './CoverImage';
 
 export const CardExpansionOverlay: React.FC = () => {
   const { cardTransition, clearCardTransition, navigateTo, isNavCollapsed } = useAppStore();
@@ -101,8 +102,8 @@ export const CardExpansionOverlay: React.FC = () => {
       {/* 展开过程中的中心海报视差定位，与详情页 Hero Poster 精准重合 */}
       {isExpanded && (
         <div className="absolute inset-0 flex items-start max-w-6xl mx-auto px-8 gap-8 pt-14 animate-fade-in pointer-events-none">
-          <div className="w-48 sm:w-56 aspect-[3/4] rounded-2xl overflow-hidden shadow-fluent-hud border-2 border-white flex-shrink-0 bg-white">
-            <img src={cover} alt={title} className="w-full h-full object-cover" />
+          <div className="relative w-48 sm:w-56 aspect-[3/4] rounded-2xl overflow-hidden shadow-fluent-hud border-2 border-white flex-shrink-0 bg-white">
+            <CoverImage src={cover} title={title} placeholderTextClassName="text-5xl" loading="eager" />
           </div>
           <div className="flex flex-col gap-3 pt-1">
             <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight leading-tight">

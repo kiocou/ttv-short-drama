@@ -154,6 +154,50 @@ fn store_theme_routes(channel: &str, routes: &[(String, String)]) {
     }
 }
 
+/// 官方题材页结果缓存（短 TTL）。
+///
+/// "点几个题材比较一下"是发现页最高频的操作，而每次点击都要重新抓一页
+/// （约 280KB）并重新解析——来回点 A→B→A 就是三次完整往返。这里把解析后的
+/// 整页结果缓存住，重复点击变成纯内存操作。
+///
+/// TTL 刻意只有 60s：题材页是实时排行，久缓存会让新上的剧进不来；而 60s
+/// 足够覆盖"来回比较几个题材"这一段典型操作。
+const THEME_PAGE_TTL: Duration = Duration::from_secs(60);
+
+static THEME_PAGE_CACHE: OnceLock<Mutex<HashMap<String, ThemePageEntry>>> = OnceLock::new();
+
+struct ThemePageEntry {
+    page: CatalogPage,
+    stored_at: Instant,
+}
+
+fn theme_page_cache() -> &'static Mutex<HashMap<String, ThemePageEntry>> {
+    THEME_PAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_theme_page(key: &str) -> Option<CatalogPage> {
+    let guard = theme_page_cache().lock().ok()?;
+    let entry = guard.get(key)?;
+    if entry.stored_at.elapsed() > THEME_PAGE_TTL {
+        return None;
+    }
+    Some(entry.page.clone())
+}
+
+fn store_theme_page(key: &str, page: &CatalogPage) {
+    if let Ok(mut guard) = theme_page_cache().lock() {
+        // 只有两个频道的题材 × 页数，条目很少；顺带清掉过期的，避免长期驻留。
+        guard.retain(|_, entry| entry.stored_at.elapsed() <= THEME_PAGE_TTL);
+        guard.insert(
+            key.to_owned(),
+            ThemePageEntry {
+                page: page.clone(),
+                stored_at: Instant::now(),
+            },
+        );
+    }
+}
+
 /// 从 `/category` 的导航里解析某频道的**官方题材**（名称 → slug，保序去重）。
 ///
 /// 实测真人剧有 24 个官方题材（爱情/都市/古装/玄幻…），且官方题材就是卡片上的
@@ -322,6 +366,13 @@ impl DramaProvider {
         let Some(segment) = site_channel_segment(filter.channel.as_str()) else {
             return Err("该频道没有官方题材路由。".to_string());
         };
+        let cache_key = format!(
+            "{}|{}|{}|{}|{}",
+            filter.channel, slug, requested_page, filter.page_size, filter.sort
+        );
+        if let Some(page) = cached_theme_page(&cache_key) {
+            return Ok(page);
+        }
         let path = if requested_page <= 1 {
             format!("/category/{segment}/{slug}")
         } else {
@@ -347,7 +398,7 @@ impl DramaProvider {
             .catalog_categories(filter.channel.as_str())
             .await
             .unwrap_or_default();
-        Ok(CatalogPage {
+        let page = CatalogPage {
             total,
             items,
             has_more,
@@ -359,7 +410,9 @@ impl DramaProvider {
                 filter.category,
                 sort_label(&filter.sort)
             ),
-        })
+        };
+        store_theme_page(&cache_key, &page);
+        Ok(page)
     }
 
     /// 取全站卡片索引（带 TTL 缓存）。题材/受众过滤必须走它。
@@ -850,11 +903,25 @@ fn encode_uri_component(input: &str) -> String {
     out
 }
 
+/// 去掉所有空白字符后比较，用于判定"这段文本是不是标题"。
+///
+/// 站点同一部剧在不同位置的空格并不一致：实测 alt 为
+/// `你让我当牛马我在荒岛　成王第一季`（中间一个 U+3000 全角空格），而卡片标题
+/// 元素里没有任何空格。`trim()` 只管首尾，中间的空格会让精确比较失效，标题
+/// 因此被当成题材标签收下，再跟着"只增不减"的题材词表永久留在分类栏。
+fn strip_spaces(value: &str) -> String {
+    value.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
     let document = Html::parse_document(html);
     let anchor_selector = Selector::parse("a[href*='detail?series_id=']").expect("anchor selector");
     let image_selector = Selector::parse("img").expect("image selector");
     let source_selector = Selector::parse("source").expect("source selector");
+    // 卡片标题元素：站点用 CSS module，类名形如 `pc-title-l_s3n8` / `m-title-F3bkRB`，
+    // 前缀稳定、hash 后缀随构建变化，所以按前缀匹配。
+    let title_selector =
+        Selector::parse("[class*='pc-title-'], [class*='m-title-']").expect("title selector");
     let episode_re = Regex::new(r"(?:全|更新至|第)\s*(\d+)\s*集").expect("episode regex");
     let id_re = Regex::new(r"series_id=(\d+)").expect("id regex");
     let mut seen = HashSet::new();
@@ -872,13 +939,27 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
         if !seen.insert(id.clone()) {
             continue;
         }
+        // 标题优先取卡片自己的标题元素，img alt 只作兜底。
+        //
+        // 为什么不能只信 alt：站点数据里 alt 与标题文本并不总相等——实测存在
+        // alt="你让我当牛马我在荒岛　成王第一季"（中间多一个全角空格）而卡片
+        // 文本没有空格的卡片。旧实现只从 alt 取标题、再用"文本 != 标题"的精确
+        // 比较去剔除标题，于是那个标题原样成了题材标签，跟着"只增不减"的题材
+        // 词表永久留在分类栏（用户看到的是"分类里出现了视频标题名称"）。
         let title = anchor
-            .select(&image_selector)
-            .filter_map(|image| image.value().attr("alt"))
-            .map(str::trim)
+            .select(&title_selector)
+            .map(|node| node.text().collect::<String>())
+            .map(|text| text.trim().to_string())
             .find(|value| !value.is_empty())
-            .unwrap_or("未命名短剧")
-            .to_string();
+            .or_else(|| {
+                anchor
+                    .select(&image_selector)
+                    .filter_map(|image| image.value().attr("alt"))
+                    .map(str::trim)
+                    .find(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "未命名短剧".to_string());
         let cover = anchor
             .select(&image_selector)
             .filter_map(|image| image.value().attr("src"))
@@ -898,11 +979,37 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
             .and_then(|captures| captures.get(1))
             .and_then(|value| value.as_str().parse::<u32>().ok())
             .unwrap_or(0);
+        // 题材标签 = 卡片里"除了标题和集数之外的文本"。
+        //
+        // 两个判据缺一不可：① 与标题比较前先做空白归一化（站点同一部剧在 alt 与
+        // 标题元素里的空格并不一致，精确比较必然漏判）；② 只收"纯字词"文本——
+        // 题材词是"爱情""无限流"这种词，而剧名常带"，""！"等标点。
+        let title_key = strip_spaces(&title);
         let tags = anchor
             .text()
             .map(str::trim)
             .filter(|value| {
-                !value.is_empty() && *value != title.as_str() && !episode_re.is_match(value)
+                if value.is_empty() || episode_re.is_match(value) {
+                    return false;
+                }
+                if !value
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '/' || c == '·')
+                {
+                    return false;
+                }
+                let norm = strip_spaces(value);
+                if norm == title_key {
+                    return false;
+                }
+                // 标题被站点截断/加后缀时长度对不上，退一步用包含关系兜底；
+                // 只对长文本启用，避免把"爱情"这种真题材词从"爱情公寓"里误杀。
+                if norm.chars().count() >= 6
+                    && (title_key.contains(norm.as_str()) || norm.contains(title_key.as_str()))
+                {
+                    return false;
+                }
+                true
             })
             .filter(|value| value.chars().count() <= 16)
             .map(str::to_string)
@@ -1259,8 +1366,9 @@ fn unique(items: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog_page_path, detect_total_pages, find_pagination_value, normalize_playback_url,
-        parse_router_script, parse_theme_routes, rank_search_items, DramaProvider, Value,
+        cached_theme_page, catalog_page_path, detect_total_pages, find_pagination_value,
+        normalize_playback_url, parse_catalog_cards, parse_router_script, parse_theme_routes,
+        rank_search_items, store_theme_page, DramaProvider, Value,
     };
     use crate::models::{CatalogFilter, SeriesItem};
 
@@ -1287,6 +1395,123 @@ mod tests {
         rank_search_items(&mut items, "战神");
         assert_eq!(items[0].title, "我只想找死，却被奉为九州战神了");
         assert_eq!(items[2].title, "大将军扛楼养活百万大军");
+    }
+
+    /// 题材页缓存要能原样取回，且不同键不得互相命中。
+    ///
+    /// 这条锁住"来回点题材秒切"的能力：键里少拼了频道或页码，用户点 A 拿到的
+    /// 就会是 B 的卡片——那比慢更糟。TTL 内的过期行为不便在单测里等待，只锁键。
+    #[test]
+    fn theme_page_cache_round_trips_and_separates_keys() {
+        let page = |title: &str| crate::models::CatalogPage {
+            items: vec![SeriesItem {
+                id: "1".into(),
+                title: title.into(),
+                cover: String::new(),
+                item_type: "drama".into(),
+                episodes_count: 0,
+                latest_episode_title: None,
+                tags: vec![],
+                origin: String::new(),
+                brief: None,
+            }],
+            total: 1,
+            has_more: false,
+            page: 1,
+            categories: vec!["全部".into()],
+            next_cursor: None,
+            source: "test".into(),
+        };
+        let key = "theme-cache-test|huanxiang|1|30|recommend";
+        store_theme_page(key, &page("玄幻"));
+        let hit = cached_theme_page(key).expect("刚存进去的题材页应命中");
+        assert_eq!(hit.items[0].title, "玄幻");
+        assert!(cached_theme_page("theme-cache-test|huanxiang|2|30|recommend").is_none());
+        assert!(cached_theme_page("comic|huanxiang|1|30|recommend").is_none());
+    }
+
+    /// 卡片标题绝不能变成题材标签。
+    ///
+    /// 锁住"分类里出现了视频标题名称"：站点同一部剧在 img alt 与标题元素里的
+    /// 空格并不一致（实测 alt 中间多一个 U+3000 全角空格），而旧实现用精确比较
+    /// 剔除标题——漏判一次，剧名就被当成题材收下，并跟着"只增不减"的题材词表
+    /// 永久留在分类栏里。
+    #[test]
+    fn card_title_never_becomes_category_tag() {
+        let html = r#"<html><body>
+        <a href="/detail?series_id=7673888102712101950" class="pc-card-DQXf3W">
+          <div class="pc-img-container-lewSpn">
+            <img class="image-PWlIcn" src="https://p3.example.com/a.image" alt="你让我当牛马我在荒岛　成王第一季"/>
+          </div>
+          <p class="pc-title-l_s3n8 m-title-F3bkRB">你让我当牛马我在荒岛成王第一季</p>
+          <div class="pc-tags-fSDXii"><span>脑洞</span><span>异能</span></div>
+        </a>
+        <a href="/detail?series_id=111" class="pc-card-DQXf3W">
+          <div class="pc-img-container-lewSpn">
+            <img class="image-PWlIcn" src="https://p3.example.com/b.image" alt="破库房的秘密"/>
+          </div>
+          <p class="pc-title-l_s3n8 m-title-F3bkRB">破库房的秘密</p>
+          <div class="pc-tags-fSDXii"><span>剧情</span><span>逆袭</span><span>年代</span></div>
+        </a>
+        </body></html>"#;
+        let cards = parse_catalog_cards(html, "comic");
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].title, "你让我当牛马我在荒岛成王第一季");
+        assert_eq!(cards[0].tags, vec!["脑洞", "异能"]);
+        assert_eq!(cards[1].tags, vec!["剧情", "逆袭", "年代"]);
+    }
+
+    /// 带标点的剧名（站点上真实存在，如"栀栀复栀栀！太子爷非她不可第七季"）
+    /// 同样不能当题材——真题材词不带标点。
+    #[test]
+    fn punctuated_title_is_not_a_category_tag() {
+        let html = r#"<html><body>
+        <a href="/detail?series_id=222">
+          <img src="https://p3.example.com/c.image" alt="栀栀复栀栀！太子爷非她不可第七季"/>
+          <p class="pc-title-l_s3n8">栀栀复栀栀！太子爷非她不可第七季</p>
+          <span>豪门</span><span>甜宠</span>
+        </a>
+        </body></html>"#;
+        let cards = parse_catalog_cards(html, "drama");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].tags, vec!["豪门", "甜宠"]);
+    }
+
+    /// 联网回归：真实页面里的卡片标题不能变成题材标签。
+    ///
+    /// 漫剧第 10 页实测就有 alt 与标题空格不一致的卡片（"你让我当牛马我在荒岛
+    /// 成王第一季"），它曾把整条剧名塞进题材栏并永久留在那里。默认忽略：
+    ///   cargo test --bins -- --ignored --nocapture catalog_tags_live
+    #[tokio::test]
+    #[ignore = "需要联网，手动运行"]
+    async fn catalog_tags_live() {
+        let provider = DramaProvider::new().expect("provider");
+        let filter = CatalogFilter {
+            channel: "comic".to_string(),
+            category: "全部".to_string(),
+            audience: "全部".to_string(),
+            sort: "recommend".to_string(),
+            keyword: None,
+            page: 10,
+            page_size: 30,
+            cursor: None,
+        };
+        let page = provider.catalog(&filter).await.expect("comic page 10");
+        assert!(!page.items.is_empty(), "漫剧第 10 页为空");
+        for item in &page.items {
+            for tag in &item.tags {
+                assert!(
+                    !tag.contains("成王") && !tag.contains("破库房"),
+                    "标题混进了题材标签：{tag:?}（来自《{}》）",
+                    item.title
+                );
+            }
+        }
+        println!(
+            "漫剧第 10 页 {} 条，首条标签：{:?}",
+            page.items.len(),
+            page.items.first().map(|item| &item.tags)
+        );
     }
 
     /// 漫剧现在走完整目录 `/category/comic-drama`，不再是只有 5 页的热播榜。
@@ -1506,12 +1731,14 @@ mod tests {
             page_size: 30,
             cursor: None,
         };
+        let cold_start = std::time::Instant::now();
         let first = provider.catalog(&filter(1)).await.expect("theme page 1");
         println!(
-            "题材「都市」第 1 页: {} 条 has_more={} source={:?}",
+            "题材「都市」第 1 页: {} 条 has_more={} source={:?}（首次，耗时 {:?}）",
             first.items.len(),
             first.has_more,
-            first.source
+            first.source,
+            cold_start.elapsed()
         );
         assert!(
             first.items.len() >= 20,
@@ -1533,6 +1760,24 @@ mod tests {
             first.categories.len() >= 20,
             "题材词表不完整: {}",
             first.categories.len()
+        );
+
+        // 题材页缓存实测：同一题材连点两次（"点回上一个题材看看"是最普通的
+        // 操作），第二次必须走缓存——它决定了来回比较几个题材是否秒切。
+        let warm_start = std::time::Instant::now();
+        let again = provider
+            .catalog(&filter(1))
+            .await
+            .expect("theme page 1 (cached)");
+        println!(
+            "题材「都市」第 1 页（第二次，命中缓存）: {} 条，耗时 {:?}",
+            again.items.len(),
+            warm_start.elapsed()
+        );
+        assert_eq!(
+            again.items.len(),
+            first.items.len(),
+            "缓存返回的条目数应与首次一致"
         );
 
         let second = provider.catalog(&filter(2)).await.expect("theme page 2");

@@ -924,7 +924,11 @@ def search_cmd(keyword: str, device_id: str, install_id: str, aid: int) -> dict:
                 if not isinstance(sub, dict):
                     continue
                 name = str(sub.get("content") or "").strip()
-                if name and not name.startswith("第") and "热度" not in name:
+                # 剧名本身也会出现在 sub_title_list 里。把它当题材收下，卡片
+                # 角标就会拿剧名当分类显示（"分类里出现了视频标题名称"）。
+                # 标题不是题材，按与 title 相等直接剔除。
+                if (name and name != title
+                        and not name.startswith("第") and "热度" not in name):
                     tags.append(name)
             # 实测大多数联想条目的 video_data.cover 直接为空——只有"首位主条目"
             # 带签名封面。空封面又没有集数的条目是纯联想（用户点进去什么都没有，

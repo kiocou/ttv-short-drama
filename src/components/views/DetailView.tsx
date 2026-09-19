@@ -7,6 +7,7 @@ import { ipcService } from '../../services/ipc';
 import { SeriesDetail, EpisodeItem } from '../../types/series';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
+import { CoverImage } from '../common/CoverImage';
 import { StatusBadge } from '../common/StatusBadge';
 import { 
   Play, 
@@ -194,11 +195,16 @@ export const DetailView: React.FC = () => {
         {/* Hero 主展示区：3:4 核心海报 (带 GPU 硬件加速缩放就位动效) + 详细资料与操作区 */}
         <div className="flex flex-col md:flex-row gap-7 items-start">
           {/* 核心海报：3:4 比例，带 animate-fluent-hero-poster 硬件加速平滑入场 */}
-          <div className="w-44 sm:w-52 aspect-[3/4] rounded-2xl overflow-hidden shadow-fluent-hud border-2 border-white flex-shrink-0 bg-white animate-fluent-hero-poster transition-transform duration-300 hover:scale-[1.02]">
-            <img
+          <div className="relative w-44 sm:w-52 aspect-[3/4] rounded-2xl overflow-hidden shadow-fluent-hud border-2 border-white flex-shrink-0 bg-white animate-fluent-hero-poster transition-transform duration-300 hover:scale-[1.02]">
+            {/* 这里是封面缺失最刺眼的位置：源站脏数据（实测有指向已 404 的第三方
+                图床）会让整块海报变成白框，而列表卡片当时已经有首字兜底。 */}
+            <CoverImage
               src={detail.cover}
-              alt={detail.title}
-              className="w-full h-full object-cover"
+              title={detail.title}
+              fallbackChar="影"
+              placeholderTextClassName="text-5xl"
+              loading="eager"
+              fetchPriority="high"
             />
           </div>
 

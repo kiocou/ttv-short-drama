@@ -70,7 +70,9 @@ src/
 │   ├── ipc.ts        唯一后端入口 + sessionId 分配 + 详情缓存 + localStorage 降级
 │   ├── mockData.ts   Web/演示模式的高保真数据源
 │   ├── hlsAttach.ts  m3u8 挂载与 hls.js 生命周期
-│   └── windowFx.ts   原生全屏唯一入口
+│   ├── windowFx.ts   原生全屏唯一入口
+│   └── pip.ts        画中画小窗交接协议（窗口标签判定 / 交接包 / 进度回传）
+│   └── updater.ts     检查更新（GitHub Releases，走 Rust 不走 CSP）
 ├── stores/       Context 状态机：app / catalog / playback / history / favorites / settings
 ├── components/   layout · common · player · views
 └── styles/       mica.css · crystal.css（玻璃材质与动效）
@@ -93,6 +95,8 @@ src/
 | `dmghg_bridge.rs` | 驱动厂商 `electron_bridge.dll`（JSON RPC），目录/详情/播放地址/清晰度档位 |
 | `hls_proxy.rs` | 本地 HLS 代理（127.0.0.1，带访问令牌，分块流式转发） |
 | `storage.rs` | SQLite：历史、收藏、设置 |
+| `pip.rs` | 画中画小窗（label: `mini`）：置顶无边框窗口创建/复用、交接包与进度回传、关闭回报 |
+| `update.rs` | 客户端更新：查 GitHub Releases、下载安装包到下载目录、定位文件（不自动安装） |
 | `models.rs` | 跨 IPC 的 serde 契约 |
 
 单元测试写在各自 `.rs` 底部的 `#[cfg(test)] mod tests`；需要真机/联网的冒烟测试标 `#[ignore]`（如 `dmghg_smoke`），默认不跑。
@@ -113,6 +117,10 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 10. **HEVC 依赖 WebView2 `PlatformHEVCDecoderSupport`**。不要加回 `--disable-gpu-compositing`：它会让全部渲染退回软件光栅（界面有 30 处 `backdrop-blur`）并让平台 HEVC 硬解失效，直接导致"该媒体无法由 WebView 解码"。
 11. **整集解析是单飞（leader/follower）**。预取与前台换集可能同时打同一集，只有 leader 跑 worker，follower 等产物。按 mtime 清理缓存时**不能删除很新的 `.part.mp4` / `.source.tmp`**，那是并发 worker 正在写的半成品。
 12. 前端错误文案**不泄露**内部 URL、令牌、文件路径；`external_player_open` 只接受 `https://` 且不得把用户输入直接当命令行参数。
+13. **画中画小窗是第二块 `<video>`，但播放权同一时刻只属于一个窗口**（小窗 = 独立置顶窗口 `mini`，见 `src-tauri/src/pip.rs` + `src/services/pip.ts`）。交接时主窗口先 `pause()` 再离开播放器视图（`stopPlayback` 作废会话 + 落盘）；主窗口要自己起播时先 `dismissPip()` 收掉小窗。交接包里传的是**身份 + 播放参数**（seriesId / episodeId / 秒数 / 音量 / 静音 / 倍速 / 连播设置 / 集列表），**不传播放地址**——动漫链路主窗口挂的是 hls.js 的 MSE `blob:`（跨窗口不可用），所以小窗自己按同一条 IPC 命令重新解析。另：两个窗口各自持有一份前端会话号计数（都从 100 起），靠"播放权唯一"避开撞号；若将来允许两路同时播，必须把会话号收口到后端。
+    （补充：创建小窗的 `pip_open` **必须是 `async` 命令** —— 同步命令跑在主线程上，而 `WebviewWindowBuilder::build()` 在主线程里要内联建窗口、又需要事件循环继续泵消息，两边互等会让这次 IPC 永不返回、小窗停在 `about:blank`。小窗起播还必须容忍 WebView2 的省电暂停：小窗刚创建时还没有前台激活权限，首次 `play()` 几乎必定抛 `AbortError`，而小窗的常态就是“别的窗口在前台”，所以要靠“播放意图 + 周期重试”自己接上，不能只挂 `focus`/`visibilitychange`。）
+    （补充二：**停播必须自己动手，不能指望"窗口没了声音就停"**。窗口 `hide()` 之后音频照旧在播（Chromium 标准行为），而页面的 `document.visibilityState` 仍是 `visible` —— 前端根本发现不了自己被藏起来，"声音停掉"曾完全依赖销毁 webview，而 `destroy()` 是异步投递且可能失败。因此 `pip.rs` 里停播、隐藏、销毁是**三步分开的**：先注入停播脚本（`pause()` + 清 `src` + `load()`）→ 再 `hide()` → 留 150ms 排空 → 最后销毁；销毁失败退化为 `close()` 并写 stderr，不得静默吞错。系统关闭路径（Alt+F4）同样要在 **`CloseRequested`** 里补停播，`Destroyed` 是事后的、什么都来不及。另：那 150ms 内窗口可能被 `pip_open` 重新 `show()` 复用，销毁前必须先看可见性，否则会出现"点了画中画、小窗闪一下就没"。）
+    （补充三：**「检查更新」的网络请求放在 Rust 侧**（`update.rs`），不走前端 `fetch`——前端 CSP 收得很紧且**只在生产构建注入**，页面里试通、打包后才挂是这类功能的经典翻车方式。另外：仓库是私有时 GitHub 的 `/releases/latest` 对未认证请求返回 **404**（而不是 403，避免泄露私有资源是否存在），这条要写成可读的提示，不要笼统一句「检查更新失败」。下载完成后**只定位文件、不得自动安装**。）
 
 ## 6. 文档与现实存在偏差（重要）
 

@@ -4,14 +4,17 @@ mod anime_provider;
 mod dmghg_bridge;
 mod hls_proxy;
 mod models;
+mod pip;
 mod provider;
 mod short_drama_app;
 mod storage;
+mod update;
 
 use crate::models::{
     CacheClearResult, CatalogFilter, CatalogPage, FavoriteItem, PlaybackOpenInput, PlaybackSession,
     PlaybackSnapshot, PlaybackUiState, SeriesDetail, SeriesItem, UserSettings, WatchHistoryItem,
 };
+use crate::pip::{pip_close, pip_dismiss, pip_handoff, pip_is_open, pip_open, pip_report};
 use crate::provider::DramaProvider;
 use crate::short_drama_app::{
     short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
@@ -20,6 +23,7 @@ use crate::short_drama_app::{
     short_drama_app_stream,
 };
 use crate::storage::Database;
+use crate::update::{app_version, update_check, update_download, update_reveal};
 use std::collections::HashMap;
 use std::fs;
 use std::os::windows::process::CommandExt;
@@ -36,46 +40,93 @@ struct AppState {
     cache_dir: PathBuf,
 }
 
-#[tauri::command]
-async fn catalog_list(
-    app: tauri::AppHandle,
-    filter: CatalogFilter,
-    state: State<'_, AppState>,
-) -> Result<CatalogPage, String> {
-    let keyword = filter
+/// 目录首屏返回后，后台预热两个频道的官方题材路由。
+///
+/// 点题材此前要先抓一次 `/category/{segment}` 才能把题材名换成子路由 slug，
+/// 那一次往返就压在用户的点击路径上（实测首次点题材要等一秒上下）。这里在
+/// 用户还在浏览目录时就抓好，点击时只剩题材页本身一次往返。
+///
+/// 只在第 1 页触发：翻页会反复调用 `catalog_list`，而预热只需要一次。
+/// 命中缓存时这里就是一次内存查表，无网络开销。
+fn warm_theme_routes(app: &tauri::AppHandle, page: u32) {
+    if page > 1 {
+        return;
+    }
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = handle.state::<AppState>();
+        for channel in ["drama", "comic"] {
+            let _ = state.provider.theme_routes(channel).await;
+        }
+    });
+}
+
+/// 从筛选器里取出非空关键词。
+fn keyword_of(filter: &CatalogFilter) -> Option<String> {
+    filter
         .keyword
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    // 动漫专区走独立数据源（暴风资源），不与短剧目录共享链路。
-    if filter.channel == "anime" {
-        return state.anime_provider.catalog(&filter).await;
+        .map(str::to_owned)
+}
+
+fn suggestion_to_item(
+    suggestion: crate::short_drama_app::SearchSuggestion,
+    channel: &str,
+) -> SeriesItem {
+    SeriesItem {
+        id: suggestion.id,
+        title: suggestion.title,
+        cover: suggestion.cover,
+        item_type: channel.to_owned(),
+        episodes_count: suggestion.episode_count,
+        latest_episode_title: None,
+        tags: suggestion.tags,
+        origin: "红果 App 联想".into(),
+        brief: None,
     }
-    let Some(keyword) = keyword else {
-        return state.provider.catalog(&filter).await;
-    };
-    // 三个来源并发：红果网页搜索（结构化、带集数与题材）+ App 联想（分季齐全）
-    // + 动漫共和国 dmghg（anime 频道的正式源）。串行会让搜索凭空多等一次往返，
-    // 而三者互不依赖。
-    //
-    // 为什么在后端合并：搜索页此前只搜红果（channel 硬编码 drama），动漫共和国
-    // 的视频永远搜不到。dmghg 搜索失败只静默跳过——它是补充来源，不该让
-    // 红果结果陪葬。
+}
+
+/// 多源搜索的合并链：红果网页（结构化、带集数与题材）+ 动漫源，外加可选的
+/// App 联想（补齐分季条目）。
+///
+/// 三个来源并发：串行会让搜索凭空多等一次往返，而三者互不依赖。
+///
+/// 为什么在后端合并：搜索页此前只搜红果（channel 硬编码 drama），动漫共和国
+/// 的视频永远搜不到。动漫源失败只静默跳过——它是补充来源，不该让红果结果陪葬。
+///
+/// `with_suggestions` 为什么是个开关：联想要冷启动一个 Python 进程（实测端到端
+/// 0.6-1.9s），而它只是补充。开着它，网页结果 0.3s 就绪也要在 join! 里陪等到
+/// 1s 以后——这正是"搜索慢"的主因。快速首屏传 false，联想由前端随后单独补齐。
+async fn merge_search_sources(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    filter: &CatalogFilter,
+    keyword: &str,
+    with_suggestions: bool,
+) -> Result<CatalogPage, String> {
     let comic = filter.channel == "comic";
     let dmghg_filter = CatalogFilter {
-        keyword: Some(keyword.clone()),
+        keyword: Some(keyword.to_owned()),
         channel: "anime".into(),
         category: "全部".into(),
         ..filter.clone()
     };
-    let (web, suggestions, anime) = tokio::join!(
-        state.provider.catalog(&filter),
-        crate::short_drama_app::search_suggest(&app, &keyword, comic),
-        async { state.anime_provider.catalog(&dmghg_filter).await },
-    );
+    let suggestions_fut = async {
+        if with_suggestions {
+            crate::short_drama_app::search_suggest(app, keyword, comic).await
+        } else {
+            Vec::new()
+        }
+    };
+    let (web, suggestions, anime) =
+        tokio::join!(state.provider.catalog(filter), suggestions_fut, async {
+            state.anime_provider.catalog(&dmghg_filter).await
+        },);
     let mut page = web?;
-    // 动漫结果排在 App 联想之后：主关键词命中优先，动漫是补充来源。
+    // 追加顺序 = 网页结果 → 动漫源 → App 联想：主关键词命中优先，动漫是补充
+    // 来源，而联想只用来补齐网页漏掉的分季条目，排在最后。
     let mut existing: std::collections::HashSet<String> =
         page.items.iter().map(|item| item.id.clone()).collect();
     let mut added = 0usize;
@@ -89,29 +140,78 @@ async fn catalog_list(
             added += 1;
         }
     }
-    if !suggestions.is_empty() {
-        for suggestion in suggestions {
-            let sid = suggestion.id.clone();
-            if existing.contains(&sid) {
-                continue;
-            }
-            page.items.push(SeriesItem {
-                id: suggestion.id,
-                title: suggestion.title,
-                cover: suggestion.cover,
-                item_type: filter.channel.clone(),
-                episodes_count: suggestion.episode_count,
-                latest_episode_title: None,
-                tags: suggestion.tags,
-                origin: "红果 App 联想".into(),
-                brief: None,
-            });
-            existing.insert(sid);
-            added += 1;
+    for suggestion in suggestions {
+        let sid = suggestion.id.clone();
+        if existing.contains(&sid) {
+            continue;
         }
+        page.items
+            .push(suggestion_to_item(suggestion, filter.channel.as_str()));
+        existing.insert(sid);
+        added += 1;
     }
     page.total += added;
     Ok(page)
+}
+
+#[tauri::command]
+async fn catalog_list(
+    app: tauri::AppHandle,
+    filter: CatalogFilter,
+    state: State<'_, AppState>,
+) -> Result<CatalogPage, String> {
+    // 动漫专区走独立数据源（暴风资源），不与短剧目录共享链路。
+    if filter.channel == "anime" {
+        return state.anime_provider.catalog(&filter).await;
+    }
+    let Some(keyword) = keyword_of(&filter) else {
+        warm_theme_routes(&app, filter.page);
+        return state.provider.catalog(&filter).await;
+    };
+    merge_search_sources(&app, &state, &filter, &keyword, true).await
+}
+
+/// 搜索的"快速首屏"入口：只跑两个结构化来源，不等 App 联想。
+///
+/// 联想只是补齐分季条目，首屏不该为它付出一次 Python 冷启动。前端先调这里
+/// 把主结果画出来，再调 `catalog_suggest` 把联想追加到尾部。
+#[tauri::command]
+async fn catalog_fast_search(
+    app: tauri::AppHandle,
+    filter: CatalogFilter,
+    state: State<'_, AppState>,
+) -> Result<CatalogPage, String> {
+    if filter.channel == "anime" {
+        return state.anime_provider.catalog(&filter).await;
+    }
+    let Some(keyword) = keyword_of(&filter) else {
+        return state.provider.catalog(&filter).await;
+    };
+    merge_search_sources(&app, &state, &filter, &keyword, false).await
+}
+
+/// 只跑 App 搜索联想，返回可直接追加到结果尾部的条目。
+///
+/// 单独成一个命令是为了让它脱离首屏的关键路径（原因见 `merge_search_sources`）。
+/// 失败返回空数组：它是锦上添花的补充来源，不该让整次搜索报错。
+#[tauri::command]
+async fn catalog_suggest(
+    app: tauri::AppHandle,
+    keyword: String,
+    channel: String,
+) -> Result<Vec<SeriesItem>, String> {
+    let keyword = keyword.trim().to_owned();
+    if keyword.is_empty() {
+        return Ok(Vec::new());
+    }
+    let comic = channel == "comic";
+    Ok(
+        crate::short_drama_app::search_suggest(&app, &keyword, comic)
+            .await
+            .into_iter()
+            .map(|suggestion| suggestion_to_item(suggestion, channel.as_str()))
+            .collect(),
+    )
 }
 
 /// 全站题材词表：题材栏的完整来源。
@@ -675,6 +775,20 @@ fn main() {
                 cache_dir,
             });
 
+            // 画中画小窗的交接状态：窗口按需创建，状态随进程存活。
+            app.manage(crate::pip::PipState::default());
+
+            // 主窗口关闭 = 退出应用：小窗是同进程里的另一个窗口，不跟着收掉就会
+            // 留下一个没有落点的悬浮窗（Tauri 要等最后一个窗口关闭才退出进程）。
+            if let Some(main_window) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                main_window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                        crate::pip::dismiss_on_main_close(&handle);
+                    }
+                });
+            }
+
             // 动漫专区 HLS 本地代理：随应用启动（幂等），m3u8/ts 全部经它转发。
             tauri::async_runtime::spawn(async {
                 match crate::hls_proxy::start().await {
@@ -702,6 +816,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             catalog_list,
+            catalog_fast_search,
+            catalog_suggest,
             catalog_categories,
             anime_qualities,
             series_detail,
@@ -730,6 +846,16 @@ fn main() {
             settings_get,
             settings_save,
             cache_clear,
+            pip_open,
+            pip_handoff,
+            pip_report,
+            pip_close,
+            pip_dismiss,
+            pip_is_open,
+            update_check,
+            update_download,
+            update_reveal,
+            app_version,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run TTV Short Drama");
