@@ -111,6 +111,20 @@ pub struct PlaybackSession {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_url: Option<String>,
+    /// 源流形态（**只有动漫链路填**）：
+    /// - `hls`：m3u8 播放列表，必须由 hls.js 挂到 MSE 上播放；
+    /// - `file`：整段可直连的媒体文件，直接交给 `<video src>`。
+    ///
+    /// 为什么必须由后端显式标出：动漫的每条地址都会被本地代理重写成
+    /// `http://127.0.0.1:port/stream?u=…`，前端 `isHlsUrl()` 里的
+    /// `url.includes('/stream?u=')` 因此**恒为 true**——整集 MP4 也会被塞给
+    /// hls.js（解析播放列表失败）。而 WebView2 的
+    /// `canPlayType('application/vnd.apple.mpegurl')` 返回 `"maybe"`，又让前端
+    /// 误以为"原生支持 HLS"，把 m3u8 直接喂给 `<video>`（实测 15 秒后
+    /// `videoWidth=0`、只有声音，20 秒后才可能出帧——即"有声无画黑屏"）。
+    /// 真值只在解析出地址的 Rust 侧可得，所以在改写地址之前判定并下发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

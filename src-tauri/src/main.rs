@@ -137,7 +137,10 @@ async fn anime_qualities(
     episode_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::VideoQualityOption>, String> {
-    state.anime_provider.qualities(&series_id, &episode_id).await
+    state
+        .anime_provider
+        .qualities(&series_id, &episode_id)
+        .await
 }
 
 #[tauri::command]
@@ -472,19 +475,35 @@ fn clear_directory(path: &Path) -> Result<u64, String> {
 /// 只有该位置不可写时才退回系统默认目录。
 fn app_storage_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let crate_root = exe.parent()?.parent()?; // target/debug -> target
-    let crate_dir = crate_root.parent()?; // target -> <crate>
-    let candidate = crate_dir.join(".app-data");
-    match std::fs::create_dir_all(&candidate) {
-        Ok(()) => Some(candidate),
-        Err(err) => {
-            eprintln!(
-                "[ttv] 无法在 {} 创建应用数据目录：{err}",
-                candidate.display()
-            );
-            None
+    let exe_dir = exe.parent()?;
+    // 只有 **cargo 构建产物**（<crate>/src-tauri/target/{debug,release}/）才把数据
+    // 放在项目内，方便开发期查看与清理。
+    //
+    // 旧实现无条件向上回退两级，注释假设 exe 位于 "<crate>/target/debug"，
+    // 但真实布局是 "<crate>/src-tauri/target/debug"，于是回退两级得到的是
+    // **src-tauri/target** 的父目录；而打包安装后 exe 位于安装目录，回退两级
+    // 会落到 %LOCALAPPDATA% 或 Program Files 的上一级，在那里凭空创建
+    // ".app-data"（实测落在 %APPDATA%\..\.app-data），SQLite、剧集缓存与
+    // WebView2 用户数据全部被塞进这个非标准位置。
+    // 现在：非 cargo 构建一律返回 None，由调用方回退到 Tauri 的 app_data_dir()。
+    let is_cargo_target = exe_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "debug" || name == "release")
+        && exe_dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "target");
+    if is_cargo_target {
+        if let Some(crate_dir) = exe_dir.parent().and_then(Path::parent) {
+            let candidate = crate_dir.join(".app-data");
+            if std::fs::create_dir_all(&candidate).is_ok() {
+                return Some(candidate);
+            }
         }
     }
+    None
 }
 
 /// 配置 WebView2 启动参数。
@@ -525,6 +544,92 @@ fn configure_webview_browser_arguments() {
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
 }
 
+/// 为当前进程申请"高性能 GPU"（Windows 图形首选项）。
+///
+/// ## 为什么需要它
+///
+/// 本机是 **AMD Radeon 610M（核显）+ NVIDIA GeForce RTX 5060 Laptop** 的双显卡
+/// 笔记本，Windows 默认按省电策略把非游戏进程交给核显。而 **RTX 视频增强（VSR）
+/// 是 NVIDIA 驱动侧的功能**：进程跑在核显上时它根本不会被挂载，用户看到的就是
+/// "同一个驱动设置，这个播放器不生效、别的播放器生效"。
+///
+/// 这条链路在 0.2.5 随补帧一起被删掉过，后果很隐蔽：开发态（exe 在
+/// `target/debug`）因为注册表里**留有旧条目**照常走独显，而打包安装后的 exe
+/// （`%LOCALAPPDATA%\TTV Short Drama`）**没有任何首选项**——于是"开发时能用、
+/// 装完就没了"。实测本机注册表里只有 debug 那一条：
+///
+/// ```text
+/// D:\...\src-tauri\target\debug\ttv-short-drama.exe = GpuPreference=2;
+/// ```
+///
+/// ## 边界
+///
+/// - 只写 `HKCU`（当前用户），不需要管理员权限；幂等，值相同则不重复写。
+/// - 失败一律静默：首选项缺失只影响画质增强，不该让应用起不来。
+/// - 首选项在**进程启动时**读取，写入后需要重启应用才生效；这里只在真正需要
+///   改动的首次运行写一次，并在日志里说明。
+#[cfg(windows)]
+fn apply_windows_gpu_preference() {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+    };
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_text) = exe.to_str() else {
+        return;
+    };
+    // 值与值名都必须是 NUL 结尾的 UTF-16。
+    let exe_name: Vec<u16> = exe_text.encode_utf16().chain(std::iter::once(0)).collect();
+    let sub_key: Vec<u16> = "Software\\Microsoft\\DirectX\\UserGpuPreferences"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // GpuPreference=2 = "高性能"（独显）。
+    let value: Vec<u16> = "GpuPreference=2;"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut key: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+        let status = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            sub_key.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        );
+        if status != 0 {
+            eprintln!("[ttv] 图形首选项：打开注册表键失败（{status}），跳过");
+            return;
+        }
+        let bytes = std::slice::from_raw_parts(value.as_ptr() as *const u8, value.len() * 2);
+        let status = RegSetValueExW(
+            key,
+            exe_name.as_ptr(),
+            0,
+            REG_SZ,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        );
+        let _ = RegCloseKey(key);
+        if status == 0 {
+            eprintln!("[ttv] 图形首选项：已为当前 exe 申请高性能 GPU（RTX 视频增强依赖独显，下次启动生效）");
+        } else {
+            eprintln!("[ttv] 图形首选项：写入失败（{status}），跳过");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_windows_gpu_preference() {}
+
 fn main() {
     // 历史背景：系统盘写满时，WebView2 写不了 GPU/着色器缓存 → 合成管线初始化失败
     // → 窗口内容区整片纯黑。当时用 `--disable-gpu-compositing` 兜底，但那会让全部
@@ -545,6 +650,8 @@ fn main() {
     // 本机已安装 Microsoft.HEVCVideoExtension，打开这个特性开关即可复用系统解码器，
     // 无需把每集转码成 H.264（转码会耗时 20s+/集、体积膨胀约 2.5 倍）。
     configure_webview_browser_arguments();
+    // 让本进程走独显：RTX 视频增强（VSR）只在 NVIDIA 显卡渲染的视频上生效。
+    apply_windows_gpu_preference();
 
     tauri::Builder::default()
         .setup(|app| {

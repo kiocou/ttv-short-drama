@@ -236,6 +236,7 @@ impl AnimeProvider {
             // （Range 探测间歇性 SSL EOF / ERR_CONNECTION_CLOSED，WebView2 播放
             // 时直接失败）。所以**一律走本地代理**：解决 CSP、CORS、TLS 抖动与
             // 分片重写（代理对 Range 的透传已在 hls_proxy 中实现）。
+            let stream_kind = classify_stream(&url);
             let url = crate::hls_proxy::proxied_url(&url).unwrap_or(url);
             return Ok(PlaybackSession {
                 session_id,
@@ -245,6 +246,7 @@ impl AnimeProvider {
                 quality: "auto".into(),
                 url,
                 backup_url: None,
+                stream_kind: Some(stream_kind.to_string()),
             });
         }
         // 播放地址在详情接口的 vod_play_url 里：`第1集$https://...m3u8#第2集$https://...`
@@ -281,6 +283,7 @@ impl AnimeProvider {
         let url = direct
             .or(backup)
             .ok_or_else(|| "该集没有可用的播放地址。".to_string())?;
+        let stream_kind = classify_stream(&url);
         // m3u8 由本地 HLS 代理转发，绕过 WebView2 原生不支持 m3u8 的限制。
         let proxied = crate::hls_proxy::proxied_url(&url).unwrap_or(url);
         Ok(PlaybackSession {
@@ -291,7 +294,24 @@ impl AnimeProvider {
             quality: "auto".into(),
             url: proxied,
             backup_url: None,
+            stream_kind: Some(stream_kind.to_string()),
         })
+    }
+}
+
+/// 判定一条动漫源地址的形态：返回 `"hls"`（m3u8 播放列表）或 `"file"`（整段媒体文件）。
+///
+/// 必须在 `hls_proxy::proxied_url` **之前**调用——代理会把任何地址都改写为
+/// `/stream?u=…`，之后从外观上再也分不出它是播放列表还是 MP4。前端据此决定
+/// 用 hls.js 挂 MSE 还是直接把地址交给 `<video>`，两者错配就是"黑屏有声"或
+/// "解析失败"。（实测这批源里两种都存在：preview.ndcsk.com 的整集 MP4 与
+/// img.nxjunyu.asia 的 m3u8 会在同一部剧的不同集之间来回切。）
+fn classify_stream(url: &str) -> &'static str {
+    let lower = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if lower.ends_with(".m3u8") || lower.ends_with(".m3u") {
+        "hls"
+    } else {
+        "file"
     }
 }
 

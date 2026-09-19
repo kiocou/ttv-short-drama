@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useHistoryStore } from '../../stores/useHistoryStore';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
@@ -34,6 +35,7 @@ function formatRelativeTime(timestamp: number): string {
 export const HistoryView: React.FC = () => {
   const { records, loadHistory, removeRecord, clearHistory } = useHistoryStore();
   const { openEpisode } = usePlaybackStore();
+  const { open: openAnimeEpisode } = useAnimePlayer();
   const { currentView, navigateTo, showToast } = useAppStore();
 
   const [showClearConfirm, setShowClearConfirm] = useState(false);
@@ -51,7 +53,13 @@ export const HistoryView: React.FC = () => {
     if (currentView === 'history') void loadHistory();
   }, [currentView, loadHistory]);
 
-  const handleResume = (seriesId: string, episodeId: string, position: number) => {
+  const handleResume = (seriesId: string, episodeId: string, position: number, channel?: string | null) => {
+    // 动漫走独立播放器：dmghg 的 id 带 `dmghg:` 前缀，而暴风兜底源的是纯数字 id，
+    // 所以前缀与 channel 两个判据都要看（历史记录里 channel 已落库）。
+    if (channel === 'anime' || seriesId.startsWith('dmghg:')) {
+      void openAnimeEpisode(seriesId, episodeId, position);
+      return;
+    }
     navigateTo('player', seriesId);
     openEpisode(seriesId, episodeId, position);
   };
@@ -172,7 +180,7 @@ export const HistoryView: React.FC = () => {
               <div className="flex items-center gap-4 min-w-0">
                 {/* 封面缩略图 */}
                 <div
-                  onClick={() => handleResume(item.seriesId, item.episodeId, item.positionSeconds)}
+                  onClick={() => handleResume(item.seriesId, item.episodeId, item.positionSeconds, item.channel)}
                   className="relative w-16 h-22 rounded-xl overflow-hidden shadow-sm flex-shrink-0 cursor-pointer group-hover:scale-105 transition-transform duration-300"
                 >
                   <img
@@ -239,7 +247,7 @@ export const HistoryView: React.FC = () => {
                   variant="primary"
                   size="sm"
                   icon={<Play className="w-3 h-3 fill-current" />}
-                  onClick={() => handleResume(item.seriesId, item.episodeId, item.positionSeconds)}
+                  onClick={() => handleResume(item.seriesId, item.episodeId, item.positionSeconds, item.channel)}
                   className="shadow-sm"
                 >
                   继续播放
