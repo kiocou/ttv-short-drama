@@ -41,8 +41,25 @@ Windows 批处理脚本（本机环境专用，含硬编码路径）：
 | `start-dev.bat` | `npm run dev -- --open` |
 | `build.bat` | 按绝对路径调 cargo，并把 `TEMP`/`TMP` 指向项目内 `.tmp` |
 | `start-dev-safe.bat` | C 盘满盘兜底：临时目录与 WebView2 user-data 全落项目盘，再拉起 exe |
+| `release.ps1` / `release.bat` | 一键发布：检查 → 构建 → 抽 CHANGELOG → 发 GitHub Release（见 §2.1） |
 
 **改完必须跑的验证**：`npx tsc --noEmit` + `cargo clippy ... -D warnings` + `cargo test --bins`。CI 就这三项加 `npm run build`（见 `.github/workflows/ci.yml`）。
+
+### 2.1 发布流程
+
+```powershell
+pwsh -NoProfile -File release.ps1              # 版本号取自 src-tauri/tauri.conf.json
+pwsh -NoProfile -File release.ps1 -SkipChecks  # 已单独跑过检查时
+pwsh -NoProfile -File release.ps1 -NoPublish   # 只构建，先本地验包
+```
+
+发布前先把 `CHANGELOG.md` 的 `## Unreleased` 改成 `## X.Y.Z - 日期`，并同步三处版本号
+（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json`）。脚本只校验"工作区干净"，
+不会替你改版本号。
+
+脚本固化了四个手工必踩的坑：cargo 的绝对路径与 `TEMP` 落项目盘、必须走 `npm run tauri build`
+（自动带 `custom-protocol`）、**MSI 约 106 MB 超过 GitHub Release 单文件 100 MB 上限所以只发
+NSIS 的 `*-setup.exe`**、release notes 直接取自 CHANGELOG 对应段落（手抄必与正文脱节）。
 
 ## 3. 前端结构
 
