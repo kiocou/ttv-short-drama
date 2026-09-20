@@ -121,6 +121,7 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
     （补充：创建小窗的 `pip_open` **必须是 `async` 命令** —— 同步命令跑在主线程上，而 `WebviewWindowBuilder::build()` 在主线程里要内联建窗口、又需要事件循环继续泵消息，两边互等会让这次 IPC 永不返回、小窗停在 `about:blank`。小窗起播还必须容忍 WebView2 的省电暂停：小窗刚创建时还没有前台激活权限，首次 `play()` 几乎必定抛 `AbortError`，而小窗的常态就是“别的窗口在前台”，所以要靠“播放意图 + 周期重试”自己接上，不能只挂 `focus`/`visibilitychange`。）
     （补充二：**停播必须自己动手，不能指望"窗口没了声音就停"**。窗口 `hide()` 之后音频照旧在播（Chromium 标准行为），而页面的 `document.visibilityState` 仍是 `visible` —— 前端根本发现不了自己被藏起来，"声音停掉"曾完全依赖销毁 webview，而 `destroy()` 是异步投递且可能失败。因此 `pip.rs` 里停播、隐藏、销毁是**三步分开的**：先注入停播脚本（`pause()` + 清 `src` + `load()`）→ 再 `hide()` → 留 150ms 排空 → 最后销毁；销毁失败退化为 `close()` 并写 stderr，不得静默吞错。系统关闭路径（Alt+F4）同样要在 **`CloseRequested`** 里补停播，`Destroyed` 是事后的、什么都来不及。另：那 150ms 内窗口可能被 `pip_open` 重新 `show()` 复用，销毁前必须先看可见性，否则会出现"点了画中画、小窗闪一下就没"。）
     （补充三：**「检查更新」的网络请求放在 Rust 侧**（`update.rs`），不走前端 `fetch`——前端 CSP 收得很紧且**只在生产构建注入**，页面里试通、打包后才挂是这类功能的经典翻车方式。另外：仓库是私有时 GitHub 的 `/releases/latest` 对未认证请求返回 **404**（而不是 403，避免泄露私有资源是否存在），这条要写成可读的提示，不要笼统一句「检查更新失败」。下载完成后**只定位文件、不得自动安装**。）
+    （补充四：**与 GitHub 相关的请求要自己挂系统代理**。reqwest 只认 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量，**不读 Windows 的「Internet 设置」**；而本机代理写在注册表里（实测 `127.0.0.1:10808`）。两者不一致会产生很迷惑的现象——`api.github.com` 直连能通（「检查更新」看起来正常），但资产下载域名 `objects.githubusercontent.com` 直连失败，只报一句 `error sending request`，而同一地址用 PowerShell 下载却有 4.88 MB/s。`update.rs` 的 `system_proxy()` 会读 `ProxyEnable`/`ProxyServer` 并挂到下载客户端上。）
 
 ## 6. 文档与现实存在偏差（重要）
 
