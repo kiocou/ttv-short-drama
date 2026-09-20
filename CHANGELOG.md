@@ -16,6 +16,7 @@
   已知边界：两个窗口各自持有一份前端会话号计数（都从 100 起），靠“播放权唯一”避开撞号（`playback_command` / `playback_snapshot` 前端并未使用）；若将来允许两路同时播，会话号需要收口到后端。
   **真实窗口内实测**（走同一套前端代码，经 WebView2 的 CDP 端口采集）：短剧/漫剧链路点「画中画」→ 小窗默认 420×236 贴在屏幕右下角，数秒内自动续播（`videoWidth=1920` / `paused=false`）；小窗自行连播第 5 → 第 9 集，关闭后历史正确落到"此刻真正在播的那一集"（第 9 集、13s），而不是交接时那一集；点「回到播放器」后主窗口接着同一集同一秒播（`101s`），且小窗里接下的静音被一并接回（`video.muted=true`、`volume=0`）；小窗开着时在主窗口点某一集，小窗被 `pip_dismiss` 收掉（`pip_is_open` 由 true 变 false），两路声音不会同时响；`WM_GETMINMAXINFO` 回报 `ptMinTrackSize = 396x222`（即逻辑最小尺寸 264×148 × 150% 缩放），缩放拖到临界值即止。
 - 修正「检查更新」把版本号显示成 `vv0.2.9`：GitHub 的 tag 本来就是 `v0.2.9`，前端又统一按 `v{版本}` 渲染了一次。现在在 Rust 侧把 tag 的 `v` 前缀归一化掉（发布标签的习惯不该泄漏到展示层）。
+- 修正「下载安装包」在本机开着系统代理时直接失败：reqwest **只认 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量，不读 Windows 的「Internet 设置」**，而本机代理是写在注册表里的 `127.0.0.1:10808`。这造成一个很迷惑的现场：`api.github.com` 直连能通（所以"检查更新"看起来一切正常），但资产下载域名 `objects.githubusercontent.com` 直连失败，只报一句 `error sending request`——**同一个地址用 PowerShell 下载却有 4.88 MB/s**。现在下载客户端会读 HKCU 的 `ProxyEnable` / `ProxyServer` 并挂上代理（`host:port` 与 `http=…;https=…` 两种写法都认），失败信息也带上 reqwest 的 source 链，不再只给一句笼统的提示。实测修复后完整下完 76.62 MB 的安装包，102 次进度事件、`percent` 从 0 递增到 100，文件正确落在系统下载目录。
 
 ### 优化
 

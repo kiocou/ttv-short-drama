@@ -43,6 +43,135 @@ const RELEASES_LATEST_API: &str =
     "https://api.github.com/repos/kiocou/ttv-short-drama/releases/latest";
 /// GitHub API 对没有 User-Agent 的请求直接返回 403。
 const USER_AGENT: &str = "TTV-Short-Drama-Updater";
+/// 读取 Windows「Internet 设置」里的系统代理，转成 reqwest 的 Proxy。
+///
+/// ## 为什么必须自己读
+///
+/// reqwest **只认 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量，不读注册表**；而 PowerShell、浏览器、
+/// 以及绝大多数下载工具走的都是系统代理。两者不一致就会得到很迷惑的现象：本机实测开着
+/// 本地代理 `127.0.0.1:10808` 时，`api.github.com` 的请求直连能通（所以"检查更新"看起来
+/// 正常），但 release 资产的下载域名 `objects.githubusercontent.com` 直连失败，报
+/// `error sending request`——**同一个地址用 PowerShell 下载却有 4.88 MB/s**。
+///
+/// 只给下载器补这一手，不动其他模块已有的 reqwest 行为（那些链路一直直连，且都是国内源）。
+///
+/// 返回 http / https 两个方向（配置里可能只写了一个）。
+#[cfg(not(windows))]
+fn system_proxy() -> Option<Vec<reqwest::Proxy>> {
+    None
+}
+#[cfg(windows)]
+fn system_proxy() -> Option<Vec<reqwest::Proxy>> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+        REG_SZ,
+    };
+
+    /// 读一个值；不存在或类型不符都返回 None（代理是可选配置，读不到就当没设）。
+    fn read_value(
+        key: windows_sys::Win32::System::Registry::HKEY,
+        name: &str,
+    ) -> Option<(u32, Vec<u8>)> {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut kind: u32 = 0;
+        let mut size: u32 = 0;
+        // 先探长度（传空指针），拿到后再分配。
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        if status != 0 || size == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; size as usize];
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                buffer.as_mut_ptr(),
+                &mut size,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        Some((kind, buffer))
+    }
+
+    let sub_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut key: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub_key.as_ptr(), 0, KEY_READ, &mut key) };
+    if status != 0 {
+        return None;
+    }
+
+    let enabled = read_value(key, "ProxyEnable")
+        .filter(|(kind, bytes)| *kind == REG_DWORD && bytes.len() >= 4)
+        .map(|(_, bytes)| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .unwrap_or(0)
+        != 0;
+
+    let server = read_value(key, "ProxyServer")
+        .filter(|(kind, _)| *kind == REG_SZ)
+        .map(|(_, bytes)| {
+            // REG_SZ 是 UTF-16LE，去掉结尾的 NUL。
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .take_while(|unit| *unit != 0)
+                .collect();
+            String::from_utf16_lossy(&units)
+        })
+        .unwrap_or_default();
+
+    unsafe { RegCloseKey(key) };
+
+    if !enabled {
+        return None;
+    }
+
+    // 两种写法都要认：`host:port` 与 `http=host:port;https=host:port`。
+    let pick = |scheme: &str| -> Option<String> {
+        server
+            .split(';')
+            .map(str::trim)
+            .find_map(|entry| match entry.split_once('=') {
+                Some((key, value)) if key.trim().eq_ignore_ascii_case(scheme) => {
+                    Some(value.trim().to_string())
+                }
+                None if !entry.is_empty() => Some(entry.to_string()),
+                _ => None,
+            })
+            .filter(|value| !value.is_empty())
+    };
+    let http = pick("http")?;
+    let https = pick("https").unwrap_or_else(|| http.clone());
+
+    // 代理地址非法时静默放弃，退回直连（检查更新仍能跑，只是可能失败时会如实报错）。
+    let mut proxies = Vec::new();
+    if let Ok(proxy) = reqwest::Proxy::http(format!("http://{http}")) {
+        proxies.push(proxy);
+    }
+    if let Ok(proxy) = reqwest::Proxy::https(format!("http://{https}")) {
+        proxies.push(proxy);
+    }
+    // 一个都没配上就不返回：避免调用方以为“已经挂了代理”而实际是空列表。
+    (!proxies.is_empty()).then_some(proxies)
+}
+
 /// 下载进度事件的名称（前端订阅它画进度条）。
 pub const EVENT_DOWNLOAD: &str = "update://download";
 
@@ -308,17 +437,34 @@ async fn download_to(app: &AppHandle, url: &str, target: &Path) -> Result<(), St
 
     // 下载不吃 client() 的 20 秒总超时：77 MB 的安装包在慢速网络下必然超。
     // 这里单独建一个只设连接超时的客户端。
-    let client = reqwest::Client::builder()
+    //
+    // 必须挂系统代理：reqwest 不读 Windows 的「Internet 设置」，而 release 资产的
+    // 下载域名在直连时可能根本连不上（见 system_proxy 的实测记录）。
+    let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        .connect_timeout(std::time::Duration::from_secs(10))
+        // 大文件下载：连接超时给宽一点，但不要设总超时。
+        .connect_timeout(std::time::Duration::from_secs(20));
+    if let Some(proxies) = system_proxy() {
+        for proxy in proxies {
+            builder = builder.proxy(proxy);
+        }
+    }
+    let client = builder
         .build()
         .map_err(|error| format!("无法创建下载客户端：{error}"))?;
 
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| format!("下载失败：{error}"))?;
+    let mut response = client.get(url).send().await.map_err(|error| {
+        // reqwest 的 Display 经常只有一句 `error sending request for url (...)`，
+        // 把 source 链一并带上，否则用户（和排查者）看不出是连不上、TLS 失败还是被重置。
+        let mut detail = error.to_string();
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            detail.push_str(" ← ");
+            detail.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        format!("下载失败：{detail}")
+    })?;
     if !response.status().is_success() {
         return Err(format!("下载失败：GitHub 返回 {}", response.status()));
     }
