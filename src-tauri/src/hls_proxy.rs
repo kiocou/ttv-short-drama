@@ -29,7 +29,9 @@ static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        // 转发的目标正是境外 CDN（含暴风的 `p.bvvvvvvvvv1f.com`），必须挂系统代理：
+        // 本地代理自己出不去网，等于把前端的问题原样搬到后端。
+        crate::update::with_system_proxy(reqwest::Client::builder())
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126 Safari/537.36")
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
@@ -39,7 +41,10 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
-/// 把远端 m3u8 地址包装成本地代理地址（已带访问令牌）。代理未启动时返回 None。
+/// 把远端媒体地址包装成本地代理地址（已带访问令牌）。代理未启动时返回 None。
+///
+/// 这个端点是**通用 http(s) 转发器**，不只服务 m3u8：非 m3u8 走二进制分支、透传上游
+/// `Content-Type`，所以 ts 分片、整段 MP4 与封面图都能从这里走。
 pub fn proxied_url(remote: &str) -> Option<String> {
     let port = *PROXY_PORT.get()?;
     let token = PROXY_TOKEN.get()?;
@@ -47,6 +52,41 @@ pub fn proxied_url(remote: &str) -> Option<String> {
     Some(format!(
         "http://127.0.0.1:{port}/stream?u={encoded}&t={token}"
     ))
+}
+
+/// 把远端封面地址包装成本地代理地址（与 m3u8 共用同一个 `/stream` 端点）。
+///
+/// **为什么封面也要过代理**：暴风的封面域名解析到境外 IP（实测 `img.bfzypic.com` →
+/// `193.148.95.x`，与播放域名 `p.bvvvvvvvvv1f.com` 同一批节点），WebView2 的 `<img>`
+/// 直连在部分网络下会超时，而代理挂上系统代理后就能出去——实测同一台机器上「浏览器
+/// 打得开、应用封面一张不剩」，差异只在走没走系统代理。
+///
+/// 空地址与代理未启动都返回 None，调用方保留原地址即可（行为与不改写完全一致）。
+pub fn proxied_image_url(remote: &str) -> Option<String> {
+    if remote.trim().is_empty() {
+        return None;
+    }
+    proxied_url(remote)
+}
+
+/// `proxied_image_url` 的逆操作：把本地代理地址还原成原始封面地址。
+///
+/// **落库前必须调用**：代理的端口与令牌每次进程启动都是随机的（`bind("127.0.0.1:0")`
+/// 与 `Uuid::new_v4()`），一旦把代理地址写进历史 / 收藏，下次启动就是一张死链
+/// （403 令牌无效），表现为「历史里的封面一夜之间全空」。所以库里永远存原始地址，
+/// 只有交给前端渲染的那一份才改写。
+///
+/// 不是本地代理地址时原样返回：红果等境内图床的封面从不改写，落库本就该保持原样。
+pub fn restore_image_url(proxied: &str) -> String {
+    let Some(port) = PROXY_PORT.get() else {
+        return proxied.to_string();
+    };
+    let prefix = format!("http://127.0.0.1:{port}/stream?");
+    let decoded = proxied
+        .strip_prefix(prefix.as_str())
+        .and_then(|rest| rest.split('&').find_map(|pair| pair.strip_prefix("u=")))
+        .and_then(decode_url);
+    decoded.unwrap_or_else(|| proxied.to_string())
 }
 
 /// 启动本地代理（幂等：已启动则直接返回端口）。
@@ -242,10 +282,19 @@ async fn handle(mut socket: tokio::net::TcpStream) {
     }
 
     // ts 分片等二进制：沿用上游的状态码与长度类头（含 Range/206 语义）。
+    // 缓存策略**优先沿用上游**：封面这类小图必须让浏览器缓存——列表卡片的封面会反复
+    // 进出视口，一律 no-store 会让每次滚动都整列重新拉取。ts 分片上游一般不给
+    // cache-control，回退 no-store，行为与之前完全一致。
+    let cache_control = response
+        .headers()
+        .get("cache-control")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("private, no-store");
     let mut head = format!(
-        "HTTP/1.1 {}\r\n{}Cache-Control: private, no-store\r\n",
+        "HTTP/1.1 {}\r\n{}Cache-Control: {}\r\n",
         response.status(),
-        cors_headers()
+        cors_headers(),
+        cache_control
     );
     for key in [
         "content-type",
@@ -384,6 +433,32 @@ fn absolutize(base: &str, url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 还原必须是改写的**逆操作**：代理端口与令牌每次进程启动都不同（`bind("127.0.0.1:0")`
+    /// 与 `Uuid::new_v4()`），把代理地址落进历史 / 收藏就等于存了一张下次启动必死的链
+    /// （403 令牌无效，表现为「历史里的封面一夜之间全空」）。
+    #[test]
+    fn restore_image_url_round_trips_through_proxy() {
+        tokio::runtime::Builder::new_current_thread()
+            // 必须显式开 IO driver：current_thread 默认不带，`TcpListener::bind` 会直接
+            // panic（实测报在 tokio 的 listener.rs，提示 there is no reactor running）。
+            .enable_io()
+            .build()
+            .expect("runtime")
+            .block_on(start())
+            .expect("本地代理应能启动");
+        let raw = "https://img.bfzypic.com/a.jpg";
+        let proxied = proxied_image_url(raw).expect("代理已启动应能改写");
+        assert_eq!(restore_image_url(&proxied), raw);
+    }
+
+    /// 还原对**非代理地址**必须恒等：红果等境内图床的封面从不改写，落库本就该保持原样。
+    /// 这条不依赖代理是否已启动（一旦启动就不再关闭），所以在任何执行顺序下都成立。
+    #[test]
+    fn restore_image_url_leaves_plain_urls_alone() {
+        let raw = "https://img.bfzypic.com/a.jpg?x=1";
+        assert_eq!(restore_image_url(raw), raw);
+    }
 
     #[test]
     fn absolutize_handles_protocol_relative_and_root_paths() {
