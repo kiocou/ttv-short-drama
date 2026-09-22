@@ -18,6 +18,17 @@ async function invokeBackend<T>(command: string, args?: Record<string, unknown>)
 
 let currentGlobalSessionId = 100;
 const channelBySeriesId = new Map<string, string>();
+
+/**
+ * 记住剧集来源。
+ *
+ * 只在**有值**时写入：channel 缺失不代表来源是短剧，无脑覆盖反而会把已知的
+ * `anime` 抹掉。来源判定的真正权威是 id 前缀（后端 `is_anime_id`，见
+ * `anime_provider::BFZY_ID_PREFIX`），这个 Map 只为兼容加前缀之前生成的旧裸数字 id。
+ */
+function rememberChannel(seriesId: string, channel?: string | null): void {
+  if (seriesId && channel) channelBySeriesId.set(seriesId, channel);
+}
 // 会话级详情缓存：同一部剧换集/切清晰度时跳过网络往返，直接复用详情。
 // 独立缓存不过期，重新打开应用自然刷新。
 const detailCache = new Map<string, SeriesDetail>();
@@ -314,7 +325,14 @@ export const ipcService = {
 
   history: {
     async list(): Promise<WatchHistoryItem[]> {
-      if (isTauriEnvironment()) return invokeBackend<WatchHistoryItem[]>('history_list');
+      if (isTauriEnvironment()) {
+        const items = await invokeBackend<WatchHistoryItem[]>('history_list');
+        // 回填来源映射：历史是**冷启动就能直达详情**的入口，而 channelBySeriesId 是
+        // 内存 Map（应用重载后为空）。不回填的话，从历史点进加前缀之前的旧动漫 id
+        // 会因 channel 缺失而被路由到红果链路（实测：标题是别人的、共 0 集全）。
+        items.forEach(item => rememberChannel(item.seriesId, item.channel));
+        return items;
+      }
       return loadStorage<WatchHistoryItem[]>(STORAGE_KEYS.HISTORY, INITIAL_WATCH_HISTORY);
     },
 
@@ -348,7 +366,10 @@ export const ipcService = {
   favorites: {
     async list(mark?: string): Promise<FavoriteItem[]> {
       if (isTauriEnvironment()) {
-        return invokeBackend<FavoriteItem[]>('favorites_list', { mark: mark ?? null });
+        const items = await invokeBackend<FavoriteItem[]>('favorites_list', { mark: mark ?? null });
+        // 同 history.list：收藏页也是冷启动直达详情的入口，必须回填来源映射。
+        items.forEach(item => rememberChannel(item.seriesId, item.channel));
+        return items;
       }
       const list = loadStorage<FavoriteItem[]>(STORAGE_KEYS.FAVORITES, []);
       return mark ? list.filter(item => item.mark === mark) : list;

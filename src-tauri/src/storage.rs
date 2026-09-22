@@ -65,7 +65,7 @@ impl Database {
                  FROM watch_history ORDER BY updated_at DESC LIMIT 80",
             )
             .map_err(|error| error.to_string())?;
-        let records = statement
+        let mut records = statement
             .query_map([], |row| {
                 Ok(WatchHistoryItem {
                     series_id: row.get(0)?,
@@ -85,6 +85,14 @@ impl Database {
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
+        // 渲染用改写：库里存的是可持久化的原始地址，交给前端的那一份才换成本地代理
+        // （境外图床直连会超时，见 `hls_proxy::proxied_image_url`）。写库前会还原，
+        // 所以库里永远不会留下代理地址。
+        for item in &mut records {
+            if let Some(proxied) = crate::hls_proxy::proxied_image_url(&item.series_cover) {
+                item.series_cover = proxied;
+            }
+        }
         Ok(records)
     }
 
@@ -132,7 +140,8 @@ impl Database {
                     item.series_id,
                     item.episode_id,
                     item.title,
-                    item.series_cover,
+                    // 落库前还原成原始地址：代理地址跨进程启动即失效，见 restore_image_url。
+                    crate::hls_proxy::restore_image_url(&item.series_cover),
                     item.episode_number,
                     item.total_episodes,
                     item.position_seconds.max(0.0),
@@ -231,7 +240,7 @@ impl Database {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())
         };
-        let records = match mark {
+        let mut records = match mark {
             Some(value) => {
                 let mut statement = connection
                     .prepare(
@@ -251,6 +260,12 @@ impl Database {
                 read_rows(&mut statement, &[])?
             }
         };
+        // 同 list_history：渲染用改写，库里存原始地址。
+        for item in &mut records {
+            if let Some(proxied) = crate::hls_proxy::proxied_image_url(&item.cover) {
+                item.cover = proxied;
+            }
+        }
         Ok(records)
     }
 
@@ -279,7 +294,8 @@ impl Database {
                 params![
                     item.series_id,
                     item.title,
-                    item.cover,
+                    // 同 save_history：落库前还原成原始地址。
+                    crate::hls_proxy::restore_image_url(&item.cover),
                     item.mark,
                     item.channel,
                     item.updated_at,

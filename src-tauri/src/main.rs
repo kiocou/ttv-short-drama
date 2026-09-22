@@ -251,10 +251,11 @@ async fn series_detail(
 ) -> Result<SeriesDetail, String> {
     // 动漫项按 id 前缀判定，而不是只看 channel：前端的 channelBySeriesId 是内存
     // Map，页面重载 / HMR 后为空（从收藏、历史进入时也不会填），此时 channel 缺失，
-    // `dmghg:` 开头的 id 会掉进普通短剧链路，被 provider 的数字 id 校验拒掉，
-    // 表现为「剧集 ID 无效。」。id 本身已经携带来源，用它判定最稳。
-    if channel.as_deref() == Some("anime") || series_id.starts_with(crate::dmghg_bridge::ID_PREFIX)
-    {
+    // 动漫 id 会掉进普通短剧链路——`dmghg:` 那种会被 provider 的数字 id 校验拒掉，
+    // 表现为「剧集 ID 无效。」；而暴风的裸数字 id 会**通过**校验，进而撞号查到红果
+    // 同 id 的剧，实测表现为「标题是别人的、共 0 集全、选集全空」（比直接报错更难查）。
+    // id 本身已经携带来源（`dmghg:` / `bfzy:`），用它判定最稳。
+    if channel.as_deref() == Some("anime") || crate::anime_provider::is_anime_id(&series_id) {
         return state.anime_provider.detail(&series_id).await;
     }
     state.provider.detail(&series_id, channel.as_deref()).await
@@ -267,7 +268,7 @@ async fn playback_open(
 ) -> Result<PlaybackSession, String> {
     // 动漫播放走动漫源直链（m3u8 与非 https 经本地 HLS 代理），不经红果 worker。
     // 同样按 id 前缀兜底：前端 isAnime 来自 detail.type，链条上任一环缺失就会漏判。
-    if input.is_anime || input.series_id.starts_with(crate::dmghg_bridge::ID_PREFIX) {
+    if input.is_anime || crate::anime_provider::is_anime_id(&input.series_id) {
         let session = state
             .anime_provider
             .open_episode(

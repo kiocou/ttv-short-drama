@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.10 - 2026-09-22
+
+### 修复
+
+- **没装「动漫共和国」客户端的机器上，动漫专区整体失效**：详情页只剩一个标题，徽章显示「共 0 集全」，选集格子全空。根因是**来源路由把暴风兜底源的剧集送进了红果链路**。暴风的 `vod_id` 与红果的 `series_id` 都是纯数字（`provider.rs` 的 `validate_numeric_id` 只校验数字），格式完全相同；而 `series_detail` / `playback_open` 的动漫判定是 `channel == "anime"` **或** id 以 `dmghg:` 开头——走正式源时 id 自带前缀、判定可靠，走暴风兜底时 id 是裸数字，判定就全押在前端 `channelBySeriesId` 这个**内存 Map** 上。这个 Map 在应用重载后是空的，从收藏 / 历史进入也不会填（那些入口只传 id）。于是暴风的数字 id **通过了**红果的 id 校验，撞号查到红果同 id 的一部剧，而那部剧的 `vid_list` 是空的——于是只剩标题、`episodes_count = 0`。开发机上一切正常，只是因为那台机器装着客户端、走的是带 `dmghg:` 前缀的正式源。
+  **判定依据**（一条很硬的证据）：详情页显示的是「共 0 集全」而不是「单集/已完结」——`DetailView` 只在 `detail.type !== 'anime'` 时才渲染前者，而动漫链路返回的 `item_type` 恒为 `anime`。显示前者就等于证明 `detail.type` 是 `drama`/`comic`，即数据来自红果链路。
+  修法是让 id 自己携带来源：暴风 id 统一带 `bfzy:` 前缀（与 `dmghg:` 对齐），`series_detail` / `playback_open` / `anime_qualities` 一并认这个前缀。路由从此不依赖任何易失状态，顺带解决 `merge_search_sources` 按 id 去重时红果与暴风撞号会静默丢掉一条的问题。另有两点配套：`detail` / `open_episode` / `qualities` 改为**按 id 前缀**分流、不再看 `use_dmghg()`——id 跨会话持久，而源可用性只在进程内算一次，历史里存着上次会话生成的 `dmghg:` id 时，按 `use_dmghg()` 会把它当暴风 id 去查（两套数字 id 互不相通），现在改为前缀指向的源不可用就如实报错，比静默串源好排查；历史 / 收藏加载时回填 `channelBySeriesId`，让加前缀之前生成的旧裸数字 id 仍能正确路由。
+- **动漫封面一张不剩**。暴风的封面域名 `img.bfzypic.com` 与播放域名 `p.bvvvvvvvvv1f.com` 实测都解析到 `193.148.95.x`（境外 IP），而 API 域名 `bfzyapi.com` 走 Cloudflare——所以列表能出标题，唯独封面全挂。同一台机器上浏览器打得开这些图、应用里 `<img>` 却超时，差异只在**走没走系统代理**。现在封面与 m3u8 共用同一个本地代理端点（`/stream` 本就是通用 http(s) 转发器，二进制分支透传上游 `Content-Type`），由挂了系统代理的 Rust 侧出网；封面请求同时改为不发 Referer（图床普遍按 Referer 做防盗链，而 WebView2 里 `<img>` 的 Referer 是应用自身地址，最容易被当盗链）。
+  实测：`img.bfzypic.com` 与 `p.bvvvvvvvvv1f.com` 的 A 记录同为 `193.148.95.186` 等，而 `bfzyapi.com` 为 `172.67.190.220` / `104.21.92.88`；封面 GET 返回 200（26755 字节、`image/jpeg`），三种 Referer（无 / `bfzyapi.com` / `127.0.0.1:5175`）均放行——即这张图本身可达，问题在网络出口而非防盗链（首次探测得 403 是因为误用了 HEAD 方法，不是防盗链）。
+
+- **封面走本地代理后，历史 / 收藏里的封面下次启动全挂**（本次改动自查发现的回归，未流出）。落历史时存的是 `currentSeries.cover`，而它已被改写成 `http://127.0.0.1:{port}/stream?u=…&t=…`——代理端口是 `bind("127.0.0.1:0")` 随机分配、令牌是 `Uuid::new_v4()`，**两者每次进程启动都不同**，于是写进库里的封面地址跨会话即死链（403 令牌无效），表现是「历史里的封面一夜之间全空」。现在收口在存储层做双向转换：**落库前 `restore_image_url` 还原成原始地址，读出后 `proxied_image_url` 才改写**，库里永远不会出现代理地址。补一条往返单测锁住「还原是改写的逆操作」——顺带踩到 `tokio::runtime::Builder::new_current_thread()` 默认**不带 IO driver**，`TcpListener::bind` 直接 panic，测试 runtime 必须显式 `.enable_io()`。
+
+### 优化
+
+- **业务侧 reqwest 统一挂系统代理**（动漫源、HLS 代理、红果抓取）。reqwest 只认 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量、**不读 Windows 的「Internet 设置」**，这个坑上次只在下载器上补了，理由是「其他链路都是国内源」——**该结论被上面的实测推翻**（暴风的封面 / 播放域名就是境外 IP）。顺带把转发器的缓存策略改为优先沿用上游 `cache-control`：封面这类小图必须让浏览器缓存（列表卡片的封面会反复进出视口），ts 分片上游一般不给 `cache-control`、回退 `no-store`，行为不变。
+  已知边界：若那台机器既直连不通境外 IP、又没配可用的系统代理，封面仍然加载不出来——本地代理无法凭空创造连通性，这种情况需要用户侧配好系统代理（Rust 侧现在会自动读取并使用）。
+
 ## 0.2.9 - 2026-09-19
 
 ### 新增

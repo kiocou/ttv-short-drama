@@ -53,7 +53,12 @@ const USER_AGENT: &str = "TTV-Short-Drama-Updater";
 /// 正常），但 release 资产的下载域名 `objects.githubusercontent.com` 直连失败，报
 /// `error sending request`——**同一个地址用 PowerShell 下载却有 4.88 MB/s**。
 ///
-/// 只给下载器补这一手，不动其他模块已有的 reqwest 行为（那些链路一直直连，且都是国内源）。
+/// 起初只给下载器补这一手，理由是「其他链路都是国内源」。**该结论 2026-09 被实测推翻**：
+/// 动漫兜底源（暴风）的封面域名 `img.bfzypic.com` 与播放域名 `p.bvvvvvvvvv1f.com` 都
+/// 解析到 `193.148.95.x`（境外 IP），只有 API 域名 `bfzyapi.com` 走 Cloudflare。现象极具
+/// 迷惑性：同一台机器上红果短剧正常、动漫列表也能出来（API 通），唯独封面一张不剩、
+/// 播放也起不来（境外 IP 直连超时）——差异全在「有没有走系统代理」。所以业务侧的
+/// reqwest 统一改走 `with_system_proxy`。
 ///
 /// 返回 http / https 两个方向（配置里可能只写了一个）。
 #[cfg(not(windows))]
@@ -170,6 +175,20 @@ fn system_proxy() -> Option<Vec<reqwest::Proxy>> {
     }
     // 一个都没配上就不返回：避免调用方以为“已经挂了代理”而实际是空列表。
     (!proxies.is_empty()).then_some(proxies)
+}
+
+/// 给任意 reqwest 客户端构造器挂上系统代理。
+///
+/// reqwest 只认 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量，**不读 Windows 的「Internet 设置」**，
+/// 所以「浏览器打得开、应用打不开」是这套网络栈的典型现象。没配代理时原样返回构造器，
+/// 行为与直连完全一致。
+pub(crate) fn with_system_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Some(proxies) = system_proxy() else {
+        return builder;
+    };
+    proxies
+        .into_iter()
+        .fold(builder, |builder, proxy| builder.proxy(proxy))
 }
 
 /// 下载进度事件的名称（前端订阅它画进度条）。

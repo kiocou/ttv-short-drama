@@ -21,13 +21,41 @@ use std::time::Duration;
 
 const BFZY_API: &str = "https://bfzyapi.com/api.php/provide/vod/";
 
+/// 暴风兜底源的剧集 id 前缀。
+///
+/// **必须加前缀**：暴风的 `vod_id` 与红果短剧的 `series_id` 都是纯数字，格式完全
+/// 相同（`provider.rs` 的 `validate_numeric_id` 也只校验数字），光看 id 分不出来源。
+/// 历史上暴风 id 裸奔时，来源判定押在前端 `channelBySeriesId` 这个内存 Map 上，
+/// 而它在**应用重载后、以及从收藏/历史进入时**必然为空（那些入口只传 id、不回填
+/// Map），于是暴风动漫的详情被送进红果链路去查：运气好报「详情页未找到剧集信息」，
+/// 运气不好撞上红果同 id 的剧，实测表现为「标题是别人的、共 0 集全、选集全空」。
+/// id 自带来源后，路由判定不再依赖任何易失状态。
+pub const BFZY_ID_PREFIX: &str = "bfzy:";
+
+/// 是否是动漫剧集 id（不分具体源）。给 `main.rs` 的命令路由用——
+/// 动漫与短剧的数字 id 会撞号，只有前缀是可信的来源标记。
+pub fn is_anime_id(series_id: &str) -> bool {
+    series_id.starts_with(crate::dmghg_bridge::ID_PREFIX) || series_id.starts_with(BFZY_ID_PREFIX)
+}
+
+/// 剥掉暴风前缀，得到可直接请求 API 的裸数字 id。
+///
+/// 裸数字**原样返回**：历史/收藏里存着加前缀之前生成的旧 id，它们只可能来自暴风
+/// （dmghg 的 id 一直有前缀），按暴风查是唯一正确的兼容行为。
+fn strip_bfzy_prefix(series_id: &str) -> &str {
+    series_id.strip_prefix(BFZY_ID_PREFIX).unwrap_or(series_id)
+}
+
 pub struct AnimeProvider {
     client: reqwest::Client,
 }
 
 impl AnimeProvider {
     pub fn new() -> Result<Self, String> {
-        let client = reqwest::Client::builder()
+        // 必须挂系统代理：暴风的封面/播放域名解析到境外 IP（实测 `img.bfzypic.com`、
+        // `p.bvvvvvvvvv1f.com` 都是 `193.148.95.x`），直连在部分网络下直接超时，而同一台
+        // 机器上浏览器却能打开——差异只在走没走系统代理（详见 update::system_proxy）。
+        let client = crate::update::with_system_proxy(reqwest::Client::builder())
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36")
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(20))
@@ -151,11 +179,15 @@ impl AnimeProvider {
     }
 
     pub async fn detail(&self, series_id: &str) -> Result<SeriesDetail, String> {
-        // 正式源优先：`series_id` 带 `dmghg:` 前缀时走 DLL 桥接。
-        if use_dmghg() {
+        // 按 **id 前缀**决定数据源，不能看 `use_dmghg()`：id 是持久的来源标记，跨会话
+        // 有效，而源可用性只在进程内算一次。历史/收藏里的 id 可能生成于上一次会话
+        // （那时 dmghg DLL 还可用），本次 DLL 不可用时若按 use_dmghg() 改走暴风，
+        // `dmghg:181655` 会被当暴风 id 去查——两套数字 id 互不相通，表现为
+        // 「详情为空/张冠李戴」。前缀指向的源不可用就如实报错，比静默串源好排查。
+        if series_id.starts_with(crate::dmghg_bridge::ID_PREFIX) {
             return crate::dmghg_bridge::detail_async(series_id.to_string()).await;
         }
-        let id: i64 = series_id
+        let id: i64 = strip_bfzy_prefix(series_id)
             .parse()
             .map_err(|_| "动漫剧集 id 非法。".to_string())?;
         let json = self.get_json(&format!("ac=detail&ids={id}")).await?;
@@ -167,7 +199,10 @@ impl AnimeProvider {
             .ok_or_else(|| "动漫详情未找到该剧集。".to_string())?;
 
         let title = str_field(&vod, &["vod_name"]).unwrap_or_else(|| "未命名动漫".into());
+        // 封面过本地代理：暴风封面域名是境外 IP，直连在部分网络下超时，详见
+        // `hls_proxy::proxied_image_url`。代理未启动时原样返回，行为不变。
         let cover = str_field(&vod, &["vod_pic"]).unwrap_or_default();
+        let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
         let tags = class_tags(&vod);
         let (episodes, episodes_count) = parse_episodes(&vod, series_id);
 
@@ -199,7 +234,8 @@ impl AnimeProvider {
         series_id: &str,
         episode_id: &str,
     ) -> Result<Vec<VideoQualityOption>, String> {
-        if use_dmghg() {
+        // 与 detail 同理，按 id 前缀分流，不看 use_dmghg()。
+        if series_id.starts_with(crate::dmghg_bridge::ID_PREFIX) {
             return crate::dmghg_bridge::qualities_async(
                 series_id.to_string(),
                 episode_id.to_string(),
@@ -218,8 +254,9 @@ impl AnimeProvider {
         position: f64,
         quality: &str,
     ) -> Result<PlaybackSession, String> {
-        // 正式源优先：dmghg 解析出真实地址后，按需过本地代理。
-        if use_dmghg() {
+        // 与 detail 同理，按 id 前缀分流，不看 use_dmghg()。dmghg 解析出真实地址后，
+        // 按需过本地代理。
+        if series_id.starts_with(crate::dmghg_bridge::ID_PREFIX) {
             let url = crate::dmghg_bridge::resolve_play_url_async(
                 series_id.to_string(),
                 episode_id.to_string(),
@@ -250,7 +287,7 @@ impl AnimeProvider {
             });
         }
         // 播放地址在详情接口的 vod_play_url 里：`第1集$https://...m3u8#第2集$https://...`
-        let id: i64 = series_id
+        let id: i64 = strip_bfzy_prefix(series_id)
             .parse()
             .map_err(|_| "动漫剧集 id 非法。".to_string())?;
         let json = self.get_json(&format!("ac=detail&ids={id}")).await?;
@@ -340,9 +377,15 @@ fn str_field(value: &Value, keys: &[&str]) -> Option<String> {
 }
 
 fn parse_series_item(vod: &Value) -> Option<SeriesItem> {
-    let id = vod.get("vod_id").and_then(Value::as_i64)?.to_string();
+    // id 一律带 `bfzy:` 前缀：裸数字与红果短剧撞号，见 BFZY_ID_PREFIX 的说明。
+    let id = format!(
+        "{BFZY_ID_PREFIX}{}",
+        vod.get("vod_id").and_then(Value::as_i64)?
+    );
     let title = str_field(vod, &["vod_name"])?;
+    // 同 detail：封面走本地代理，境外图床直连会超时。
     let cover = str_field(vod, &["vod_pic"]).unwrap_or_default();
+    let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
     let type_name = str_field(vod, &["type_name"]).unwrap_or_else(|| "动漫".into());
     let remarks = str_field(vod, &["vod_remarks"]).unwrap_or_default();
     // 集数从 remarks（"更新至第6集"/"第10集"）提取；"已完结"等无数字 remarks
@@ -436,4 +479,44 @@ fn strip_html(text: &str) -> String {
 /// "列表来自 dmghg、详情却落到暴风" 这种 id 串源的情况。
 fn use_dmghg() -> bool {
     crate::dmghg_bridge::preferred() && crate::dmghg_bridge::available()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 来源判定必须认全两种前缀，且**不能**认裸数字：裸数字与红果短剧撞号，一旦
+    /// `is_anime_id` 对裸数字返回 true，红果的短剧就会被反向送进动漫链路。
+    #[test]
+    fn anime_id_requires_source_prefix() {
+        assert!(is_anime_id("dmghg:181655"));
+        assert!(is_anime_id("bfzy:44871"));
+        assert!(!is_anime_id("44871"));
+        assert!(!is_anime_id(""));
+    }
+
+    /// 旧数据兼容：加前缀之前生成的裸数字 id 只可能来自暴风（dmghg 的 id 一直有前缀），
+    /// 剥前缀必须原样放行，否则历史 / 收藏里的旧条目会全部失效。
+    #[test]
+    fn strip_prefix_tolerates_bare_ids() {
+        assert_eq!(strip_bfzy_prefix("bfzy:44871"), "44871");
+        assert_eq!(strip_bfzy_prefix("44871"), "44871");
+        assert_eq!(strip_bfzy_prefix(""), "");
+    }
+
+    /// 列表项 id 必须自带来源前缀：这是整个路由修复的根。退回裸数字就等于退回
+    /// 「撞号查到红果同 id 的剧、只剩标题没有集数」那个 bug。
+    #[test]
+    fn series_item_id_carries_source_prefix() {
+        let item = parse_series_item(&serde_json::json!({
+            "vod_id": 44871,
+            "vod_name": "章鱼哥",
+            "vod_pic": "https://img.bfzypic.com/a.jpg",
+            "type_name": "动漫",
+            "vod_remarks": "更新至第6集",
+        }))
+        .expect("应解析出列表项");
+        assert_eq!(item.id, "bfzy:44871");
+        assert_eq!(item.episodes_count, 6);
+    }
 }

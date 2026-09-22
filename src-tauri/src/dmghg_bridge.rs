@@ -354,11 +354,15 @@ impl DmghgBridge {
             .and_then(Value::as_str)
             .unwrap_or("未命名动漫")
             .to_string();
+        // 封面过本地代理：dmghg 封面走 `pN-ad.adukwai.com` 小站 CDN（明文 http、境外），
+        // 直连在部分网络下超时；实测还有部分条目指向百度图片代理等脏地址。
+        // 详见 `hls_proxy::proxied_image_url`。
         let cover = data
             .get("pic")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
         let description = data
             .get("content")
             .and_then(Value::as_str)
@@ -815,11 +819,13 @@ fn collect_items(data: &Value) -> Vec<Value> {
 fn parse_series_item(item: &Value) -> Option<SeriesItem> {
     let id = item.get("id").and_then(Value::as_i64)?;
     let title = item.get("name").and_then(Value::as_str)?.to_string();
+    // 同 detail：封面走本地代理，境外图床直连会超时。
     let cover = item
         .get("pic")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
     // continu 形如 "158|周日18:40更"：竖线前是已更新集数。
     let continu = item.get("continu").and_then(Value::as_str).unwrap_or("");
     let episodes_count = continu

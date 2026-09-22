@@ -178,6 +178,11 @@ export const CoverImage: React.FC<CoverImageProps> = ({
           // 时机由上面的 IntersectionObserver 决定，这里显式声明避免浏览器再插一手。
           loading="eager"
           decoding="async"
+          // 不带 Referer：图床普遍按 Referer 做防盗链，而 WebView2 里 `<img>` 的 Referer
+          // 是应用自身地址（`http://127.0.0.1:5175` / `tauri://localhost`），最容易被判定
+          // 为盗链而 403。实测暴风图床三种 Referer 都放行，但 dmghg 那批脏图床（百度图片
+          // 代理、第三方 bcebos）不一定；不发 Referer 一律按直接访问处理，判定最宽松。
+          referrerPolicy="no-referrer"
           fetchPriority={fetchPriority}
           onLoad={() => setLoaded(true)}
           onError={handleError}

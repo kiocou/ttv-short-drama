@@ -238,7 +238,9 @@ pub struct DramaProvider {
 
 impl DramaProvider {
     pub fn new() -> Result<Self, String> {
-        let client = Client::builder()
+        // 挂系统代理：reqwest 不读 Windows 的「Internet 设置」。这条链路目前实测直连可
+        // 通，但换台机器就不保证（见 update::system_proxy 的实测记录）。
+        let client = crate::update::with_system_proxy(Client::builder())
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36")
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(20))
