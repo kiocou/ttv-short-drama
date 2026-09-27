@@ -98,7 +98,6 @@ export const MiniPlayer: React.FC = () => {
   const [buffered, setBuffered] = useState(0);
   const [volume, setVolume] = useState(0.85);
   const [muted, setMuted] = useState(false);
-  const [countdown, setCountdown] = useState<number | null>(null);
   /** 仅在自动播放被拦时出现：如实告诉用户"现在是静音在放"。 */
   const [muteNotice, setMuteNotice] = useState(false);
 
@@ -107,7 +106,6 @@ export const MiniPlayer: React.FC = () => {
   const sessionRef = useRef(0);
   const currentEpisodeIdRef = useRef('');
   const lastReportRef = useRef(0);
-  const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   /**
    * 用户的播放意图：被系统/省电策略静默暂停时，靠它与"用户主动暂停"区分开。
    *
@@ -152,14 +150,6 @@ export const MiniPlayer: React.FC = () => {
     };
   }, [muted, volume]);
 
-  const clearCountdown = useCallback(() => {
-    if (countdownTimerRef.current) {
-      clearInterval(countdownTimerRef.current);
-      countdownTimerRef.current = null;
-    }
-    setCountdown(null);
-  }, []);
-
   /**
    * 解析并播放指定集。
    *
@@ -176,7 +166,6 @@ export const MiniPlayer: React.FC = () => {
     setCurrentEpisodeId(episodeId);
     setErrorText(null);
     setIsLoading(true);
-    clearCountdown();
 
     // 只拆 hls.js 实例、不清 src：旧帧留到新源就绪，换集不黑屏（与动漫播放器同一手法）。
     detachAnimeSource(video);
@@ -263,7 +252,7 @@ export const MiniPlayer: React.FC = () => {
       setIsLoading(false);
       setIsPlaying(false);
     }
-  }, [clearCountdown, report]);
+  }, [report]);
 
   /** 启动：取接力包并起播。 */
   const boot = useCallback(async (plan?: PipHandoff | null) => {
@@ -302,7 +291,6 @@ export const MiniPlayer: React.FC = () => {
   // 卸载：拆掉媒体链路，避免窗口销毁后仍有解码器在跑。
   useEffect(() => () => {
     sessionRef.current += 1;
-    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
     const video = videoRef.current;
     if (video) {
       try {
@@ -405,7 +393,7 @@ export const MiniPlayer: React.FC = () => {
     }
   }, [snapshotProgress]);
 
-  /** 播完一集：按设置自动连播（带倒计时），否则停在结尾等用户决定。 */
+  /** 播完一集：按设置自动连播，否则停在结尾等用户决定。 */
   const handleEnded = useCallback(() => {
     report(true);
     // 播完即"不该再自动续播"：否则窗口重新可见时那次续播会把结束的视频又播一遍。
@@ -414,23 +402,9 @@ export const MiniPlayer: React.FC = () => {
       setIsPlaying(false);
       return;
     }
-    const seconds = Math.max(3, handoff.countdownSeconds || 5);
-    setCountdown(seconds);
-    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
-    countdownTimerRef.current = setInterval(() => {
-      setCountdown(previous => {
-        if (previous == null) return null;
-        if (previous <= 1) {
-          if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
-          countdownTimerRef.current = null;
-          const index = handoff.episodes.findIndex(item => item.id === currentEpisodeIdRef.current);
-          const next = handoff.episodes[index + 1];
-          if (next) void playEpisode(handoff, next.id, 0);
-          return null;
-        }
-        return previous - 1;
-      });
-    }, 1000);
+    const index = handoff.episodes.findIndex(item => item.id === currentEpisodeIdRef.current);
+    const next = handoff.episodes[index + 1];
+    if (next) void playEpisode(handoff, next.id, 0);
   }, [handoff, hasNext, playEpisode, report]);
 
   // 键盘快捷键与主播放器保持一致（空格/方向键/Esc）。
@@ -610,24 +584,6 @@ export const MiniPlayer: React.FC = () => {
               className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-[11px] font-semibold transition-colors"
             >
               回到播放器
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* 连播倒计时：与主播放器一样给出"要跳集了"的明确信号，且可取消。 */}
-      {countdown != null && (
-        <div className="absolute inset-x-0 bottom-16 z-30 flex justify-center">
-          <div className="px-3 py-2 rounded-xl bg-black/75 border border-white/15 flex items-center gap-2.5">
-            <span className="text-[11px] font-semibold text-white/90">
-              {countdown} 秒后播放{hasNext && currentIndex >= 0 ? `第 ${handoff?.episodes[currentIndex + 1]?.episodeNumber} 集` : '下一集'}
-            </span>
-            <button
-              type="button"
-              onClick={clearCountdown}
-              className="text-[10px] font-semibold text-blue-300 hover:text-blue-200"
-            >
-              取消
             </button>
           </div>
         </div>
