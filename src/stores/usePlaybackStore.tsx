@@ -615,6 +615,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         noteFailure('解码失败', video.error);
         return 'error';
       }
+      // 换源后再次写入用户倍速：媒体装载期间可能把 playbackRate 恢复成默认值，
+      // 而这一行必须放在新源就绪之后，才能保证下一集仍按用户选择的速度播放。
+      video.playbackRate = playbackRateRef.current;
 
       if (startPosition > 0) {
         try {
@@ -687,6 +690,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         noteFailure('直接播放解码失败', video.error);
         return 'error';
       }
+      // 同上：`src`/`load()` 之后再恢复倍速，避免换集后回到 1x。
+      video.playbackRate = playbackRateRef.current;
       if (startPosition > 0) {
         try {
           video.currentTime = startPosition;
@@ -1208,9 +1213,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           objectUrlRef.current = '';
         }
         animeVideo.preload = 'auto';
-        animeVideo.playbackRate = playbackRate;
-        animeVideo.volume = isMuted ? 0 : volume;
-        animeVideo.muted = isMuted;
+        animeVideo.playbackRate = playbackRateRef.current;
+        animeVideo.volume = isMutedRef.current ? 0 : volumeRef.current;
+        animeVideo.muted = isMutedRef.current;
         // m3u8（本地代理流）经 hls.js 挂载；mp4 直链仍走普通 src。
         if (isHlsUrl(session.url)) {
           await attachSource(animeVideo, session.url);
@@ -1218,6 +1223,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           detachSource(animeVideo);
           animeVideo.src = session.url;
         }
+        // 源挂载完成后恢复用户倍速：换集路径必须以 ref 为准，不能读取可能滞后的
+        // React state，否则用户改完倍速后自动连播仍会拿旧值。
+        animeVideo.playbackRate = playbackRateRef.current;
         // HLS 挂载（attachSource）是长时间 await：期间用户可能已离开播放器。
         if (pauseIfStale(newSessionId, animeVideo)) return;
         markSourceCommitted(newSessionId, ep.id);
@@ -1468,6 +1476,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // 首帧等待是本段链路里唯一的长时间 await：期间用户可能已离开播放器
         // （会话已作废）。不复查就 play()，正是"退出后声音照放"的主通道。
         if (pauseIfStale(newSessionId, video)) return;
+        video.playbackRate = playbackRateRef.current;
 
         if (startPosition > 0) {
           const handleMetadata = () => {

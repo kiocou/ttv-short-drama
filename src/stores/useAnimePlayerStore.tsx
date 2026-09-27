@@ -334,13 +334,14 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
       const video = await waitForVideo(sessionId);
       if (!video) throw new Error('播放器未就绪。');
       video.preload = 'auto';
-      video.playbackRate = rateRef.current;
       video.muted = mutedRef.current;
       video.volume = mutedRef.current ? 0 : volumeRef.current;
       video.dataset.sessionId = String(sessionId);
 
       await attachAnimeSource(video, session.url, kind);
       if (sessionRef.current !== sessionId) return;
+      // 源挂载完成后再恢复倍速：下一集必须继承用户设定，而不是随媒体装载回到 1x。
+      video.playbackRate = rateRef.current;
 
       if (startPosition > 0) {
         const applySeek = () => {
