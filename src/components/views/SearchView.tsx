@@ -2,8 +2,9 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
 import { ipcService } from '../../services/ipc';
 import { CatalogFilter, SeriesItem } from '../../types/catalog';
-import { Search, X, Trash2, Clock, Play, ArrowLeft } from 'lucide-react';
-import { CoverImage } from '../common/CoverImage';
+import { ArrowLeft, Loader2 } from 'lucide-react';
+import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
+import { FluentButton } from '../common/FluentButton';
 
 type Channel = 'drama' | 'comic';
 
@@ -12,21 +13,17 @@ type Channel = 'drama' | 'comic';
 const SEARCH_CHANNEL: Channel = 'drama';
 
 /**
- * 独立搜索页。
+ * 搜索结果页。
  *
- * 存在的理由：搜索此前只是"在发现页就地过滤列表"——用户点搜索框后既没有
- * 页面跳转，也没有任何历史记录，看上去就像搜索没生效。这里把搜索做成一个
- * 真正的视图：空关键词时展示历史，有关键词时展示结果网格。
+ * 唯一的搜索输入在顶部标题栏：聚焦弹搜索历史浮层、回车直接进这里。本视图只
+ * 负责展示结果——此前页面内再放一个输入框与历史卡片的中间态已移除（用户反馈
+ * "这个页面是多余的"）。无关键词时给一个指向上方搜索框的占位提示。
  */
 export const SearchView: React.FC = () => {
   const {
     currentView,
     searchKeyword,
-    setSearchKeyword,
-    searchHistory,
     rememberSearch,
-    removeSearchHistory,
-    clearSearchHistory,
     navigateTo,
   } = useAppStore();
 
@@ -34,26 +31,51 @@ export const SearchView: React.FC = () => {
   const [items, setItems] = useState<SeriesItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  /** 后端给的来源说明（正常是"红果官网搜索 · 关键词"，失败时追加降级说明）。
+   *  染不染琥珀色看 `degraded`，不看这段文字——见下方 `degraded` 的注释。 */
+  const [sourceNote, setSourceNote] = useState<string | null>(null);
+  /** 后端给的降级标志位（有没有来源真的挂了）。 */
+  const [degraded, setDegraded] = useState(false);
+  /** 分页：hasMore 决定底部显示"加载更多"还是"已显示全部"，nextPage 是下次要拉的页。 */
+  const [hasMore, setHasMore] = useState(false);
+  const [nextPage, setNextPage] = useState(2);
+  const [total, setTotal] = useState(0);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
   // 请求编号：关键词变化很快时，旧请求不允许覆盖新结果。
   const requestIdRef = useRef(0);
+  /** 首屏那一发的 filter：加载更多直接复用它翻页，在别处重建迟早漏字段。 */
+  const filterRef = useRef<CatalogFilter | null>(null);
 
-  // 从标题栏跳进来时把焦点交给页内输入框，用户可以直接继续打字。
+  /**
+   * 换关键词（或清空）时把分页状态整体归零。
+   *
+   * 不归零的话，上一轮的 hasMore / nextPage 会跟着新结果一起显示——新关键词
+   * 明明只有一页，底部却挂着个翻到别的关键词那页去的"加载更多"。
+   */
+  const resetPaging = () => {
+    setSourceNote(null);
+    setDegraded(false);
+    setHasMore(false);
+    setNextPage(2);
+    setIsLoadingMore(false);
+    setLoadMoreError(null);
+  };
+
   useEffect(() => {
+    // 只在结果页激活时发起搜索：顶部搜索框的输入是全局状态，用户在其它页面
+    // 敲字（尚未回车提交）不该在后台空跑一轮请求。
     if (currentView !== 'search') return;
-    const timer = setTimeout(() => inputRef.current?.focus(), 60);
-    return () => clearTimeout(timer);
-  }, [currentView]);
-
-  useEffect(() => {
     const keyword = searchKeyword.trim();
     // 每次关键词变化立即作废在途请求：防抖窗口内用户又敲了一个字时，
-    // 上一次的响应回来不该再往屏幕上画。
+    // 上一次的响应回来不该再往屏幕上画。加载更多复用同一个编号。
     const requestId = ++requestIdRef.current;
     if (!keyword) {
       setItems([]);
       setError(null);
       setIsLoading(false);
+      resetPaging();
+      filterRef.current = null;
       return;
     }
     // 防抖 300ms：旧实现每敲一个字就发一次全量搜索，而每一发在后端都要
@@ -61,8 +83,12 @@ export const SearchView: React.FC = () => {
     const timer = window.setTimeout(() => {
       setIsLoading(true);
       setError(null);
+      resetPaging();
       const filter: CatalogFilter = {
         channel,
+        // 不带 source：搜索恒走全源（红果官网 + 动漫 + App 联想）。此前把浏览页
+        // 选中的站源拼进来，用户在发现页选了什么就只搜得到什么——换个源连搜索
+        // 结果都跟着换，搜索失去了"帮我找"的意义。source 为空后端才走三路合并。
         category: '全部',
         audience: '全部',
         sort: 'recommend',
@@ -70,6 +96,7 @@ export const SearchView: React.FC = () => {
         page: 1,
         pageSize: 40,
       };
+      filterRef.current = filter;
       // 两段式：先出结构化来源（红果网页 + 动漫源，实测 0.3-0.6s），
       // 再把慢的 App 联想追加到尾部。
       //
@@ -80,6 +107,13 @@ export const SearchView: React.FC = () => {
         .then(page => {
           if (requestId !== requestIdRef.current) return undefined;
           setItems(page.items);
+          setSourceNote(page.source ?? null);
+          setDegraded(page.degraded === true);
+          setHasMore(page.hasMore);
+          setTotal(page.total);
+          // 红果官网搜索本身有分页，此前固定只要第 1 页，hasMore / total 一直
+          // 被白白丢掉：命中多页的长尾剧永远只剩首屏那几十张卡片。
+          setNextPage(page.page + 1);
           // 首屏已可用，先收掉 loading 再等联想，用户不用为补充来源继续等。
           setIsLoading(false);
           return ipcService.catalog.searchSuggest(keyword, channel);
@@ -104,13 +138,43 @@ export const SearchView: React.FC = () => {
         });
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [searchKeyword, channel]);
+  }, [currentView, searchKeyword, channel]);
 
-  const runSearch = (keyword: string) => {
-    const trimmed = keyword.trim();
-    setSearchKeyword(trimmed);
-    rememberSearch(trimmed);
-    inputRef.current?.focus();
+  /**
+   * 加载更多：复用首屏的 filter，只把 page 往后推一格。
+   *
+   * 必须复查 requestIdRef —— 用户在加载途中改了关键词，这一页的响应属于上一轮，
+   * 直接追加就会把别的关键词的剧混进当前列表。页号在 await 之前快照，避免续体
+   * 读到已经翻过一次的 nextPage。
+   */
+  const loadMore = async () => {
+    const filter = filterRef.current;
+    if (!filter || isLoadingMore) return;
+    const requestId = requestIdRef.current;
+    const page = nextPage;
+    setIsLoadingMore(true);
+    setLoadMoreError(null);
+    try {
+      const result = await ipcService.catalog.list({ ...filter, page });
+      if (requestId !== requestIdRef.current) return;
+      // 去重同样是必需的：后端 catalog_list 带关键词时也会合并 App 联想，
+      // 联想是整批重复的，不滤掉每翻一页都会白长出同样几张卡片。
+      setItems(previous => {
+        const seen = new Set(previous.map(item => item.id));
+        const extra = result.items.filter(item => !seen.has(item.id));
+        return extra.length > 0 ? [...previous, ...extra] : previous;
+      });
+      setHasMore(result.hasMore);
+      setTotal(result.total);
+      setNextPage(page + 1);
+    } catch (err) {
+      // 不动已有结果：翻页失败没理由把用户已经看到的几十张卡片清空。
+      if (requestId === requestIdRef.current) {
+        setLoadMoreError((err as Error).message || '加载更多失败，请重试。');
+      }
+    } finally {
+      if (requestId === requestIdRef.current) setIsLoadingMore(false);
+    }
   };
 
   const hasKeyword = searchKeyword.trim().length > 0;
@@ -118,7 +182,7 @@ export const SearchView: React.FC = () => {
   return (
     <div className="w-full h-full overflow-y-auto select-none p-6 sm:p-8">
       <div className="max-w-5xl mx-auto flex flex-col gap-5 pb-24">
-        {/* 搜索输入区 */}
+        {/* 结果页头部：返回 + 当前关键词 + 计数（搜索输入与历史都在顶部搜索框） */}
         <div className="flex items-center gap-3">
           <button
             type="button"
@@ -129,103 +193,42 @@ export const SearchView: React.FC = () => {
             <ArrowLeft className="w-4 h-4" />
           </button>
 
-          <div className="relative flex-1 p-0.5 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner flex items-center">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
-            <input
-              ref={inputRef}
-              type="text"
-              value={searchKeyword}
-              onChange={event => setSearchKeyword(event.target.value)}
-              onKeyDown={event => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  runSearch(searchKeyword);
-                } else if (event.key === 'Escape') {
-                  setSearchKeyword('');
-                }
-              }}
-              placeholder="搜索短剧、漫剧，支持剧名关键词与分季名称"
-              className="w-full h-9 pl-9 pr-8 text-sm bg-white text-slate-800 placeholder-slate-400 rounded-lg border-none focus:outline-none shadow-xs transition-all"
-            />
-            {hasKeyword && (
-              <button
-                type="button"
-                onClick={() => setSearchKeyword('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
-                title="清空"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
+          <div className="flex-1 min-w-0">
+            <h2 className="text-sm font-bold text-slate-800 truncate">
+              {hasKeyword ? `「${searchKeyword.trim()}」的搜索结果` : '搜索'}
+            </h2>
+            <p className="mt-0.5 text-[11px] text-slate-400">
+              {hasKeyword
+                ? (isLoading ? '搜索中…' : `按相关度排序 · 精确匹配在前 · 找到 ${items.length} 部`)
+                : '在顶部的搜索框输入关键词开始搜索'}
+            </p>
+            {/* 来源说明：正常态是灰字（哪种来源、搜的什么），后端给出 degraded
+                标志位（有一路来源真的挂了）就染成琥珀色——降级不等于失败，
+                不该借用 rose 那套错误色。
+                此前这里是拿 `source` 文案去匹配「不可用/已跳过/失败/超时」等词表的，
+                而这段文案里本来就嵌着用户搜的词：搜"失败"会把正常来源行染成警告色。
+                标志位是结构化的，同样的文案换个关键词不再误判。 */}
+            {sourceNote && (
+              <p className={`mt-0.5 text-[11px] ${degraded ? 'text-amber-600' : 'text-slate-400'}`}>
+                {sourceNote}
+              </p>
             )}
           </div>
         </div>
 
-        {/* 空态：搜索历史 */}
+        {/* 无关键词时的占位 */}
         {!hasKeyword && (
-          <div className="rounded-2xl bg-white/88 backdrop-blur-xl border border-white/80 shadow-fluent p-5">
-            <div className="flex items-center justify-between pb-3 border-b border-black/[0.05]">
-              <div className="flex items-center gap-2 text-sm font-bold text-slate-800">
-                <Clock className="w-4 h-4 text-blue-600" />
-                <span>搜索历史</span>
-              </div>
-              {searchHistory.length > 0 && (
-                <button
-                  type="button"
-                  onClick={clearSearchHistory}
-                  className="flex items-center gap-1 text-[11px] font-semibold text-slate-400 hover:text-rose-600 transition-colors cursor-pointer"
-                >
-                  <Trash2 className="w-3 h-3" />
-                  清空历史
-                </button>
-              )}
-            </div>
-
-            {searchHistory.length === 0 ? (
-              <p className="pt-4 text-xs text-slate-400">
-                还没有搜索记录。输入剧名后回车即可搜索，历史会保存在本地。
-              </p>
-            ) : (
-              <div className="pt-4 flex flex-wrap gap-2">
-                {searchHistory.map(keyword => (
-                  <span
-                    key={keyword}
-                    className="group inline-flex items-center gap-1.5 pl-3 pr-1.5 py-1.5 rounded-xl bg-slate-100/90 hover:bg-blue-50 border border-slate-200/70 hover:border-blue-200 text-xs font-medium text-slate-700 hover:text-blue-700 transition-all"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => runSearch(keyword)}
-                      className="cursor-pointer max-w-[220px] truncate"
-                      title={keyword}
-                    >
-                      {keyword}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => removeSearchHistory(keyword)}
-                      className="w-4 h-4 rounded-md text-slate-300 hover:text-rose-600 hover:bg-white/80 flex items-center justify-center transition-colors cursor-pointer"
-                      title="移除这条记录"
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
+          <div className="rounded-2xl bg-white/88 border border-white/80 shadow-fluent p-8 text-center">
+            <p className="text-sm font-semibold text-slate-700">在上方搜索框输入剧名开始搜索</p>
+            <p className="mt-1.5 text-xs text-slate-400">
+              支持剧名关键词与分季名称；点击搜索框可查看历史记录。
+            </p>
           </div>
         )}
 
         {/* 有关键词：结果区 */}
         {hasKeyword && (
           <>
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-xs text-slate-500">
-                按相关度排序 · 精确匹配在前
-              </span>
-              <span className="text-xs text-slate-500">
-                {isLoading ? '搜索中…' : `找到 ${items.length} 部`}
-              </span>
-            </div>
-
             {error && (
               <div className="rounded-2xl bg-rose-50/80 border border-rose-200/70 p-4 text-xs text-rose-700">
                 {error}
@@ -242,55 +245,41 @@ export const SearchView: React.FC = () => {
             )}
 
             {items.length > 0 && (
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+              <div className={SERIES_GRID_CLASS}>
                 {items.map((series, index) => (
-                  <div
+                  <SeriesCard
                     key={`${series.id}-${index}`}
+                    series={series}
+                    index={index}
                     onClick={() => {
                       rememberSearch(searchKeyword.trim());
                       navigateTo('detail', series.id);
                     }}
-                    className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
-                  >
-                    <div className="relative w-full aspect-[3/4] overflow-hidden bg-slate-100 rounded-t-2xl">
-                      {/* 无封面时露出剧名首字：App 联想结果里有些条目不带封面。 */}
-                      <CoverImage
-                        src={series.cover}
-                        title={series.title}
-                        fallbackChar="剧"
-                        className="group-hover:scale-105 transition-transform duration-500"
-                        loading={index < 8 ? 'eager' : 'lazy'}
-                      />
-                      <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
-                      <div className="absolute top-2 left-2 flex gap-1">
-                        <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-blue-600/95 text-white shadow-xs">
-                          {series.tags[0] || '热门'}
-                        </span>
-                      </div>
-                      <div className="absolute bottom-2 inset-x-2 flex items-center justify-between text-[11px] text-white/95">
-                        {series.episodesCount > 0 ? (
-                          <span className="font-semibold">{series.episodesCount} 集全</span>
-                        ) : (
-                          <span className="font-semibold text-white/60">集数未知</span>
-                        )}
-                        <span className="text-[10px] text-white/75 truncate max-w-[80px]">{series.origin}</span>
-                      </div>
-                      <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-200 bg-black/20">
-                        <div className="w-11 h-11 rounded-full bg-white/95 text-blue-600 flex items-center justify-center shadow-lg transform scale-75 group-hover:scale-100 transition-all duration-200">
-                          <Play className="w-5 h-5 fill-current ml-0.5" />
-                        </div>
-                      </div>
-                    </div>
-                    <div className="px-1 pt-2.5 pb-3 bg-transparent">
-                      <h4 className="text-xs font-bold text-slate-800 truncate" title={series.title}>
-                        {series.title}
-                      </h4>
-                      <p className="mt-1 text-[10px] text-slate-400 truncate">
-                        {series.tags.slice(0, 2).join(' · ') || '精品短剧'}
-                      </p>
-                    </div>
-                  </div>
+                  />
                 ))}
+              </div>
+            )}
+
+            {/* 分页：按钮与"已显示全部"互斥，翻页出错只在这块提示，不清空上面的结果 */}
+            {items.length > 0 && (
+              <div className="flex flex-col items-center gap-2">
+                {loadMoreError && <p className="text-[11px] text-rose-600">{loadMoreError}</p>}
+                {hasMore ? (
+                  <FluentButton
+                    size="md"
+                    disabled={isLoadingMore}
+                    onClick={loadMore}
+                    icon={isLoadingMore ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : undefined}
+                  >
+                    {isLoadingMore ? '加载中…' : '加载更多'}
+                  </FluentButton>
+                ) : (
+                  // 取 max：联想是前端追加的，后端 total 未必算上它，直接显示
+                  // 会出现"已显示全部 8 部"底下摆着 14 张卡片。
+                  <p className="text-[11px] text-slate-400">
+                    已显示全部 {Math.max(total, items.length)} 部
+                  </p>
+                )}
               </div>
             )}
           </>

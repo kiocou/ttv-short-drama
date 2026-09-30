@@ -171,7 +171,10 @@ export const MiniPlayer: React.FC = () => {
     detachAnimeSource(video);
 
     try {
-      if (plan.kind === 'anime') {
+      // guo 与动漫同走 playback_open（后端按 id 前缀路由到 guo-core / 动漫源）：
+      // resolveNative 只认红果纯数字 vid，guo id 进去必报"缺少有效的集 vid"——
+      // 此前 guo 剧的画中画整条链路就是坏的。
+      if (plan.kind === 'anime' || plan.seriesId.startsWith('guo:')) {
         const opened = await ipcService.playback.open(
           plan.seriesId,
           episodeId,
@@ -244,6 +247,7 @@ export const MiniPlayer: React.FC = () => {
       setIsLoading(false);
       setIsPlaying(!video.paused);
       report(true);
+      prefetchNextEpisode(plan, episodeId);
     } catch (error) {
       if (sessionRef.current !== session) return;
       const detail = error instanceof Error ? error.message : String(error);
@@ -253,6 +257,33 @@ export const MiniPlayer: React.FC = () => {
       setIsPlaying(false);
     }
   }, [report]);
+
+  /**
+   * 连播预取：起播稳定后把下一集的解析提前做掉。
+   *
+   * 红果整集解析实测约 7.4 秒（签名 + 下载 + 解密），此前只挂在 ended 事件里，
+   * 每一集播完都要黑等一轮——预取把这段等待藏进上一集的播放时间里（一集
+   * 50~140 秒，足够后台备好）。prefetchNative 是纯缓存预热：产物落盘、跨会话
+   * 有效，没有会话语义要守；命中后前台 resolveNative 直接秒回。失败静默，
+   * 前台播放时自然重试。延后 3 秒是让当前集先把首屏带宽吃稳。
+   *
+   * 动漫/guo 不预取：它们走 playback.open 取直链（秒级轻请求），且直链有
+   * 时效，提前拿到的 URL 到播时可能已失效。
+   */
+  const prefetchNextEpisode = useCallback((plan: PipHandoff, episodeId: string) => {
+    if (plan.kind !== 'drama' || plan.seriesId.startsWith('guo:')) return;
+    const index = plan.episodes.findIndex(item => item.id === episodeId);
+    const next = plan.episodes[index + 1];
+    if (!next) return;
+    window.setTimeout(() => {
+      void ipcService.playback.prefetchNative(
+        plan.seriesId,
+        next.id,
+        plan.contentType ?? 1,
+        plan.quality || 'auto',
+      );
+    }, 3000);
+  }, []);
 
   /** 启动：取接力包并起播。 */
   const boot = useCallback(async (plan?: PipHandoff | null) => {

@@ -30,6 +30,13 @@ short-drama-device.json
 .agents/
 .workbuddy-ai/
 .serena/
+# 抓包/站点分析的中间产物：实测 `.har-analysis/` 单独就 43MB（HAR 响应体 +
+# 下载样本 + 解析脚本），是排查某个源能不能播的临时材料，不是项目内容。
+.har-analysis/
+# 调试会话的临时工作区（空壳目录，实际内容在 @wingsky-* 子目录里）。
+.dsh/
+# 设计提案的交互预览稿：单文件 HTML，不参与构建，体积大且随时可重新生成。
+design-proposals/random-pick/
 
 # ---- 随包分发的第三方运行期资源 ----
 # 现已纳入版本控制，使仓库开箱即用。

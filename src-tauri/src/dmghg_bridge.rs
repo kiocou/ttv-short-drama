@@ -292,6 +292,7 @@ impl DmghgBridge {
                 categories: vec!["全部".to_string()],
                 next_cursor: None,
                 source: "动漫共和国".into(),
+                degraded: false,
             });
         }
 
@@ -340,6 +341,7 @@ impl DmghgBridge {
             categories: table.into_iter().map(|(_, name)| name).collect(),
             next_cursor: has_more.then(|| (page + 1).to_string()),
             source: "动漫共和国".into(),
+            degraded: false,
         })
     }
 
@@ -860,6 +862,9 @@ fn parse_series_item(item: &Value) -> Option<SeriesItem> {
         tags,
         origin: "动漫共和国".into(),
         brief: (!continu.is_empty()).then(|| continu.to_string()),
+        // 站方不给评分：填 0 会被前端渲染成"0.0 分"角标（SeriesCard 的
+        // `{series.rating && …}` 对 Some(0.0) 为真），那是凭空造分。
+        rating: None,
     })
 }
 
@@ -999,6 +1004,7 @@ mod tests {
         let guard = lock(bridge);
 
         let filter = CatalogFilter {
+            source: None,
             channel: "anime".into(),
             category: "全部".into(),
             audience: String::new(),
