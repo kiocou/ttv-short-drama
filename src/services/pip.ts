@@ -1,4 +1,5 @@
 import { isTauriEnvironment } from './ipc';
+import type { ChannelType } from '../types/catalog';
 
 /**
  * 画中画小窗的交接协议（前端侧唯一入口）。
@@ -50,8 +51,15 @@ export interface PipHandoff {
   episodeId: string;
   title: string;
   cover: string;
-  /** 落历史用：`drama` / `comic` / `anime`。 */
-  channel: 'drama' | 'comic' | 'anime';
+  /**
+   * 落历史用：`drama` / `comic` / `anime` / `adult`。
+   *
+   * 直接用 `ChannelType` 而不是自己窄写一份联合类型：它唯一的消费点是回流时
+   * 写 `WatchHistoryItem.channel`（那个字段本来就是 `ChannelType`），窄写一份
+   * 就得在两处各维护一次频道列表——新增「神秘小窝」（`adult`）时就漏过一次，
+   * 表现为 `openPip` 传 `series.type` 编译不过。这里让类型自己跟上。
+   */
+  channel: ChannelType;
   totalEpisodes: number;
   /** 交接时那一集的集号：集列表缺失时小窗至少还能显示"第 N 集"。 */
   episodeNumber: number;

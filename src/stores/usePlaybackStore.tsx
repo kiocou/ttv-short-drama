@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useRef, useEffect, useCallback, ReactNode } from 'react';
-import { PlaybackUiState } from '../types/playback';
+import { PlaybackUiState, PlaybackSession } from '../types/playback';
 import { SeriesDetail, EpisodeItem } from '../types/series';
 import { ipcService, isTauriEnvironment } from '../services/ipc';
 import { attachSource, isHlsUrl, detachSource } from '../services/hlsAttach';
@@ -35,7 +35,10 @@ interface PreparedSource {
   element: HTMLVideoElement;
 }
 
-export function disposePrepared(prepared: PreparedSource | null): void {
+// 不能 export：本文件是组件模块，混进一个非组件导出会让 react-refresh 判定
+// "无法 Fast Refresh"，之后每次编辑本文件都整树刷新（实测一次追剧连吃 4 次，
+// 播放现场全灭）。它只在本文件内使用，保持模块私有即可。
+function disposePrepared(prepared: PreparedSource | null): void {
   if (!prepared) return;
   try {
     prepared.element.pause();
@@ -45,6 +48,9 @@ export function disposePrepared(prepared: PreparedSource | null): void {
     // 释放失败不影响主流程
   }
 }
+
+/** 首帧预解池的容量。3 = 下一集 + 下两集，与 warmAdjacentEpisodes 的下三集对齐。 */
+const PREPARED_POOL_MAX = 3;
 
 interface CountdownState {
   active: boolean;
@@ -114,6 +120,15 @@ interface PlaybackContextType {
   errorDetail: string | null;
   /** 提前预热某一集（详情页 / 选集抽屉），已在缓存或已在途则跳过。 */
   prewarmEpisode: (seriesId: string, episodeId: string, contentType?: number) => void;
+  /**
+   * 卡死提示文案，null 表示不显示。
+   *
+   * 生命周期由 store 管：卡死 → 非空 → 恢复成功 / 用户关闭 / 判死 → 回到 null。
+   * 绝不允许它永久停在一个非空值上（那是死 UI）。
+   */
+  stallNotice: string | null;
+  /** 用户手动关掉卡死提示。 */
+  dismissStallNotice: () => void;
 }
 
 /** 原生解析 worker 上报的进度（Rust 转发的 `shortdrama://app-resolve` 事件）。 */
@@ -211,6 +226,179 @@ function outcomeErrorCode(outcome: PlayOutcome, fallback = 'MEDIA_LOAD_FAILED'):
   return outcome === 'autoplay-blocked' ? 'MEDIA_AUTOPLAY_FAILED' : fallback;
 }
 
+/**
+ * `play()` 的保底时限。
+ *
+ * `play()` 的 promise 有一种**永不落定**的挂法：源已经赋给 video 元素，却既不
+ * 派发 `loadeddata` 也不派发 `error`（本地 asset 协议请求与探针并发读同一文件
+ * 被顶住、远端连接吊死等），`play()` 就会一直 pending——上层 `openEpisode` 的
+ * await 永不返回，界面永远停在旧帧/00:00:00，连错误卡都不出（实测：连播
+ * 42 → 43 集时画面停死十分钟无任何进展、无任何报错）。装载链上其余每个等待
+ * （preload 探针、firstFrame、webFirstFrame）都有超时兜底，唯独这最后一跳
+ * 没有；超时后按 error 交给既有降级链（清缓存 → 重解析 → 公开直链兜底 →
+ * 错误卡），把死局变成自愈。
+ */
+const PLAY_PENDING_TIMEOUT_MS = 8000;
+
+function playBounded(video: HTMLVideoElement): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // 判死前再看一眼：play() 迟到但确实已经在播（慢盘/慢解码），按成功算，
+      // 否则会把一段已经起来的播放重装载一遍。
+      if (video.readyState >= 3 && !video.error) {
+        resolve();
+        return;
+      }
+      reject(new DOMException('play() 超时未落定（源无数据也无错误）', 'TimeoutError'));
+    }, PLAY_PENDING_TIMEOUT_MS);
+    video.play().then(
+      () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve();
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+// ==================== 卡死看门狗（短剧链路） ====================
+
+/**
+ * 判定"播到一半卡死"的窗口。
+ *
+ * 为什么比动漫侧的 9 秒更宽：动漫侧的 `onStalled` 判的是"**从没解出过**一帧"
+ * （HEVC 本机解不了，硬伤，重试无意义，所以判出来就直接判死），而这里要判的是
+ * "播着播着解码线程不再吐帧"——真实内容里一次正常 seek、一次重新缓冲同样会让
+ * 时钟停上几秒，窗口太窄会把这些正常现象当成卡死，白白触发一次重装载。
+ */
+const PLAYBACK_STALL_MS = 10000;
+
+/** 第 1 级原地重试后，等这么久仍未见恢复就升级到"重装载当前这一集"。 */
+const STALL_RETRY_SETTLE_MS = 2000;
+
+/**
+ * 重装载时回退的秒数。
+ *
+ * 卡死多半发生在某个 GOP 上，退一点落回上一个关键帧比原地再来一次更容易解开；
+ * 代价只是几秒的重复播放，比整集卡死划算得多。
+ */
+const STALL_REWIND_SECONDS = 3;
+
+/** 卡死提示文案。恢复成功 / 用户关闭 / 判死都会把它收回 null，不留死 UI。 */
+const STALL_RETRY_NOTICE = '画面卡住了，正在尝试恢复…';
+
+/**
+ * 出帧停滞看门狗（短剧链路）。
+ *
+ * 判定："本该在播"（非 paused、非 seeking）却连续 `PLAYBACK_STALL_MS` 既没有
+ * 时钟推进、也没有新的解码帧、**也没有新数据在进**。
+ *
+ * "数据在进"这一条是必须的：网络卡顿也会让时钟停住、画面冻在最后一帧，
+ * 但缓冲期间 `progress` 持续推进 buffered 末端。少了它，一次 10 秒的慢网
+ * 缓冲就会被当成解码卡死，白白触发一次 7 秒级的重装载。
+ *
+ * 反过来，解码线程卡死时 buffered 也不再增长——这才是真正无解的那种：
+ * 既没有新数据，也没有新帧，`waiting` 还会照常派发且再也不回来。
+ *
+ * 为什么不能只看 `readyState`：解码线程卡死时它会长期停在 2（HAVE_CURRENT_DATA），
+ * 而用户看到的现象"画面停住、进度条不动"与网络缓冲时完全一致——只有把
+ * `paused` / `seeking` 排除掉之后，剩下的那个交集才是"本该在播却不播"。
+ *
+ * 与 `startAnimeFrameWatchdog` 的关键区别：那边是**分类器**（判出来直接判死，
+ * 因为 HEVC 无画面重试也没用，所以它 `stop()` 自己）；这边是**自愈器**——判定成立
+ * 先做一次原地重试（`onRetry`），一段时间内仍不见恢复才升级到既有兜底入口
+ * 重装载当前这一集（`onEscalate`），再失败才停。因此本函数不会把自己停掉，
+ * 一次卡死只报一次，恢复与否由调用方从 `onHealthy` 得到答复。
+ *
+ * 返回停止函数。**换源 / 出错 / 离开播放器 / 组件卸载都必须执行**，否则会留下
+ * 孤儿定时器，在用户已经切走之后继续判定并拉起播放。
+ */
+function startDramaStallWatchdog(
+  video: HTMLVideoElement,
+  callbacks: {
+    /** 第 1 级：原地重试（同一个时间点重拉数据）。 */
+    onRetry: () => void;
+    /** 第 2 级：重装载当前这一集。 */
+    onEscalate: () => void;
+    /** 画面重新推进了（恢复成功）：用来收回卡死提示。 */
+    onHealthy: () => void;
+  },
+): () => void {
+  const bufferedEnd = (): number => (video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0);
+  let lastFrames = -1;
+  let lastClock = video.currentTime;
+  let lastBuffered = bufferedEnd();
+  let lastAdvancedAt = performance.now();
+  let escalateTimer: number | null = null;
+  let stalled = false;
+  let settled = false;
+
+  const tick = () => {
+    if (settled) return;
+    const now = performance.now();
+    const quality = video.getVideoPlaybackQuality?.();
+    const frames = quality ? quality.totalVideoFrames : -1;
+    const end = bufferedEnd();
+    const clockMoved = video.currentTime > lastClock + 0.05;
+    const framesMoved = frames >= 0 && lastFrames >= 0 && frames > lastFrames;
+    const dataArrived = end > lastBuffered + 0.05;
+    if (clockMoved || framesMoved || dataArrived) {
+      lastClock = video.currentTime;
+      lastFrames = frames;
+      lastBuffered = end;
+      lastAdvancedAt = now;
+      if (escalateTimer !== null) {
+        window.clearTimeout(escalateTimer);
+        escalateTimer = null;
+      }
+      if (stalled) {
+        stalled = false;
+        callbacks.onHealthy();
+      }
+      return;
+    }
+    // 用户暂停、正在 seek、**已经播完**、以及本次恢复流程还没走完，都不是卡死。
+    // 最后一条尤其重要：升级到重装载之后若不置位，会每 700ms 重复报一次。
+    // `ended` 必须单列：规范上播到结尾后 `paused` 仍是 false，而"播完停在结尾"
+    // 与"解码线程卡死"在时钟/帧/缓冲三个信号上完全一致——少了这条，每集播完
+    // 10 秒后都会被误判成卡死，末帧被 seek 倒带闪回一次，再触发一次假重装载。
+    if (video.paused || video.ended || video.seeking || stalled) return;
+    if (now - lastAdvancedAt < PLAYBACK_STALL_MS) return;
+    stalled = true;
+    callbacks.onRetry();
+    escalateTimer = window.setTimeout(() => {
+      escalateTimer = null;
+      callbacks.onEscalate();
+    }, STALL_RETRY_SETTLE_MS);
+  };
+
+  const timer = window.setInterval(tick, 700);
+  return () => {
+    settled = true;
+    window.clearInterval(timer);
+    if (escalateTimer !== null) window.clearTimeout(escalateTimer);
+    escalateTimer = null;
+  };
+}
+
+// ==================== 弹幕（曾接入，0.2.x 整段移除） ====================
+
+/**
+ * 为什么这里没有弹幕层：红果走 TTV 自有链路，剧集 id 是裸 `series_id`、不带
+ * `guo:` 前缀，而按集 id 关联的弹幕数据源只认带前缀的那一族 id，接不上。
+ * 详见 CHANGELOG 的负面结论——别再接一遍。
+ */
+
 const PlaybackContext = createContext<PlaybackContextType | null>(null);
 
 export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
@@ -255,6 +443,31 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const [isSwitching, setIsSwitching] = useState<boolean>(false);
   // 悬停预热的在途计数，见 prewarmEpisode 的并发上限说明。
   const prewarmInflightRef = useRef<number>(0);
+  /**
+   * 首帧预解池：episodeCacheKey → 已解到 canplay 的探针。
+   *
+   * 为什么要这一层（预取只做到"文件就绪"是不够的）：
+   * 预取链条的终点一直是 `resolvedFileByVidRef` 里存一个 **URL 字符串**，
+   * 而首帧就绪（preloadSource → canplay）是在**用户切集那一刻**才做的。
+   * 于是连播的时间轴是：ended → 快路径命中（URL 已在盘）→ preloadSource
+   * (~150~400ms) → adoptPreparedSource 等 loadeddata (~100~200ms)。
+   * 解析那 7.4s 早就被预取吃掉了，**剩下的缝就是这 200~600ms**——画面停在
+   * 旧帧（不是黑屏），声音已断，用户感知是"顿一下"。
+   *
+   * 所以这里把"首帧预解"的产物也留下来：预取解析成功后顺手预解一次，
+   * 切集时直接接管，整个 preloadSource 环节被跳过。
+   *
+   * 安全性：`preloadSource` 本来就造一个不挂进文档流的隐藏 video（避免
+   * Layout/绘制开销），所以池里的探针**不产生额外合成层**；数量封顶 3，
+   * 离 MicaCard 注释里记的"79 个 backdrop-filter 元素 → p95 164.8ms"差两个
+   * 数量级。回收一律走 disposePrepared，否则解码器不释放。
+   *
+   * 边界：**只对本地整集文件 / 直链生效**。dmghg / 暴风是 m3u8，预解会把 MSE
+   * 实例建起来，主播放器接管时反而要重建，那条链路继续靠 prefetchStream。
+   */
+  const preparedPoolRef = useRef<Map<string, PreparedSource>>(new Map());
+  /** 池命中 / 池查询次数——没有这个指标就不知道预留窗口够不够长。 */
+  const preparedPoolStatRef = useRef<{ hit: number; miss: number }>({ hit: 0, miss: 0 });
   // 下载速率采样：worker 每 10% 上报一次百分比，用相邻两点算出速率再推算剩余时间。
   const downloadSampleRef = useRef<{ percent: number; at: number } | null>(null);
   /**
@@ -305,7 +518,39 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const countdownArmedRef = useRef<string>('');
   // 供"只绑定一次"的事件监听器间接调用的稳定引用。
   const playNextEpisodeRef = useRef<() => void>(() => {});
+  const openEpisodeRef = useRef<
+    (seriesId: string, episodeId?: string, startPosition?: number, qualityOverride?: string) => Promise<void>
+  >(() => Promise.resolve());
   const saveProgressThrottledRef = useRef<(pos: number, dur: number, force?: boolean) => void>(() => {});
+
+  const [stallNotice, setStallNotice] = useState<string | null>(null);
+
+  /**
+   * 卡死看门狗的停止函数。
+   *
+   * 换源、进入缓冲、error、离开播放器、组件卸载都要调它：看门狗的续体会重起播
+   * 甚至重装载整集，孤儿定时器等于"人已退出却仍被后台拉起播放"——与
+   * "离开播放器必须 stopPlayback" 是同一类事故。
+   */
+  const stallWatchdogStopRef = useRef<(() => void) | null>(null);
+  const stopStallWatchdog = useCallback(() => {
+    if (stallWatchdogStopRef.current) {
+      stallWatchdogStopRef.current();
+      stallWatchdogStopRef.current = null;
+    }
+  }, []);
+  /**
+   * 已经为"卡死自动重装载"花掉机会的集。
+   *
+   * 每集只给一次：重装载本身是 7 秒级的重活，若不给上限，一集反复卡死就会
+   * 变成"卡死 → 重装载 → 再卡死"的循环。
+   */
+  const stallRecoveredRef = useRef<Set<string>>(new Set());
+  /** 本次 `openEpisode` 由看门狗发起（用户手动切集要清空重装载额度，它不能）。 */
+  const stallReloadingRef = useRef<boolean>(false);
+
+  /** 用户手动关掉卡死提示。 */
+  const dismissStallNotice = useCallback(() => setStallNotice(null), []);
 
   /**
    * 主播放器里**实际装载的是哪一集**（连同装载它时的会话号与时刻）。
@@ -511,6 +756,67 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   /**
+   * 预解一集并放进池（LRU 淘汰）。解析成功后由预取链路调用。
+   *
+   * 入池前先做 LRU 淘汰：Map 保持插入序，删第一个键就是最久未用的。
+   * 淘汰必须 disposePrepared——只删不释放的话，解码器会一直挂在那些
+   * 脱离文档流的 video 上，直到 WebView 回收，实测能把内存推到 GB 级。
+   */
+  const pushPreparedPool = async (key: string, assetUrl: string): Promise<void> => {
+    if (preparedPoolRef.current.has(key)) return;
+    const existing = preparedPoolRef.current;
+    while (existing.size >= PREPARED_POOL_MAX) {
+      const oldest = existing.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      const evicted = existing.get(oldest);
+      existing.delete(oldest);
+      disposePrepared(evicted ?? null);
+    }
+    const probe = await preloadSource(assetUrl, 0, 8000);
+    if (!probe) return;
+    // 预解期间用户可能已经切走/换剧，那一轮的池早被清空了，别再塞回去。
+    const prepared: PreparedSource = { url: assetUrl, element: probe };
+    existing.set(key, prepared);
+  };
+
+  /** 清空池并释放全部探针。换剧、退出播放器、会话失效时调用。 */
+  const drainPreparedPool = (): void => {
+    preparedPoolRef.current.forEach(disposePrepared);
+    preparedPoolRef.current.clear();
+  };
+
+  /**
+   * 取池里的预解结果。
+   *
+   * **只在 startPosition === 0 时命中**：池里的探针是按"从头播"预解的，
+   * 带历史进度重入时 currentTime 对不上，硬用会跳帧——那种情况老老实实走
+   * preloadSource 重新定位。连播与新集前进都是 startPosition=0，
+   * 正好覆盖主场景。
+   *
+   * 取出即从池里删除：同一集的探针只能被接管一次，
+   * 留着会被下一轮 LRU 重复命中成"已用过"的对象。
+   */
+  const takePreparedPool = (key: string, startPosition: number): PreparedSource | null => {
+    if (startPosition > 0) {
+      preparedPoolStatRef.current.miss += 1;
+      return null;
+    }
+    const pooled = preparedPoolRef.current.get(key);
+    if (!pooled) {
+      preparedPoolStatRef.current.miss += 1;
+      return null;
+    }
+    preparedPoolRef.current.delete(key);
+    preparedPoolStatRef.current.hit += 1;
+    const s = preparedPoolStatRef.current;
+    console.debug(
+      `[ttv] 首帧预解命中 ${key}（池剩 ${preparedPoolRef.current.size}/${PREPARED_POOL_MAX}，` +
+      `命中 ${s.hit} / 未命中 ${s.miss}）`,
+    );
+    return pooled;
+  };
+
+  /**
    * 让主播放器真正起播。
    *
    * 返回**结果分类**而不是布尔值，是因为三种失败的处理方式完全不同，
@@ -523,7 +829,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    */
   const startPlayback = async (video: HTMLVideoElement): Promise<PlayStartResult> => {
     try {
-      await video.play();
+      // 必须走有界版本：这条 await 是"打开并播放"链路的最后一跳，此前每个
+      // 等待都有超时，唯独它挂死时整条链路（含错误卡）就再也走不到了。
+      await playBounded(video);
       return 'ok';
     } catch (error) {
       if (error instanceof DOMException && error.name === 'NotAllowedError') {
@@ -737,7 +1045,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         );
       }
       if (activeSessionRef.current !== sessionId) return 'stale';
-      const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition, episodeId);
+      const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition, episodeId, seriesId);
       // 只有"源本身有问题"才撤掉登记。自动播放被拦（autoplay-blocked）时
       // 文件是完好的，撤掉会导致下次重下一整集——白等 7 秒。
       if (outcome === 'error' && activeSessionRef.current === sessionId) {
@@ -793,6 +1101,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 跳过注定被 CDN 防盗链拦截的公开直链链路（直链→备用→Blob 三连失败）。
   const resolvedFileByVidRef = useRef<Map<string, string>>(new Map());
 
+  // guo 连播预取（seriesId:episodeId → 该集 playback.open 的完整会话，或
+  // '__prefetching__' 占位）。guo 的 open 产物是 guo-core 本地媒体服务的
+  // URL + streamKind，与红果的本地文件路径语义不同、装载方式也不同，所以
+  // 单独一张表，不复用 resolvedFileByVidRef。
+  const resolvedGuoSessionRef = useRef<Map<string, PlaybackSession | '__prefetching__'>>(new Map());
+  // 预取专用会话号：绝不能走 activeSessionRef（推进它 = 当前播放立即 stale）。
+  // 基数压过主会话（100 起、几百量级）；Rust 侧的会话表随真实播放的 retain
+  // 滚动清理，前端装载只靠 URL，不依赖这些表。
+  const guoPrefetchSessionRef = useRef(1_000_000);
+
   /**
    * 探测该集源流真实提供的清晰度档位。
    *
@@ -806,6 +1124,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 动漫档位探测的"已探过"键（`seriesId::episodeId`）。与短剧的 probedVidsRef
   // 分开：那条记的是红果 vid，这里是动漫集 id，混用会互相顶掉。
   const animeProbedRef = useRef<string>('');
+  // guo 外部站源档位探测的"已探过"键（`seriesId::episodeId`）。与动漫那条分开，
+  // 避免两个链路来回顶掉、重复付 resolve 的网络成本。
+  const guoProbedRef = useRef<string>('');
   const probeQualities = async (episodeId: string, contentType: number) => {
     if (probedVidsRef.current.has(episodeId)) return;
     probedVidsRef.current.add(episodeId);
@@ -866,10 +1187,22 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // short_drama_app_resolve 命令，串成 .then 链等于把同一集解析两遍。
     void ipcService.playback
       .resolveNative(seriesId, episodeId, contentType, 'auto')
-      .then(resolved => {
+      .then(async resolved => {
         clearTimeout(guard);
-        if (resolved.playUrl) resolvedFileByVidRef.current.set(key, resolved.playUrl);
-        else resolvedFileByVidRef.current.delete(key);
+        if (!resolved.playUrl) {
+          resolvedFileByVidRef.current.delete(key);
+          return;
+        }
+        resolvedFileByVidRef.current.set(key, resolved.playUrl);
+        // 解析成功只是"文件在盘上"，首帧还没解。顺手再预解一次并入池，
+        // 切集时就能整段跳过 preloadSource（那 200~600ms 的缝就在这里）。
+        // 失败静默：预解只是加速手段，拿不到就退回原来的慢路径。
+        try {
+          const { convertFileSrc } = await import('@tauri-apps/api/core');
+          await pushPreparedPool(key, convertFileSrc(resolved.playUrl));
+        } catch {
+          // 忽略：预解失败不影响解析成果
+        }
       })
       .catch(() => {
         clearTimeout(guard);
@@ -906,11 +1239,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     currentEpisodeId: string,
     sessionAtRequest: number,
   ) => {
+    if (series.id.startsWith('guo:')) return;
     const idx = series.episodes.findIndex(e => e.id === currentEpisodeId);
     if (idx < 0) return;
     const contentType = series.type === 'comic' ? 1004 : 1;
     // 每次重新排队前先清空旧队列：换了剧或换了集之后，之前的预测已经过时。
     prefetchQueueRef.current = [];
+    // 旧队列对应的首帧预解也随之作废——那些集已经不是"接下来要播的"了。
+    // 必须连同 dispose 一起清，只清 Map 不释放会让解码器挂在脱离文档流的
+    // video 上直到 WebView 回收。
+    drainPreparedPool();
     // 下三集优先（连播与随手点开的主要目标），上一集兜底"回看"。
     const next = series.episodes.slice(idx + 1, idx + 4);
     const prev = series.episodes[idx - 1] ? [series.episodes[idx - 1]] : [];
@@ -933,6 +1271,39 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 两者抢锁串行（worker 单实例），前台那一集白等一拍。让前台先跑。
     setTimeout(() => pumpPrefetchQueueForSession(sessionAtRequest), 800);
   };
+
+  /**
+   * guo 连播预取：本集起播稳定后，后台把下一集的 playback.open 做掉。
+   *
+   * guo 不走红果预取队列（上面那张表存的是本地文件路径，走 startNativeResolve；
+   * guo 的产物是 guo-core 本地媒体服务 URL，走 playback.open），此前连播每一集
+   * 都要播完才现场 resolve（实测 0.6~5.8s，用户感知就是"播完才开始加载"）。
+   * 现在命中预取的集由 openEpisode 的快路径直接装载，resolve 等待消失。
+   *
+   * 预取失败静默清占位，前台自然重试完整链路。预取会推进 guo-core 的解析高
+   * 水位并 cancel 上一个在途 resolve——对**正在播**的集无影响（它的 resolve 早已
+   * 完成，媒体服务流与会话独立存在；画质探测在播放中调 resolve 是既有实证）。
+   */
+  const prefetchGuoNext = useCallback((series: SeriesDetail, episodeId: string, quality: string) => {
+    if (!series.id.startsWith('guo:')) return;
+    const idx = series.episodes.findIndex(e => e.id === episodeId);
+    const next = series.episodes[idx + 1];
+    if (!next) return;
+    const key = episodeCacheKey(series.id, next.id, quality);
+    if (resolvedGuoSessionRef.current.has(key)) return;
+    if (resolvedGuoSessionRef.current.size > 16) resolvedGuoSessionRef.current.clear();
+    resolvedGuoSessionRef.current.set(key, '__prefetching__');
+    const sessionId = (guoPrefetchSessionRef.current += 1);
+    void ipcService.playback.open(series.id, next.id, quality, 0, sessionId, true)
+      .then(session => {
+        if (resolvedGuoSessionRef.current.get(key) === '__prefetching__') {
+          resolvedGuoSessionRef.current.set(key, session);
+        }
+      })
+      .catch(() => {
+        resolvedGuoSessionRef.current.delete(key);
+      });
+  }, []);
 
   /// 带会话校验的队列泵入口：用户切走后不再为旧会话继续占用带宽。
   const pumpPrefetchQueueForSession = (sessionAtQueueBuild: number) => {
@@ -993,14 +1364,24 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     sessionId: number,
     startPosition: number,
     episodeId: string,
+    seriesId?: string,
   ): Promise<PlayOutcome> => {
     try {
       const { convertFileSrc } = await import('@tauri-apps/api/core');
       const assetUrl = convertFileSrc(playUrl);
       if (activeSessionRef.current !== sessionId) return 'stale'; // 已切走
+      // 池里有这一集的首帧就先用池里的（走连播时预解早已完成），
+      // 直接进接管，**整段 preloadSource 被跳过**——这就是"进下一集直接播"。
+      const pooled = seriesId
+        ? takePreparedPool(episodeCacheKey(seriesId, episodeId, 'auto'), startPosition)
+        : null;
+      if (activeSessionRef.current !== sessionId) {
+        disposePrepared(pooled);
+        return 'stale';
+      }
       // 本地整集文件同样走"先预载、再接管"：即便文件已在盘上，
       // 也让旧帧留到新源解码就绪，避免同一条换集链路上出现两套体验。
-      const prepared = await preloadSource(assetUrl, startPosition, 10000);
+      const prepared = pooled ? pooled.element : await preloadSource(assetUrl, startPosition, 10000);
       if (activeSessionRef.current !== sessionId) {
         disposePrepared(prepared ? { url: assetUrl, element: prepared } : null);
         return 'stale';
@@ -1119,6 +1500,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 而残留的旧错误说明会让本次失败的原因被误读。
     setPrepareStatus(null);
     setErrorDetail(null);
+    // 卡死自动重装载的额度：用户自己切集/重开是"新的开始"，额度应当清掉；
+    // 而看门狗自己发起的重装载不清（否则刚花掉就被自己抹掉，防不住循环）。
+    //
+    // 卡死提示走同一条判据：开新会话就没必要留着上一会话的横幅（实测：卡死自愈
+    // 成功、或用户在卡死期间手动切集后，"画面卡住了…"会一直挂在正常播放的画面上，
+    // 只能手点 ✕ 或离开播放器才消失）。看门狗那条是例外——重装载是"恢复动作"，
+    // 提示要一直留到画面真的回来，由 handlePlaying 收回，不在重装载刚开始就撤掉。
+    if (!stallReloadingRef.current) {
+      stallRecoveredRef.current.clear();
+      setStallNotice(null);
+    }
+    stallReloadingRef.current = false;
 
     const newSessionId = (activeSessionRef.current += 1);
     setSessionId(newSessionId);
@@ -1155,6 +1548,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       if (activeSessionRef.current !== newSessionId) return; // 已有更新的请求
 
       setCurrentSeries(detail);
+      const isGuoSeries = seriesId.startsWith('guo:');
       // 首次进入某剧且用户未显式指定：采用设置里的默认清晰度。
       // 此前 currentQuality 硬编码 'auto'，设置页的选择从未生效。
       const isFirstOpenOfSeries = currentSeries?.id !== seriesId;
@@ -1168,6 +1562,24 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         throw new Error('该剧集暂无可播放的集数。');
       }
       setCurrentEpisode(ep);
+
+      // guo 外部站源的档位藏在 resolve 结果里（详情接口不带 qualities），与动漫
+      // 链路同理：按"剧+集"探测一次。探测异步进行、不阻塞起播；`animeQualities`
+      // 失败时返回空数组——宁可退回单档"自动"，也绝不虚构源里没有的档位；
+      // 结果回来时若会话已被更新的切换作废则丢弃。
+      // （不能改用详情里的 availableQualities 直填：那里对 guo 源恒为空，
+      // 每次换集都会把已探测到的档位清掉，清晰度按钮就永远是禁用的。）
+      if (isGuoSeries) {
+        const guoQualityKey = `${seriesId}::${ep.id}`;
+        if (guoProbedRef.current !== guoQualityKey) {
+          guoProbedRef.current = guoQualityKey;
+          void ipcService.playback.animeQualities(seriesId, ep.id)
+            .then(options => {
+              if (activeSessionRef.current !== newSessionId) return;
+              setAvailableQualities(options);
+            });
+        }
+      }
 
       const selectedQuality = qualityOverride || currentQuality;
 
@@ -1323,7 +1735,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         hasTriedBackupRef.current = true;
         hasTriedBlobRef.current = true;
         hasTriedNativeResolveRef.current = true;
-        const outcome = await playLocalFile(cachedPlayUrl, video, newSessionId, startPosition, ep.id);
+        const outcome = await playLocalFile(cachedPlayUrl, video, newSessionId, startPosition, ep.id, seriesId);
         if (isSettled(outcome)) {
           // 已被更新的切换接管就直接退出：warmAdjacentEpisodes 会先清空预取队列，
           // 而队列是共享的——这里再排一次会把新会话刚建好的队列清掉。
@@ -1351,7 +1763,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 无预取缓存时的路径选择：红果公开 /player 直链在 WebView 里被防盗链
       // 拦截（直链→备用→Blob 三连失败后才到本地解析），对未缓存集直接跳过
       // 公开链路走本地解析，省 3-10 秒无谓等待。已缓存的集由上面的快路径处理。
-      if (videoRef.current && activeSessionRef.current === newSessionId) {
+      if (!isGuoSeries && videoRef.current && activeSessionRef.current === newSessionId) {
         const video = videoRef.current;
         video.dataset.sessionId = String(newSessionId);
         backupUrlRef.current = '';
@@ -1425,12 +1837,34 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 本地解析失败后的公开直链兜底：会话已作废（用户已离开）就直接放弃——
       // open 会白跑 Rust/worker，其进度事件还会污染下一会话的加载提示卡。
       if (activeSessionRef.current !== newSessionId) return;
-      let session;
-      try {
-        session = await ipcService.playback.open(seriesId, ep.id, selectedQuality, startPosition, newSessionId);
-      } catch (webError) {
-        if (activeSessionRef.current !== newSessionId) return;
-        throw webError;
+      // guo 预取快路径：连播的下一集已被后台 open 过（resolvedGuoSessionRef），
+      // 直接拿那个会话装载，跳过现场 resolve（实测 0.6~5.8s）——这是"小窗返回
+      // 主播放器后连播每集都黑等一轮"的主要修复。占位中/无缓存照常走完整 open。
+      const guoPrefetchKey = isGuoSeries ? episodeCacheKey(seriesId, ep.id, selectedQuality) : '';
+      const guoPrefetched = guoPrefetchKey
+        ? resolvedGuoSessionRef.current.get(guoPrefetchKey)
+        : undefined;
+      let session: PlaybackSession;
+      if (isGuoSeries && guoPrefetched && guoPrefetched !== '__prefetching__') {
+        // URL 幂等（guo-core 本地媒体服务），保留条目以便重播同集时继续命中。
+        session = {
+          ...guoPrefetched,
+          sessionId: newSessionId,
+          position: startPosition,
+          quality: selectedQuality,
+        };
+      } else {
+        try {
+          session = await ipcService.playback.open(seriesId, ep.id, selectedQuality, startPosition, newSessionId);
+        } catch (webError) {
+          if (activeSessionRef.current !== newSessionId) return;
+          throw webError;
+        }
+      }
+      // 预取下一集：URL 已可用即可触发，不等 play() 成功——自动播放被拦等
+      // 起播问题与本集 URL 的有效性无关，预取不该为它们买单。
+      if (isGuoSeries && activeSessionRef.current === newSessionId) {
+        prefetchGuoNext(detail, ep.id, selectedQuality);
       }
       if (activeSessionRef.current !== newSessionId) return;
 
@@ -1470,7 +1904,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           video.addEventListener('loadeddata', done, { once: true });
           video.addEventListener('error', done, { once: true });
         });
-        video.src = session.url;
+        if (session.streamKind === 'hls' || isHlsUrl(session.url)) {
+          await attachSource(video, session.url);
+        } else {
+          detachSource(video);
+          video.src = session.url;
+        }
         markSourceCommitted(newSessionId, ep.id);
         await webFirstFrame;
         // 首帧等待是本段链路里唯一的长时间 await：期间用户可能已离开播放器
@@ -1494,7 +1933,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           }
         }
 
-        video.play().then(() => {
+        // 公开直链是"吊死连接"最高发的一条路（远端不回包也不断开），play()
+        // 在这里挂死就是永久 opening。有界版本超时后走 catch → 本地解析兜底。
+        playBounded(video).then(() => {
           if (pauseIfStale(newSessionId, video)) return;
           video.muted = preferredMuted;
           setIsPlaying(true);
@@ -1507,7 +1948,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             video.muted = true;
             setIsMuted(true);
             isMutedRef.current = true;
-            void video.play().then(() => {
+            // 静音重试的源仍是公开直链：play() 挂死时靠有界版本的超时走到
+            // MEDIA_AUTOPLAY_FAILED，而不是永久停在 opening。
+            void playBounded(video).then(() => {
               if (pauseIfStale(newSessionId, video)) return;
               setIsPlaying(true);
               setUiState({ kind: 'playing', sessionId: newSessionId, position: video.currentTime });
@@ -1605,6 +2048,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     openInFlightRef.current.set(key, task);
     return task;
   };
+  // 只绑定一次的事件监听器需要**最新**的 openEpisode：首帧那次渲染的闭包里
+  // currentSeries 还是 null，直接调用会拿不到任何上下文（与 playNextEpisodeRef 同一理由）。
+  openEpisodeRef.current = openEpisode;
 
   const togglePlay = () => {
     if (!videoRef.current) return;
@@ -1781,6 +2227,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 不作废的后果（实测）：换集长期卡在切线重试 → 用户返回主界面 → worker
     // 稍后成功 → 旧会话续体照常 setSrc/play()，常驻 <video> 被隐藏着出声。
     activeSessionRef.current += 1;
+    // 首帧预解池同理：会话已作废，池里的探针不会再被接管，
+    // 不释放就是几份解码器白挂在脱离文档流的 video 上。
+    drainPreparedPool();
     // 在途 open 任务绑定的是刚作废的会话，不能留在复用池：重进播放器再点
     // 同一集若复用到这条"所有续体都会 stale"的死任务，会表现为点了没反应。
     openInFlightRef.current.clear();
@@ -1790,6 +2239,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
     countdownArmedRef.current = '';
     setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
+    // 看门狗必须一起收掉：它的续体会重起播、甚至重装载整集，留着就是"人已退出
+    // 却仍被后台定时器拉起播放"。提示同时收回，播放器下次进来是干净的。
+    stopStallWatchdog();
+    setStallNotice(null);
 
     const video = videoRef.current;
     if (video) {
@@ -1887,6 +2340,91 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     autoNext: settings.autoNext,
     countdownSeconds: settings.countdownSeconds,
   };
+
+  // 看门狗唯一的定时器型资源，组件卸载必须收口。Provider 理论上与窗口同寿，
+  // 但 HMR 与严格模式会重挂载，漏掉就是一条常驻 interval。
+  useEffect(() => () => { stopStallWatchdog(); }, [stopStallWatchdog]);
+
+  /**
+   * 武装卡死看门狗——**只在真正开播这一刻调用**。
+   *
+   * 装源之前的等待期里没有帧是正常的，那段该由 `opening` / `buffering` 表达；
+   * 交给看门狗只会把"正在解析"误判成"卡死"，在解析还没回来时就触发重装载。
+   */
+  const armStallWatchdog = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    stopStallWatchdog();
+    const sessionId = activeSessionRef.current;
+    stallWatchdogStopRef.current = startDramaStallWatchdog(video, {
+      onRetry: () => {
+        // 已被更新的切换接管：连提示都不该再弹（人已经在看别的集了）。
+        if (activeSessionRef.current !== sessionId) return;
+        // 播完的视频绝不能碰：此时 seek 会把已 ended 的视频"倒带重生"再立刻
+        // 播回结尾，用户看到的就是结尾几秒无故闪回一次。
+        if (video.paused || video.ended || video.seeking) return;
+        setStallNotice(STALL_RETRY_NOTICE);
+        const el = videoRef.current;
+        if (!el) return;
+        // 第 1 级：原地重试。同一个时间点重拉一次数据就能唤醒卡死的解码线程的
+        // 场合不少，而重装载一整集要 7 秒左右——先试便宜的那一下。
+        try {
+          el.currentTime = el.currentTime;
+        } catch {
+          // 源尚未可 seek：交给第 2 级。
+        }
+        if (el.paused) void el.play().catch(() => { /* 第 2 级接手 */ });
+      },
+      onEscalate: () => {
+        // 恢复动作与 §5-2 的其余续体同一条规矩：先复查会话号，否则用户在卡死期间
+        // 早就手动切集了，这里会把已切走的集重新拉回来。
+        if (activeSessionRef.current !== sessionId) return;
+        // 第 1 级 tick 的两条排除判据在这里必须复读一遍：那两条此前只挡 tick，
+        // 而升级发生在 2 秒之后——卡死后用户按暂停是极常见的反应，不复读就会把
+        // "用户主动暂停"当成"还在卡"，强行重装载并出声。**用户主动暂停优先于自动
+        // 恢复**：自动恢复的理由是"本来该在播却没播"，用户按了暂停就已经否掉了这个
+        // 前提。返回后不重试是安全的——`stalled` 仍为 true，tick 会继续挡着；用户
+        // 重新播放、时钟恢复推进时 tick 走健康分支并回调 onHealthy 收回提示。
+        if (video.paused || video.seeking) return;
+        const ctx = handlerCtxRef.current;
+        if (!ctx.currentSeries || !ctx.currentEpisode) return;
+        const episodeId = ctx.currentEpisode.id;
+        if (stallRecoveredRef.current.has(episodeId)) {
+          // 额度用尽：这一集已经重装载过一次还是卡，如实停下来，把决定权交回用户。
+          // 提示在这里收回 null——终局由错误卡负责表达，不留一个撤不掉的横幅。
+          setStallNotice(null);
+          setIsPlaying(false);
+          setUiState({ kind: 'error', sessionId, code: 'MEDIA_PLAYBACK_STALLED', recoverable: true });
+          return;
+        }
+        stallRecoveredRef.current.add(episodeId);
+        // 第 2 级：复用**既有的**换集入口重装载同一集。它自带完整的降级链
+        // （本地快路径 → 整集解析 + 一次重试 → 公开直链兜底）与三级兜底开关复位，
+        // 复用它就不必再写一套恢复逻辑。
+        //
+        // 这只是"重新装载当前这一集"：会话号在那个入口里照常递增，所有在途续体
+        // 一律按 stale 处理；**绝不**推进到下一集，因此 §5-3 的连播四重闸门原样
+        // 保留（`autoAdvanceLatchRef` / `videoCommittedRef` 全不碰）。
+        const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+        stallReloadingRef.current = true;
+        // 标志必须由这次调用自己回收，不能指望 runOpenEpisode 复位：openEpisode 对
+        // "同键重复打开"会去重，命中在途任务时 runOpenEpisode 根本不执行，标志就
+        // 永久停在 true，之后用户手动切集也不再清 stallRecoveredRef（每集一次的重
+        // 装载额度从此不再重置）。正常路径下 runOpenEpisode 在第一个 await 之前就
+        // 读走并复位了它，这里的复位是幂等的兜底。
+        void openEpisodeRef.current(
+          ctx.currentSeries.id,
+          episodeId,
+          Math.max(0, resumeAt - STALL_REWIND_SECONDS),
+        ).finally(() => { stallReloadingRef.current = false; });
+      },
+      onHealthy: () => {
+        if (activeSessionRef.current !== sessionId) return;
+        // 恢复成功：提示必须回到 null，否则它会一直挂在画面上（死 UI）。
+        setStallNotice(null);
+      },
+    });
+  }, [stopStallWatchdog]);
 
   // 监听播放器事件（缓冲、时间更新、结束）——只绑定一次，永不重绑。
   useEffect(() => {
@@ -1995,10 +2533,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 转圈图标闪一下，加重"卡顿"的观感。
       if (!video.currentSrc && !video.src) return;
       if (video.readyState >= 3) return;
+      // 缓冲**不**卸看门狗：解码线程卡死时 `waiting` 照样会派发且再也不回来，
+      // 在这里卸掉它恰好会漏掉本次要治的那个症状。区分"慢网缓冲"与"真卡死"
+      // 靠的是看门狗里那条"没有新数据在进"——缓冲期间 buffered 还在长。
       setUiState({ kind: 'buffering', sessionId: activeSessionRef.current });
     };
 
     const handlePlaying = () => {
+      // 真正开播这一刻才武装看门狗（装载等待期里没有帧是正常的）。
+      armStallWatchdog();
+      // 画面真的回来了就收回卡死提示。第 1 级原地重试恢复时由看门狗的 onHealthy
+      // 负责，但第 2 级重装载换了一个**新的**看门狗实例（stalled 初值 false，
+      // onHealthy 永远不会来），只能由这里兜底——否则横幅会一直挂在正常播放上。
+      setStallNotice(null);
       setIsPlaying(true);
       setUiState({ kind: 'playing', sessionId: activeSessionRef.current, position: video.currentTime });
       // 真正出画就立刻落一条历史，而不是等第一次 timeupdate 的 4 秒节流窗口。
@@ -2013,6 +2560,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     };
 
     const handleEnded = () => {
+      // 一集播完，看门狗的使命就结束了："本该在播却不播"的前提不再成立。
+      // 不停掉的话，播完静置 10 秒它会照着 ended 状态（paused 仍为 false）
+      // 误判成卡死并拉起恢复流程。下一集真正开播时 handlePlaying 会重新武装。
+      stopStallWatchdog();
       setIsPlaying(false);
       setUiState({ kind: 'ended', sessionId: activeSessionRef.current });
       // 落盘"这一集看完了"必须归属**真正放完的那一集**。
@@ -2041,6 +2592,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const handleError = () => {
       // 清理旧源时 WebView2 可能派发一次空源 error，不应覆盖真实播放状态。
       if (!video.currentSrc && !video.src) return;
+      // 源已经报错：恢复交给下面的三级兜底链（备用直链 → Blob → 本地解析），
+      // 看门狗此刻只会跟它抢同一块画面。
+      stopStallWatchdog();
       // 接管流程（adoptPreparedSource / playDirect）进行中：这次 error 是它自己的
       // 事务，由它重试或判死。这里若抢先弹错误页，就会出现"视频已播起来、
       // 界面却停在错误页"，也会让 playDirect 的兜底完全失效。
@@ -2066,7 +2620,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         video.src = backupUrl;
         if (ctx.currentEpisode) markSourceCommitted(activeSessionRef.current, ctx.currentEpisode.id);
         video.load();
-        void video.play()
+        // 备用直链同样是远端地址，play() 挂死会永久停在 opening；超时后走
+        // catch 的 MEDIA_BACKUP_LOAD_FAILED，让位给 Blob / 本地解析兜底。
+        void playBounded(video)
           .then(() => {
             if (pauseIfStale(sessionAtBackup, video)) return;
             video.muted = preferredMuted;
@@ -2098,7 +2654,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             const blobCtx = handlerCtxRef.current;
             if (blobCtx.currentEpisode) markSourceCommitted(activeSessionRef.current, blobCtx.currentEpisode.id);
             video.load();
-            return video.play();
+            // Blob 直播的 play() 同样要设保底：挂死时这条 .then 永不落地，
+            // 下面的本地解析兜底就永远轮不到。
+            return playBounded(video);
           })
           .then(() => {
             if (pauseIfStale(Number(video.dataset.sessionId), video)) return;
@@ -2245,6 +2803,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         errorDetail,
         prewarmEpisode,
         enterPip,
+        stallNotice,
+        dismissStallNotice,
       }}
     >
       {children}

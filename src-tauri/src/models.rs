@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct CatalogFilter {
     pub channel: String,
+    /// 外部 guoapp 站源 id；为空表示沿用红果短剧/漫剧链路。
+    #[serde(default)]
+    pub source: Option<String>,
     pub category: String,
     pub audience: String,
     pub sort: String,
@@ -26,6 +29,17 @@ pub struct SeriesItem {
     pub tags: Vec<String>,
     pub origin: String,
     pub brief: Option<String>,
+    /// 站点给出的用户评分，**0-10 量纲**，原样透传不换算。
+    ///
+    /// 站点不给就是 `None`，**绝不能填 0**：前端 `SeriesCard` 是
+    /// `{series.rating && …}`，填 0 既渲染成"0.0 分"角标，又是凭空造分
+    /// （不变量 8：不要把不存在的东西显示成可用）。
+    ///
+    /// `#[serde(default)]` 对当前只 `Serialize` 的结构体其实不生效（它只管反序列化），
+    /// 留着是为了哪天给这个结构体补 `Deserialize`（旧缓存 / 旧快照）时不必再改这里。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +52,21 @@ pub struct CatalogPage {
     pub categories: Vec<String>,
     pub next_cursor: Option<String>,
     pub source: String,
+    /// **这份结果是降级的**：有来源失败或结果不完整，但仍然返回了内容。
+    ///
+    /// 为什么不能只靠 `source` 里那句文案（"；动漫来源暂不可用"）：前端判定要靠
+    /// 字符串词表（`不可用`/`可重试`/…），而**用户搜的词本身可能含这些字**，
+    /// 于是正常来源行会被染成琥珀色。`degraded` 只回答"这次结果可不可信"。
+    ///
+    /// 真正的多来源合并发生在 `main.rs::merge_search_sources`，它在那儿置位；
+    /// 各 provider 内部的部分成功（见 `provider.rs` 的四处）也各自置位。
+    /// 失败即整体 `Err` 的链路填 `false`。
+    ///
+    /// **不要** `skip_serializing_if`：这是常量语义、没有"缺失"这一说，
+    /// 恒定出现在载荷里前端才能直接读，不用判 undefined。
+    /// 同上，`#[serde(default)]` 现在不生效，是留给将来 `Deserialize` 的。
+    #[serde(default)]
+    pub degraded: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,6 +250,21 @@ pub struct UserSettings {
     pub hardware_acceleration: bool,
     pub catalog_cache_mb: f64,
     pub playback_cache_mb: f64,
+    /// 是否展示 18+ 外部内容源（黄豆/剧果/野果/帝果/黄果 AI/黄果视频）。
+    ///
+    /// 旧设置记录里没有这个字段，serde default 保证升级后读取不会失败；
+    /// 默认关闭——成人内容源需要用户显式开启。
+    #[serde(default)]
+    pub show_adult_sources: bool,
+    /// 用户勾选启用的视频源 id（前端 `enabledSources`）。
+    ///
+    /// 存 id 列表而不是"逐源开关"：源表在前端（`services/guoSources.ts`），
+    /// 后端不需要知道有哪些源，也不需要在源增删时迁移设置。
+    ///
+    /// 空列表回落到 `["hongguo"]`——旧设置记录没有这个字段，若按空列表处理，
+    /// 升级后用户会看到"一个源都没有"的空目录。
+    #[serde(default)]
+    pub enabled_sources: Vec<String>,
 }
 
 impl Default for UserSettings {
@@ -234,6 +278,8 @@ impl Default for UserSettings {
             hardware_acceleration: true,
             catalog_cache_mb: 0.0,
             playback_cache_mb: 0.0,
+            show_adult_sources: false,
+            enabled_sources: vec!["hongguo".to_string()],
         }
     }
 }

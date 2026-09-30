@@ -2,24 +2,40 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useCatalogStore } from '../../stores/useCatalogStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
-import { MicaCard } from '../common/MicaCard';
+import { useSettingsStore } from '../../stores/useSettingsStore';
 import { StatusBadge } from '../common/StatusBadge';
 import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
+import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
 import {
   Flame,
   Sparkles,
   Play,
   TrendingUp,
   Clock,
-  Star,
+  Moon,
   X
 } from 'lucide-react';
+
+/**
+ * 各频道的标题与量词。
+ *
+ * 刻意集中一处而不是散在 JSX 里写三元：`channel` 现在有四个值，再散着写
+ * `channel === 'comic' ? 漫剧 : 短剧` 的话，新加的 `adult` 会静默落进"短剧"
+ * 那个 else 分支——用户看到的是"精选短剧推荐"顶着 18+ 内容。
+ */
+const CHANNEL_COPY: Record<string, { title: string; noun: string }> = {
+  drama: { title: '精选短剧推荐', noun: '短剧' },
+  comic: { title: '精选漫剧推荐', noun: '漫剧' },
+  adult: { title: '神秘小窝', noun: '内容' },
+  anime: { title: '动漫推荐', noun: '动漫' },
+};
 
 export const ExploreView: React.FC = () => {
   const {
     channel,
     category,
+    audience,
     sort,
     categories,
     items,
@@ -28,6 +44,7 @@ export const ExploreView: React.FC = () => {
     isLoadingMore,
     hasMore,
     error,
+    activeSources,
     setChannel,
     setCategory,
     setSort,
@@ -38,6 +55,19 @@ export const ExploreView: React.FC = () => {
 
   const { currentView, navigateTo, triggerCardTransition } = useAppStore();
   const { openEpisode } = usePlaybackStore();
+  const { settings } = useSettingsStore();
+  const showAdultSources = settings.showAdultSources;
+
+  /**
+   * 关掉 18+ 总开关时，若正停在神秘小窝就退回短剧专区。
+   *
+   * tab 会在开关关闭时消失，但 `channel` 还停在 `adult`——不拉回来的话，
+   * `sources` 变成空数组，页面会既没有 tab 高亮、也没有任何卡片，用户看到的是
+   * "发现页坏了"而不是"你刚关掉了一个开关"。
+   */
+  useEffect(() => {
+    if (!showAdultSources && channel === 'adult') setChannel('drama');
+  }, [showAdultSources, channel, setChannel]);
 
   // 回到发现页就刷新"继续观看"：横幅的数据来自历史记录，而目录本身不会因为
   // 看了几集而变化，不单独刷新就会一直停在启动那一刻的旧进度。
@@ -48,6 +78,37 @@ export const ExploreView: React.FC = () => {
   // 允许用户点击叉号隐藏继续观看条，卡片自动顶上去
   const [isContinueDismissed, setIsContinueDismissed] = useState(false);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * 封面不可得的卡片 id：从当前列表移除、不再展示。
+   *
+   * 判定条件是"确定不可得"——CoverImage 的三次加载重试已耗尽，或 guo 源的
+   * 封面解析（Rust 侧带源侧 Referer 的下载）失败。切源/换筛选时整体重来：
+   * 消失的卡片在下一次列表里重新获得一次出现机会（网络抖动不该永久除名）。
+   */
+  const [hiddenSeriesIds, setHiddenSeriesIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    setHiddenSeriesIds(new Set());
+  }, [activeSources, channel, category, audience, sort]);
+
+  const markSeriesUnavailable = (seriesId: string) => {
+    setHiddenSeriesIds(prev => {
+      if (prev.has(seriesId)) return prev;
+      const next = new Set(prev);
+      next.add(seriesId);
+      return next;
+    });
+  };
+
+  /**
+   * 实际展示的卡片：无封面地址的条目直接过滤（guo 源的封面不来自该字段，
+   * 走 CoverImage 的异步解析，不过滤）；加载失败的按 id 移除。
+   */
+  const visibleItems = items.filter(item => {
+    if (hiddenSeriesIds.has(item.id)) return false;
+    if (!item.id.startsWith('guo:') && !(item.cover || '').trim()) return false;
+    return true;
+  });
   const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
   const searchReadyRef = useRef(false);
   const refreshCatalogRef = useRef(refreshCatalog);
@@ -114,6 +175,24 @@ export const ExploreView: React.FC = () => {
               <Sparkles className="w-3.5 h-3.5" />
               <span>漫剧次元</span>
             </button>
+            {/* 神秘小窝：只在设置页打开 18+ 总开关后才出现，且**不留痕**——
+                用户关掉开关时这个 tab 整体消失，而不是留在那儿点进去空空如也。
+                它用玫红色而不是蓝色：这是与前两个专区语义完全不同的一类内容，
+                颜色上就该一眼分得开。 */}
+            {showAdultSources && (
+              <button
+                type="button"
+                onClick={() => setChannel('adult')}
+                className={`flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-xs font-bold transition-all duration-150 cursor-pointer ${
+                  channel === 'adult'
+                    ? 'fluent-convex-tab text-rose-600'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
+                }`}
+              >
+                <Moon className="w-3.5 h-3.5" />
+                <span>神秘小窝</span>
+              </button>
+            )}
           </div>
 
           {/* 排序方式 (嵌入式凹槽托盘) */}
@@ -259,14 +338,14 @@ export const ExploreView: React.FC = () => {
       <div className="flex flex-col gap-3">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
-            <span>{channel === 'comic' ? '精选漫剧推荐' : '精选短剧推荐'}</span>
-            <span className="text-xs font-normal text-slate-400">({items.length} 部)</span>
+            <span>{CHANNEL_COPY[channel].title}</span>
+            <span className="text-xs font-normal text-slate-400">({visibleItems.length} 部)</span>
           </h2>
         </div>
 
         {/* 骨架屏加载态 (保持相同舒适比例) */}
         {isLoading && items.length === 0 ? (
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 sm:gap-4.5">
+          <div className={SERIES_GRID_CLASS}>
             {Array.from({ length: 12 }).map((_, i) => (
               <div key={i} className="flex flex-col gap-2">
                 <div className="w-full aspect-[3/4] rounded-2xl shimmer-loading shadow-xs" />
@@ -284,8 +363,17 @@ export const ExploreView: React.FC = () => {
           /* 空结果态 */
           <div className="py-20 flex flex-col items-center justify-center text-center gap-3">
             <img src="/app-icon.png" alt="" className="w-12 h-12 object-contain opacity-60" draggable={false} />
-            <p className="text-sm font-medium text-slate-600">没有找到匹配的{channel === 'comic' ? '漫剧' : '短剧'}</p>
-            <p className="text-xs text-slate-400">尝试更换关键词或分类筛选项</p>
+            {channel === 'adult' ? (
+              <>
+                <p className="text-sm font-medium text-slate-600">还没有勾选成人内容源</p>
+                <p className="text-xs text-slate-400">到「系统设置 → 视频源 → 18+ 成人内容」里勾选，这里就会出现内容</p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm font-medium text-slate-600">没有找到匹配的{CHANNEL_COPY[channel].noun}</p>
+                <p className="text-xs text-slate-400">尝试更换关键词或分类筛选项</p>
+              </>
+            )}
           </div>
         ) : (
           /* 舒展大气的剧集卡片网格 (带级联入场动画与平滑交互) */
@@ -300,76 +388,19 @@ export const ExploreView: React.FC = () => {
               内容又会让用户以为"点了没反应"（旧实现只挂一行 11px 小字，几乎
               看不见）。压暗 + 屏蔽点击同时表达"正在加载"和"这张卡不再属于
               当前筛选"，避免用户点进一个已经不属于该题材的剧。 */}
-          <div className={`grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 sm:gap-4.5 transition-opacity duration-150 ${
+          <div className={`${SERIES_GRID_CLASS} transition-opacity duration-150 ${
             isLoading ? 'opacity-40 saturate-50 pointer-events-none' : ''
           }`}>
-            {items.map((series, index) => (
-              <MicaCard
+            {visibleItems.map((series, index) => (
+              <SeriesCard
                 key={series.id}
-                hoverable
+                series={series}
+                index={index}
                 onClick={() => {
                   navigateTo('detail', series.id);
                 }}
-                className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
-              >
-                {/* 海报封面 (3:4 黄金竖屏比例) */}
-                <div className="relative w-full aspect-[3/4] overflow-hidden bg-slate-100 rounded-t-2xl">
-                  {/* 封面缺失时露出剧名首字，而不是留一个空框。
-                      App 联想结果里有部分条目不带封面（其 video_data 为空），
-                      onError 也统一走这里——图片 403/超时同样会退回占位。 */}
-                  <CoverImage
-                    src={series.cover}
-                    title={series.title}
-                    fallbackChar="剧"
-                    className="transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
-                    loading={index < 8 ? 'eager' : 'lazy'}
-                    fetchPriority={index < 4 ? 'high' : 'auto'}
-                  />
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
-
-                  {/* 顶部标签 */}
-                  <div className="absolute top-2 left-2 flex gap-1">
-                    <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-blue-600/95 text-white shadow-xs">
-                      {series.tags[0] || '热门'}
-                    </span>
-                  </div>
-
-                  {/* 评分角标 */}
-                  {series.rating && (
-                    <div className="absolute top-2 right-2 flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-black/65 text-amber-300">
-                      <Star className="w-2.5 h-2.5 fill-current" />
-                      <span>{series.rating.toFixed(1)}</span>
-                    </div>
-                  )}
-
-                  {/* 底部集数与来源 */}
-                  <div className="absolute bottom-2 inset-x-2 flex items-center justify-between text-[11px] text-white/95">
-                    {series.episodesCount > 0 ? (
-                      <span className="font-semibold">{series.episodesCount} 集全</span>
-                    ) : (
-                      <span className="font-semibold text-white/60">集数未知</span>
-                    )}
-                    <span className="text-[10px] text-white/75 truncate max-w-[80px]">{series.origin}</span>
-                  </div>
-
-                  {/* 悬停快捷播放图标 (实体凸出的立体浮雕圆盘) */}
-                  <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-200 bg-black/20">
-                    <div className="w-11 h-11 rounded-full fluent-convex-disc text-white flex items-center justify-center shadow-lg transform scale-75 group-hover:scale-100 transition-all duration-200 ease-[cubic-bezier(0.34,1.56,0.64,1)]">
-                      <Play className="w-5 h-5 fill-current ml-0.5" />
-                    </div>
-                  </div>
-                </div>
-
-                {/* 卡片下半部元信息 (舒适舒展排版) */}
-                <div className="p-3 flex flex-col gap-1">
-                  <h3 className="text-xs sm:text-sm font-bold text-slate-800 truncate group-hover:text-blue-600 transition-colors duration-150">
-                    {series.title}
-                  </h3>
-                  <div className="flex items-center gap-1.5 text-[11px] text-slate-400 truncate">
-                    <span>{series.tags.slice(1, 3).join(' · ') || (series.type === 'drama' ? '精品短剧' : '精选漫剧')}</span>
-                  </div>
-                </div>
-              </MicaCard>
+                onUnavailable={() => markSeriesUnavailable(series.id)}
+              />
             ))}
           </div>
           </>

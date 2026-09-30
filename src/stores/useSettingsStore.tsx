@@ -21,7 +21,9 @@ export const SettingsProvider: React.FC<{ children: ReactNode }> = ({ children }
     let active = true;
     ipcService.settings.get()
       .then(saved => {
-        if (active) setSettings(saved);
+        // 与默认值合并：旧设置记录可能没有新增字段（Web 模式的 localStorage
+        // 与旧版后端都算），缺字段时回落到默认而不是 undefined。
+        if (active) setSettings({ ...DEFAULT_SETTINGS, ...saved });
       })
       .catch(error => console.warn('Settings load failed:', error));
     return () => { active = false; };

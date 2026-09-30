@@ -7,7 +7,7 @@ import { PlayerControls } from './PlayerControls';
 import { EpisodeDrawer } from './EpisodeDrawer';
 import { NextCountdown } from './NextCountdown';
 import { DiagnosticsModal } from './DiagnosticsModal';
-import { Loader2, AlertCircle, RefreshCw, Copy } from 'lucide-react';
+import { Loader2, AlertCircle, RefreshCw, Copy, X } from 'lucide-react';
 
 /** worker 上报的解析阶段 → 用户可读文案。 */
 const STAGE_LABEL: Record<string, string> = {
@@ -56,6 +56,8 @@ export const VideoSurface: React.FC = () => {
     prepareStatus,
     isSwitching,
     errorDetail,
+    stallNotice,
+    dismissStallNotice,
   } = usePlaybackStore();
 
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
@@ -395,6 +397,33 @@ export const VideoSurface: React.FC = () => {
       )}
 
       {/*
+        卡死提示：复用下方"正在切换"那张晶体卡片的样式与容器（不再造一个 toast
+        系统）。刻意挂在顶部而不是底部——卡死时 uiState 往往同时是 buffering，
+        底部的切换提示已经占着那个位置，两张卡叠在一起会互相盖住。
+
+        生命周期归 store：恢复成功后它自己置回 null，这里只管"用户手动关掉"。
+      */}
+      {stallNotice && (
+        <div className="absolute top-20 inset-x-0 z-30 flex justify-center pointer-events-none px-6">
+          <div className="min-w-[268px] max-w-md px-4 py-3 rounded-2xl bg-black/70 shadow-2xl border border-white/15 flex items-center gap-2.5">
+            <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+            <span className="text-xs font-semibold text-white leading-relaxed">
+              {stallNotice}
+            </span>
+            <button
+              type="button"
+              onClick={dismissStallNotice}
+              className="btn-fluent-action -mr-1.5 flex-shrink-0 pointer-events-auto"
+              title="关闭提示"
+              aria-label="关闭提示"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/*
         等待提示分两种，取决于用户是"切换"还是"首次进入"：
 
         - **切换**（isSwitching）：用户已经等待过一次，需要知道还要多久。
@@ -468,16 +497,41 @@ export const VideoSurface: React.FC = () => {
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm z-30">
           <div className="p-6 max-w-sm rounded-2xl bg-white/95 backdrop-blur-2xl shadow-fluent-lg flex flex-col items-center text-center gap-3 border border-white">
             <AlertCircle className="w-10 h-10 text-rose-500" />
-            <h3 className="text-sm font-bold text-slate-800">
-              {uiState.code === 'MEDIA_AUTOPLAY_FAILED'
-                ? '请点击播放按钮开始'
-                : '播放源连接受阻'}
-            </h3>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              {uiState.code === 'MEDIA_AUTOPLAY_FAILED'
-                ? '浏览器限制了自动播放，点击下方按钮即可继续。'
-                : '该媒体无法由 WebView 解码，已尝试备用源与兼容 Blob 播放。'}
-            </p>
+            {/* 卡死与解码失败是两回事：源是好的、是解码线程不再吐帧。原先它落进
+                默认分支显示"该媒体无法由 WebView 解码"，等于把这个结论错误地归因给
+                源与 WebView —— 与不变量 8「诚实报告边界」冲突。 */}
+            {/* 站方资源下线同理：guo 站源 404（后端 sanitize_guo_error 的稳定字面量，
+                见 CHANGELOG 2026-09-30）是站方的数据死了，与 WebView 解码无关。
+                同一部剧多源转载是 guo 站常态（实测《蜂门》花果死而无果 63 章全可播），
+                所以这里直接给出换源出路，而不是让用户对着一个错误的归因反复重试。 */}
+            {uiState.code === 'MEDIA_PLAYBACK_STALLED' ? (
+              <>
+                <h3 className="text-sm font-bold text-slate-800">播放已停止响应</h3>
+                <p className="text-xs text-slate-500 leading-relaxed">
+                                    画面长时间没有推进，自动重试播放仍无响应。已为你回到 3 秒前重新载入本集；若仍然卡住，请换一集。
+                </p>
+              </>
+            ) : uiState.code === 'MEDIA_LOAD_FAILED' && errorDetail?.includes('播放文件不存在或已下线') ? (
+              <>
+                <h3 className="text-sm font-bold text-slate-800">这一集在当前站源已失效</h3>
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  站方已下线本集的播放文件，重试无效。可换看其他集，或回到发现页切换其他站源观看同一部剧。
+                </p>
+              </>
+            ) : (
+              <>
+                <h3 className="text-sm font-bold text-slate-800">
+                  {uiState.code === 'MEDIA_AUTOPLAY_FAILED'
+                    ? '请点击播放按钮开始'
+                    : '播放源连接受阻'}
+                </h3>
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  {uiState.code === 'MEDIA_AUTOPLAY_FAILED'
+                    ? '浏览器限制了自动播放，点击下方按钮即可继续。'
+                    : '该媒体无法由 WebView 解码，已尝试备用源与兼容 Blob 播放。'}
+                </p>
+              </>
+            )}
             {/* 失败原因必须可见：否则用户（和排查者）只能看到一句笼统的
                 "播放源连接受阻"，分不清是整集解析失败、解码失败还是 play 被打断。 */}
             {errorDetail && (
@@ -514,13 +568,27 @@ export const VideoSurface: React.FC = () => {
                 } else if (uiState.code === 'MEDIA_BACKUP_LOAD_FAILED' && currentSeries && currentEpisode) {
                   openEpisode(currentSeries.id, currentEpisode.id, position);
                 } else if (currentSeries && currentEpisode) {
-                  openEpisode(currentSeries.id, currentEpisode.id, 0);
+                  // 卡死是从头看回退 3 秒，与看门狗的自动重装载保持同一套起播点；
+                  // 其它错误码才是"源可能已经坏了，从头重解一次"的语义。
+                  const restartAt = uiState.code === 'MEDIA_PLAYBACK_STALLED'
+                    ? Math.max(0, position - 3)
+                    : 0;
+                  openEpisode(currentSeries.id, currentEpisode.id, restartAt);
                 }
               }}
               className="mt-2 flex items-center gap-2 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold shadow-sm transition-transform active:scale-95"
             >
               <RefreshCw className="w-3.5 h-3.5" />
-              <span>{uiState.code === 'MEDIA_AUTOPLAY_FAILED' ? '点击播放' : '重新解析播放'}</span>
+              <span>
+                {/* 标签必须与下方 onClick 的真实调用同语义：卡死走的是"回退 3 秒重载本集"，
+                    旧文案"重新解析播放"会诱导用户以为点完换了条链路，实际上还是这一集
+                    （整集已缓存，不重签名不重下），点完只会再卡一次（不变量 8）。 */}
+                {uiState.code === 'MEDIA_AUTOPLAY_FAILED'
+                  ? '点击播放'
+                  : uiState.code === 'MEDIA_PLAYBACK_STALLED'
+                    ? '重新载入本集'
+                    : '重新解析播放'}
+              </span>
             </button>
           </div>
         </div>

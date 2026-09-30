@@ -57,6 +57,8 @@ export const DEFAULT_SETTINGS: UserSettings = {
   targetFps: 60,
   catalogCacheMb: 0,
   playbackCacheMb: 0,
+  showAdultSources: false,
+  enabledSources: ['hongguo'],
 };
 
 function loadStorage<T>(key: string, fallback: T): T {
@@ -103,6 +105,70 @@ async function mockCatalogList(filter: CatalogFilter): Promise<CatalogPage> {
     page: filter.page,
     categories: ['全部', ...[...new Set(list.flatMap(item => item.tags))].slice(0, 12)],
   };
+}
+
+/**
+ * 19 个 guo 站源的实时状态，逐字段对应 guo-core 的 `nativeSourceStatus`
+ * （`src-tauri/guo-core/core/app_sources.go`），Rust 侧原样透传。
+ *
+ * ⚠️ 这些字段不是前端设计的，改之前先去 Go 源码对齐。几个容易踩的点：
+ * - `updatedAt` 是 `time.Time`，**零值是 `"0001-01-01T00:00:00Z"` 而不是 null**，
+ *   那是"从未拉取过目录"，UI 必须当成未检测而不是公元 1 年。
+ * - `hasMore` 在源从未被收录时**也是 true**（Go: `!found || state.HasMore`），
+ *   所以"有条目时才算有更多页"是必要的，不能照字面渲染。
+ * - `health` 是可选字段，缺它就是**没跑过体检**，不是"一切正常"。
+ */
+export interface GuoSourceStatus {
+  source: string;
+  count: number;
+  page: number;
+  hasMore: boolean;
+  /** RFC3339。零值 `0001-01-01T00:00:00Z` = 从未更新。 */
+  updatedAt: string;
+  operation: string;
+  running: boolean;
+  stage: string;
+  completed: number;
+  total: number;
+  added: number;
+  /** 站源任务记录的失败原因。Go 侧已过 `publicError`（URL 的 query 被打码）。 */
+  error?: string;
+  storageError?: string;
+  startedAt: string;
+  finishedAt: string;
+  retryAt: string;
+  health?: GuoSourceCheck;
+}
+
+/**
+ * 单源五步链路体检报告，对应 Go 的 `nativeSourceHealth` + `nativeHealthStep`
+ * （`app_source_health.go`）。
+ *
+ * `state` 取值来自 Go：`ok` = 五步全过（入口→目录→分集→播放地址→密钥→媒体），
+ * `catalogOnly` = 只验到目录就停了（`checkCatalog` 模式，不验播放），
+ * `failed` = 中途失败，`checking` = 还在跑。
+ */
+export interface GuoSourceCheck {
+  checkedAt: string;
+  state: 'checking' | 'ok' | 'catalogOnly' | 'failed';
+  /** 被抽检的剧名——用来确认"体检的到底是不是我想的那一部"。 */
+  sample: string;
+  steps: GuoSourceStep[];
+}
+
+export interface GuoSourceStep {
+  name: string;
+  state: 'ok' | 'failed';
+  /**
+   * ⚠️ 成功时是 Go 侧写死的字面量（"已解析 N 部剧"等）；失败时来自
+   * `publicError(err)`，那是站方响应的派生物——只把 URL 的 query 打了码，
+   * 不挡本地路径与裸 token。调用方只在 `state === 'ok'` 时展示它。
+   */
+  message: string;
+  host?: string;
+  /** Go 侧带 `omitempty`，无响应时该字段缺省。 */
+  httpStatus?: number;
+  elapsedMs: number;
 }
 
 export const ipcService = {
@@ -173,13 +239,86 @@ export const ipcService = {
      * 所以调用方应在首屏渲染完成后后台调用。失败返回空数组——题材栏保留原有内容，
      * 不该因为一次抖动而空掉。
      */
-    async categories(channel: CatalogFilter['channel']): Promise<string[]> {
+    async categories(channel: CatalogFilter['channel'], source?: string): Promise<string[]> {
       if (!isTauriEnvironment()) return [];
       try {
-        return await invokeBackend<string[]>('catalog_categories', { channel });
+        return await invokeBackend<string[]>('catalog_categories', { channel, source });
       } catch {
         return [];
       }
+    },
+    /**
+     * guo 源的封面：返回本地缓存文件路径（调用方 convertFileSrc 后呈现）。
+     *
+     * 不能直接把站源封面地址塞给 `<img>`：黄果视频有 Cloudflare 防护（实测
+     * 裸请求 403），部分源封面还是加过密的（前端拿到密文无从解码）。统一交
+     * 给 guo-core 带源侧 Referer 下载、解密、校验后落盘。失败返回 null——
+     * 调用方按"无封面"处置，不重试。
+     */
+    async guoCover(seriesId: string): Promise<string | null> {
+      if (!isTauriEnvironment()) return null;
+      try {
+        return await invokeBackend<string | null>('guo_cover', { seriesId });
+      } catch {
+        return null;
+      }
+    },
+    /**
+     * 逐源实时状态。取代 `guoSources.ts` 里手写的 `status`——那批判定是一次性
+     * 探针手填的（2026-09-29），站点状态会变，而 guo-core 本来就一直在跑体检。
+     *
+     * Web/演示模式返回空数组而不是编 19 条假记录：调用方按 id 查表，查不到
+     * 一律显示"未检测"，与真跑一次体检的观感完全一致 —— 编造 `count` /
+     * `updatedAt` 反而是在断言站方状态（不变量 8）。
+     */
+    async guoSourceStatus(): Promise<GuoSourceStatus[]> {
+      if (!isTauriEnvironment()) return [];
+      try {
+        return await invokeBackend<GuoSourceStatus[]>('guo_source_status');
+      } catch {
+        return [];
+      }
+    },
+    /**
+     * 对单个源跑一次五步链路体检（入口→目录→分集→播放地址→密钥→媒体）。
+     *
+     * ⚠️ **后端返回的是整条源状态记录，体检报告嵌在 `.health` 里**（同
+     * `guoSourceStatus` 的形状），不是裸的体检对象。原先按 `GuoSourceCheck`
+     * 顶层断言，调用方读 `report.steps` 得到 `undefined`，`.length` 在渲染期
+     * 抛错 —— 仓库里没有 ErrorBoundary，一处渲染异常就是整页白屏。
+     * 后端失败时返回的是 `{error: ...}`（不是 Err），所以这里必须显式判空后
+     * 抛出去，否则界面会把"失败"当"已完成"渲染（不变量 8）。
+     */
+    async guoSourceCheck(source: string): Promise<GuoSourceCheck> {
+      if (!isTauriEnvironment()) {
+        return { checkedAt: '', state: 'checking', sample: '', steps: [] };
+      }
+      const status = await invokeBackend<GuoSourceStatus>('guo_source_check', { source });
+      if (!status || status.error || !status.health) {
+        throw new Error(status?.error || '未拿到体检报告');
+      }
+      return status.health;
+    },
+    /**
+     * guo 源的网络模式：`direct` 直连 / `auto` 跟随系统代理。
+     *
+     * 真实状态存放在 guo-core 的 resource-settings.json（后端首次运行默认
+     * 直连——guo 源全是境内 CDN 站点，实测系统代理出口会被站点 403）。读取
+     * 失败返回 null：设置页按"未知"渲染并禁用开关，不猜默认值。
+     */
+    async guoProxyMode(): Promise<'auto' | 'direct' | null> {
+      if (!isTauriEnvironment()) return null;
+      try {
+        const mode = await invokeBackend<string>('guo_proxy_get');
+        return mode === 'auto' || mode === 'direct' ? mode : null;
+      } catch {
+        return null;
+      }
+    },
+    /** 切换 guo 源网络模式，guo-core 热应用并持久化，无需重启。失败时抛错。 */
+    async setGuoProxyMode(mode: 'auto' | 'direct'): Promise<void> {
+      if (!isTauriEnvironment()) return;
+      await invokeBackend('guo_proxy_set', { mode });
     },
   },
 

@@ -1,10 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
-import { MicaCard } from '../common/MicaCard';
 import { ipcService } from '../../services/ipc';
 import type { SeriesItem } from '../../types/catalog';
-import { Clapperboard, Play, Star, RefreshCw, Tv } from 'lucide-react';
-import { CoverImage } from '../common/CoverImage';
+import { Clapperboard, RefreshCw, Tv } from 'lucide-react';
+import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
 
 const PAGE_SIZE = 30;
 
@@ -170,7 +169,7 @@ export const AnimeView: React.FC = () => {
         </div>
 
         {isLoading && items.length === 0 ? (
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 sm:gap-4.5">
+          <div className={SERIES_GRID_CLASS}>
             {Array.from({ length: 12 }).map((_, i) => (
               <div key={i} className="flex flex-col gap-2">
                 <div className="w-full aspect-[3/4] rounded-2xl shimmer-loading shadow-xs" />
@@ -190,66 +189,18 @@ export const AnimeView: React.FC = () => {
             <p className="text-xs text-slate-400">尝试切换其他分类</p>
           </div>
         ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 sm:gap-4.5">
+          <div className={SERIES_GRID_CLASS}>
             {items.map((series, index) => (
-              <MicaCard
+              <SeriesCard
                 key={`${series.id}-${index}`}
-                hoverable
+                series={series}
+                index={index}
                 onClick={() => {
                   // 动漫卡片点击直接进入播放（免登录直连）：详情页用于看简介与选集，
                   // 但动漫源选集数据同在详情里，先走 detail 保持一致的导航体验。
                   navigateTo('detail', series.id);
                 }}
-                className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
-              >
-                <div className="relative w-full aspect-[3/4] overflow-hidden bg-slate-100 rounded-t-2xl">
-                  <CoverImage
-                    src={series.cover}
-                    title={series.title}
-                    fallbackChar="漫"
-                    placeholderClassName="bg-gradient-to-br from-violet-50 to-slate-200"
-                    className="transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
-                    loading={index < 8 ? 'eager' : 'lazy'}
-                    fetchPriority={index < 4 ? 'high' : 'auto'}
-                  />
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
-
-                  {/* 顶部分类标签 */}
-                  <div className="absolute top-2 left-2 flex gap-1">
-                    <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-violet-600/95 text-white shadow-xs">
-                      {series.tags[0] || '动漫'}
-                    </span>
-                  </div>
-
-                  {/* 悬停快捷播放 */}
-                  <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-200 bg-black/20">
-                    <div className="w-11 h-11 rounded-full fluent-convex-disc text-white flex items-center justify-center shadow-lg transform scale-75 group-hover:scale-100 transition-all duration-200 ease-[cubic-bezier(0.34,1.56,0.64,1)]">
-                      <Play className="w-5 h-5 fill-current ml-0.5" />
-                    </div>
-                  </div>
-
-                  {/* 底部集数与来源：remarks 无数字（如"已完结"）时显示原文 */}
-                  <div className="absolute bottom-2 inset-x-2 flex items-center justify-between text-[11px] text-white/95">
-                    {series.episodesCount > 0 ? (
-                      <span className="font-semibold">{series.latestEpisodeTitle || `${series.episodesCount} 集`}</span>
-                    ) : series.brief ? (
-                      <span className="font-semibold text-white/80">{series.brief}</span>
-                    ) : (
-                      <span className="font-semibold text-white/60">集数未知</span>
-                    )}
-                    <span className="text-[10px] text-white/75 truncate max-w-[80px]">{series.origin}</span>
-                  </div>
-                </div>
-
-                <div className="p-3 flex flex-col gap-1">
-                  <h3 className="text-xs sm:text-sm font-bold text-slate-800 truncate group-hover:text-violet-600 transition-colors duration-150">
-                    {series.title}
-                  </h3>
-                  <div className="flex items-center gap-1.5 text-[11px] text-slate-400 truncate">
-                    <span>{series.tags.slice(1, 3).join(' · ') || '动漫'}</span>
-                  </div>
-                </div>
-              </MicaCard>
+              />
             ))}
           </div>
         )}

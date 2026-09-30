@@ -175,6 +175,12 @@ impl AnimeProvider {
             categories,
             next_cursor: has_more.then(|| (page + 1).to_string()),
             source: "暴风动漫源".into(),
+            // 恒为 false：这条链路只有一个来源、一次请求，`get_json` 用 `?`
+            // 直接冒泡，没有"一部分拿到了、另一部分失败"的分支。`list` 缺失
+            // 会被 `unwrap_or_default` 兜成空数组，但那属于"这一页就是空的"
+            // （末页/无匹配），不是来源失败。多来源合并的降级由
+            // `main.rs::merge_search_sources` 汇总。
+            degraded: false,
         })
     }
 
@@ -401,6 +407,11 @@ fn parse_series_item(vod: &Value) -> Option<SeriesItem> {
         tags: vec![type_name],
         origin: "暴风动漫源".into(),
         brief: Some(remarks),
+        // 恒为 None：苹果CMS 的 vod_* 字段里没有任何评分位（实测字段集为
+        // vod_id / vod_name / vod_pic / type_name / vod_remarks / vod_class /
+        // vod_content / vod_play_url）。评分角标是红果那条链路的事，动漫源
+        // 本来就没有——不造分，不显示 0.0 分。
+        rating: None,
     })
 }
 
@@ -518,5 +529,31 @@ mod tests {
         .expect("应解析出列表项");
         assert_eq!(item.id, "bfzy:44871");
         assert_eq!(item.episodes_count, 6);
+    }
+
+    /// 暴风源没有评分位，卡片必须给 `None` 而不是 0。
+    ///
+    /// 苹果CMS 的 vod_* 字段集里根本没有评分（实测见 parse_series_item 的注释），
+    /// 而前端 `SeriesCard` 是 `{series.rating && …}` —— 填 0 会渲染成"0.0 分"的
+    /// 琥珀角标，是凭空造分（不变量 8：不要把不存在的东西显示成可用）。
+    #[test]
+    fn anime_items_never_carry_a_fabricated_rating() {
+        let item = parse_series_item(&serde_json::json!({
+            "vod_id": 44871,
+            "vod_name": "章鱼哥",
+            "vod_remarks": "已完结",
+        }))
+        .expect("应解析出列表项");
+        assert!(
+            item.rating.is_none(),
+            "暴风源没有评分数据，rating 必须是 None 而不是 0"
+        );
+        let json = serde_json::to_value(&item).expect("序列化");
+        assert!(
+            !json
+                .get("rating")
+                .is_some_and(|value| value.as_f64() == Some(0.0)),
+            "载荷里不得出现 0 分占位"
+        );
     }
 }

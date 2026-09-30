@@ -6,6 +6,7 @@ use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde_json::{Map, Value};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -26,6 +27,10 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 struct CatalogIndex {
     items: Vec<SeriesItem>,
     built_at: Instant,
+    /// 建索引时有整页抓取失败（"单页失败不整体失败"那条容忍策略留下的欠账）。
+    /// 缓存里必须把这个事实一起存下来：命中缓存的题材筛选同样要能报降级，
+    /// 否则只有冷启动那一次会亮、之后 TTL 内全被当成完整结果。
+    degraded: bool,
 }
 
 const INDEX_TTL: Duration = Duration::from_secs(30 * 60);
@@ -40,22 +45,23 @@ fn index_cache() -> &'static Mutex<HashMap<String, CatalogIndex>> {
     CATALOG_INDEX.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_catalog_index(channel: &str) -> Option<Vec<SeriesItem>> {
+fn cached_catalog_index(channel: &str) -> Option<(Vec<SeriesItem>, bool)> {
     let guard = index_cache().lock().ok()?;
     let entry = guard.get(channel)?;
     if entry.built_at.elapsed() > INDEX_TTL {
         return None;
     }
-    Some(entry.items.clone())
+    Some((entry.items.clone(), entry.degraded))
 }
 
-fn store_catalog_index(channel: &str, items: &[SeriesItem]) {
+fn store_catalog_index(channel: &str, items: &[SeriesItem], degraded: bool) {
     if let Ok(mut guard) = index_cache().lock() {
         guard.insert(
             channel.to_owned(),
             CatalogIndex {
                 items: items.to_vec(),
                 built_at: Instant::now(),
+                degraded,
             },
         );
     }
@@ -88,10 +94,14 @@ fn has_active_filter(filter: &CatalogFilter) -> bool {
 }
 
 /// 把全站索引按筛选条件过滤后切页（题材筛选走这条路）。
+///
+/// `index_degraded`：建索引时有整页抓取失败，索引是**残缺**的，因此这一页也是
+/// 降级结果（少的是可筛出来的条目数与 total，不是我眼前的 24 张卡）。
 fn paginate_filtered(
     items: Vec<SeriesItem>,
     filter: &CatalogFilter,
     requested_page: u32,
+    index_degraded: bool,
 ) -> CatalogPage {
     // 词表取过滤前的全集：点题材不该让题材栏跟着缩水。
     let categories = categories_for(&items);
@@ -119,6 +129,7 @@ fn paginate_filtered(
             "红果公开目录 · 题材「{}」全站筛选 · 共 {total} 部",
             filter.category
         ),
+        degraded: index_degraded,
     }
 }
 
@@ -286,8 +297,13 @@ impl DramaProvider {
         //    刻意不再按频道是否有子路由分流：漫剧官方题材只有 8 个，用户手上的其余
         //    标签同样需要索引兜底，否则又会退回"单页后置过滤"。
         if has_active_filter(filter) {
-            let items = self.catalog_index(filter.channel.as_str()).await?;
-            return Ok(paginate_filtered(items, filter, requested_page));
+            let (items, index_degraded) = self.catalog_index(filter.channel.as_str()).await?;
+            return Ok(paginate_filtered(
+                items,
+                filter,
+                requested_page,
+                index_degraded,
+            ));
         }
         let path = catalog_page_path(filter.channel.as_str(), requested_page);
         let html = self.fetch_page(&path).await?;
@@ -296,7 +312,7 @@ impl DramaProvider {
         // 题材词表优先用全站索引：一页只有 24 条，词表会随翻页/筛选变来变去；
         // 索引就绪后给出的是全站题材的稳定全集。
         let categories = match cached_catalog_index(filter.channel.as_str()) {
-            Some(indexed) if !indexed.is_empty() => categories_for(&indexed),
+            Some((indexed, _)) if !indexed.is_empty() => categories_for(&indexed),
             _ => categories_for(&raw_items),
         };
         let mut items = raw_items
@@ -330,6 +346,12 @@ impl DramaProvider {
             } else {
                 format!("红果短剧公开目录 · {}", sort_label(&filter.sort))
             },
+            // 这条链路失败即整体 Err：`fetch_page` 用 `?` 直接冒泡，索引也是
+            // `?`，拿不到就是拿不到，不存在"少了几页还照样返回"的情况。
+            // 唯一的部分成功在上面的题材分支里，已经由 `paginate_filtered` 置位。
+            // 多来源合并（红果 + 动漫 + App 联想）的降级在
+            // `main.rs::merge_search_sources` 里汇总。
+            degraded: false,
         })
     }
 
@@ -396,10 +418,15 @@ impl DramaProvider {
             .unwrap_or(items.len());
         // 空页即到底：即使页码估算偏大，也不会让无限滚动空转。
         let has_more = !items.is_empty() && requested_page < total_pages;
-        let categories = self
-            .catalog_categories(filter.channel.as_str())
-            .await
-            .unwrap_or_default();
+        // 题材词表是**额外**抓一次频道页拿的，拿不到时题材栏会是空的——内容仍
+        // 完整可用，所以不整体 Err，但要照实报降级。
+        //
+        // 不能只看 `categories.is_empty()` 就置位：那是"抓成功了但站点这条频道
+        // 恰好没有题材词表"，与"抓挂了"是两回事。
+        let (categories, degraded) = match self.catalog_categories(filter.channel.as_str()).await {
+            Ok(categories) => (categories, false),
+            Err(_) => (Vec::new(), true),
+        };
         let page = CatalogPage {
             total,
             items,
@@ -412,6 +439,7 @@ impl DramaProvider {
                 filter.category,
                 sort_label(&filter.sort)
             ),
+            degraded,
         };
         store_theme_page(&cache_key, &page);
         Ok(page)
@@ -419,11 +447,15 @@ impl DramaProvider {
 
     /// 取全站卡片索引（带 TTL 缓存）。题材/受众过滤必须走它。
     ///
+    /// 返回 `(条目, 是否残缺)`：首页那一页抓失败即整体 `Err`，但**后续页**允许
+    /// 跳过（见下面"单页失败不整体失败"）。跳过的页对应"全站少了一页"这种不完整，
+    /// 必须原样带出去给 `CatalogPage.degraded`，不能只剩一份看起来很全的结果。
+    ///
     /// 首页用来拿总页数，其余页并发抓取后按 id 去重合并。实测 34 页约 3.4s；
     /// 索引缓存在进程内，TTL 内重复调用是纯内存操作。
-    pub async fn catalog_index(&self, channel: &str) -> Result<Vec<SeriesItem>, String> {
-        if let Some(items) = cached_catalog_index(channel) {
-            return Ok(items);
+    pub async fn catalog_index(&self, channel: &str) -> Result<(Vec<SeriesItem>, bool), String> {
+        if let Some(cached) = cached_catalog_index(channel) {
+            return Ok(cached);
         }
         let first = self.fetch_page(&catalog_page_path(channel, 1)).await?;
         let total_pages = router_data_total_pages(&first, channel).clamp(1, INDEX_MAX_PAGES);
@@ -431,6 +463,7 @@ impl DramaProvider {
         let mut seen: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
 
         let mut next_page = 2u32;
+        let mut degraded = false;
         while next_page <= total_pages {
             let mut join = tokio::task::JoinSet::new();
             let mut scheduled = 0usize;
@@ -445,9 +478,11 @@ impl DramaProvider {
                 break;
             }
             // 单页失败不整体失败：索引少一两页仍能提供完整的题材过滤，
-            // 比因为一次抖动就让用户点不了题材要好。
+            // 比因为一次抖动就让用户点不了题材要好。但这笔欠账要记在
+            // `degraded` 上——少的那一页是真的搜不到。
             while let Some(joined) = join.join_next().await {
                 let Ok(Ok(html)) = joined else {
+                    degraded = true;
                     continue;
                 };
                 for item in parse_catalog_cards(&html, channel) {
@@ -457,8 +492,8 @@ impl DramaProvider {
                 }
             }
         }
-        store_catalog_index(channel, &items);
-        Ok(items)
+        store_catalog_index(channel, &items, degraded);
+        Ok((items, degraded))
     }
 
     /// 题材词表（供前端题材栏使用）。
@@ -474,7 +509,7 @@ impl DramaProvider {
             names.extend(routes.into_iter().map(|(name, _)| name));
             return Ok(names);
         }
-        let items = self.catalog_index(channel).await?;
+        let (items, _) = self.catalog_index(channel).await?;
         if items.is_empty() {
             return Err("目录索引为空，未能汇总题材。".to_string());
         }
@@ -500,16 +535,22 @@ impl DramaProvider {
         let mut items: Vec<SeriesItem> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut last_error: Option<String> = None;
+        // 变体之间是**或**的关系：一个变体挂了另一个仍可能出结果，最终照样返回
+        // CatalogPage。这时结果是残缺的（少了那个词形能搜到的条目），必须报降级。
+        let mut degraded = false;
         for variant in keyword_variants(keyword) {
             let encoded = encode_uri_component(&variant);
             let html = match self.fetch_page(&format!("/search/{encoded}")).await {
                 Ok(html) => html,
                 Err(error) => {
                     last_error = Some(error);
+                    degraded = true;
                     continue;
                 }
             };
             let Some(data) = parse_router_data(&html) else {
+                // 页面拿到了但读不出结构化数据，同样算这个词形没搜成。
+                degraded = true;
                 continue;
             };
             for item in parse_search_items(&data, &filter.channel) {
@@ -522,14 +563,26 @@ impl DramaProvider {
             if let Some(error) = last_error {
                 return Err(error);
             }
+            // 到这里 items 空但没有 fetch 失败：要么这词真没结果（`degraded`
+            // 保持 false，那是事实），要么页面拿到了却读不出结构化数据
+            //（此时 `degraded` 已被上面置位，空列表照实报降级而不是假装"无结果"）。
         }
+        // 补齐放在排序之前：新补进来的季要跟其它条目一起过一遍相关度与季号排序，
+        // 否则它们会挂在结果末尾（用户看着就像"搜索没找到"）。
+        //
+        // 补查失败**不进** `degraded`：按它自己的约定那是"锦上添花"，回挂了也不
+        // 改这次搜索的成功语义、也不加任何错误文案。既然刻意不告诉用户，就不该
+        // 转头用 degraded 告诉前端——两个口径必须一致，否则同一件事在两个地方
+        // 一个说"没事"一个说"降级"。
+        self.complete_search_seasons(&mut items, &mut seen, &filter.channel, keyword)
+            .await;
         // 按与关键词的相关度重排，再交给站点顺序兜底。
         //
         // 站点搜索是模糊匹配：实测搜"战神"返回的第一条是"我只想找死，却被奉为
         // 九州战神了"，而"特级战龙""大将军扛楼养活百万大军"这类标题完全不含
         // 关键词的联想条目也混在里面。用户看到的就是"搜出来的第一张卡片不是
         // 我要的那部"，点进详情自然像"下载了错误的剧"。
-        // 精确子串（含完整关键词）排最前，其次按命中词数，站点原始顺序兜底。
+        // 相关度分五级，另有分季次序的 tie-break，详见 rank_search_items。
         rank_search_items(&mut items, keyword);
         // 刻意不再叠加列表页的题材/受众筛选：站点返回的本就是按相关度排序的
         // 搜索结果，再用"当前选中的题材"剪一刀就会出现"明明搜得到却显示不全"。
@@ -548,7 +601,47 @@ impl DramaProvider {
             categories,
             next_cursor: has_more.then(|| (requested_page + 1).to_string()),
             source: format!("红果官网搜索 · {keyword}"),
+            degraded,
         })
+    }
+
+    /// 分季补齐：搜「聚宝仙盆」只回来第二、三季时，用「剧名第N季」回查缺的
+    /// 那一季，把结果并进本次搜索。
+    ///
+    /// 补查失败一律静默忽略，不改本次搜索的成功/失败语义、不加任何错误文案：
+    /// 这只是锦上添花，为了多一季把一次本来能用的搜索变成红字是不划算的。
+    /// 上限 `SEARCH_SEASON_MAX_REQUESTS` 次真实请求，理由见那里的注释。
+    async fn complete_search_seasons(
+        &self,
+        items: &mut Vec<SeriesItem>,
+        seen: &mut HashSet<String>,
+        channel: &str,
+        keyword: &str,
+    ) {
+        for plan in season_fill_plan(items, keyword) {
+            let encoded = encode_uri_component(&plan.query);
+            let Ok(html) = self.fetch_page(&format!("/search/{encoded}")).await else {
+                continue;
+            };
+            let Some(data) = parse_router_data(&html) else {
+                continue;
+            };
+            for item in parse_search_items(&data, channel) {
+                // 只收确实属于这一组的那一季。回查的搜索结果同样会带一串联想条目，
+                // 不逐条核对就会把别的剧、甚至别季的条目塞进本次结果里。
+                let belongs = match search_season(&item.title) {
+                    Some((base, season, unit)) => {
+                        season == plan.season
+                            && unit == plan.unit
+                            && search_text(&base) == plan.base_key
+                    }
+                    None => false,
+                };
+                if belongs && seen.insert(item.id.clone()) {
+                    items.push(item);
+                }
+            }
+        }
     }
 
     pub async fn detail(
@@ -772,6 +865,10 @@ fn flush_number(out: &mut String, digits: &str) {
     }
 }
 
+/// 阿拉伯数字 → 中文数字（仅覆盖分季用得到的 1..=200）。
+///
+/// 上限 200 与 `search_season` 的季号上限一致：`flush_number` 仍只把 ≤99 的数字
+/// 转中文（分季数不会更大），而分季补齐拼查询串时要能写出「第一百零八季」。
 fn to_chinese_number(value: u32) -> String {
     const DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
     match value {
@@ -785,6 +882,20 @@ fn to_chinese_number(value: u32) -> String {
                 format!("{}十", DIGITS[tens as usize])
             } else {
                 format!("{}十{}", DIGITS[tens as usize], DIGITS[ones as usize])
+            }
+        }
+        100..=200 => {
+            let prefix = format!("{}百", DIGITS[(value / 100) as usize]);
+            match value % 100 {
+                0 => prefix,
+                // 「一百零八」而不是「一百八」：1x 的剩余位前面要补零。
+                1..=9 => format!("{prefix}零{}", DIGITS[(value % 10) as usize]),
+                // 「一百一十八」而不是「一百十八」：11..=19 前面得带个「一」。
+                10..=19 => match value % 10 {
+                    0 => format!("{prefix}一十"),
+                    ones => format!("{prefix}一十{}", DIGITS[ones as usize]),
+                },
+                _ => format!("{prefix}{}", to_chinese_number(value % 100)),
             }
         }
         _ => value.to_string(),
@@ -849,31 +960,386 @@ fn parse_search_items(data: &Value, channel: &str) -> Vec<SeriesItem> {
             tags,
             origin: "红果官网搜索".into(),
             brief: (!brief.trim().is_empty()).then(|| brief.trim().to_string()),
+            // 实测搜索结果的 `video_data` 上**没有**评分键（详见 parse_rating 的
+            // 现状说明），这里照常取值：站点哪天补上就自动亮，不用再改解析。
+            rating: parse_rating(video),
         });
     }
     items
 }
 
+/// 分季补齐的硬上限：每补一季是一次真实的 HTTP 回查。
+///
+/// 参考实现那边一次搜索最多回查 32 次（`hongguoSearchSeasonQueries`），因为它是
+/// 常驻进程、有单飞去重和 5 分钟结果缓存，回查几乎不花钱；这里的搜索是用户在
+/// 搜索框敲完字就干等的主链路，一个来回就是页面转圈。这里先按 2 次封顶，
+/// 等 `main.rs` 侧的搜索缓存落地后可以放宽到 4。
+const SEARCH_SEASON_MAX_REQUESTS: usize = 2;
+
+/// 季号上限。超过它的后缀当噪声处理：站点不会有这个量级的分季，而超长的数字
+/// 多半是"第 1080 集"之类被误认成季号的集数，认下来只会把补齐带偏。
+const SEARCH_SEASON_LIMIT: u32 = 200;
+
+/// 搜索比较用的归一化文本：全角转半角 → 去掉所有非字母数字 → 转小写。
+///
+/// 为什么两侧都要过这道：站点同一句话在不同位置的写法并不一致——实测卡片标题
+/// 中间会带 U+3000 全角空格、alt 与标题元素里的空格有无也不一致，用户又会
+/// 照着海报敲全角数字。全角/空格不归一，"聚宝仙盆" 与 "聚宝仙盆　第三季" 就
+/// 永远比不相等，相关度分级和分季比较会同时失灵。
+///
+/// 归一后为空（关键词全是标点）时退回"仅 trim + 小写"：否则空串被任何标题
+/// `contains` 命中，整页会被判成同级命中、把站点原始顺序全抹平。
+fn search_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        // NFKC 里最常用的一小块：全角 ASCII 与全角空格。其余全角形态（全角中文
+        // 标点、全角数字）要么被下面的 alphanumeric 滤掉、要么本来就该保留。
+        let ch = match ch {
+            '\u{3000}' => ' ',
+            c if ('\u{FF01}'..='\u{FF5E}').contains(&c) => {
+                char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+            }
+            c => c,
+        };
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+        }
+    }
+    if out.is_empty() {
+        return input.trim().to_lowercase();
+    }
+    out
+}
+
+/// 把关键词按非字母数字切成词，供"全分词命中"这一级使用（等价于 Go 侧的
+/// `FieldsFunc(IsSpace || IsPunct)`）。
+fn query_words(keyword: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in keyword.chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            words.push(search_text(&current));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        words.push(search_text(&current));
+    }
+    words
+}
+
+/// 标题对关键词的相关度分级：0 完全相等 / 1 前缀 / 2 包含 / 3 全分词命中 / 4 其余。
+///
+/// 之前只有两级（"含完整关键词" 0，其余按未命中字数排），实测搜"战神"时
+/// "我只想找死，却被奉为九州战神了" 排第一没问题，但"九州战神·风起陇西"这种
+/// 真剧目反而落到"其余"里、跟在联想词后面——用户看到的是"搜出来的第一张不是
+/// 我要的那部"，点进详情像下错了剧。前缀/包含分家后，正片主标题才稳定压过
+/// 蹭热度的联想条目。
+fn title_search_rank(title: &str, keyword: &str) -> u8 {
+    let words = query_words(keyword);
+    let query = search_text(keyword);
+    let title = search_text(title);
+    if title == query {
+        return 0;
+    }
+    if title.starts_with(&query) {
+        return 1;
+    }
+    if title.contains(&query) {
+        return 2;
+    }
+    // 关键词带空格/标点时（"九州 战神"），整串匹配不上但每个词都在标题里同样算强命中。
+    if !words.is_empty() && words.iter().all(|word| title.contains(word)) {
+        return 3;
+    }
+    4
+}
+
 /// 按与关键词的相关度给搜索结果重排（稳定排序，同分保持站点原始顺序）。
 ///
-/// 分级：标题含完整关键词（不区分大小写）> 标题含关键词逐字命中 > 其余。
-/// 排序只影响展示顺序，不丢弃任何条目——联想补齐仍然可用。
+/// 相关度之外再加一条分季次序 tie-break：同系列（base 归一后相同且量词相同）
+/// 的按季号升序，「聚宝仙盆第一季」必须排在「聚宝仙盆第三季」前面——用户
+/// 搜主标题时期待看到的是完整的一串季，而不是按站点热度东一季西一季。
+///
+/// 排序只影响展示顺序，不丢弃任何条目——联想补齐、分季补齐仍然可用。
 fn rank_search_items(items: &mut [SeriesItem], keyword: &str) {
-    let keyword_lower = keyword.to_lowercase();
-    let chars: Vec<char> = keyword_lower.chars().collect();
-    items.sort_by_key(|item| {
-        let title_lower = item.title.to_lowercase();
-        // 0 = 精确子串；其余按"未命中字数"升序（命中越多未命中越少，排越前），
-        // 站点原始顺序由 sort_by_key 的稳定性兜底。
-        if title_lower.contains(&keyword_lower) {
-            return 0usize;
-        }
-        let misses = chars
-            .iter()
-            .filter(|ch| !title_lower.contains(**ch))
-            .count();
-        misses + 1
+    items.sort_by(|left, right| {
+        title_search_rank(&left.title, keyword)
+            .cmp(&title_search_rank(&right.title, keyword))
+            .then_with(|| compare_season_order(&left.title, &right.title))
     });
+}
+
+/// 同系列按季号升序；不是同系列（或没有季号）返回 Equal，交由 sort_by 的稳定性
+/// 退回站点原始顺序。
+fn compare_season_order(left: &str, right: &str) -> Ordering {
+    let (Some((left_base, left_season, left_unit)), Some((right_base, right_season, right_unit))) =
+        (search_season(left), search_season(right))
+    else {
+        return Ordering::Equal;
+    };
+    if left_unit != right_unit || search_text(&left_base) != search_text(&right_base) {
+        return Ordering::Equal;
+    }
+    left_season.cmp(&right_season)
+}
+
+/// 解析标题尾部的「第N季 / 第N部」，返回 `(base, 季号, 量词)`。
+///
+/// 只认**尾部**后缀：「第三季」这种本身就叫这个名字的片子没有 base，不构成系列，
+/// 认下来只会造出一个 base 为空的组把补齐带偏。base 两端的空白与标点要摘掉
+/// （实测有「《聚宝仙盆》第二季」这类写法），base 才等于用户会输入的剧名。
+fn search_season(title: &str) -> Option<(String, u32, String)> {
+    let chars: Vec<char> = title
+        .trim()
+        // 尾部允许挂标点（实测有「…第二季·」），先把它们摘掉再从后往前数。
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .chars()
+        .collect();
+    let unit = chars.last().copied()?;
+    if unit != '季' && unit != '部' {
+        return None;
+    }
+    let mut label_end = chars.len() - 1;
+    // 「第 2 季」在实测数据里出现过，数字与量词之间也要容空白。
+    while label_end > 0 && chars[label_end - 1].is_whitespace() {
+        label_end -= 1;
+    }
+    let mut start = label_end;
+    while start > 0 && is_season_digit(chars[start - 1]) {
+        start -= 1;
+    }
+    if start == label_end {
+        return None;
+    }
+    let mut marker = start;
+    while marker > 0 && chars[marker - 1].is_whitespace() {
+        marker -= 1;
+    }
+    if marker == 0 || chars[marker - 1] != '第' {
+        return None;
+    }
+    let number = parse_season_number(&chars[start..label_end])?;
+    if !(1..=SEARCH_SEASON_LIMIT).contains(&number) {
+        return None;
+    }
+    // base 两端的标点都摘掉（实测有「《聚宝仙盆》第二季」这类写法）：《》是版式装饰
+    // 不属于剧名，留在 base 里会让分季补齐拼出「《聚宝仙盆第四季」」这种查询词。
+    let base: String = chars[..marker - 1]
+        .iter()
+        .collect::<String>()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_string();
+    if base.is_empty() {
+        return None;
+    }
+    Some((base, number, unit.to_string()))
+}
+
+fn is_season_digit(ch: char) -> bool {
+    ch.is_ascii_digit()
+        || matches!(
+            ch,
+            '零' | '〇'
+                | '一'
+                | '二'
+                | '两'
+                | '兩'
+                | '三'
+                | '四'
+                | '五'
+                | '六'
+                | '七'
+                | '八'
+                | '九'
+                | '十'
+                | '百'
+        )
+}
+
+fn chinese_digit(ch: char) -> Option<u32> {
+    Some(match ch {
+        '零' | '〇' => 0,
+        '一' => 1,
+        '二' | '两' | '兩' => 2,
+        '三' => 3,
+        '四' => 4,
+        '五' => 5,
+        '六' => 6,
+        '七' => 7,
+        '八' => 8,
+        '九' => 9,
+        _ => return None,
+    })
+}
+
+/// 中文数字 → 阿拉伯数字（照参考实现 `hongguoSearchSeason` 的进位规则手写）。
+///
+/// 关键是拒绝而不是"凑"：权值不降（十十）、个位堆了两位（十二三）这类写法一旦
+/// 硬算就会得到一个看着像季号、其实来自错误标题的数字，补齐会拿着它去查一个
+/// 不存在的季。
+fn parse_season_number(label: &[char]) -> Option<u32> {
+    if label.iter().all(|ch| ch.is_ascii_digit()) {
+        return label.iter().collect::<String>().parse::<u32>().ok();
+    }
+    if !label.iter().any(|ch| *ch == '十' || *ch == '百') {
+        // 没有十/百的纯位值写法（实测基本只有单个「二」），逐位累加。
+        let mut number = 0u32;
+        for ch in label {
+            number = number.checked_mul(10)?.checked_add(chinese_digit(*ch)?)?;
+            if number > SEARCH_SEASON_LIMIT {
+                return None;
+            }
+        }
+        return Some(number);
+    }
+    // 十/百进位：「十二」= 12、「一百零八」= 108。previous 记住上一位的权值，
+    // 用来判掉「十十」「百十」这种逆序写法。
+    let mut number = 0u32;
+    let mut digit = 0u32;
+    let mut previous = 1000u32;
+    // 是否已经进过位。`digit.max(1)` 那个"空个位按 1 算"的省略写法只对**首位**
+    // 合法（十 = 10、百 = 100）；已经进过位之后又遇到空个位，说明中间那一位
+    // 从来没被写出来（「百十」），那不是季号，按同一条原则一起拒掉。
+    let mut carried = false;
+    for ch in label {
+        if let Some(value) = chinese_digit(*ch) {
+            digit = digit.checked_mul(10)?.checked_add(value)?;
+            // 个位只容得下一位：否则「十二三」会硬算出 33、「一二三」算出 123，
+            // 看着像个季号，其实来自一个被误读的标题。
+            if digit > 9 {
+                return None;
+            }
+            continue;
+        }
+        let value = match ch {
+            '十' => 10,
+            '百' => 100,
+            _ => return None,
+        };
+        if value >= previous || digit > 9 || (carried && digit == 0) {
+            return None;
+        }
+        number += digit.max(1) * value;
+        digit = 0;
+        previous = value;
+        carried = true;
+    }
+    Some(number + digit)
+}
+
+/// 补齐计划里的一组同系列条目。
+struct SeasonGroup {
+    /// 摘掉季号后的剧名原样（拼回查要用，不能用归一后的）。
+    base: String,
+    /// `search_text(base)`，与量词一起当组键。
+    key: String,
+    unit: String,
+    known: HashSet<u32>,
+}
+
+/// 一次分季补齐的纯计划：查什么词、期望拿回哪一季。
+struct SeasonFill {
+    query: String,
+    base_key: String,
+    unit: String,
+    season: u32,
+}
+
+/// 挑下一季该补的季号。
+///
+/// 至少要知道两季才补：只见过一季说明搜索根本没覆盖到这个系列，回查大概率是
+/// 白花一次请求。优先补最大已知季号的下一季（站点把最新一季排前面，缺的多半
+/// 就是它），断了头（最小已知季号 > 1）才回退到前一季。
+fn next_season_to_fill(known: &HashSet<u32>) -> Option<u32> {
+    if known.len() < 2 {
+        return None;
+    }
+    let maximum = known.iter().copied().max()?;
+    let minimum = known.iter().copied().min()?;
+    if maximum < SEARCH_SEASON_LIMIT && !known.contains(&(maximum + 1)) {
+        return Some(maximum + 1);
+    }
+    if minimum > 1 && !known.contains(&(minimum - 1)) {
+        return Some(minimum - 1);
+    }
+    None
+}
+
+/// 从当前结果里挑出值得补的季号组，返回**至多 `SEARCH_SEASON_MAX_REQUESTS`**
+/// 条回查计划（纯逻辑，不发请求，便于单测）。
+///
+/// 只补 base 里含关键词的组，否则搜「战神」会把「九州战神传」和「战神来了」
+/// 两个不相干的系列都各回查一次，预算两次就白烧光了。
+/// 组按相关度再按已知季数排，抢预算的自然是用户最可能要看的那部。
+fn season_fill_plan(items: &[SeriesItem], keyword: &str) -> Vec<SeasonFill> {
+    // 用户直接搜「聚宝仙盆第三季」时不要补：那已经是明确指向某一季的查询，
+    // 再补一季只会让结果里混进用户没要的东西。
+    if search_season(keyword).is_some() {
+        return Vec::new();
+    }
+    let query_key = search_text(keyword);
+    if query_key.is_empty() {
+        return Vec::new();
+    }
+    let mut groups: Vec<SeasonGroup> = Vec::new();
+    for item in items {
+        let Some((base, season, unit)) = search_season(&item.title) else {
+            continue;
+        };
+        let key = search_text(&base);
+        if !key.contains(&query_key) {
+            continue;
+        }
+        let position = match groups.iter().position(|g| g.key == key && g.unit == unit) {
+            Some(position) => position,
+            None => {
+                groups.push(SeasonGroup {
+                    base,
+                    key: key.clone(),
+                    unit,
+                    known: HashSet::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        groups[position].known.insert(season);
+    }
+    let mut candidates: Vec<SeasonGroup> = groups
+        .into_iter()
+        .filter(|group| group.known.len() >= 2)
+        .collect();
+    candidates.sort_by(|left, right| {
+        title_search_rank(&left.base, keyword)
+            .cmp(&title_search_rank(&right.base, keyword))
+            .then_with(|| right.known.len().cmp(&left.known.len()))
+    });
+    candidates
+        .iter()
+        .filter_map(|group| {
+            let season = next_season_to_fill(&group.known)?;
+            let query = format!(
+                "{}第{}{}",
+                group.base,
+                to_chinese_number(season),
+                group.unit
+            );
+            // 用户搜的词本身就是这一季（如 base 为「聚宝仙盆」+ 季号 1 且季号后缀
+            // 没被 search_season 认出来），补查就是原地重发一次。
+            if query == keyword {
+                return None;
+            }
+            Some(SeasonFill {
+                query,
+                base_key: group.key.clone(),
+                unit: group.unit.clone(),
+                season,
+            })
+        })
+        .take(SEARCH_SEASON_MAX_REQUESTS)
+        .collect()
 }
 
 /// 按形状查找 searchList，不写死 loaderData 的键名——那是随路由命名的
@@ -1034,6 +1500,12 @@ fn parse_catalog_cards(html: &str, channel: &str) -> Vec<SeriesItem> {
                 "红果短剧公开目录".into()
             },
             brief: None,
+            // 恒为 None：目录卡片是**从 HTML 抓**的，实测卡片文本里只有剧名、
+            // 题材词与"全 77 集"这类集数文案，站点不在卡面上标评分。评分只在
+            // 详情页（`seriesSocialInfo.rating`），而详情页进的是 SeriesDetail。
+            // 这里写死 None 而不是去正则扒文本——扒不出就是 None，扒出来一个像
+            // 集数或题材的数字比没有评分更糟。
+            rating: None,
         });
     }
     cards
@@ -1355,6 +1827,40 @@ fn number_field(object: &Map<String, Value>, keys: &[&str]) -> Option<u32> {
     })
 }
 
+/// 取一条剧集对象上的**用户评分**，0-10 量纲，站点不给返回 `None`。
+///
+/// 键名只认 `rating` / `rate`，**刻意不认 `score`**。实测（2026-09-29 抓
+/// `/search/战神` 的 SSR router data）搜索结果的 `video_data` 上确实有 `score`，
+/// 但它在 `hot_score_data` 子对象里、值是 `44456111`、配套文案"4445万热度"——
+/// 那是**热度**不是评分，`hot` 与评分是两回事（热度另走 `heat` 那个字段）。
+/// 把它当评分读，角标会直接显示成 "44456111.0 分"。
+///
+/// 量纲实测：`/detail?series_id=…` 的 `loaderData.detail_page.seriesSocialInfo.rating`
+/// 是 0-10（实测 7.8 / 8.3 / 8.7 / 9 / 9.6），并且**整数与浮点混着发**
+/// （同一次实测里 `9` 是 JSON 整数）。`Value::as_f64` 两种都吃，故不做 `as_f64` 之外
+/// 的额外分支。前端角标是 `rating.toFixed(1)`，量纲一致，**不需要换算**。
+///
+/// 超出 0-10 一律当 `None`：站点哪天改量纲（换 0-5 或 0-100）时，宁可角标不显示，
+/// 也不能把 87.3 分显示成 87.3/10。
+///
+/// ⚠️ 现状（实测，别照文档猜）：**列表页与搜索页的卡片数据里根本没有评分**。
+/// 逐个抓过 `/category/real-drama`、`/category/comic-drama`、
+/// `/category/real-drama/romance`、`/rank/hot-comic-drama` 与 `/search/{词}`，
+/// score/rating/rate/grade 类键一个都没有；`recommendList[]` 的字段只有
+/// accessible_episode_cnt / celebrities / episode_cnt / episode_right_text /
+/// pay_type / series_cover / series_episode_info / series_id / series_intro /
+/// series_name / tags / vid_list。评分**只在详情页**，而详情页不进
+/// `SeriesItem`（进的是 `SeriesDetail`）。所以真实数据下角标仍然是空的——
+/// 这是站点的事实，不是解析漏了。这里先把取值与判据落好并锁测试，站点哪天在
+/// 列表里补上评分就会自动亮。
+fn parse_rating(video: &Map<String, Value>) -> Option<f64> {
+    ["rating", "rate"]
+        .iter()
+        .find_map(|key| video.get(*key))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..=10.0).contains(value))
+}
+
 fn unique(items: Vec<String>) -> Vec<String> {
     let mut result = Vec::new();
     for item in items {
@@ -1369,16 +1875,16 @@ fn unique(items: Vec<String>) -> Vec<String> {
 mod tests {
     use super::{
         cached_theme_page, catalog_page_path, detect_total_pages, find_pagination_value,
-        normalize_playback_url, parse_catalog_cards, parse_router_script, parse_theme_routes,
-        rank_search_items, store_theme_page, DramaProvider, Value,
+        next_season_to_fill, normalize_playback_url, paginate_filtered, parse_catalog_cards,
+        parse_rating, parse_router_script, parse_season_number, parse_theme_routes,
+        rank_search_items, search_season, search_text, season_fill_plan, store_theme_page,
+        title_search_rank, DramaProvider, SeriesItem, Value,
     };
-    use crate::models::{CatalogFilter, SeriesItem};
+    use crate::models::CatalogFilter;
+    use std::collections::HashSet;
 
-    /// 搜索结果按关键词相关度重排：含完整关键词的排最前，
-    /// 标题完全不含关键词的联想条目排最后（"搜出来的第一张不是我要的"）。
-    #[test]
-    fn ranks_search_items_by_keyword_relevance() {
-        let make = |id: &str, title: &str| SeriesItem {
+    fn search_item(id: &str, title: &str) -> SeriesItem {
+        SeriesItem {
             id: id.into(),
             title: title.into(),
             cover: String::new(),
@@ -1388,15 +1894,190 @@ mod tests {
             tags: vec![],
             origin: String::new(),
             brief: None,
-        };
-        let mut items = vec![
-            make("1", "大将军扛楼养活百万大军"),
-            make("2", "特级战龙"),
-            make("3", "我只想找死，却被奉为九州战神了"),
-        ];
-        rank_search_items(&mut items, "战神");
-        assert_eq!(items[0].title, "我只想找死，却被奉为九州战神了");
-        assert_eq!(items[2].title, "大将军扛楼养活百万大军");
+            rating: None,
+        }
+    }
+
+    fn ranked_titles(keyword: &str, items: &[(&str, &str)]) -> Vec<String> {
+        let mut items: Vec<SeriesItem> = items
+            .iter()
+            .map(|(id, title)| search_item(id, title))
+            .collect();
+        rank_search_items(&mut items, keyword);
+        items.into_iter().map(|item| item.title).collect()
+    }
+
+    /// 搜索结果按关键词相关度重排：含完整关键词的排最前，
+    /// 标题完全不含关键词的联想条目排最后（"搜出来的第一张不是我要的"）。
+    ///
+    /// 同级的两条联想项按站点原始顺序留原样——新分级不再区分它们，
+    /// 这条断言锁住"没有新的信息就别乱动顺序"。
+    #[test]
+    fn ranks_search_items_by_keyword_relevance() {
+        let titles = ranked_titles(
+            "战神",
+            &[
+                ("1", "大将军扛楼养活百万大军"),
+                ("2", "特级战龙"),
+                ("3", "我只想找死，却被奉为九州战神了"),
+            ],
+        );
+        assert_eq!(titles[0], "我只想找死，却被奉为九州战神了");
+        assert_eq!(titles[1], "大将军扛楼养活百万大军");
+        assert_eq!(titles[2], "特级战龙");
+    }
+
+    /// 五级相关度：完全相等 > 前缀 > 包含 > 全分词命中 > 其余。
+    ///
+    /// 关键词故意带一个空格："九州 战神"整串匹配不上"战神降临九州"，
+    /// 但两个词都在标题里，这一级才有机会被覆盖到。
+    #[test]
+    fn ranks_search_items_into_five_levels() {
+        assert_eq!(title_search_rank("九州战神", "九州 战神"), 0);
+        assert_eq!(title_search_rank("九州战神录", "九州 战神"), 1);
+        assert_eq!(
+            title_search_rank("我只想找死却被奉为九州战神了", "九州 战神"),
+            2
+        );
+        assert_eq!(title_search_rank("战神降临九州", "九州 战神"), 3);
+        assert_eq!(title_search_rank("大将军扛楼养活百万大军", "九州 战神"), 4);
+
+        let titles = ranked_titles(
+            "九州 战神",
+            &[
+                ("1", "大将军扛楼养活百万大军"),
+                ("2", "战神降临九州"),
+                ("3", "我只想找死，却被奉为九州战神了"),
+                ("4", "九州战神"),
+                ("5", "九州战神录"),
+            ],
+        );
+        assert_eq!(
+            titles,
+            vec![
+                "九州战神",
+                "九州战神录",
+                "我只想找死，却被奉为九州战神了",
+                "战神降临九州",
+                "大将军扛楼养活百万大军",
+            ]
+        );
+    }
+
+    /// 归一化：全角数字字母与全角空格要和半角写法算出同一个值。
+    ///
+    /// 用户照着海报敲全角是常态，而站点标题里混着 U+3000 全角空格；
+    /// 不归一的话「ＡＢＣ」搜不出「abc 之崛起」。
+    #[test]
+    fn search_text_normalizes_fullwidth_and_case() {
+        assert_eq!(search_text("ＡＢＣ　def-１"), "abcdef1");
+        assert_eq!(search_text("ABC def-1"), search_text("ＡＢＣ　def-１"));
+        // 全标点的关键词不能把所有标题都判成命中，否则整页顺序会被抹平。
+        assert_eq!(title_search_rank("ＡＢＣ！", "abc"), 0);
+        assert_eq!(title_search_rank("随便什么剧", "！？"), 4);
+    }
+
+    /// 同系列按季号升序：搜主标题时看到的应该是一整串连续的季。
+    #[test]
+    fn ranks_same_series_by_season_number() {
+        let titles = ranked_titles(
+            "聚宝仙盆",
+            &[
+                ("1", "聚宝仙盆第三季"),
+                ("2", "聚宝仙盆"),
+                ("3", "聚宝仙盆第二季"),
+            ],
+        );
+        assert_eq!(titles, vec!["聚宝仙盆", "聚宝仙盆第二季", "聚宝仙盆第三季"]);
+    }
+
+    /// 季号解析：中文数字要按十/百进位读，缺 base 的「第三季」不构成系列。
+    #[test]
+    fn search_season_parses_chinese_numerals() {
+        assert_eq!(
+            search_season("聚宝仙盆第十二季"),
+            Some(("聚宝仙盆".to_string(), 12, "季".to_string()))
+        );
+        assert_eq!(
+            search_season("某剧第一百零八部"),
+            Some(("某剧".to_string(), 108, "部".to_string()))
+        );
+        assert_eq!(
+            search_season("《聚宝仙盆》第二季"),
+            Some(("聚宝仙盆".to_string(), 2, "季".to_string()))
+        );
+        assert_eq!(
+            search_season("聚宝仙盆第 2 季"),
+            Some(("聚宝仙盆".to_string(), 2, "季".to_string()))
+        );
+        // 超上限的集数不能被认成季号：认下来只会把补齐带偏。
+        assert_eq!(search_season("某剧第 1080 季"), None);
+        // 尾数写错就整条判负，不硬凑一个看着像季号的数字。
+        assert_eq!(search_season("某剧第十十季"), None);
+        assert_eq!(search_season("第三季"), None);
+        assert_eq!(search_season("聚宝仙盆"), None);
+    }
+
+    /// `parse_season_number` 的"拒绝而不是凑"：畸形写法必须返回 `None`，
+    /// 否则会拿着一个看着像季号、其实来自错误标题的数字去回查，烧掉
+    /// `SEARCH_SEASON_MAX_REQUESTS` 的预算并把分季顺序排错。
+    ///
+    /// - 「十二三」个位堆了两位 → 硬算会得到 33；
+    /// - 「百十」进过位之后又碰到空个位 → 硬算会得到 110；
+    /// - 「十十」权值不降 → 早已由 `previous` 拦下，这里钉住不回归。
+    #[test]
+    fn parse_season_number_rejects_malformed_chinese_numerals() {
+        let parse = |text: &str| parse_season_number(&text.chars().collect::<Vec<_>>());
+        assert_eq!(parse("十二三"), None, "个位堆两位");
+        assert_eq!(parse("百十"), None, "进位后又遇空个位");
+        assert_eq!(parse("十十"), None, "权值不降");
+        // 正常写法一个都不能被误伤（「某剧第一百零八部」是实测真标题）。
+        assert_eq!(parse("一百零八"), Some(108));
+        assert_eq!(parse("二十一"), Some(21));
+        assert_eq!(parse("两百"), Some(200));
+        assert_eq!(parse("十二"), Some(12));
+        assert_eq!(parse("一百二十"), Some(120));
+        assert_eq!(parse("十"), Some(10));
+        // 纯位值写法走的是另一条分支，不受十/百那套进位规则影响。
+        assert_eq!(parse("二三"), Some(23));
+        assert_eq!(parse("二"), Some(2));
+        // 阿拉伯数字原样解析，空标签仍然无解。
+        assert_eq!(parse("12"), Some(12));
+        assert_eq!(parse(""), None);
+        assert_eq!(parse("十X"), None);
+    }
+
+    /// 挑补哪一季：优先补最大已知季号的下一季，断了头才回退。
+    #[test]
+    fn next_season_to_fill_prefers_next_then_gap() {
+        let known = |seasons: &[u32]| -> HashSet<u32> { seasons.iter().copied().collect() };
+        assert_eq!(next_season_to_fill(&known(&[2, 3])), Some(4));
+        assert_eq!(next_season_to_fill(&known(&[1, 2, 3])), Some(4));
+        // 只见过一季说明搜索没覆盖到整个系列，回查多半白花一次请求。
+        assert_eq!(next_season_to_fill(&known(&[3])), None);
+        // 最大季号顶到上限时不再往上补，改补断头的那一季（生产路径上这类组
+        // 会被 season_fill_plan 先剔掉，这里留着当上限万一被调高时的护栏）。
+        assert_eq!(next_season_to_fill(&known(&[150, 200])), Some(149));
+    }
+
+    /// 补齐计划：只补"确实缺一季"的同系列，用户直接搜某一季时不补，
+    /// 不相关的系列不占回查预算。
+    #[test]
+    fn season_fill_plan_targets_gaps_only() {
+        let items: Vec<SeriesItem> = ["聚宝仙盆第二季", "聚宝仙盆第三季", "别的剧第五季"]
+            .iter()
+            .enumerate()
+            .map(|(index, title)| search_item(&index.to_string(), title))
+            .collect();
+        let plan = season_fill_plan(&items, "聚宝仙盆");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].query, "聚宝仙盆第四季");
+        assert_eq!(plan[0].season, 4);
+        // 用户已经指定了季号，别再往结果里塞别的季。
+        assert!(season_fill_plan(&items, "聚宝仙盆第三季").is_empty());
+        // 只有一季的系列不补。
+        let lonely = vec![search_item("1", "聚宝仙盆第三季")];
+        assert!(season_fill_plan(&lonely, "聚宝仙盆").is_empty());
     }
 
     /// 题材页缓存要能原样取回，且不同键不得互相命中。
@@ -1416,6 +2097,7 @@ mod tests {
                 tags: vec![],
                 origin: String::new(),
                 brief: None,
+                rating: None,
             }],
             total: 1,
             has_more: false,
@@ -1423,6 +2105,7 @@ mod tests {
             categories: vec!["全部".into()],
             next_cursor: None,
             source: "test".into(),
+            degraded: false,
         };
         let key = "theme-cache-test|huanxiang|1|30|recommend";
         store_theme_page(key, &page("玄幻"));
@@ -1489,6 +2172,7 @@ mod tests {
     async fn catalog_tags_live() {
         let provider = DramaProvider::new().expect("provider");
         let filter = CatalogFilter {
+            source: None,
             channel: "comic".to_string(),
             category: "全部".to_string(),
             audience: "全部".to_string(),
@@ -1650,6 +2334,7 @@ mod tests {
         let provider = DramaProvider::new().expect("provider");
         for channel in ["drama", "comic"] {
             let filter = |page: u32| CatalogFilter {
+                source: None,
                 channel: channel.to_string(),
                 category: "全部".into(),
                 audience: "全部".into(),
@@ -1724,6 +2409,7 @@ mod tests {
         );
 
         let filter = |page: u32| CatalogFilter {
+            source: None,
             channel: "drama".to_string(),
             category: "都市".into(),
             audience: "全部".into(),
@@ -1812,6 +2498,7 @@ mod tests {
         //   用户看到的就是"点题材只有一个、也不再继续加载"。）
         for theme in comic_categories.iter().skip(1).take(1) {
             let comic_filter = CatalogFilter {
+                source: None,
                 channel: "comic".to_string(),
                 category: theme.clone(),
                 audience: "全部".into(),
@@ -1843,6 +2530,7 @@ mod tests {
             );
             let comic_second = provider
                 .catalog(&CatalogFilter {
+                    source: None,
                     channel: "comic".to_string(),
                     category: theme.clone(),
                     audience: "全部".into(),
@@ -1878,6 +2566,7 @@ mod tests {
         let provider = DramaProvider::new().expect("provider");
         let page = provider
             .catalog(&CatalogFilter {
+                source: None,
                 channel: "comic".into(),
                 category: "全部".into(),
                 audience: "全部".into(),
@@ -1915,5 +2604,123 @@ mod tests {
             serde_json::from_str(r#"{"loaderData":{"rank_hot-comic-drama":{"items":[]}}}"#)
                 .expect("router data");
         assert_eq!(find_pagination_value(&data, &["totalPages"]), None);
+    }
+
+    /// 评分只取站点真给的值，脏数据一律 None。
+    ///
+    /// 形状照抄 2026-09-29 实测的 `/search/{词}` → `video_data`：
+    /// 实测这条链路上**没有** `rating`，只有 `hot_score_data.score`（热度），
+    /// 所以正常路径是 `None`——这是站点的现状，不是解析失败。
+    ///
+    /// 锁住的是取值规则本身：站点哪天把 `rating` 补上就得立刻能用，且**绝不能**
+    /// 拿热度冒充评分。
+    #[test]
+    fn rating_reads_only_real_scores() {
+        // `parse_rating` 收的是 `video_data` 那个对象，所以按 `Value::Object`
+        // 解析——直接 `from_str::<Value>` 再取引用会把类型对不上。
+        let rating_of = |raw: &str| -> Option<f64> {
+            let value: Value = serde_json::from_str(raw).expect("json");
+            match value {
+                Value::Object(map) => parse_rating(&map),
+                other => panic!("期望 JSON 对象，实际是 {other}"),
+            }
+        };
+        // 缺失：实测的 video_data 原样就是这种形状 → None
+        assert_eq!(
+            rating_of(r#"{"series_id":"1","series_title":"战神"}"#),
+            None
+        );
+        // 实测热度键：4445 万热度，绝不能当评分读进来
+        assert_eq!(
+            rating_of(r#"{"hot_score_data":{"score":44456111,"text":"4445万热度"}}"#),
+            None
+        );
+        // 实测详情页 seriesSocialInfo 的形状：整数 9 与浮点 9.6 混着发
+        assert_eq!(rating_of(r#"{"rating":9}"#), Some(9.0));
+        assert_eq!(rating_of(r#"{"rating":9.6}"#), Some(9.6));
+        assert_eq!(rating_of(r#"{"rating":0}"#), Some(0.0));
+        // 非数字 / null / 空串：站点没给分，不能变成 0
+        assert_eq!(rating_of(r#"{"rating":"9.6"}"#), None);
+        assert_eq!(rating_of(r#"{"rating":null}"#), None);
+        assert_eq!(rating_of(r#"{"rating":""}"#), None);
+    }
+
+    /// 量纲锁死 0-10，越界当 None。
+    ///
+    /// 前端角标是 `rating.toFixed(1)` 直出、不做任何换算，所以 Rust 侧**不能**
+    /// 换算（换算就得两处都改，一个漏改就是错分）。代价是站点哪天把量纲换成
+    /// 0-100，这里会返回 None 而不是显示 "87.3 分"——宁可角标不显示（不变量 8）。
+    #[test]
+    fn rating_rejects_out_of_scale_values() {
+        let rating_of = |raw: &str| -> Option<f64> {
+            match serde_json::from_str::<Value>(raw).expect("json") {
+                Value::Object(map) => parse_rating(&map),
+                other => panic!("期望 JSON 对象，实际是 {other}"),
+            }
+        };
+        assert_eq!(rating_of(r#"{"rating":10.0}"#), Some(10.0));
+        // 0-100 量纲的 87.3 会被挡住
+        assert_eq!(rating_of(r#"{"rating":87.3}"#), None);
+        assert_eq!(rating_of(r#"{"rating":-1}"#), None);
+        // `rate` 是同义键（guo-core 的 provider_huangguo.go 就是 score/rating 二选一），
+        // 但那个源的 score 是热度字符串，Rust 侧不读它。
+        assert_eq!(rating_of(r#"{"rate":7.8}"#), Some(7.8));
+    }
+
+    /// 索引残缺必须一路传到 `CatalogPage.degraded`，且**只在**真的残缺时置位。
+    ///
+    /// 锁的是"题材筛选那条路"：它全靠全站索引，`catalog_index` 里"单页失败不
+    /// 整体失败"跳过的那几页对应的条目是真的搜不到，不报就是骗用户说"全站就
+    /// 这些"。索引完整时必须是 false，否则正常浏览也会常亮降级角标。
+    #[test]
+    fn paginate_filtered_carries_index_degradation() {
+        let filter = CatalogFilter {
+            source: None,
+            channel: "drama".to_string(),
+            category: "全部".into(),
+            audience: "全部".into(),
+            sort: "recommend".into(),
+            keyword: None,
+            page: 1,
+            page_size: 30,
+            cursor: None,
+        };
+        let items = vec![search_item("1", "战神"), search_item("2", "和气生财")];
+        assert!(
+            !paginate_filtered(items.clone(), &filter, 1, false).degraded,
+            "索引完整时不得报降级"
+        );
+        assert!(
+            paginate_filtered(items, &filter, 1, true).degraded,
+            "索引建的时候跳过过整页，就必须报降级"
+        );
+    }
+
+    /// `rating` 缺失时序列化仍是合法 JSON（前端 `rating?: number` 兼容 undefined）。
+    ///
+    /// 顺带锁住 `degraded` 恒定出现——前端靠它区分"这次结果可不可信"，
+    /// 少这个键就退回到按 `source` 文案猜的老路。
+    #[test]
+    fn catalog_page_always_emits_degraded_and_omits_absent_rating() {
+        let item = search_item("1", "战神");
+        let page = crate::models::CatalogPage {
+            items: vec![item],
+            total: 1,
+            has_more: false,
+            page: 1,
+            categories: vec!["全部".into()],
+            next_cursor: None,
+            source: "test".into(),
+            degraded: true,
+        };
+        let json = serde_json::to_string(&page).expect("序列化");
+        assert!(
+            json.contains(r#""degraded":true"#),
+            "degraded 必须恒定出现在载荷里：{json}"
+        );
+        assert!(
+            !json.contains("rating"),
+            "rating 为 None 时不该输出占位 0：{json}"
+        );
     }
 }

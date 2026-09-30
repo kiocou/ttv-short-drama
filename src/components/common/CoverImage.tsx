@@ -30,9 +30,17 @@ import React, { useEffect, useRef, useState } from 'react';
  * - 图片在 `onLoad` 之前是透明的，**加载完成才淡入**——所以中途看到的是占位而不是半截空白；
  * - 加载慢/挂起时占位一直顶着，图片元素留在原地继续尝试，**一旦成功会自动浮现**，
  *   不会出现"等太久被前端判死、其实后来又加载好了"的浪费。
+ *
+ * ## guo 外部源的封面（`resolveSrc`）
+ *
+ * guo 源的封面地址不能直接喂给 `<img>`（黄果视频有 Cloudflare 防护、部分源封面
+ * 是加过密的），必须经 guo-core 带源侧 Referer 下载后取本地缓存文件。提供
+ * `resolveSrc` 时：视口到达 → 调它拿本地路径 → `convertFileSrc` 后加载；
+ * 拿不到（含明确的"该剧没有封面"）直接判不可得。失败/耗尽重试的卡片由宿主
+ * 通过 `onUnavailable` 感知并决定是否移除。
  */
 export interface CoverImageProps {
-  /** 封面地址；空/纯空白时直接显示占位，不发任何请求。 */
+  /** 封面地址；空/纯空白时直接显示占位，不发任何请求。提供 `resolveSrc` 时忽略。 */
   src?: string | null;
   /** 标题，取首字作为占位。 */
   title: string;
@@ -47,6 +55,10 @@ export interface CoverImageProps {
   /** 语义仍是"要不要立即加载"：`eager` 跳过视口判断直接开始。 */
   loading?: 'eager' | 'lazy';
   fetchPriority?: 'high' | 'auto' | 'low';
+  /** 异步解析真实封面（guo 源：返回本地缓存文件路径）。提供后忽略 `src`。 */
+  resolveSrc?: () => Promise<string | null>;
+  /** 封面确定不可得（解析失败 / 重试耗尽）时回调一次，宿主可据此移除卡片。 */
+  onUnavailable?: () => void;
 }
 
 /** 重试上限（含首次）：CDN 抖动两次还不行，就没必要继续折腾用户。 */
@@ -74,19 +86,34 @@ export const CoverImage: React.FC<CoverImageProps> = ({
   placeholderTextClassName = 'text-3xl',
   loading = 'lazy',
   fetchPriority = 'auto',
+  resolveSrc,
+  onUnavailable,
 }) => {
-  const url = (src || '').trim();
+  const directUrl = (src || '').trim();
   const char = (title || '').trim().slice(0, 1) || fallbackChar;
 
   const [started, setStarted] = useState(loading === 'eager');
   const [loaded, setLoaded] = useState(false);
   const [attempt, setAttempt] = useState(0);
-  /** 重试次数用尽：不再渲染 `img`，只留占位。 */
+  /** 重试次数用尽（或 guo 封面解析失败）：不再渲染 `img`，只留占位。 */
   const [givenUp, setGivenUp] = useState(false);
+  /** guo 封面解析结果：null = 尚未解析，其余 = 可用地址（失败走 givenUp）。 */
+  const [resolvedUrl, setResolvedUrl] = useState<string | null>(null);
+  const resolveAttemptedRef = useRef(false);
   const holderRef = useRef<HTMLDivElement | null>(null);
   /** 上一个地址：用来区分“首次挂载”与“地址真的变了”。 */
-  const prevUrlRef = useRef(url);
+  const prevUrlRef = useRef('');
   const imgRef = useRef<HTMLImageElement | null>(null);
+  // 用 ref 存回调：宿主传入的箭头函数每次渲染都是新 identity，作为 effect deps
+  // 会反复触发；值本身只在"要通知"时用一次。
+  const onUnavailableRef = useRef(onUnavailable);
+  onUnavailableRef.current = onUnavailable;
+  const reportedUnavailableRef = useRef(false);
+
+  // guo 源（resolveSrc）忽略直接地址——站源封面直连在 WebView 里不可用，
+  // 必须等 Rust 换回本地缓存的图片。
+  const url = resolveSrc ? (resolvedUrl ?? '') : directUrl;
+  const hasSource = Boolean(directUrl || resolveSrc);
 
   /**
    * **只在地址真的变了**时整体重来（换剧 / 节点被复用）。
@@ -105,10 +132,10 @@ export const CoverImage: React.FC<CoverImageProps> = ({
     setGivenUp(false);
   }, [url]);
 
-  /** 进入视口（提前一屏）才开始加载。 */
+  /** 进入视口（提前一屏）才开始加载；guo 源的解析也等这个信号，避免整页一起打 IPC。 */
   useEffect(() => {
-    if (!url || started || typeof IntersectionObserver === 'undefined') {
-      if (url && !started && typeof IntersectionObserver === 'undefined') setStarted(true);
+    if (!hasSource || started || typeof IntersectionObserver === 'undefined') {
+      if (hasSource && !started && typeof IntersectionObserver === 'undefined') setStarted(true);
       return;
     }
     const holder = holderRef.current;
@@ -125,7 +152,54 @@ export const CoverImage: React.FC<CoverImageProps> = ({
     );
     observer.observe(holder);
     return () => observer.disconnect();
-  }, [url, started]);
+  }, [hasSource, started]);
+
+  /**
+   * guo 封面解析：视口到达后向 Rust 换本地缓存路径 → asset URL。
+   *
+   * 只尝试一次（`resolveAttemptedRef`）：解析失败 = 这张卡没有可用封面
+   * （guo-core 已带源侧 Referer 试过一轮），直接走 givenUp，不再发第二次请求。
+   * 请求在尝试时捕获 `resolveSrc` 引用而不是跟着它的 identity 重启——宿主每次
+   * 渲染都会传新箭头函数，跟着重启会把在途结果当"过期"丢掉。
+   */
+  useEffect(() => {
+    if (!resolveSrc || !started || resolvedUrl !== null || resolveAttemptedRef.current) return;
+    resolveAttemptedRef.current = true;
+    const request = resolveSrc;
+    void (async () => {
+      try {
+        const path = await request();
+        if (!path) {
+          setGivenUp(true);
+          return;
+        }
+        // 动态引入：Web/演示模式没有 Tauri 运行时，静态 import 会直接炸构建产物。
+        const { convertFileSrc } = await import('@tauri-apps/api/core');
+        setResolvedUrl(convertFileSrc(path));
+      } catch {
+        setGivenUp(true);
+      }
+    })();
+  }, [resolveSrc, started, resolvedUrl]);
+
+  /** 封面确定不可得时通知宿主一次（宿主据此移除卡片）。 */
+  useEffect(() => {
+    if (!givenUp || reportedUnavailableRef.current) return;
+    reportedUnavailableRef.current = true;
+    onUnavailableRef.current?.();
+  }, [givenUp]);
+
+  /**
+   * 挂起兜底：CDN 连接一直 pending 时 `onError` 永远不会触发（见文件头注释），
+   * 没有终点的话卡片就是永久字占位——在"首页卡片必须都有封面"的约束下，
+   * 挂起与失败等价。20 秒是保守值：正常封面（含冷门小站 CDN）都在数秒内出图，
+   * 撑到 20 秒还没像素的，放进后续列表也比留着秃卡好。
+   */
+  useEffect(() => {
+    if (!started || loaded || givenUp || !url) return;
+    const timer = setTimeout(() => setGivenUp(true), 20_000);
+    return () => clearTimeout(timer);
+  }, [started, loaded, givenUp, url]);
 
   // `loading` 由 lazy 变为 eager（列表重排等）时补上开始信号，避免还傻等视口。
   useEffect(() => {
