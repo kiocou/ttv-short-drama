@@ -48,7 +48,17 @@ export function downloadUpdate(url: string, fileName: string): Promise<string> {
   return invokeUpdate<string>('update_download', { url, fileName });
 }
 
-/** 在资源管理器中定位到已下载的安装包。 */
+/**
+ * 静默安装已下载的安装包，然后退出应用。
+ *
+ * 调用即意味着应用即将退出：安装器要覆盖本进程的 exe 与随包资源。失败时抛错，
+ * 调用方应回落到 `revealUpdate`，而不是吞掉——静默安装失败对用户不可见。
+ */
+export function installUpdate(path: string): Promise<void> {
+  return invokeUpdate<void>('update_install', { path });
+}
+
+/** 在资源管理器中定位到已下载的安装包（静默安装失败时的退路）。 */
 export function revealUpdate(path: string): Promise<void> {
   return invokeUpdate<void>('update_reveal', { path });
 }

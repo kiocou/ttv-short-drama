@@ -8,7 +8,7 @@ TTV Short Drama —— **Windows 专属**的短剧 / 漫剧 / 动漫桌面播放
 
 - 前端：React 19 + TypeScript + Vite 6 + Tailwind（`src/`）
 - 后端：Tauri 2 + Rust（`src-tauri/src/`）
-- 随包运行时：嵌入式 CPython + 解析 worker + ffmpeg + mpv + **guo-core（Go 编译的 `duanju_core.dll`）**（`src-tauri/resources/`）
+- 随包运行时：嵌入式 CPython + 解析 worker + ffmpeg + **guo-core（Go 编译的 `duanju_core.dll`）**（`src-tauri/resources/`）。ffmpeg 住在 `resources/mpv/` 目录下，但该目录**只装 ffmpeg**，mpv 已于 0.2.15 移除
 - 窗口：无边框（`decorations: false`）+ Windows 11 Mica 纯白玻璃质感
 - 播放内核：**WebView2 里的 `<video>`**，不是 libmpv（见 §6 文档偏差）
 
@@ -112,7 +112,7 @@ src/
 | `anime_provider.rs` | 526 | 动漫源分发：dmghg 正式源 / 暴风兜底源，按 id 前缀与源可用性选择 |
 | `hls_proxy.rs` | 488 | 本地 HLS 代理（127.0.0.1，带访问令牌，分块流式转发） |
 | `pip.rs` | 412 | 画中画小窗（label: `mini`）：置顶无边框窗口创建/复用、交接包与进度回传、关闭回报 |
-| `update.rs` | 559 | 客户端更新：查 GitHub Releases、下载安装包到下载目录、定位文件（不自动安装） |
+| `update.rs` | 559 | 客户端更新：查 GitHub Releases、下载安装包到下载目录、静默安装并退出 |
 | `storage.rs` | 310 | SQLite：历史、收藏、设置 |
 | `models.rs` | 353 | 跨 IPC 的 serde 契约 |
 
@@ -139,8 +139,14 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 13. **画中画小窗是第三块 `<video>`，但播放权同一时刻只属于一个窗口**（小窗 = 独立置顶窗口 `mini`，见 `src-tauri/src/pip.rs` + `src/services/pip.ts`）。交接时主窗口先 `pause()` 再离开播放器视图（`stopPlayback` 作废会话 + 落盘）；主窗口要自己起播时先 `dismissPip()` 收掉小窗。交接包里传的是**身份 + 播放参数**（seriesId / episodeId / 秒数 / 音量 / 静音 / 倍速 / 连播设置 / 集列表），**不传播放地址**——动漫链路主窗口挂的是 hls.js 的 MSE `blob:`（跨窗口不可用），所以小窗自己按同一条 IPC 命令重新解析。另：两个窗口各自持有一份前端会话号计数（都从 100 起），靠"播放权唯一"避开撞号；若将来允许两路同时播，必须把会话号收口到后端。
     （补充：创建小窗的 `pip_open` **必须是 `async` 命令** —— 同步命令跑在主线程上，而 `WebviewWindowBuilder::build()` 在主线程里要内联建窗口、又需要事件循环继续泵消息，两边互等会让这次 IPC 永不返回、小窗停在 `about:blank`。小窗起播还必须容忍 WebView2 的省电暂停：小窗刚创建时还没有前台激活权限，首次 `play()` 几乎必定抛 `AbortError`，而小窗的常态就是"别的窗口在前台"，所以要靠"播放意图 + 周期重试"自己接上，不能只挂 `focus`/`visibilitychange`。）
     （补充二：**停播必须自己动手，不能指望"窗口没了声音就停"**。窗口 `hide()` 之后音频照旧在播（Chromium 标准行为），而页面的 `document.visibilityState` 仍是 `visible` —— 前端根本发现不了自己被藏起来，"声音停掉"曾完全依赖销毁 webview，而 `destroy()` 是异步投递且可能失败。因此 `pip.rs` 里停播、隐藏、销毁是**三步分开的**：先注入停播脚本（`pause()` + 清 `src` + `load()`）→ 再 `hide()` → 留 150ms 排空 → 最后销毁；销毁失败退化为 `close()` 并写 stderr，不得静默吞错。系统关闭路径（Alt+F4）同样要在 **`CloseRequested`** 里补停播，`Destroyed` 是事后的、什么都来不及。另：那 150ms 内窗口可能被 `pip_open` 重新 `show()` 复用，销毁前必须先看可见性，否则会出现"点了画中画、小窗闪一下就没"。）
-    （补充三：**「检查更新」的网络请求放在 Rust 侧**（`update.rs`），不走前端 `fetch`——前端 CSP 收得很紧且**只在生产构建注入**，页面里试通、打包后才挂是这类功能的经典翻车方式。另外：仓库是私有时 GitHub 的 `/releases/latest` 对未认证请求返回 **404**（而不是 403，避免泄露私有资源是否存在），这条要写成可读的提示，不要笼统一句「检查更新失败」。下载完成后**只定位文件、不得自动安装**。）
+    （补充三：**「检查更新」的网络请求放在 Rust 侧**（`update.rs`），不走前端 `fetch`——前端 CSP 收得很紧且**只在生产构建注入**，页面里试通、打包后才挂是这类功能的经典翻车方式。另外：仓库是私有时 GitHub 的 `/releases/latest` 对未认证请求返回 **404**（而不是 403，避免泄露私有资源是否存在），这条要写成可读的提示，不要笼统一句「检查更新失败」。**下载完成后会自动静默安装**——2026-10 改了原设计，原文是「只定位文件、不得自动安装」，理由与新约束见补充五。）
     （补充四：**与 GitHub 相关的请求要自己挂系统代理**。reqwest 只认 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量，**不读 Windows 的「Internet 设置」**；而本机代理写在注册表里（实测 `127.0.0.1:10808`）。两者不一致会产生很迷惑的现象——`api.github.com` 直连能通（「检查更新」看起来正常），但资产下载域名 `objects.githubusercontent.com` 直连失败，只报一句 `error sending request`，而同一地址用 PowerShell 下载却有 4.88 MB/s。`update.rs` 的 `system_proxy()` 会读 `ProxyEnable`/`ProxyServer` 并挂到下载客户端上。）
+    （补充五：**更新现在会自动静默安装，这条改了原设计**。2026-10 前的不变量是「下载完成**只定位文件、不得自动安装**」，理由是「静默运行一个从网上下载的可执行文件是这类功能最不该做的事」。新设计改为下载完成后直接 `update_install`：启动安装器（NSIS `/S`）+ `app.exit(0)`，用户零操作。
+      - **为什么改**：本项目所有用户都是被动更新的普通用户，「下载完还要自己翻下载目录、自己双击」对更新流程而言是纯粹的手工活，而且实测中旧流程的完成率极低。
+      - **风险如何收紧**（`update.rs` 的 `update_install` 必须同时满足，缺一条就要拒绝执行）：路径必须 `canonicalize` 后仍落在下载目录内（与 `update_reveal` 同一道校验，入参来自前端，不加限制等于给了「运行下载目录里任意 exe」）；扩展名必须是 `.exe`；文件头必须是 `MZ`；体积 ≥ 1 MB（挡下载中断的半截文件）。资产域名白名单与文件名净化（`is_trusted_asset_url` / `safe_file_name`）仍然生效。
+      - **失败不得静默**：`update_install` 返回错误时前端必须回落成「打开安装包所在文件夹」并如实提示原因，不能重试下载（那大概率同样失败），更不能吞掉。
+      - **退出时机**：`app.exit(0)` 必须在安装器 spawn **之后**调用。安装器自己会等旧进程退出，退出只是为了尽早释放 exe 与随包资源的文件句柄。
+      - **别把它做成后台静默更新**：启动时的自动提示必须**由用户选**（`UpdatePrompt` 组件：检查 → 有新版本则弹窗 → 立即更新 / 稍后）。「自动检查」可以，「不打招呼就换掉应用」不行。检查频率也要克制（6 小时一次 + 用户对同一版本说过「稍后」后不再问），GitHub 未认证配额只有 60 次/小时。）
 14. **guo 的播放 sequence 是 guo-core 的全局高水位，不是会话号**。`nativeBeginPlayback` 把 sequence 当高水位用（`sequence <= engine.playbackSequence` 直接回 `context.Canceled`），每发新的还会先掐掉上一次 resolve。**绝不能把前端 `session_id` 裸当 sequence 传**——它从 100 起，第一次起播就把水位抬过 100，此后任何画质探测必被 Cancel（这正是"guo 画质从第二集起恒为空"的根因），而画中画两个窗口各自持有一份从 100 起的计数，还会互相撞车。正确做法是 `guo_provider.rs` 里的 `AtomicU64`，基数 `SEQUENCE_BASE = 1_000_000`，起播与探测共用。
 15. **guo bridge 是全局单锁，锁内绝不能 `.await`**。`GuoBridge::request` 跨 FFI 可能耗时数百毫秒到数十秒（死源实测 25–60s），持锁等待会把**所有** guo 调用（其它源目录、封面、起播、轮询）一起堵在排队上。`guo_source_check` 的轮询就是标准写法：起锁发一枪就放掉，每轮 sleep 之后再取。拿 `category_index` / `sessions` 锁时也不要顺手调 bridge。
 16. **guo 源的分类必须做 id 映射**。前端题材栏回传的是中文**显示名**，而各源的分类 id 体系互不相同（黄果视频要纯数字、黄果 AI 要 slug、duanju 系要英文键），直接把"全部/爱情"发过去会被 guo-core 的分类校验**整体拒绝**——连默认首屏都挂（表现是所有 guo 源一律"目录加载失败"）。`guo_provider.rs` 的 `category_id()` 负责映射（分类表按源缓存，查不到回退"全部"而不是报错）。
@@ -157,7 +163,7 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 
 本仓库的文档描述的是**目标架构**，代码是**兼容期实现**。不要照文档写代码：
 
-- `docs/frontend-design.md` / `docs/backend-architecture.md` 讲的是 libmpv actor、`mpv_render_context` + D3D11 合成、小黄鸭/RIFE 补帧、`commands/mod.rs` 拆分迁移。**现状**：WebView2 `<video>` + MSE(hls.js)，补帧引擎已整体移除，mpv 仅用于 `external_player_open` 外部播放兜底。
+- `docs/frontend-design.md` / `docs/backend-architecture.md` 讲的是 libmpv actor、`mpv_render_context` + D3D11 合成、小黄鸭/RIFE 补帧、`commands/mod.rs` 拆分迁移。**现状**：WebView2 `<video>` + MSE(hls.js)，补帧引擎已整体移除；mpv 与 `external_player_open` 外部播放兜底也已于 0.2.15 一并删除（零调用方），现在不存在任何外部播放器路径。
 - `README.md` 提到的 `src/stores/useEnhancementStore.tsx`、`src-tauri/src/rtx_vsr.rs`、`lossless_scaling.rs` 都**不存在**。`Cargo.toml` 里关于它们的注释同样是残留 —— 那段注释提到的 `Win32_System_LibraryLoader` 现在有真实用途：`guo_provider.rs` 用它 `LoadLibraryA` 加载 `duanju_core.dll`。
 - 前端设计文档里"主导航只保留发现/历史/设置"也已过时：现在还有动漫、收藏、搜索。
 - 根目录的分析报告（`红果短剧抓包分析报告*.md`、`画质档位分辨率实测验证.md`、`短剧画质链路集成实施方案.md`）是**阶段性调研记录**，不随代码更新，读它们时以代码为准。
@@ -175,12 +181,12 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 
 - 仓库只能在 **Windows** 上构建运行（WebView2 / Mica / Win32 API / cgo）；CI 跑 `windows-latest`。
 - 随包资源都在 `src-tauri/resources/`，**都是构建/运行必需**，CI 会校验 `python/python.exe`、`shortdrama-worker/worker.py`、`mpv/ffmpeg.exe` 存在。`resources/guo-core/duanju_core.dll`（15.2 MB）**CI 暂未校验** —— 但缺了它应用起不来（`GuoProvider::new` 直接 Err），别把它加进 `.gitignore`。
-- `ffmpeg.exe`（101.9 MiB）与 `mpv.exe`（114.8 MiB）走 **Git LFS**（都超 GitHub 单文件 100 MiB 硬限制），克隆后需 `git lfs pull`。`duanju_core.dll` 是普通入库二进制（`.gitattributes` 里 `*.dll binary`）。
+- `ffmpeg.exe`（101.9 MiB）走 **Git LFS**（超 GitHub 单文件 100 MiB 硬限制），克隆后需 `git lfs pull`。`duanju_core.dll` 是普通入库二进制（`.gitattributes` 里 `*.dll binary`）。`mpv.exe` 原先也走 LFS，已随 0.2.15 一并移除。
 - `.gitignore` 里刻意用 `*.pyc` 而不是 `*.py[cod]`：后者会连带忽略 `.pyd`（Python C 扩展，运行必需，实测会漏掉 108 个）。
 - Vite 的文件监听带路径谓词过滤 + watcher error 降级（`vite.config.ts`）。Windows 上 `fs.watch` 的 EBUSY 曾两次让 dev server 直接退出，不要把这个逻辑简化掉。
 - 开发态数据落在 `src-tauri/.app-data/`（含 WebView2 的 `.app-data/webview-data`），运行期数据在 `%LOCALAPPDATA%\com.ttv.shortdrama`（设备凭据 + 剧集缓存 + `guo-core/`）。这些目录**绝不入库**。
 - `VidCom图标库/`、`design-proposals/` 是素材与预览，不参与构建。
-- `TTV_GUO_CORE_DLL` 环境变量可覆盖 DLL 查找路径（调试用）；`TTV_BOX_MPV` 同理覆盖外部播放器的 mpv 路径。
+- `TTV_GUO_CORE_DLL` 环境变量可覆盖 DLL 查找路径（调试用）。
 - 抓包/站点分析产物在 `.har-analysis/`（实测单个就有 43MB），是临时材料，别入库也别当参考资料。
 
 ## 9. 提交前检查清单

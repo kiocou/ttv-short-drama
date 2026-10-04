@@ -2327,7 +2327,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     currentEpisode,
     currentQuality,
     isMuted,
-    countdownActive: countdown.active,
+countdownActive: countdown.active,
+    countdownEpisodeId: countdown.episodeId,
     autoNext: settings.autoNext,
     countdownSeconds: settings.countdownSeconds,
   });
@@ -2336,7 +2337,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     currentEpisode,
     currentQuality,
     isMuted,
-    countdownActive: countdown.active,
+countdownActive: countdown.active,
+    countdownEpisodeId: countdown.episodeId,
     autoNext: settings.autoNext,
     countdownSeconds: settings.countdownSeconds,
   };
@@ -2494,32 +2496,40 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           countdownArmedRef.current = armedKey;
           setCountdown({ active: true, remaining: total, nextEpisode: nextEp, episodeId: armedEpisodeId });
 
-          let sec = total;
+          /**
+           * 读秒用**绝对截止时间**，而不是 `sec -= 1`。
+           *
+           * `setInterval` 不保证每 1000ms 准点回调：主线程一忙（解码、`backdrop-filter`
+           * 重绘）回调就会排队，到点后**连续补发**——那几次补发会把读秒连砍几秒，肉眼
+           * 可见地「跳着走」。改成每次拿当前时刻与截止时间相减，读秒就与真实秒数一致，
+           * 主线程卡多久都不累积误差。
+           */
+          const deadline = Date.now() + total * 1000;
           if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
           countdownIntervalRef.current = setInterval(() => {
-            sec -= 1;
-            if (sec <= 0) {
+            const left = Math.ceil((deadline - Date.now()) / 1000);
+            if (left <= 0) {
               if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
               countdownIntervalRef.current = null;
-              // 先收起面板再跳集：跳集要走"解析 → 接管"若干秒，状态留着会让
+              // 先收起面板再跳集：跳集要走「解析 → 接管」若干秒，状态留着会让
               // 倒计时停在最后一秒不消失。
               setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
               const ctxNow = handlerCtxRef.current;
               // 读秒期间用户若关掉了自动连播、或已经手动切走这一集，都不跳集。
-              // `tryClaimAutoAdvance` 再确认"画面里放的就是这一集、期间没有更新的
-              // 切换、且这一集还没被自动跳过"——三道关都过了才允许往后跳一集。
+              // `tryClaimAutoAdvance` 再确认「画面里放的就是这一集、期间没有更新的
+              // 切换、且这一集还没被自动跳过」——三道关都过了才允许往后跳一集。
               if (ctxNow.autoNext
                   && ctxNow.currentEpisode?.id === armedEpisodeId
                   && tryClaimAutoAdvance(armedEpisodeId)) {
                 playNextEpisodeRef.current();
               }
             } else {
-              setCountdown(prev => ({ ...prev, remaining: sec }));
+              setCountdown(prev => ({ ...prev, remaining: left }));
             }
           }, 1000);
-        }
-      }
-    };
+          }
+          }
+          };
 
     const handleProgress = () => {
       if (video.buffered.length > 0) {
@@ -2584,6 +2594,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 画面里装的已经不是 currentEpisode（说明这次 ended 是迟到的旧源事件），
       // 或这一集刚被倒计时跳过——一律不再往后跳，否则就是"一次跳好几集"。
       if (endedEpisodeId !== ctxEnded.currentEpisode?.id) return;
+      // 这一集**正在走倒计时**：跳转归倒计时管，`ended` 不许抢跑。
+      //
+      // 旧实现里两者是并列的触发器，抢同一把 `tryClaimAutoAdvance` 锁——而 `ended` 在
+      // 视频真正播完那一刻必然先到，于是它抢先 claim 成功、立刻跳集，正在跑的读秒被
+      // 腰斩。表现就是"54321 读到 3 就跳下一集"：读秒时长由 `dur - cur` 估算，
+      // `dur` 偏大（分片 MP4、本地解析产物）时它比真实剩余时间长，两者一交叉就提前跳。
+      //
+      // 倒计时本来就是"预告这次切换"的 UI，由它把切换发出去才不会中途变卦；`ended`
+      // 退化为**没有倒计时时的兜底**（末集、短片、结算期未武装等）。
+      if (ctxEnded.countdownActive && ctxEnded.countdownEpisodeId === endedEpisodeId) return;
       if (!ctxEnded.autoNext) return;
       if (!tryClaimAutoAdvance(endedEpisodeId)) return;
       playNextEpisodeRef.current();

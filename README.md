@@ -39,7 +39,7 @@
 
 - **前端**：React 19 + TypeScript + Vite 6 + Tailwind CSS
 - **后端**：Tauri 2 + Rust（`src-tauri/src/`）
-- **随包运行时**：嵌入式 CPython + 解析 worker + ffmpeg + mpv
+- **随包运行时**：嵌入式 CPython + 解析 worker + ffmpeg
 - **数据**：SQLite（历史 / 收藏 / 设置）
 
 ## 快速开始
@@ -122,7 +122,7 @@ TTV Short Drama/
 │   │   ├── pip.rs                # 画中画小窗
 │   │   ├── update.rs             # 检查更新与安装包下载
 │   │   └── storage.rs            # SQLite
-│   └── resources/                # 随包运行时（Python / worker / ffmpeg / mpv / guo-core）
+│   └── resources/                # 随包运行时（Python / worker / ffmpeg / guo-core）
 ├── release.ps1                   # 一键发布
 └── CHANGELOG.md                  # 变更记录（含根因与实测数据）
 ```

@@ -22,6 +22,7 @@ import { SearchView } from './components/views/SearchView';
 import { VideoSurface } from './components/player/VideoSurface';
 import { AnimeVideoSurface } from './components/player/AnimeVideoSurface';
 import { PipReturnBridge } from './components/player/PipReturnBridge';
+import { UpdatePrompt } from './components/common/UpdatePrompt';
 
 const AppContent: React.FC = () => {
   const { currentView, selectedSeriesId, isFullscreen, setIsFullscreen } = useAppStore();
@@ -165,6 +166,9 @@ const AppContent: React.FC = () => {
       {/* 画中画小窗回流：小窗关闭时接回播放/落历史（不渲染任何界面） */}
       <PipReturnBridge />
       <ToastContainer />
+      {/* 启动时的更新提示：常驻最上层，且自己管「检查 / 下载 / 安装」全过程。
+          放在这里而不是各个视图里，是为了让用户在任意页面都能收到它。 */}
+      <UpdatePrompt />
     </div>
   );
 };

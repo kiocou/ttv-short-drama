@@ -8,6 +8,7 @@ import {
   checkForUpdate,
   downloadUpdate,
   formatBytes,
+  installUpdate,
   listenDownloadProgress,
   revealUpdate,
   type DownloadProgress,
@@ -615,8 +616,12 @@ export const SettingsView: React.FC = () => {
   >({ kind: 'idle' });
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
-  /** 已下载的安装包路径；“打开所在文件夹”按钮用它。 */
+  /** 已下载的安装包路径；静默安装失败时用它做「打开文件夹」退路。 */
   const [savedPath, setSavedPath] = useState<string | null>(null);
+  /** 下载完成后正在静默安装（此时应用即将退出，界面不该再给可点的操作）。 */
+  const [isInstalling, setIsInstalling] = useState(false);
+  /** 静默安装失败的原因。非 null 时才显示「打开文件夹」退路。 */
+  const [installError, setInstallError] = useState<string | null>(null);
   /** 当前版本号：从二进制里拿，不在前端另写一份。 */
   const [appVersion, setAppVersion] = useState('');
   const canUpdate = isTauriEnvironment();
@@ -662,6 +667,10 @@ export const SettingsView: React.FC = () => {
   const handleCheckUpdate = async () => {
     setUpdateState({ kind: 'checking' });
     setSavedPath(null);
+    setInstallError(null);
+    setIsInstalling(false);
+    setInstallError(null);
+    setIsInstalling(false);
     setProgress(null);
     try {
       const info = await checkForUpdate();
@@ -687,12 +696,27 @@ export const SettingsView: React.FC = () => {
       // 进度走事件，这里只等最终路径；下载失败会抛错，同时事件也会带一次 done。
       const path = await downloadUpdate(info.assetUrl, info.assetName);
       setSavedPath(path);
+      // 下载完成就装上：用户点的是「更新」，不是「帮我把文件存下来」。
+      // installUpdate 成功会让后端直接退出应用，这里不会返回。
+      setIsInstalling(true);
+      try {
+        await installUpdate(path);
+        // 走到这里说明应用没有退出——后端已 exit，属于不该发生的状态，如实报出来，
+        // 免得界面永远停在「正在安装…」。
+        setIsInstalling(false);
+        setInstallError('安装器已启动，但应用未能自动退出，请手动关闭后重试。');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setIsInstalling(false);
+        setInstallError(message);
+        showToast(`自动安装未启动：${message}`, 'error');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       showToast(`下载失败：${message}`, 'error');
       setIsDownloading(false);
     }
-  };
+};
 
   const handleReveal = async () => {
     if (!savedPath) return;
@@ -965,25 +989,46 @@ export const SettingsView: React.FC = () => {
                 </p>
               )}
 
-              {/* 下载进度：只在下载中出现，完成后面板换成“打开文件夹” */}
-              {isDownloading && (
+              {/* 下载 / 安装进度。安装阶段没有百分比，用一条不确定宽度的脉冲条如实表达
+                  "正在进行"，而不是拿下载的百分比假装还在下载。 */}
+              {(isDownloading || isInstalling) && (
                 <div className="flex flex-col gap-1.5">
                   <div className="h-1.5 w-full rounded-full bg-blue-200/60 overflow-hidden">
-                    <div
-                      className="h-full bg-blue-600 rounded-full transition-[width] duration-200 ease-out"
-                      style={{ width: `${progress?.percent ?? 0}%` }}
-                    />
+                    {isInstalling ? (
+                      <div className="h-full w-1/3 bg-blue-600 animate-pulse" />
+                    ) : (
+                      <div
+                        className="h-full bg-blue-600 rounded-full transition-[width] duration-200 ease-out"
+                        style={{ width: `${progress?.percent ?? 0}%` }}
+                      />
+                    )}
                   </div>
                   <span className="text-[10px] font-mono text-slate-500">
-                    {progress && progress.total > 0
-                      ? `${formatBytes(progress.received)} / ${formatBytes(progress.total)} · ${progress.percent}%`
-                      : '正在连接…'}
+                    {isInstalling
+                      ? '下载完成，正在启动安装程序…'
+                      : progress && progress.total > 0
+                        ? `${formatBytes(progress.received)} / ${formatBytes(progress.total)} · ${progress.percent}%`
+                        : '正在连接…'}
                   </span>
                 </div>
               )}
 
               <div className="flex items-center gap-2 flex-wrap">
-                {!savedPath ? (
+                {isInstalling ? (
+                  // 安装阶段应用即将退出，不给任何可点的东西——点了也只是白点。
+                  <span className="text-[11px] text-slate-500">安装程序启动后本应用会自动关闭…</span>
+                ) : installError && savedPath ? (
+                  // 静默安装没跑起来时的退路：把包暴露给用户自己双击，而不是重试一次
+                  // 大概率同样失败的下载。
+                  <FluentButton
+                    variant="primary"
+                    size="sm"
+                    icon={<FolderSearch className="w-3.5 h-3.5" />}
+                    onClick={handleReveal}
+                  >
+                    打开安装包所在文件夹
+                  </FluentButton>
+                ) : (
                   <FluentButton
                     variant="primary"
                     size="sm"
@@ -991,19 +1036,15 @@ export const SettingsView: React.FC = () => {
                     icon={<Download className="w-3.5 h-3.5" />}
                     onClick={handleDownload}
                   >
-                    {isDownloading ? '正在下载…' : '下载安装包'}
-                  </FluentButton>
-                ) : (
-                  <FluentButton
-                    variant="primary"
-                    size="sm"
-                    icon={<FolderSearch className="w-3.5 h-3.5" />}
-                    onClick={handleReveal}
-                  >
-                    打开所在文件夹
+                    {isDownloading ? '正在下载…' : '下载并安装'}
                   </FluentButton>
                 )}
               </div>
+              {installError && (
+                <p className="text-[11px] text-amber-700 leading-relaxed">
+                  自动安装未启动：{installError}。已下载的安装包在下方可手动打开。
+                </p>
+              )}
             </div>
           )}
         </SectionCard>

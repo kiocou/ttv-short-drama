@@ -24,12 +24,10 @@ use crate::short_drama_app::{
     short_drama_app_stream,
 };
 use crate::storage::Database;
-use crate::update::{app_version, update_check, update_download, update_reveal};
+use crate::update::{app_version, update_check, update_download, update_install, update_reveal};
 use std::collections::HashMap;
 use std::fs;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Manager, State};
@@ -702,40 +700,6 @@ fn playback_snapshot(
 }
 
 #[tauri::command]
-fn external_player_open(url: String) -> Result<(), String> {
-    let url = url.trim();
-    if !url.starts_with("https://") {
-        return Err("播放地址无效。".into());
-    }
-    let candidates = [
-        std::env::var_os("TTV_BOX_MPV").map(PathBuf::from),
-        Some(PathBuf::from("src-tauri/resources/mpv/mpv.exe")),
-    ];
-    let player = candidates
-        .into_iter()
-        .flatten()
-        .find(|path| path.is_file())
-        .or_else(|| Some(PathBuf::from("mpv.exe")))
-        .ok_or_else(|| "未找到兼容播放器 mpv。".to_string())?;
-    let mut command = Command::new(player);
-    command.args([
-        "--no-config",
-        "--force-window=yes",
-        "--keep-open=no",
-        "--http-header-fields=Referer: https://novel.snssdk.com/,User-Agent: com.phoenix.read/71332",
-        url,
-    ]);
-    // CREATE_NO_WINDOW：外部播放器由用户手势触发，但 GUI 子系统下 mpv.com
-    // 兼容层与宿主仍可能闪终端窗口，后台创建标志一并抑制。
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    command
-        .spawn()
-        .map_err(|error| format!("启动兼容播放器失败：{error}"))?;
-    Ok(())
-}
-
-#[tauri::command]
 fn history_list(state: State<'_, AppState>) -> Result<Vec<WatchHistoryItem>, String> {
     state.database.list_history()
 }
@@ -1235,7 +1199,6 @@ fn main() {
             playback_open,
             playback_command,
             playback_snapshot,
-            external_player_open,
             short_drama_app_status,
             short_drama_app_set_device,
             short_drama_app_resolve,
@@ -1266,6 +1229,7 @@ fn main() {
             update_check,
             update_download,
             update_reveal,
+            update_install,
             app_version,
         ])
         .run(tauri::generate_context!())
