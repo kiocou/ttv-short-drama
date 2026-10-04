@@ -71,7 +71,6 @@ export interface PipHandoff {
   /** 短剧 worker 的内容类型（1 短剧 / 1004 漫剧）；动漫链路为空。 */
   contentType?: number | null;
   autoNext: boolean;
-  countdownSeconds: number;
   episodes: PipEpisodeRef[];
 }
 

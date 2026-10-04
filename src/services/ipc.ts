@@ -77,7 +77,6 @@ const STORAGE_KEYS = {
 export const DEFAULT_SETTINGS: UserSettings = {
   defaultQuality: 'auto',
   autoNext: true,
-  countdownSeconds: 5,
   preferredEngine: 'off',
   targetFps: 60,
   catalogCacheMb: 0,

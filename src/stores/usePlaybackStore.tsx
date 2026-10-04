@@ -52,19 +52,6 @@ function disposePrepared(prepared: PreparedSource | null): void {
 /** 首帧预解池的容量。3 = 下一集 + 下两集，与 warmAdjacentEpisodes 的下三集对齐。 */
 const PREPARED_POOL_MAX = 3;
 
-interface CountdownState {
-  active: boolean;
-  remaining: number;
-  nextEpisode: EpisodeItem | null;
-  /**
-   * 这次倒计时是为**哪一集**启动的（vid）。
-   *
-   * 没有它就无法判断倒计时是否已经过期：用户手动切集后，旧倒计时的
-   * "下一集"是相对旧集算出来的，若还按它跳，就会跳过一整集。
-   */
-  episodeId: string | null;
-}
-
 interface PlaybackContextType {
   sessionId: number;
   currentSeries: SeriesDetail | null;
@@ -80,7 +67,6 @@ interface PlaybackContextType {
   currentQuality: string;
   availableQualities: Array<{ label: string; value: string; resolution: string }>;
   isSideDrawerOpen: boolean;
-  countdown: CountdownState;
   isDiagnosticsOpen: boolean;
   videoRef: React.RefObject<HTMLVideoElement | null>;
   openEpisode: (seriesId: string, episodeId?: string, startPosition?: number, qualityOverride?: string) => Promise<void>;
@@ -95,8 +81,6 @@ interface PlaybackContextType {
   playPrevEpisode: () => void;
   toggleSideDrawer: (open?: boolean) => void;
   toggleDiagnostics: (open?: boolean) => void;
-  cancelCountdown: () => void;
-  acceptCountdown: () => void;
   /** 离开播放器工作区时调用：暂停画面、取消后台连播并落盘进度。 */
   stopPlayback: () => void;
   /** 显式设置静音（从小窗回播放器时接回音频状态用）。 */
@@ -433,12 +417,6 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const [currentQuality, setCurrentQuality] = useState<string>('auto');
   const [isSideDrawerOpen, setIsSideDrawerOpen] = useState<boolean>(false);
   const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState<boolean>(false);
-  const [countdown, setCountdown] = useState<CountdownState>({
-    active: false,
-    remaining: 5,
-    nextEpisode: null,
-    episodeId: null,
-  });
   const [prepareStatus, setPrepareStatus] = useState<PrepareStatus | null>(null);
   const [isSwitching, setIsSwitching] = useState<boolean>(false);
   // 悬停预热的在途计数，见 prewarmEpisode 的并发上限说明。
@@ -507,15 +485,6 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 结果是"视频其实已经播起来了，界面却停在错误页"。
    */
   const adoptingRef = useRef<boolean>(false);
-  const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  /**
-   * 已经为哪一集武装过连播倒计时，键为 `${sessionId}:${episodeId}`。
-   *
-   * `timeupdate` 每 ~250ms 触发一次，而换集交接期主播放器上残留的
-   * duration/currentTime 仍属于上一集——没有这个"只武装一次"的标记，
-   * 倒计时会被反复重建，甚至在用户点过"立即播放"之后又重新出现。
-   */
-  const countdownArmedRef = useRef<string>('');
   // 供"只绑定一次"的事件监听器间接调用的稳定引用。
   const playNextEpisodeRef = useRef<() => void>(() => {});
   const openEpisodeRef = useRef<
@@ -1490,12 +1459,6 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     );
     // 清除现有的连播倒计时。换集后上一集的"已武装"标记必须一起作废，
     // 否则新一集（sessionId 变了、键不同）之外的残留状态会互相干扰。
-    if (countdownIntervalRef.current) {
-      clearInterval(countdownIntervalRef.current);
-      countdownIntervalRef.current = null;
-    }
-    countdownArmedRef.current = '';
-    setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
     // 上一集的解析进度与失败原因都不能留到这一集：新的解析会立刻重新上报，
     // 而残留的旧错误说明会让本次失败的原因被误读。
     setPrepareStatus(null);
@@ -2192,22 +2155,6 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   }, [currentSeries, currentEpisode]);
 
   // 连播倒计时处理
-  const cancelCountdown = () => {
-    if (countdownIntervalRef.current) {
-      clearInterval(countdownIntervalRef.current);
-      countdownIntervalRef.current = null;
-    }
-    setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
-  };
-
-  const acceptCountdown = () => {
-    // 手动点"立即播放"同样要过闸门：否则它会与"旧源随后派发的 ended"各跳一集，
-    // 用户点一次却跳了两集。claim 失败说明这一集已经被自动跳过了，直接收手。
-    const fromEpisodeId = countdown.episodeId;
-    cancelCountdown();
-    if (fromEpisodeId && !tryClaimAutoAdvance(fromEpisodeId)) return;
-    playNextEpisode();
-  };
 
   /**
    * 离开播放器工作区时停止播放。
@@ -2233,12 +2180,6 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 在途 open 任务绑定的是刚作废的会话，不能留在复用池：重进播放器再点
     // 同一集若复用到这条"所有续体都会 stale"的死任务，会表现为点了没反应。
     openInFlightRef.current.clear();
-    if (countdownIntervalRef.current) {
-      clearInterval(countdownIntervalRef.current);
-      countdownIntervalRef.current = null;
-    }
-    countdownArmedRef.current = '';
-    setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
     // 看门狗必须一起收掉：它的续体会重起播、甚至重装载整集，留着就是"人已退出
     // 却仍被后台定时器拉起播放"。提示同时收回，播放器下次进来是干净的。
     stopStallWatchdog();
@@ -2297,7 +2238,6 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // worker 的内容类型：漫剧与短剧在 App-API 上是两套参数（1004 / 1）。
         contentType: series.type === 'comic' ? 1004 : 1,
         autoNext: settings.autoNext,
-        countdownSeconds: settings.countdownSeconds,
         episodes: series.episodes.map(item => ({
           id: item.id,
           episodeNumber: item.episodeNumber,
@@ -2311,13 +2251,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
   }, [
     currentSeries, currentEpisode, currentQuality, volume, isMuted, playbackRate,
-    settings.autoNext, settings.countdownSeconds,
+    settings.autoNext,
   ]);
 
   /**
    * 事件处理器上下文。
    *
-   * 旧实现把 6 个监听器直接绑在 effect 里，依赖数组带着 `countdown.active`——
+   * 旧实现把 6 个监听器直接绑在 effect 里，依赖数组带着若干每秒都会变的状态——
    * 倒计时每秒跳一下就会把 6 个监听器全部摘掉重绑，换集瞬间还叠加
    * currentSeries/currentEpisode 变化，造成成片的事件抖动与 listener 泄漏风险。
    * 现在监听器**只绑定一次**，通过这个 ref 读到最新状态。
@@ -2327,20 +2267,14 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     currentEpisode,
     currentQuality,
     isMuted,
-countdownActive: countdown.active,
-    countdownEpisodeId: countdown.episodeId,
     autoNext: settings.autoNext,
-    countdownSeconds: settings.countdownSeconds,
   });
   handlerCtxRef.current = {
     currentSeries,
     currentEpisode,
     currentQuality,
     isMuted,
-countdownActive: countdown.active,
-    countdownEpisodeId: countdown.episodeId,
     autoNext: settings.autoNext,
-    countdownSeconds: settings.countdownSeconds,
   };
 
   // 看门狗唯一的定时器型资源，组件卸载必须收口。Provider 理论上与窗口同寿，
@@ -2439,97 +2373,7 @@ countdownActive: countdown.active,
       setPosition(cur);
       setDuration(dur);
       saveProgressThrottledRef.current(cur, dur);
-
-      const ctx = handlerCtxRef.current;
-
-      // 武装倒计时的前置条件：主播放器此刻承载的必须就是当前这一集。
-      //
-      // 少了这道判断就会复现"点了立即播放，下一集还在倒计时、到点又跳一集"：
-      //   cancelCountdown 清掉读秒后，主播放器开始把新源接管进来；而
-      //   adoptPreparedSource 为了保住旧帧、不黑屏，**刻意不调用 video.load()**，
-      //   于是 `video.src = 新源` 之后、`loadeddata` 之前，媒体元素上残留的
-      //   duration/currentTime 仍属于上一集（仍在结尾 8 秒内）。这次 timeupdate
-      //   会让 `dur - cur <= 8` 继续成立，把刚被取消的倒计时重新武装起来，
-      //   读秒结束后再切一集。
-      const liveSession = Number(video.dataset.sessionId);
-      const armedKey = `${liveSession}:${ctx.currentEpisode?.id ?? ''}`;
-      const playerCarriesCurrentEpisode = !adoptingRef.current
-        && liveSession === activeSessionRef.current;
-      // 画面里的源要经过"结算期"才允许武装倒计时——与 tryClaimAutoAdvance
-      // 同一道闸。cancelCountdown 之后新源接管进来的头 2 秒内，媒体元素上的
-      // duration/currentTime 仍是旧集残留值（adoptPreparedSource 刻意不调
-      // video.load()），这段窗口里的 timeupdate 会让 `dur - cur <= 8` 继续成立，
-      // 把刚被取消的倒计时重新武装起来（实测：点"立即播放"后倒计时消失几秒
-      // 又出现，到点再跳一集）。结算期判断让这次 timeupdate 直接作废。
-      const committed = videoCommittedRef.current;
-      const sourceSettled = Boolean(
-        committed
-        && committed.episodeId === (ctx.currentEpisode?.id ?? '')
-        && Date.now() - committed.at >= AUTO_ADVANCE_SETTLE_MS,
-      );
-
-      // 剩余时间等于读秒时长时触发连播倒计时（尊重用户的自动连播开关）。
-      //
-      // 触发点必须与读秒时长**动态对齐**：旧实现固定在剩 8 秒武装、读 5 秒，
-      // 于是每集最后 3 秒被跳过（8 - 5 = 3）——用户永远看不到结尾几秒。
-      // 现在剩余时间一进入读秒窗口（剩 countdownSeconds 秒）就武装，读完秒
-      // 恰好播完。窗口下限 3 秒：再短倒计时数字看不清；上限 8 秒兜底
-      // countdownSeconds 配置异常的情况。
-      const countdownWindow = Math.max(3, Math.min(8, ctx.countdownSeconds || 5));
-      if (playerCarriesCurrentEpisode
-          && sourceSettled
-          && countdownArmedRef.current !== armedKey
-          && dur > 20 && dur - cur <= countdownWindow && dur - cur > 0 && !ctx.countdownActive && ctx.autoNext
-          && ctx.currentSeries && ctx.currentEpisode) {
-        const curIdx = ctx.currentSeries.episodes.findIndex(e => e.id === ctx.currentEpisode!.id);
-        if (curIdx >= 0 && curIdx < ctx.currentSeries.episodes.length - 1) {
-          const nextEp = ctx.currentSeries.episodes[curIdx + 1];
-          // 记下这次倒计时是"为哪一集"启动的：读秒期间用户可能手动切集，
-          // 那时 nextEpisode 已经是相对旧集算出来的，绝不能照跳。
-          const armedEpisodeId = ctx.currentEpisode.id;
-          // 读秒时长与剩余时间取小者：剩余比配置短（比如分片 MP4 的时长
-          // 估计偏大）时，读完秒即播完，不能让读秒超过视频本身。
-          const total = Math.max(3, Math.min(
-            Math.max(3, Math.min(15, ctx.countdownSeconds || 5)),
-            Math.ceil(dur - cur),
-          ));
-          countdownArmedRef.current = armedKey;
-          setCountdown({ active: true, remaining: total, nextEpisode: nextEp, episodeId: armedEpisodeId });
-
-          /**
-           * 读秒用**绝对截止时间**，而不是 `sec -= 1`。
-           *
-           * `setInterval` 不保证每 1000ms 准点回调：主线程一忙（解码、`backdrop-filter`
-           * 重绘）回调就会排队，到点后**连续补发**——那几次补发会把读秒连砍几秒，肉眼
-           * 可见地「跳着走」。改成每次拿当前时刻与截止时间相减，读秒就与真实秒数一致，
-           * 主线程卡多久都不累积误差。
-           */
-          const deadline = Date.now() + total * 1000;
-          if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
-          countdownIntervalRef.current = setInterval(() => {
-            const left = Math.ceil((deadline - Date.now()) / 1000);
-            if (left <= 0) {
-              if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
-              countdownIntervalRef.current = null;
-              // 先收起面板再跳集：跳集要走「解析 → 接管」若干秒，状态留着会让
-              // 倒计时停在最后一秒不消失。
-              setCountdown({ active: false, remaining: 5, nextEpisode: null, episodeId: null });
-              const ctxNow = handlerCtxRef.current;
-              // 读秒期间用户若关掉了自动连播、或已经手动切走这一集，都不跳集。
-              // `tryClaimAutoAdvance` 再确认「画面里放的就是这一集、期间没有更新的
-              // 切换、且这一集还没被自动跳过」——三道关都过了才允许往后跳一集。
-              if (ctxNow.autoNext
-                  && ctxNow.currentEpisode?.id === armedEpisodeId
-                  && tryClaimAutoAdvance(armedEpisodeId)) {
-                playNextEpisodeRef.current();
-              }
-            } else {
-              setCountdown(prev => ({ ...prev, remaining: left }));
-            }
-          }, 1000);
-          }
-          }
-          };
+    };
 
     const handleProgress = () => {
       if (video.buffered.length > 0) {
@@ -2594,16 +2438,10 @@ countdownActive: countdown.active,
       // 画面里装的已经不是 currentEpisode（说明这次 ended 是迟到的旧源事件），
       // 或这一集刚被倒计时跳过——一律不再往后跳，否则就是"一次跳好几集"。
       if (endedEpisodeId !== ctxEnded.currentEpisode?.id) return;
-      // 这一集**正在走倒计时**：跳转归倒计时管，`ended` 不许抢跑。
-      //
-      // 旧实现里两者是并列的触发器，抢同一把 `tryClaimAutoAdvance` 锁——而 `ended` 在
-      // 视频真正播完那一刻必然先到，于是它抢先 claim 成功、立刻跳集，正在跑的读秒被
-      // 腰斩。表现就是"54321 读到 3 就跳下一集"：读秒时长由 `dur - cur` 估算，
-      // `dur` 偏大（分片 MP4、本地解析产物）时它比真实剩余时间长，两者一交叉就提前跳。
-      //
-      // 倒计时本来就是"预告这次切换"的 UI，由它把切换发出去才不会中途变卦；`ended`
-      // 退化为**没有倒计时时的兜底**（末集、短片、结算期未武装等）。
-      if (ctxEnded.countdownActive && ctxEnded.countdownEpisodeId === endedEpisodeId) return;
+      // 这里是**唯一**的自动跳集触发点：倒计时只做提示，不参与跳转。
+      // 上面 `endedEpisodeId !== ctxEnded.currentEpisode?.id` 挡掉迟到的旧源事件，
+      // `tryClaimAutoAdvance` 保证同一集只跳一次。加上「只有一个触发器」这个前提，
+      // 「一次跳好几集」这个历史上反复出现的故障就没有第二条路径可钻了。
       if (!ctxEnded.autoNext) return;
       if (!tryClaimAutoAdvance(endedEpisodeId)) return;
       playNextEpisodeRef.current();
@@ -2775,7 +2613,7 @@ countdownActive: countdown.active,
       video.removeEventListener('error', handleError);
     };
     // 有意留空依赖：监听器只绑定一次。
-    // 旧版把 currentSeries / currentEpisode / currentQuality / countdown.active /
+    // 旧版把 currentSeries / currentEpisode / currentQuality / 播放进度这类状态 /
     // isMuted 都列进依赖，导致倒计时每秒、每次换集都全量摘绑 6 个监听器——
     // 既是性能抖动源，也有 listener 泄漏风险。所有需要的状态改由
     // handlerCtxRef 实时读取，saveProgressThrottled 用 ref 间接调用。
@@ -2799,7 +2637,6 @@ countdownActive: countdown.active,
         currentQuality,
         availableQualities,
         isSideDrawerOpen,
-        countdown,
         isDiagnosticsOpen,
         videoRef,
         openEpisode,
@@ -2814,8 +2651,6 @@ countdownActive: countdown.active,
         playPrevEpisode,
         toggleSideDrawer: (open) => setIsSideDrawerOpen(prev => open ?? !prev),
         toggleDiagnostics: (open) => setIsDiagnosticsOpen(prev => open ?? !prev),
-        cancelCountdown,
-        acceptCountdown,
         stopPlayback,
         setMuted,
         isSwitching,
