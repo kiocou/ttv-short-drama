@@ -407,10 +407,6 @@ async guoCover(seriesId: string): Promise<string | null> {
       if (isTauriEnvironment()) await invokeBackend('playback_command', { sessionId, action, payload });
     },
 
-    async openExternal(url: string): Promise<void> {
-      if (isTauriEnvironment()) await invokeBackend('external_player_open', { url });
-    },
-
     async resolveNative(seriesId: string, vid: string, contentType?: number, quality = 'auto'): Promise<{ playUrl: string; width: number; height: number; sizeBytes: number; cached: boolean }> {
       if (!isTauriEnvironment()) throw new Error('原生短剧播放仅在桌面应用中可用。');
       return invokeBackend('short_drama_app_resolve', {

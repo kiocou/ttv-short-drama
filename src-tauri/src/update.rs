@@ -12,11 +12,22 @@
 //! 试通、打包后才挂掉是这类功能的经典翻车方式（见 AGENTS.md 的 CSP 条目）。
 //! 这里让请求由 reqwest 发出，既不碰 CSP，也不把 API 域名暴露给页面。
 //!
-//! ## 安装包不会自动静默安装
+//! ## 安装包会自动静默安装
 //!
-//! 下载完只**打开文件管理器定位到包**，是否安装、什么时候装由用户决定。
-//! 静默运行一个从网上下载的可执行文件，是这类功能最不该做的事。
-
+//! 下载完成后**直接启动安装器（`/S` 静默）并退出本应用**，用户全程零操作。
+//!
+//! 这是 2026-10 改的设计决策（原先是「只定位到下载目录，由用户自己点」）：
+//! 「下载完还要自己找文件、自己双击」对更新流程来说是纯粹的手工活，而本项目所有用户都是
+//! 从站内取内容的普通用户，不会有人主动去翻下载目录。
+//!
+//! 静默运行从网上下载的可执行文件确实不是好习惯，所以这里把风险收紧到可接受：
+//!   - 资产域名白名单 + 文件名单独净化（见 `is_trusted_asset_url` / `safe_file_name`），
+//!     且本次执行的文件路径必须**仍落在下载目录内**（与 `update_reveal` 同一道校验）；
+//!   - 只接受 `.exe`，且校验 MZ 文件头与最小体积，避免把空文件/占位文件当安装器跑；
+//!   - 启动失败不静默：返回错误，前端回落成「打开文件夹」并如实提示。
+//!
+//! 安装器本身是 NSIS 的 `/S`，它会自己处理「等待旧进程退出」；本应用退出只是让文件
+//! 句柄尽早释放，避免安装器写不进去。
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
@@ -561,6 +572,74 @@ pub fn update_reveal(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 安装包最小体积：低于此值视为下载中断留下的半截文件。
+///
+/// 1 MB 是保守下限——真实的 NSIS 安装包有几十 MB，而一个正常的可执行文件几乎不可能
+/// 只有几十 KB。这个阈值挡的是「下载到一半被取消、留下一个看着像安装包的文件」。
+const MIN_INSTALLER_BYTES: u64 = 1024 * 1024;
+
+/// 校验一个待安装的文件是否可以被执行，返回它的真实路径。
+///
+/// 这是 `update_install` 的安全边界，四道检查缺一不可：
+///   1. `canonicalize` 后必须仍在 `allowed_dir` 内——入参来自前端，不加限制等于给了页面
+///      一个「运行任意路径下的 exe」的能力。`canonicalize` 必须在比较之前：否则
+///      `下载目录\..\..\Windows\System32\cmd.exe` 能靠前缀比较蒙混过关。
+///   2. 扩展名必须是 `.exe`——挡掉把数据文件、脚本、快捷方式当安装器。
+///   3. 文件头必须是 `MZ`——Windows 可执行文件的魔数。
+///   4. 体积不小于 `MIN_INSTALLER_BYTES`——挡掉半截文件。
+///
+/// 抽成独立函数是为了能单测：这几条是纯判定，不该只能靠真机点一次安装来验证。
+fn resolve_installable(path: &Path, allowed_dir: &Path) -> Result<PathBuf, String> {
+    let real = path
+        .canonicalize()
+        .map_err(|error| format!("安装包不存在：{error}"))?;
+    let real_allowed = allowed_dir
+        .canonicalize()
+        .unwrap_or_else(|_| allowed_dir.to_path_buf());
+    if !real.starts_with(&real_allowed) {
+        return Err("只允许安装下载目录里的安装包。".to_string());
+    }
+    if real
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_none_or(|ext| !ext.eq_ignore_ascii_case("exe"))
+    {
+        return Err("那不是安装程序，已取消自动安装。".to_string());
+    }
+    let meta = std::fs::metadata(&real).map_err(|error| format!("无法读取安装包：{error}"))?;
+    if meta.len() < MIN_INSTALLER_BYTES {
+        return Err("安装包不完整（体积异常），已取消自动安装。".to_string());
+    }
+    let mut magic = [0u8; 2];
+    let mut file =
+        std::fs::File::open(&real).map_err(|error| format!("无法读取安装包：{error}"))?;
+    std::io::Read::read_exact(&mut file, &mut magic)
+        .map_err(|error| format!("无法读取安装包：{error}"))?;
+    if &magic != b"MZ" {
+        return Err("安装包格式不正确，已取消自动安装。".to_string());
+    }
+    Ok(real)
+}
+
+/// 下载完成后静默安装，并退出本应用让出文件锁。
+///
+/// 四道安全校验在 `resolve_installable` 里（AGENTS.md 不变量 13 补充五），这里只负责
+/// 启动与退出。`/S` 是 NSIS 的静默安装开关，参数以独立 argv 传递，不经过 shell。
+#[tauri::command]
+pub fn update_install(app: AppHandle, path: String) -> Result<(), String> {
+    let real = resolve_installable(&PathBuf::from(&path), &download_dir())?;
+
+    std::process::Command::new(&real)
+        .arg("/S")
+        .spawn()
+        .map_err(|error| format!("无法启动安装程序：{error}"))?;
+
+    // 安装器要覆盖本应用的 exe 与随包资源，必须等本进程彻底退出。先把界面收掉，避免
+    // 用户在安装的几秒里以为程序卡死。
+    app.exit(0);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +678,89 @@ mod tests {
         // 前缀伪装：必须连斜杠一起匹配
         assert!(!is_trusted_asset_url("https://github.com.evil.com/x.exe"));
         assert!(!is_trusted_asset_url("http://github.com/x.exe"));
+    }
+
+    /// 在临时目录里造一个够大、带 MZ 头的假安装包，返回 (下载目录, 安装包路径)。
+    fn fake_installer(dir_name: &str, file_name: &str, bytes: usize) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("ttv-update-test-{dir_name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("建临时目录");
+        let file = root.join(file_name);
+        let mut data = vec![b'M', b'Z'];
+        data.resize(bytes, 0u8);
+        std::fs::write(&file, data).expect("写假安装包");
+        (root, file)
+    }
+
+    fn big() -> usize {
+        MIN_INSTALLER_BYTES as usize + 1
+    }
+
+    #[test]
+    fn accepts_a_well_formed_installer_inside_the_download_dir() {
+        let (dir, file) = fake_installer("ok", "setup.exe", big());
+        assert!(resolve_installable(&file, &dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_file_outside_the_download_dir() {
+        let (dir, file) = fake_installer("outside", "setup.exe", big());
+        let elsewhere = std::env::temp_dir().join("ttv-update-test-not-the-dir");
+        std::fs::create_dir_all(&elsewhere).expect("建另一个目录");
+        let error = resolve_installable(&file, &elsewhere).unwrap_err();
+        assert!(error.contains("下载目录"), "实际错误：{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn rejects_path_traversal_out_of_the_download_dir() {
+        // `下载目录\..\evil.exe` 字符串上前缀匹配是通过的，只有 canonicalize 之后才发现
+        // 它其实在下载目录之外。这条正是第 1 道检查必须先 canonicalize、再比较的原因。
+        let (dir, file) = fake_installer("traversal-src", "evil.exe", big());
+        let escaped = std::env::temp_dir().join("ttv-update-test-traversal-evil.exe");
+        std::fs::copy(&file, &escaped).expect("把文件放到下载目录之外");
+        let sneaky = dir.join("..").join("ttv-update-test-traversal-evil.exe");
+        // 前提：`..` 拼出来的路径在字符串上确实以下载目录开头。
+        assert!(
+            sneaky.starts_with(&dir),
+            "测试前提不成立：带 .. 的路径不应以目录开头"
+        );
+        let error = resolve_installable(&sneaky, &dir).unwrap_err();
+        assert!(error.contains("下载目录"), "实际错误：{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&escaped);
+    }
+
+    #[test]
+    fn rejects_non_exe_extensions() {
+        let (dir, file) = fake_installer("bat", "setup.bat", big());
+        let error = resolve_installable(&file, &dir).unwrap_err();
+        assert!(error.contains("不是安装程序"), "实际错误：{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_truncated_download() {
+        // 下载到一半被取消：MZ 头有、体积不够。
+        let (dir, file) = fake_installer("truncated", "setup.exe", 4096);
+        let error = resolve_installable(&file, &dir).unwrap_err();
+        assert!(error.contains("不完整"), "实际错误：{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_file_without_the_mz_magic() {
+        // 体积够、扩展名对，但内容不是可执行文件（例如把视频改名成 .exe）。
+        let (dir, file) = fake_installer("notmz", "setup.exe", big());
+        // 必须写满 big() 字节：只写 4 个字节会先被体积检查拦下，那样测的就不是
+        // MZ 这一道了。
+        let mut data = vec![b'N', b'O'];
+        data.resize(big(), 0u8);
+        std::fs::write(&file, data).expect("改写内容");
+        let error = resolve_installable(&file, &dir).unwrap_err();
+        assert!(error.contains("格式不正确"), "实际错误：{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
