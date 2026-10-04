@@ -1,3 +1,30 @@
+## 0.2.14 - 2026-10-04
+
+### 修复
+
+- **解析时闪出黑色控制台窗口**：随包的 `ffmpeg.exe` 是 console 子系统程序，由 Python worker 拉起。Rust 启 worker 时已经给了 `CREATE_NO_WINDOW`（所以 worker 自身没控制台），但该标志**不传递给子进程**，父进程无控制台时 Windows 会给 ffmpeg 新分配一个 —— 表现是用户在前台界面播放红果剧集时偶发闪出一个黑窗。三处 ffmpeg 调用（直连拉流解密、`resolve-prefix` 前缀解密、下载后转存）统一经 `_no_window()` 传 `CREATE_NO_WINDOW`；该标志作用在 `CreateProcess` 上，比 `STARTF_USESHOWWINDOW + SW_HIDE` 可靠（后者偶尔仍会闪）。mpv（外部播放）与 worker 进程的标志此前已存在，本次一并复核确认。
+- **全局重渲染风暴：卡片与搜索的响应速度修复**（实测驱动：`position` 是 React state，`timeupdate` 每秒约 4 次写入 → `PlaybackProvider` 每秒重渲染 4 次 → `ExploreView` 跟着重渲染 → 整页卡片重画；搜索框每敲一个字同样触发一遍）：
+  - **根因一：所有 store 的 context value 都是每次渲染新建的对象字面量**。于是任何一次 `setState`——切视图、弹个 toast、播放进度跳动、搜索框敲字——都会广播给**所有**消费者。而 App.tsx 把七个视图全部常驻 DOM（隐藏 ≠ 卸载），所以一次无关的状态变化会连带重渲染隐藏视图里的上百张卡片。`useAppStore` / `useFavoritesStore` / `useHistoryStore` / `useSettingsStore` / `useCatalogStore` 全部改为 `useMemo` 的 value。
+  - **根因二：action 每次渲染都换身份**。`navigateTo` / `goBack` / `rememberSearch` / `showToast` 等都被视图里内联的 `onClick` 依赖，它们一变，下游所有 `useMemo` / `React.memo` 全部失效。改为 `useCallback` + ref 读最新 state（依赖 state 的函数不该把 state 放进依赖）。
+  - **根因三：收藏状态订阅粒度是整张表**。`markBySeriesId` 每次渲染 `new Map(...)`，而每张卡片都订阅它——改任意一部剧的收藏就重渲染全部卡片。新增 `useFavoriteMark(seriesId)`（`useSyncExternalStore` + 逐 id 监听表），收藏变化只重渲染那一张卡；通知放在 effect 里而非 `useMemo` 里，避免渲染期间调用 listener 触发 React 警告。`markBySeriesId` 本身也补上 `useMemo`。
+  - **根因四：`SeriesCard` 不是 `memo`，且宿主传的是内联箭头函数**。现在它是 `React.memo`，`onClick` / `onUnavailable` 签名改为收 `seriesId`——卡片自己知道自己的 id，宿主只需传**一个** `useCallback` 给全部卡片，而不是每张卡新建一个闭包。三个宿主视图（发现 / 动漫 / 搜索）同步改。
+  - **封面：上百个 IntersectionObserver 合并成一个**。每张封面各建一个 IO 实例，一页 30 张、无限流后上百张，而它们要的判定完全一样。改为模块级共享单例 + `WeakMap` 回调表，惰性创建、命中即自注销。
+  - **`convertFileSrc` 的动态 import 提升为模块级 Promise 缓存**：原先每张 guo 卡都调一次（几十次 Promise 调度），现在全应用只解析一次，失败不缓存。
+  - **guo 封面 IPC 加会话内缓存 + 在途去重**（容量封顶 400）：同一张卡同时挂在多个常驻视图上时会重复请求；后端已落盘缓存，前端缓存的是稳定本地路径，不会拿到失效地址。失败结果（`null`）同样记录——那个源确实没封面，重试只是白打 IPC。
+  - **移除 `MicaCard` 的 `will-change-transform`**：它为每个元素强制分配合成层，而卡片是首屏 24 张、上百张的高频元素。与该文件已有的 backdrop-filter 实测（79 个模糊元素 → 滚动 p95 164.8ms）同源，合成层数量本身就是代价。
+  - **搜索：联想与快路并行**。原先联想挂在 `searchFast` 的 `.then` 里，总耗时 = 0.3-0.6s + 0.6-1.9s（联想要冷启动 Python）；而联想是纯补充、从头到尾不阻塞首屏。改为并行后总耗时是两者的最大值。
+- **首页无限流改成真正的预取式，滚动不再等网络**：旧实现是"滚到底 → 发请求 → 等回来 → 插入"，整段请求延迟就摆在滚动路径上，所以体感是"不能一直下滑，卡一下才出下一页"——`rootMargin` 从 640px 一路加到 1200px 也只是把停顿往前挪，没有取消它。现在把**发请求**与**提交到界面**拆开：
+  - **单页预取槽位（`pendingFetchRef`）**：一页只发一次，发完连同算好的页码与 Promise 一起搁在槽位里；用户滚到底时通常它已在途甚至已完成，提交变成同步动作。页码推进**刻意放在提交期而不是发起期**——这样"同一页被发起两次"（预取撞上提交、失败后重试）算出的页码完全相同，`requestCatalog` 的 inflight 去重直接复用同一个 Promise，天然幂等且不跳页。
+  - **预取不碰任何界面状态**：失败静默释放槽位，下一次滚动退化成同步加载即可，不该弹错误。登记 `seenIds` 也是提交期的职责，否则预取来的卡片会在真正提交时被自己的去重表过滤掉。
+  - **两条触发线**：store 里一条 `requestIdleCallback` 空闲预取（每页落地后排下一页，不和点击/切题材抢帧，文档隐藏时不预取），页面里一条"距底部 800px 就预取、400px 才提交"的双 IntersectionObserver。两条靠槽位幂等，不会重复打站源。
+  - **认领标记（`claimed`）**：`isLoadingMore` 是 state，React 重渲染前可能有第二个 `loadMore` 挤进来；此时页码尚未推进，它算出的会是同一页 —— 不挡住的话会留下一条已过期的记录，下一次提交因 id 去重拿到 0 条新卡片，从而**误判到底、无限流中途消失**。同理 `beginFetch` 返回 null 有"到底"与"正被认领"两种含义，只有槽位为空才能宣告到底。
+  - **提交后几何自检**：IntersectionObserver 只在"穿过阈值"时回调，而追加的内容可能不足以把哨兵推出 rootMargin（典型是本轮只多出两三条、其余源已到底），此时既没有新交叉事件、`loadMore` 也不会自己再来 —— 表现为"滚到底停住，往上推一下才有反应"。追加后按实际位置再兜一次。
+  - **observer 不再拿 `isLoading` / `isLoadingMore` 当守卫**：它们进依赖会让 observer 随每次提交重建，而哨兵若仍在窗口内会立刻再触发一次，等于把提交时机交给重建节奏。单飞由 store 的 `isLoadingMore` 负责。
+- **首页无限滚动永久卡在「正在加载更多内容…」**：翻页请求（`loadMore`）的收尾与失败处理有三处缺陷叠加，任一条都会让底部转圈停不下来。
+  - **根因一：`isLoadingMore` 复位带 requestId 判定**。翻页途中发生任何会重跑首屏的动作（切题材/排序/频道、设置页改启用源、顶部搜索回车），`requestIdRef` 就会前进；那一轮翻页随即被作废，它的 `finally` 因为判定不相等而**不复位 `isLoadingMore`**。这一标志一旦停在 `true`，`loadMore` 首行的 `if (isLoadingMore) return` 与 `ExploreView` 那句 `|| isLoadingMore` 会同时短路——滚动监听器还在，但永远不会有人再调它。表现就是底部永远挂着"正在加载更多内容…"，往上滚也不再加载。`loadMore` 本来就有 `isLoadingMore` 单飞，不存在两个在途请求互相踩，因此改成**无条件复位**（不带 requestId），并在 `loadData` 开头也显式清一次，覆盖"作废的那一轮永远等不到自己收尾"的情况。
+  - **根因二：全源到底时被当成加载失败**。所有源的页码都记作 0 之后 `pending` 为空，`requestAllSources` 里 `failures.length === sources.length` 在 `0 === 0` 时成立，于是抛出"目录数据加载失败（0 个源均无响应）"——一次正常的到底被抛进 `catch`。现在 `pending` 为空直接 `setHasMore(false)` 返回。
+  - **根因三：失败后自动重试风暴**。`isLoadingMore` 复位会重建 IntersectionObserver，而哨兵仍在视口内，于是立刻再次触发 `loadMore`；后端还在失败时这就变成一秒几次的请求风暴。翻页连续失败两次后置 `hasMore=false` 熔断，把重试交回用户——底部此时显示"加载更多失败，点此重试"而不是谎称"已加载全部公开内容"（该文案只在真到底时出现）。翻页成功一次即清零计数。
+
 ## 0.2.13 - 2026-09-30
 
 ### 新增

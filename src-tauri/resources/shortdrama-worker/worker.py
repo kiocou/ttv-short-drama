@@ -49,6 +49,22 @@ for _candidate in (_WORKER_DIR / "site-packages", _WORKER_DIR / "liushen", _WORK
 
 import requests  # noqa: E402
 
+
+def _no_window() -> dict:
+    """子进程创建标志：Windows 下不要弹出控制台窗口。
+
+    Rust 侧启 worker 时已经用了 CREATE_NO_WINDOW，所以 worker 自己没有控制台；
+    而随包的 ffmpeg.exe 是 console 子系统程序，它**不继承**父进程的这个标志——
+    父进程无控制台时，Windows 会给子进程新分配一个，于是用户在前台界面播放剧集时
+    会被闪出一个黑色终端窗口（只在全链路 ffmpeg 路径出现，所以很容易被漏测）。
+
+    CREATE_NO_WINDOW 在这里可靠：它作用在 CreateProcess 上，而 STARTF_USESHOWWINDOW
+    + SW_HIDE 偶尔仍会闪。Windows 之外没有这个概念，返回空 dict。
+    """
+    if os.name != "nt":
+        return {}
+    return {"creationflags": subprocess.CREATE_NO_WINDOW}
+
 from flurl.core import core_sixgod  # noqa: E402
 
 USER_AGENT = (
@@ -800,7 +816,7 @@ def _ffmpeg_direct_decrypt(ffmpeg: str, url: str, key_hex: str | None,
     command += ["-i", url, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", str(partial)]
 
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace")
+                            text=True, encoding="utf-8", errors="replace", **_no_window())
     last_pct = -10
     try:
         if proc.stdout is not None:
@@ -1016,7 +1032,8 @@ def resolve_prefix(vid: str, out_path: Path, device_id: str, install_id: str,
         # 全部可用——产物是正常可播的（实测 1.5MB 前缀解出 28.16 秒）。
         command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
                     "-movflags", "+faststart", str(partial)]
-        proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                              **_no_window())
         if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
             raise RuntimeError("前缀解密失败: " + (proc.stderr or "").strip()[:200])
         partial.replace(out_path)
@@ -1153,7 +1170,8 @@ def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: s
             command += ["-decryption_key", content_key.hex()]
         command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
                     "-movflags", "+faststart", str(partial)]
-        proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                              **_no_window())
         if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
             raise RuntimeError("ffmpeg 处理失败: " + (proc.stderr or "").strip()[:300])
         partial.replace(out_path)

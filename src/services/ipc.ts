@@ -20,6 +20,31 @@ let currentGlobalSessionId = 100;
 const channelBySeriesId = new Map<string, string>();
 
 /**
+ * guo 封面解析结果的会话内缓存。
+ *
+ * key 是 seriesId，值是后端返回的**本地缓存文件路径**（或 `null` 表示该剧确实没有封面）。
+ * 后端 `guo_cover` 自己也会落盘缓存，所以前端这份缓存不会拿到失效地址。
+ *
+ * 容量封顶：无限流会持续引入新剧，不设上限就是一个只增不减的 Map。
+ */
+const GUO_COVER_CACHE_LIMIT = 400;
+const guoCoverCache = new Map<string, string | null>();
+const guoCoverInflight = new Map<string, Promise<string | null>>();
+
+function rememberGuoCover(seriesId: string, path: string | null): void {
+  guoCoverCache.set(seriesId, path);
+  if (guoCoverCache.size <= GUO_COVER_CACHE_LIMIT) return;
+  // Map 保持插入序：删最早插入的那一批即可，不必维护完整 LRU。
+  const excess = guoCoverCache.size - GUO_COVER_CACHE_LIMIT;
+  let removed = 0;
+  for (const key of guoCoverCache.keys()) {
+    guoCoverCache.delete(key);
+    removed += 1;
+    if (removed >= excess) break;
+  }
+}
+
+/**
  * 记住剧集来源。
  *
  * 只在**有值**时写入：channel 缺失不代表来源是短剧，无脑覆盖反而会把已知的
@@ -255,13 +280,34 @@ export const ipcService = {
      * 给 guo-core 带源侧 Referer 下载、解密、校验后落盘。失败返回 null——
      * 调用方按"无封面"处置，不重试。
      */
-    async guoCover(seriesId: string): Promise<string | null> {
+async guoCover(seriesId: string): Promise<string | null> {
       if (!isTauriEnvironment()) return null;
-      try {
-        return await invokeBackend<string | null>('guo_cover', { seriesId });
-      } catch {
-        return null;
-      }
+      // 会话内缓存 + 在途去重。
+      //
+      // 两个理由：
+      // ① 同一张卡可能同时挂在多个视图上（App.tsx 所有视图常驻 DOM），同一部剧的封面
+      //    就会被请求两次；这里也顺带覆盖详情页再次取同一张封面。
+      // ② 后端已经把封面落盘缓存，返回的是稳定的本地路径，所以前端缓存不会拿到过期地址。
+      //    缓存失败结果（null）也要记：那个源确实没有封面，重试只是白打一次 IPC。
+      const cached = guoCoverCache.get(seriesId);
+      if (cached !== undefined) return cached;
+      const inflight = guoCoverInflight.get(seriesId);
+      if (inflight) return inflight;
+
+      const request = invokeBackend<string | null>('guo_cover', { seriesId })
+        .then(path => {
+          rememberGuoCover(seriesId, path);
+          return path;
+        })
+        .catch(() => {
+          rememberGuoCover(seriesId, null);
+          return null;
+        })
+        .finally(() => {
+          guoCoverInflight.delete(seriesId);
+        });
+      guoCoverInflight.set(seriesId, request);
+      return request;
     },
     /**
      * 逐源实时状态。取代 `guoSources.ts` 里手写的 `status`——那批判定是一次性

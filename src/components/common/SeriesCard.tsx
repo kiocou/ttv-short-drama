@@ -3,7 +3,7 @@ import { Bookmark, Play, Star } from 'lucide-react';
 import { ipcService } from '../../services/ipc';
 import { SeriesItem } from '../../types/catalog';
 import { FAVORITE_MARK_LABEL, type FavoriteMark } from '../../types/favorite';
-import { useFavorites } from '../../stores/useFavoritesStore';
+import { useFavoriteMark } from '../../stores/useFavoritesStore';
 import { CoverImage } from './CoverImage';
 import { MicaCard } from './MicaCard';
 
@@ -37,25 +37,38 @@ export const SERIES_GRID_CLASS =
 interface SeriesCardProps {
   series: SeriesItem;
   index: number;
-  onClick: () => void;
-  /** 封面确定不可得时把整张卡移出列表。发现页要，搜索/动漫保留首字占位。 */
-  onUnavailable?: () => void;
+  /**
+   * 点击回调。**签名收 seriesId 而不是无参**：卡片自己知道自己的 id，这样宿主只需传
+   * **一个** `useCallback` 给全部卡片，而不是每张卡新建一个闭包。
+   *
+   * 这是 `React.memo` 能否生效的前提：内联箭头函数每次渲染都是新引用，props 永远
+   * 不相等，memo 等于没写。首页上百张卡时这个差别就是"滑动掉帧"与"顺滑"的差别。
+   */
+  onClick: (seriesId: string) => void;
+/**
+   * 封面确定不可得时把整张卡移出列表。发现页要，搜索/动漫保留首字占位。
+   * 同样收 seriesId，理由同 `onClick`。
+   */
+  onUnavailable?: (seriesId: string) => void;
 }
 
-export const SeriesCard: React.FC<SeriesCardProps> = ({ series, index, onClick, onUnavailable }) => {
+export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index, onClick, onUnavailable }) => {
   const isAnime = series.type === 'anime';
   /** 徽章占了 tags[0]，副标题只展示剩下的标签；没有就干脆空着。 */
   const tagLine = series.tags.slice(1, 3).join(' · ');
   /**
    * 追剧状态。**没有收藏记录就完全不渲染角标**——显示"未收藏"是纯噪音，
    * 而且大多数卡片本来就是未收藏状态。
+   *
+   * 用 `useFavoriteMark` 逐条订阅而不是 `useFavorites().markBySeriesId`：后者订阅
+   * 整张表，改任意一部剧的收藏都会重渲染这一张卡；首页上百张卡时这是纯粹的浪费。
    */
-  const mark = useFavorites().markBySeriesId.get(series.id);
+  const mark = useFavoriteMark(series.id);
 
   return (
     <MicaCard
       hoverable
-      onClick={onClick}
+      onClick={() => onClick(series.id)}
       className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
     >
       {/* 海报封面 (3:4 黄金竖屏比例) */}
@@ -72,7 +85,7 @@ export const SeriesCard: React.FC<SeriesCardProps> = ({ series, index, onClick, 
           loading={index < 8 ? 'eager' : 'lazy'}
           fetchPriority={index < 4 ? 'high' : 'auto'}
           resolveSrc={series.id.startsWith('guo:') ? () => ipcService.catalog.guoCover(series.id) : undefined}
-          onUnavailable={onUnavailable}
+          onUnavailable={onUnavailable ? () => onUnavailable(series.id) : undefined}
         />
         <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
 
@@ -167,4 +180,19 @@ export const SeriesCard: React.FC<SeriesCardProps> = ({ series, index, onClick, 
       </div>
     </MicaCard>
   );
-};
+});
+
+/**
+ * `React.memo` 只挡**父组件**引发的重渲染，而这正是我们要的效果：
+ *
+ * - 父组件（列表视图）因无关状态变化而重渲染时，props 逐个相同 → 整张卡片跳过；
+ * - 收藏状态变化走 `useFavoriteMark` 的内部订阅，属于该组件**自身**的状态更新，本来
+ *   就会绕过 memo 精确重渲染这一张卡 —— 不需要（也不能）在比较函数里管它。
+ *
+ * 所以默认浅比较即可。前提是宿主传**稳定**的 `onClick` / `onUnavailable`：每次渲染都
+ * 新建的箭头函数会让 props 永远不相等，memo 形同虚设。宿主侧要用 `useCallback` +
+ * ref 的写法，见 ExploreView / SearchView / AnimeView。
+ *
+ * `index` 参与比较是有意的：它决定封面是 eager 还是 lazy、`fetchPriority` 是 high 还是
+ * auto，翻页导致位置变化时必须重渲染（否则新追加的卡片会沿用错误的加载策略）。
+ */

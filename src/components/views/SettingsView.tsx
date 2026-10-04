@@ -15,24 +15,168 @@ import {
 } from '../../services/updater';
 import { isTauriEnvironment, ipcService, type GuoSourceCheck, type GuoSourceStatus } from '../../services/ipc';
 import { GUO_SOURCES, type GuoSource } from '../../services/guoSources';
-import { 
-  Settings, 
-  Tv, 
-  HardDrive, 
-  FileText, 
-  Check, 
+import {
+  Settings,
+  Tv,
+  HardDrive,
+  FileText,
+  Check,
   RefreshCw,
   FolderOpen,
-  MonitorPlay,
   Clock,
-  Gauge,
   Download,
   Server,
   Sparkles,
   FolderSearch,
   Activity,
-  ChevronDown
+  ChevronDown,
 } from 'lucide-react';
+
+/* ==========================================================================
+   统一样式原语
+
+   这一段以前不存在：卡片标题、开关、徽章、分段选项、按钮底座各自在 5 张卡片里
+   手写了一遍，于是同一种控件在页面上出现了 2~3 种尺寸（开关有 h-6 w-11 和
+   h-5 w-9 两种、徽章有两种蓝、chip 有三份几乎相同的字符串），而其中一份还
+   带 `as any`。控件抽出来后，"改一处样式"才真的只改一处。
+   ========================================================================== */
+
+/** 条目标题 / 说明文字的字阶。全页只有这两级，不要再随手加第三级。 */
+const TITLE_CLS = 'text-xs font-semibold text-slate-800';
+const HINT_CLS = 'text-[11px] text-slate-400 leading-relaxed';
+
+/**
+ * 分段选项（单选 chip）的状态样式。
+ *
+ * 「站源网络」与源分组共用这一套，所以两个看起来像控件的东西在页面上是同一件
+ * 东西——此前一个带勾选框一个不带，视觉上像两种控件，用户要重新学一遍。
+ *
+ * **刻意不加边框**：这里曾给每个选项套 `border-slate-200/80 bg-white/70`，而
+ * 源分组有 19 个选项，一屏 19 个带边框的圆角盒子排成网格，整块看着像一堆散沙
+ * 而不是一组可选项。现在只靠底色 + 字重区分状态：选中有浅蓝底，未选中只有
+ * 文字与 hover 底色——信息量没减，视觉噪音降一个数量级。
+ */
+function chipClass(selected: boolean, disabled: boolean): string {
+  const base = 'px-2.5 py-1.5 rounded-lg text-xs transition-colors duration-150';
+  if (disabled) return `${base} text-slate-300 cursor-not-allowed`;
+  if (selected) return `${base} bg-blue-50/90 text-blue-700 font-semibold`;
+  return `${base} text-slate-600 hover:bg-slate-100/80`;
+}
+
+/** 一行「标题 + 说明 + 右侧控件」。控件列固定宽度，避免每行各自靠右、参差不齐。 */
+const SettingRow: React.FC<{
+  title: string;
+/** 说明文字。允许传节点：有些说明要在中间嵌一个加粗片段（“不会自动安装”之类）。 */
+  hint?: React.ReactNode;
+  children: React.ReactNode;
+}> = ({ title, hint, children }) => (
+  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+    <div className="min-w-0">
+      <h4 className={TITLE_CLS}>{title}</h4>
+      {hint && <p className={`${HINT_CLS} mt-0.5`}>{hint}</p>}
+    </div>
+    <div className="flex-shrink-0 self-start sm:self-center">{children}</div>
+  </div>
+);
+
+/**
+ * 开关。
+ *
+ * 全页只有一个尺寸。旧的连播开关是 h-6 w-11、18+ 开关是 h-5 w-9 并排出现在
+ * 同一页里，同一个开关在两处长得不一样；现在统一成后者（小一号更适合 40px
+ * 级的行高，也与卡片里的 chip 同一套密度）。
+ *
+ * `focus-visible` 环是补的：原来两个开关都写了 `focus:outline-none` 又没有任何
+ * 替代样式，键盘 Tab 过去焦点完全不可见。
+ */
+const Toggle: React.FC<{
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label: string;
+  disabled?: boolean;
+}> = ({ checked, onChange, label, disabled }) => (
+  <button
+    type="button"
+    role="switch"
+    aria-checked={checked}
+    aria-label={label}
+    disabled={disabled}
+    onClick={() => onChange(!checked)}
+    className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 focus-visible:ring-offset-1 ${
+      checked ? 'bg-blue-600' : 'bg-slate-300'
+    } ${disabled ? 'opacity-45 pointer-events-none' : ''}`}
+  >
+    <span
+      className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition duration-200 ease-in-out ${
+        checked ? 'translate-x-4' : 'translate-x-0'
+      }`}
+    />
+  </button>
+);
+
+/**
+ * 数值徽章（缓存大小、版本号、倒计时秒数）。
+ *
+ * 之前这些徽章在卡片 3 和卡片 4 各写了一份完全相同的 className 字符串。
+ */
+const ValueBadge: React.FC<{ children: React.ReactNode; tone?: 'info' | 'neutral' }> = ({
+  children,
+  tone = 'info',
+}) => (
+  <span
+    className={`text-[11px] font-bold font-mono px-2 py-0.5 rounded-md border ${
+      tone === 'info'
+        ? 'text-blue-600 bg-blue-50 border-blue-200/60'
+        : 'text-slate-500 bg-slate-50 border-slate-200'
+    }`}
+  >
+    {children}
+  </span>
+);
+
+/**
+ * 卡片骨架： MicaCard + 统一标题行。
+ *
+ * 卡片标题此前在 5 张卡片里手写了 5 遍同款 className（`text-sm font-bold` + 底部
+ * 分隔线），改一次字号要改五处；图标颜色也不统一（两张 blue-600、两张 slate-700）。
+ * 现在标题行只有这一处，字阶与图标色一起定死。
+ */
+
+/** 卡片骨架： MicaCard + 统一标题行。 */
+const SectionCard: React.FC<{
+  icon: React.ReactNode;
+  title: string;
+  children: React.ReactNode;
+}> = ({ icon, title, children }) => (
+  <MicaCard className="p-6 flex flex-col gap-5 shrink-0 animate-fluent-card-in">
+    <div className="flex items-center gap-2 text-[13px] font-semibold text-slate-800 pb-3 border-b border-black/[0.04]">
+      {icon}
+      <span>{title}</span>
+    </div>
+    {children}
+  </MicaCard>
+);
+
+/** 卡片内一节的小标题（对应原来的 `<h4>` + 说明 + 控件的组合）。 */
+const SubSection: React.FC<{
+  title: string;
+hint?: React.ReactNode;
+  aside?: React.ReactNode;
+  children: React.ReactNode;
+}> = ({ title, hint, aside, children }) => (
+  <div className="flex flex-col gap-2">
+    <div className="flex items-center gap-2">
+      <h4 className={TITLE_CLS}>{title}</h4>
+      {aside && <span className="ml-auto">{aside}</span>}
+    </div>
+    {hint && <p className={HINT_CLS}>{hint}</p>}
+    {children}
+  </div>
+);
+
+/* ==========================================================================
+   视频源
+   ========================================================================== */
 
 /**
  * 一组同类视频源的勾选列表。
@@ -59,14 +203,17 @@ const SourceGroup: React.FC<{
 }> = ({ title, hint, sources, enabled, locked, onToggle, header }) => {
   if (sources.length === 0) return null;
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2">
-        <h4 className="text-xs font-semibold text-slate-800">{title}</h4>
-        <span className="text-[10px] text-slate-400">{sources.length} 个源</span>
-        {header && <span className="ml-auto">{header}</span>}
-      </div>
-      <p className="text-[11px] text-slate-400 leading-relaxed">{hint}</p>
-      <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+    <SubSection
+      title={title}
+      hint={hint}
+      aside={
+        <>
+          <span className="text-[10px] text-slate-400">{sources.length} 个源</span>
+          {header}
+        </>
+      }
+    >
+      <div className="flex flex-wrap gap-1.5">
         {sources.map(item => {
           const on = enabled.includes(item.id);
           return (
@@ -76,27 +223,22 @@ const SourceGroup: React.FC<{
               disabled={locked}
               aria-pressed={on}
               onClick={() => onToggle(item.id)}
-              className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-left text-xs transition-all duration-150 ${
-                locked
-                  ? 'border-slate-200/60 bg-slate-50 text-slate-300 cursor-not-allowed'
-                  : on
-                    ? 'border-blue-300/80 bg-blue-50/70 text-blue-700 font-semibold'
-                    : 'border-slate-200/80 bg-white/70 text-slate-600 hover:bg-white'
-              }`}
+              title={item.name}
+              className={`flex items-center gap-1.5 text-left ${chipClass(on, locked)}`}
             >
               <span
-                className={`w-3.5 h-3.5 rounded-[4px] border flex items-center justify-center flex-shrink-0 ${
-                  on ? 'border-blue-500 bg-blue-500 text-white' : 'border-slate-300 bg-white'
+                className={`w-3 h-3 rounded-[3px] border flex items-center justify-center flex-shrink-0 transition-colors ${
+                  on ? 'border-blue-500 bg-blue-500 text-white' : 'border-slate-300'
                 }`}
               >
-                {on && <Check className="w-2.5 h-2.5" />}
+                {on && <Check className="w-2 h-2" strokeWidth={3} />}
               </span>
               <span className="truncate">{item.name}</span>
             </button>
           );
         })}
       </div>
-    </div>
+    </SubSection>
   );
 };
 
@@ -106,10 +248,6 @@ type SourceCheckUi =
   | { kind: 'error' }
   | { kind: 'result'; report: GuoSourceCheck };
 
-/**
- * 状态徽章。四态必须肉眼可分，尤其「未检测」不能长得像「可用」——
- * guo-core 的 `health` 是可选字段，缺它就是**没有结论**。
- */
 /** 徽章配色。与文案分开抽出来，是为了让"上次记录"这层前缀能套在任何状态色上。 */
 const HEALTH_TONE = {
   ok: 'text-emerald-600 bg-emerald-50 border-emerald-200/70',
@@ -246,16 +384,25 @@ const SourceStatusPanel: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-3">
-      <button type="button" onClick={toggle} aria-expanded={open} className="flex items-center gap-2 text-left cursor-pointer">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={open}
+        className="flex items-center gap-2 text-left cursor-pointer group"
+      >
         <Activity className="w-3.5 h-3.5 text-blue-600" />
-        <span className="text-xs font-semibold text-slate-700">站源状态与链路体检</span>
-        <span className="text-[10px] text-slate-400">展开后查询 guo-core 的 19 个站源</span>
-        <ChevronDown className={`w-3.5 h-3.5 text-slate-400 ml-auto transition-transform duration-200 ${open ? 'rotate-180' : ''}`} />
+        <span className={TITLE_CLS}>站源状态与链路体检</span>
+        <span className="text-[11px] text-slate-400 group-hover:text-slate-500 transition-colors">
+          展开后查询 guo-core 的 19 个站源
+        </span>
+        <ChevronDown
+          className={`w-3.5 h-3.5 text-slate-400 ml-auto transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+        />
       </button>
 
       {open && (
         <div className="flex flex-col gap-2 animate-fluent-slide-down">
-          <p className="text-[11px] text-slate-400 leading-relaxed">
+          <p className={HINT_CLS}>
             状态读的是 guo-core 自己的体检结果，<span className="text-slate-500">不再是源表里那份手填快照</span>。
             「未检测」表示还没跑过体检——既不代表源坏了，<span className="text-slate-500">也不代表它可用</span>。
             「检查」会真连站方走一遍入口→目录→分集→播放地址→密钥→媒体，秒级到十几秒。
@@ -403,43 +550,33 @@ const GuoNetworkRow: React.FC = () => {
   ];
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2">
-        <h4 className="text-xs font-semibold text-slate-800">站源网络</h4>
-        {mode === null && <span className="text-[10px] text-slate-400">读取中…</span>}
-      </div>
-      <p className="text-[11px] text-slate-400 leading-relaxed">
-        这些站源的请求全部走本地 guo-core。站方 CDN 会拒绝代理（机场）出口 IP——挂着系统代理时
-        目录能看（缓存）、点开就报「获取剧集详情失败」，就是它。默认直连；只有直连到不了站点的境外网络才选代理。
-      </p>
+    <SubSection
+      title="站源网络"
+      hint="这些站源的请求全部走本地 guo-core。站方 CDN 会拒绝代理（机场）出口 IP——挂着系统代理时目录能看（吃缓存）、点开就报「获取剧集详情失败」，就是它。默认直连；只有直连到不了站点的境外网络才选代理。"
+      aside={mode === null ? <span className="text-[11px] text-slate-400">读取中…</span> : undefined}
+    >
       <div className="grid grid-cols-2 gap-1.5">
-        {options.map(option => {
-          const on = mode === option.id;
-          const disabled = mode === null || saving;
-          return (
-            <button
-              key={option.id}
-              type="button"
-              disabled={disabled}
-              aria-pressed={on}
-              onClick={() => void pick(option.id)}
-              title={option.hint}
-              className={`px-2.5 py-1.5 rounded-lg border text-xs transition-all duration-150 ${
-                disabled
-                  ? 'border-slate-200/60 bg-slate-50 text-slate-300 cursor-not-allowed'
-                  : on
-                    ? 'border-blue-300/80 bg-blue-50/70 text-blue-700 font-semibold'
-                    : 'border-slate-200/80 bg-white/70 text-slate-600 hover:bg-white'
-              }`}
-            >
-              {option.label}
-            </button>
-          );
-        })}
+        {options.map(option => (
+          <button
+            key={option.id}
+            type="button"
+            disabled={mode === null || saving}
+            aria-pressed={mode === option.id}
+            onClick={() => void pick(option.id)}
+            title={option.hint}
+            className={chipClass(mode === option.id, mode === null || saving)}
+          >
+            {option.label}
+          </button>
+        ))}
       </div>
-    </div>
+    </SubSection>
   );
 };
+
+/* ==========================================================================
+   页面
+   ========================================================================== */
 
 export const SettingsView: React.FC = () => {
   const { settings, updateSettings, clearCache, cacheUsage, refreshCacheUsage } = useSettingsStore();
@@ -608,94 +745,52 @@ export const SettingsView: React.FC = () => {
     showToast('诊断日志已导出', 'success');
   };
 
-  const qualityOptions = [
-    { label: '自动适应', value: 'auto' },
-  ];
-
   return (
     <div className="w-full h-full overflow-y-auto select-none p-6 sm:p-8">
-      <div className="max-w-4xl mx-auto flex flex-col gap-6 pb-24">
+      <div className="max-w-4xl mx-auto flex flex-col gap-4 pb-24">
         {/* 页面主标题 */}
-        <div className="pb-4 border-b border-black/[0.05] shrink-0">
+        <div className="pb-4 mb-2 border-b border-black/[0.05] shrink-0">
           <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center border border-blue-200/50">
               <Settings className="w-4 h-4" />
             </div>
-            <span>系统与播放偏好设置</span>
+            <span>设置</span>
           </h1>
           <p className="text-xs text-slate-400 mt-1">
-            自定义默认清晰度、自动连播参数与本地高速缓存
+            自动连播、本地缓存与视频源
           </p>
         </div>
 
-        {/* 1. 播放偏好设置卡片 */}
-        <MicaCard className="p-6 flex flex-col gap-5 shrink-0 animate-fluent-card-in">
-          <div className="flex items-center gap-2 text-sm font-bold text-slate-800 pb-3 border-b border-black/[0.04]">
-            <Tv className="w-4 h-4 text-blue-600" />
-            <span>播放体验偏好</span>
-          </div>
+        {/* 1. 播放体验 */}
+        <SectionCard icon={<Tv className="w-4 h-4 text-blue-600" />} title="播放体验">
+          <SettingRow
+            title="视频清晰度"
+            hint="由播放源实测决定：源里真的带多档时才显示切换，探测不到就只显示单档「自动」，不会虚构档位。"
+          >
+            <ValueBadge>自动</ValueBadge>
+          </SettingRow>
 
-          {/* 默认清晰度选择（分段按钮组件） */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <h4 className="text-xs font-semibold text-slate-800">首选视频清晰度</h4>
-              <p className="text-[11px] text-slate-400 mt-0.5">当剧集包含多个清晰度档位时优先自动切换</p>
-            </div>
-            <div className="flex items-center p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner flex-shrink-0">
-              {qualityOptions.map((opt) => {
-                const isActive = settings.defaultQuality === opt.value;
-                return (
-                  <button
-                    key={opt.value}
-                    type="button"
-                    onClick={() => updateSettings({ defaultQuality: opt.value as any })}
-                    className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 cursor-pointer ${
-                      isActive
-                        ? 'fluent-convex-tab text-blue-600'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* 自动连播开关（标准的 Windows 11 开关按钮） */}
-          <div className="flex items-center justify-between pt-4 border-t border-black/[0.04]">
-            <div>
-              <h4 className="text-xs font-semibold text-slate-800">剧集自动连播</h4>
-              <p className="text-[11px] text-slate-400 mt-0.5">本集临近结尾时弹出圆环倒计时并自动平滑播放下一集</p>
-            </div>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={settings.autoNext}
-              onClick={() => updateSettings({ autoNext: !settings.autoNext })}
-              className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                settings.autoNext ? 'bg-blue-600' : 'bg-slate-300'
-              }`}
+          <div className="pt-4 border-t border-black/[0.04]">
+            <SettingRow
+              title="剧集自动连播"
+              hint="本集临近结尾时弹出圆环倒计时并自动平滑播放下一集"
             >
-              <span
-                className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                  settings.autoNext ? 'translate-x-5' : 'translate-x-0'
-                }`}
+              <Toggle
+                checked={settings.autoNext}
+                onChange={value => updateSettings({ autoNext: value })}
+                label="剧集自动连播"
               />
-            </button>
+            </SettingRow>
           </div>
 
-          {/* 倒计时秒数滑块 */}
           {settings.autoNext && (
-            <div className="flex flex-col gap-2.5 pt-3.5 pb-3 px-4 bg-slate-50/80 rounded-xl border border-slate-200/80 shrink-0 transition-all duration-200 animate-fluent-slide-down">
+            <div className="flex flex-col gap-2.5 px-4 py-3 bg-slate-50/80 rounded-xl border border-slate-200/80 shrink-0 transition-all duration-200 animate-fluent-slide-down">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold text-slate-700 flex items-center gap-2">
                   <Clock className="w-3.5 h-3.5 text-blue-600" />
                   连播倒计时等待时间
                 </span>
-                <span className="font-bold text-blue-600 font-mono bg-blue-50 px-2.5 py-0.5 rounded-md border border-blue-200/60">
-                  {settings.countdownSeconds} 秒
-                </span>
+                <ValueBadge>{settings.countdownSeconds} 秒</ValueBadge>
               </div>
               <div className="py-1">
                 <FluentSlider
@@ -713,20 +808,14 @@ export const SettingsView: React.FC = () => {
               </div>
             </div>
           )}
-        </MicaCard>
+        </SectionCard>
 
-        {/* 2. 视频源启用（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
-        <MicaCard className="p-6 flex flex-col gap-5 shrink-0 animate-fluent-card-in">
-          <div className="flex items-center gap-2 text-sm font-bold text-slate-800 pb-3 border-b border-black/[0.04]">
-            <Server className="w-4 h-4 text-blue-600" />
-            <span>视频源</span>
-          </div>
-
-          <p className="text-[11px] text-slate-400 leading-relaxed">
+        {/* 2. 视频源（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
+        <SectionCard icon={<Server className="w-4 h-4 text-blue-600" />} title="视频源">
+          <p className={HINT_CLS}>
             勾选后这些源会一起汇入发现页——前两组进「短剧专区」与「漫剧次元」，
-            18+ 那组只在打开开关后进「神秘小窝」独占，不混进前两个专区。
-            归类是逐源实测目录内容得出的
-            （2026-09-29 拉每个源的前 12 条看标题/分类/集数），不是按站名猜的。
+            18+ 那组只在打开开关后进「神秘小窝」独占。
+            归类是逐源实测目录内容得出的（2026-09-29 拉每个源的前 12 条看标题/分类/集数），不是按站名猜的。
             <span className="text-slate-500">勾得越多，首屏要并发等待的站点也越多</span>
             ——实测 19 个源全开会打 19 个站点，最慢的那个决定首屏时间。
           </p>
@@ -763,21 +852,11 @@ export const SettingsView: React.FC = () => {
                这一组的门闩。关闭时该组置灰不可点，但**不取消已勾选项**——静默
                清空会让用户回来开开关时发现自己的选择没了。 */
             header={
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.showAdultSources}
-                onClick={() => updateSettings({ showAdultSources: !settings.showAdultSources })}
-                className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                  settings.showAdultSources ? 'bg-blue-600' : 'bg-slate-300'
-                }`}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                    settings.showAdultSources ? 'translate-x-4' : 'translate-x-0'
-                  }`}
-                />
-              </button>
+              <Toggle
+                checked={settings.showAdultSources}
+                onChange={value => updateSettings({ showAdultSources: value })}
+                label="显示 18+ 内容源"
+              />
             }
           />
 
@@ -790,85 +869,65 @@ export const SettingsView: React.FC = () => {
           <div className="pt-4 border-t border-black/[0.04]">
             <SourceStatusPanel />
           </div>
-        </MicaCard>
+        </SectionCard>
 
-        {/* 3. 本地存储与缓存卡片 */}
-        <MicaCard className="p-6 flex flex-col gap-5 shrink-0 animate-fluent-card-in">
-          <div className="flex items-center gap-2 text-sm font-bold text-slate-800 pb-3 border-b border-black/[0.04]">
-            <HardDrive className="w-4 h-4 text-slate-700" />
-            <span>存储空间与本地缓存</span>
-          </div>
-
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="flex flex-col gap-1.5">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h4 className="text-xs font-semibold text-slate-800">剧集缓存</h4>
-                <span className="text-[11px] font-bold text-blue-600 font-mono bg-blue-50 px-2.5 py-0.5 rounded-md border border-blue-200/60">
-                  {cacheLabel}
-                </span>
-                {cacheUsage.files > 0 && (
-                  <span className="text-[10px] text-slate-400 font-mono">
-                    {cacheUsage.files} 集
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-slate-500 leading-relaxed">
+        {/* 3. 本地存储与缓存 */}
+        <SectionCard icon={<HardDrive className="w-4 h-4 text-blue-600" />} title="存储空间与本地缓存">
+          <SettingRow
+            title="剧集缓存"
+            hint={
+              <>
                 播放过的剧集会缓存到本地，以便回看与换集时秒开。
                 <span className="text-slate-600 font-medium">已开启全自动清理</span>
                 ：超过 7 天未播放的剧集、以及总量超过 1 GB 时最旧的剧集，都会自动移除，无需手动操作。
-              </p>
+              </>
+            }
+          >
+            <div className="flex items-center gap-2">
+              <ValueBadge>{cacheLabel}</ValueBadge>
+              {cacheUsage.files > 0 && (
+                <span className="text-[11px] text-slate-400 font-mono">{cacheUsage.files} 集</span>
+              )}
             </div>
+          </SettingRow>
 
-            {/* 嵌入式按钮底座 */}
-            <div className="p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner inline-flex shrink-0 self-start sm:self-center">
-              <FluentButton
-                variant="secondary"
-                size="md"
-                disabled={isCleaning}
-                icon={<RefreshCw className={`w-3.5 h-3.5 ${isCleaning ? 'animate-spin' : ''}`} />}
-                onClick={handleClearCache}
-                className="shadow-sm"
-              >
-                {isCleaning ? '正在清理...' : '立即全部清空'}
-              </FluentButton>
-            </div>
+          <div className="flex justify-end">
+            <FluentButton
+              variant="secondary"
+              size="md"
+              disabled={isCleaning}
+              icon={<RefreshCw className={`w-3.5 h-3.5 ${isCleaning ? 'animate-spin' : ''}`} />}
+              onClick={handleClearCache}
+            >
+              {isCleaning ? '正在清理…' : '立即全部清空'}
+            </FluentButton>
           </div>
-        </MicaCard>
+        </SectionCard>
 
         {/* 4. 版本与更新 */}
-        <MicaCard className="p-6 flex flex-col gap-5 shrink-0 animate-fluent-card-in">
-          <div className="flex items-center gap-2 text-sm font-bold text-slate-800 pb-3 border-b border-black/[0.04]">
-            <Sparkles className="w-4 h-4 text-blue-600" />
-            <span>版本与更新</span>
-          </div>
-
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="flex flex-col gap-1.5">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h4 className="text-xs font-semibold text-slate-800">当前版本</h4>
-                <span className="text-[11px] font-bold text-blue-600 font-mono bg-blue-50 px-2.5 py-0.5 rounded-md border border-blue-200/60">
-                  v{appVersion || '—'}
-                </span>
-              </div>
-              <p className="text-xs text-slate-500 leading-relaxed">
+        <SectionCard icon={<Sparkles className="w-4 h-4 text-blue-600" />} title="版本与更新">
+          <SettingRow
+            title="当前版本"
+            hint={
+              <>
                 从 GitHub Releases 拉取最新安装包。下载完成后只会打开文件夹定位到安装包，
                 <span className="text-slate-600 font-medium">不会自动安装</span>。
-              </p>
-            </div>
-
-            <div className="p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner inline-flex shrink-0 self-start sm:self-center">
+              </>
+            }
+          >
+            <div className="flex items-center gap-2">
+              <ValueBadge>v{appVersion || '—'}</ValueBadge>
               <FluentButton
                 variant="secondary"
-                size="md"
+                size="sm"
                 disabled={!canUpdate || updateState.kind === 'checking'}
                 icon={<RefreshCw className={`w-3.5 h-3.5 ${updateState.kind === 'checking' ? 'animate-spin' : ''}`} />}
                 onClick={handleCheckUpdate}
-                className="shadow-sm"
               >
                 {updateState.kind === 'checking' ? '正在检查…' : '检查更新'}
               </FluentButton>
             </div>
-          </div>
+          </SettingRow>
 
           {/* 检查失败：如实展示原因（超时 / 限流 / 无 release 都是不同的可排查信号） */}
           {updateState.kind === 'error' && (
@@ -944,46 +1003,30 @@ export const SettingsView: React.FC = () => {
                     打开所在文件夹
                   </FluentButton>
                 )}
-
               </div>
             </div>
           )}
-        </MicaCard>
+        </SectionCard>
 
         {/* 5. 关于与日志诊断 */}
-        <MicaCard className="p-6 flex flex-col gap-5 shrink-0 animate-fluent-card-in">
-          <div className="flex items-center gap-2 text-sm font-bold text-slate-800 pb-3 border-b border-black/[0.04]">
-            <FileText className="w-4 h-4 text-slate-700" />
-            <span>客户端信息与诊断</span>
-          </div>
-
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="flex flex-col gap-1.5 text-xs leading-relaxed">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="font-semibold text-slate-800">TTV Short Drama 独立桌面客户端</span>
-                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 border border-blue-200/50">
-                  v{appVersion || '—'} Mica Light
-                </span>
-              </div>
-              <p className="text-xs text-slate-500">
-                基于 Tauri + React 19 + TypeScript 构建 · 硬件加速渲染已启用
-              </p>
-            </div>
-
-            {/* 嵌入式按钮底座 */}
-            <div className="p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner inline-flex shrink-0 self-start sm:self-center">
+        <SectionCard icon={<FileText className="w-4 h-4 text-blue-600" />} title="客户端信息与诊断">
+          <SettingRow
+            title="TTV Short Drama 独立桌面客户端"
+            hint="基于 Tauri + React 19 + TypeScript 构建 · 硬件加速渲染已启用"
+          >
+            <div className="flex items-center gap-2">
+              <ValueBadge tone="neutral">Mica Light</ValueBadge>
               <FluentButton
                 variant="secondary"
-                size="md"
-                icon={<FolderOpen className="w-3.5 h-3.5 text-slate-600" />}
+                size="sm"
+                icon={<FolderOpen className="w-3.5 h-3.5" />}
                 onClick={handleExportLogs}
-                className="shadow-sm"
               >
                 导出匿名运行日志
               </FluentButton>
             </div>
-          </div>
-        </MicaCard>
+          </SettingRow>
+        </SectionCard>
       </div>
     </div>
   );
