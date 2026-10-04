@@ -687,7 +687,6 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
         // 动漫走 dmghg 直链，没有红果 worker 的内容类型。
         contentType: null,
         autoNext: autoNextRef.current,
-        countdownSeconds: settings.countdownSeconds,
         episodes: currentSeries.episodes.map(item => ({
           id: item.id,
           episodeNumber: item.episodeNumber,
@@ -700,7 +699,7 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
       showToast(`进入画中画失败：${detail}`, 'error');
       return false;
     }
-  }, [settings.countdownSeconds, showToast]);
+  }, [showToast]);
 
   /** 自动连播：动漫没有倒计时（与短剧不同），播完直接进下一集。 */
   useEffect(() => {

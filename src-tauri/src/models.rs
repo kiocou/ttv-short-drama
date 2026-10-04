@@ -243,7 +243,6 @@ pub struct WatchHistoryItem {
 pub struct UserSettings {
     pub default_quality: String,
     pub auto_next: bool,
-    pub countdown_seconds: u32,
     /// 已废弃：补帧/增强链路已移除，保留字段兼容旧设置库记录，恒为 "off"。
     pub preferred_engine: String,
     pub target_fps: u32,
@@ -272,7 +271,6 @@ impl Default for UserSettings {
         Self {
             default_quality: "auto".into(),
             auto_next: true,
-            countdown_seconds: 5,
             preferred_engine: "off".into(),
             target_fps: 60,
             hardware_acceleration: true,

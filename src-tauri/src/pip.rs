@@ -119,7 +119,6 @@ pub struct PipHandoff {
     /// 短剧 worker 的内容类型（1 短剧 / 1004 漫剧）。动漫链路为空。
     pub content_type: Option<i64>,
     pub auto_next: bool,
-    pub countdown_seconds: u32,
     /// 整部剧的集列表：小窗要能自己切上一集/下一集，不该为了换集把播放权交回去。
     pub episodes: Vec<PipEpisode>,
 }

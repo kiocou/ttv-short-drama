@@ -5,7 +5,6 @@ import { isTauriEnvironment } from '../../services/ipc';
 import { enterFullscreen, leaveFullscreen, queryFullscreen } from '../../services/windowFx';
 import { PlayerControls } from './PlayerControls';
 import { EpisodeDrawer } from './EpisodeDrawer';
-import { NextCountdown } from './NextCountdown';
 import { DiagnosticsModal } from './DiagnosticsModal';
 import { Loader2, AlertCircle, RefreshCw, Copy, X } from 'lucide-react';
 
@@ -606,7 +605,6 @@ export const VideoSurface: React.FC = () => {
       />
 
       {/* 连播倒计时悬浮窗 */}
-      <NextCountdown />
 
       {/* 侧边选集抽屉 */}
       <EpisodeDrawer />

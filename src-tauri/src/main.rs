@@ -862,8 +862,7 @@ fn normalize_enabled_sources(input: &[String]) -> Vec<String> {
 /// 未知 id（全空时回落到红果，否则会存下一个"零可用源"的设置）。
 #[tauri::command]
 fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Result<(), String> {
-    // 用户可控项：倒计时与目标帧率做区间夹取。
-    settings.countdown_seconds = settings.countdown_seconds.clamp(3, 15);
+    // 用户可控项：目标帧率做区间夹取。
     settings.target_fps = settings.target_fps.clamp(30, 120);
     // 能力受限项：如实归零而非静默接受。
     // - 清晰度：公开网页与 App 源都只有单一路径，多档位是幻影，强制 auto。

@@ -806,32 +806,6 @@ export const SettingsView: React.FC = () => {
               />
             </SettingRow>
           </div>
-
-          {settings.autoNext && (
-            <div className="flex flex-col gap-2.5 px-4 py-3 bg-slate-50/80 rounded-xl border border-slate-200/80 shrink-0 transition-all duration-200 animate-fluent-slide-down">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-700 flex items-center gap-2">
-                  <Clock className="w-3.5 h-3.5 text-blue-600" />
-                  连播倒计时等待时间
-                </span>
-                <ValueBadge>{settings.countdownSeconds} 秒</ValueBadge>
-              </div>
-              <div className="py-1">
-                <FluentSlider
-                  value={settings.countdownSeconds}
-                  min={3}
-                  max={15}
-                  step={1}
-                  onChange={(val) => updateSettings({ countdownSeconds: val })}
-                  tooltipFormat={(v) => `${v} 秒`}
-                />
-              </div>
-              <div className="flex justify-between text-[11px] text-slate-400 font-medium">
-                <span>3 秒 (极速连播)</span>
-                <span>15 秒 (充裕反应)</span>
-              </div>
-            </div>
-          )}
         </SectionCard>
 
         {/* 2. 视频源（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
