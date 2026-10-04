@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { UserSettings } from '../types/settings';
 import { ipcService, DEFAULT_SETTINGS } from '../services/ipc';
 
@@ -33,38 +33,43 @@ export const SettingsProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 而这两个字段被后端强制归零（"不做字节级统计，报 0 而不是编造数字"），
   // 于是设置页永远显示 0.0 MB，与实际占用完全脱节。现在改为直接向后端查询
   // 真实扫描结果。
-  const refreshCacheUsage = async (): Promise<void> => {
+  const refreshCacheUsage = useCallback(async (): Promise<void> => {
     try {
       setCacheUsage(await ipcService.settings.cacheUsage());
     } catch {
       // 查询失败不影响设置页其他功能。
     }
-  };
+  }, []);
 
-  const updateSettings = (partial: Partial<UserSettings>) => {
+  const updateSettings = useCallback((partial: Partial<UserSettings>) => {
     setSettings(prev => {
       const next = { ...prev, ...partial };
       void ipcService.settings.save(next).catch(error => console.warn('Settings save failed:', error));
       return next;
     });
-  };
+  }, []);
 
-  const clearCache = async (): Promise<number> => {
+  const clearCache = useCallback(async (): Promise<number> => {
     const res = await ipcService.settings.clearCache();
     await refreshCacheUsage();
     return res.freedMb;
-  };
+  }, [refreshCacheUsage]);
+
+  /**
+   * context value 必须 memo：`settings` 被 `useCatalogStore` / `usePlaybackStore` /
+   * `useAnimePlayerStore` 订阅，其中任意一个因上层重渲染而重渲染时，不 memo 的内联对象
+   * 会把广播一路传到发现页的每张卡片。
+   */
+  const value = useMemo<SettingsContextType>(() => ({
+    settings,
+    updateSettings,
+    clearCache,
+    cacheUsage,
+    refreshCacheUsage,
+  }), [cacheUsage, clearCache, refreshCacheUsage, settings, updateSettings]);
 
   return (
-    <SettingsContext.Provider
-      value={{
-        settings,
-        updateSettings,
-        clearCache,
-        cacheUsage,
-        refreshCacheUsage,
-      }}
-    >
+    <SettingsContext.Provider value={value}>
       {children}
     </SettingsContext.Provider>
   );

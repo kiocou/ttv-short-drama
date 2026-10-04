@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useCatalogStore } from '../../stores/useCatalogStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
@@ -50,6 +50,7 @@ export const ExploreView: React.FC = () => {
     setSort,
     refreshCatalog,
     loadMore,
+    prefetchMore,
     refreshContinueWatching,
   } = useCatalogStore();
 
@@ -91,14 +92,29 @@ export const ExploreView: React.FC = () => {
     setHiddenSeriesIds(new Set());
   }, [activeSources, channel, category, audience, sort]);
 
-  const markSeriesUnavailable = (seriesId: string) => {
+/**
+   * 封面不可得就把卡片移出列表。
+   *
+   * 用 `useCallback` + 空依赖：`SeriesCard` 是 `React.memo` 的，内联箭头函数会让 props
+   * 每次渲染都不相等，memo 直接失效。上百张卡时这个差别就体现在滚动帧耗时上。
+   */
+  const markSeriesUnavailable = useCallback((seriesId: string) => {
     setHiddenSeriesIds(prev => {
       if (prev.has(seriesId)) return prev;
       const next = new Set(prev);
       next.add(seriesId);
       return next;
     });
-  };
+  }, []);
+
+  /**
+   * 卡片点击：全部卡片共用这一个回调（卡片自己带上 seriesId）。
+   *
+   * `navigateTo` 已是稳定引用（见 useAppStore），所以这个回调也稳定。
+   */
+  const handleCardClick = useCallback((seriesId: string) => {
+    navigateTo('detail', seriesId);
+  }, [navigateTo]);
 
   /**
    * 实际展示的卡片：无封面地址的条目直接过滤（guo 源的封面不来自该字段，
@@ -123,25 +139,61 @@ export const ExploreView: React.FC = () => {
     void refreshCatalogRef.current('');
   }, []);
 
+  /**
+   * 补一次提交后的自检：卡片追加后如果哨兵**仍在**可视区，就直接再提交一页。
+   *
+   * IntersectionObserver 只在“穿过阀值”时回调，而提交追加的内容可能不足以把哨兵推出
+   * rootMargin（典型：本轮只多出两三条，其余源都已到底）。这种情况下既不会产生新的
+   * 交叉事件，`loadMore` 也不会自己再来一次 —— 表现为“滚到底停住了，再往上推一下
+   * 才有反应”。真正无限流不能有这种一推一顿，所以按实际几何位置兜一次底。
+   */
+  useEffect(() => {
+    if (!hasMore || isLoadingMore || items.length === 0) return;
+    const sentinel = loadMoreSentinelRef.current;
+    const root = scrollContainerRef.current;
+    if (!sentinel || !root) return;
+    if (sentinel.getBoundingClientRect().top - root.getBoundingClientRect().top <= root.clientHeight) {
+      void loadMore('');
+    }
+  }, [hasMore, isLoadingMore, items.length, loadMore]);
+
+
   useEffect(() => {
     const sentinel = loadMoreSentinelRef.current;
     const root = scrollContainerRef.current;
-    if (!sentinel || !root || !hasMore || isLoading || isLoadingMore) return;
+if (!sentinel || !root || !hasMore) return;
 
-    const observer = new IntersectionObserver(
+    // 两条线，职责不同：
+    // ① `prefetch` 哨兵离底部 800px 就触发，**不碰任何界面状态**——它只是把请求提前
+    //    发出，让滚动不再等网络。store 里还有一条空闲预取做双保险，两者靠
+    //    `beginFetch` 的"已有在途就复用同一个 Promise"天然幂等，不会重复打站方。
+    // ② `commit` 哨兵在更靠近底部时才提交那一页；此时数据多数已在手，提交是同步的。
+    //    所以底部提示条只在网络确实没赶上时闪一下，而不是每次滚动都停一下。
+    //
+    // 注意不再拿 isLoading / isLoadingMore 当守卫：它们进依赖会让 observer 随每次
+    // 提交重建，而哨兵若仍在窗口内会立刻再触发一次，等于把提交时机交给重建节奏。
+    // 单飞由 store 的 isLoadingMore 负责，这里不需要重复把关。
+    const prefetchObserver = new IntersectionObserver(
+      entries => {
+        if (entries.some(entry => entry.isIntersecting)) prefetchMore('');
+      },
+      { root, rootMargin: '800px 0px', threshold: 0 },
+    );
+    const commitObserver = new IntersectionObserver(
       entries => {
         if (entries.some(entry => entry.isIntersecting)) {
           void loadMore('');
         }
       },
-      // rootMargin 从 640px 放宽到 1200px：首屏一页只有 24 条，640px 的
-      // 预加载窗口在卡片较高的布局里不够——用户中速滚动就会在请求回来前
-      // 滚到底（实测表现为"滚到底才开始加载"）。1200px 约等于提前两屏。
-      { root, rootMargin: '1200px 0px', threshold: 0.01 },
+      { root, rootMargin: '400px 0px', threshold: 0.01 },
     );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [hasMore, isLoading, isLoadingMore, loadMore]);
+    prefetchObserver.observe(sentinel);
+    commitObserver.observe(sentinel);
+    return () => {
+      prefetchObserver.disconnect();
+      commitObserver.disconnect();
+    };
+  }, [hasMore, loadMore, prefetchMore]);
 
 
   return (
@@ -396,10 +448,8 @@ export const ExploreView: React.FC = () => {
                 key={series.id}
                 series={series}
                 index={index}
-                onClick={() => {
-                  navigateTo('detail', series.id);
-                }}
-                onUnavailable={() => markSeriesUnavailable(series.id)}
+                onClick={handleCardClick}
+                onUnavailable={markSeriesUnavailable}
               />
             ))}
           </div>
@@ -413,7 +463,19 @@ export const ExploreView: React.FC = () => {
             </div>
           )}
           {!hasMore && items.length > 0 && (
-            <span className="text-[11px] text-slate-400">已加载全部公开内容</span>
+            error ? (
+              // 翻页连续失败后熔断（见 loadMoreFailuresRef）会走到这里：光写
+              // “已加载全部”是撒谎，必须把重试入口给回用户。
+              <button
+                type="button"
+                onClick={() => { void refreshCatalog(''); }}
+                className="px-3 py-1.5 rounded-xl bg-white/70 border border-slate-200/70 text-xs text-slate-500 shadow-xs hover:text-slate-700 hover:bg-white cursor-pointer"
+              >
+                加载更多失败，点此重试
+              </button>
+            ) : (
+              <span className="text-[11px] text-slate-400">已加载全部公开内容</span>
+            )
           )}
         </div>
       </div>

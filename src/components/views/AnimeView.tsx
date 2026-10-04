@@ -16,6 +16,18 @@ const PAGE_SIZE = 30;
 export const AnimeView: React.FC = () => {
   const { navigateTo } = useAppStore();
 
+  /**
+   * 全部卡片共用这一个点击回调（卡片自己带上 seriesId）。
+   *
+   * 必须是稳定的 `useCallback`：否则每张卡的内联箭头函数都会让 `SeriesCard` 的
+   * `React.memo` 失效，上百张卡全量重渲染。`navigateTo` 在 useAppStore 里已稳定。
+   */
+  const handleCardClick = useCallback((seriesId: string) => {
+    // 动漫卡片点击直接进入播放（免登录直连）：详情页用于看简介与选集，
+    // 但动漫源选集数据同在详情里，先走 detail 保持一致的导航体验。
+    navigateTo('detail', seriesId);
+  }, [navigateTo]);
+
   const [category, setCategory] = useState('全部');
   // 分类芯片用后端返回的真实分类（dmghg 与暴风的分类名不同），
   // 这里只是首帧渲染前的占位。
@@ -195,11 +207,7 @@ export const AnimeView: React.FC = () => {
                 key={`${series.id}-${index}`}
                 series={series}
                 index={index}
-                onClick={() => {
-                  // 动漫卡片点击直接进入播放（免登录直连）：详情页用于看简介与选集，
-                  // 但动漫源选集数据同在详情里，先走 detail 保持一致的导航体验。
-                  navigateTo('detail', series.id);
-                }}
+                onClick={handleCardClick}
               />
             ))}
           </div>

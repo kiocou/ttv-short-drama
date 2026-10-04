@@ -26,6 +26,10 @@ interface CatalogContextType {
   refreshCatalog: (keyword?: string) => Promise<void>;
   loadMore: (keyword?: string) => Promise<void>;
   /**
+   * 预取下一页（不碰界面）。滚动到距底部一定距离时调用，把请求提前到滚动路径之外。
+   */
+  prefetchMore: (keyword?: string) => void;
+  /**
    * 重新读取"继续观看"。
    *
    * 目录数据不会因为看了几集而变化，所以 `loadData` 不会重跑；但继续观看横幅
@@ -63,6 +67,16 @@ const vocabularyKey = (sources: string, channel: ChannelType) => `${sources}_${c
 /** 单源的目录请求体。`hongguo` 走红果自有接口，不带 source。 */
 function filterForSource(source: string, base: Omit<CatalogFilter, 'source'>): CatalogFilter {
   return { ...base, source: source === 'hongguo' ? undefined : source };
+}
+
+/** 一页聚合结果（`requestAllSources` 的返回形状）。 */
+interface FetchedPage {
+  items: SeriesItem[];
+  categories: string[];
+  hasMore: boolean;
+  /** 逐源的"还有没有下一页"。聚合的 hasMore 是各源的"或"，拿它判断单个源到没到底必然出错。 */
+  hasMoreBySource: Record<string, boolean>;
+  failedSources: string[];
 }
 
 const CatalogContext = createContext<CatalogContextType | null>(null);
@@ -137,6 +151,38 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
   // 已出现过的剧集 id。用于判定"本次翻页是否真的带来了新内容"：
   // 站点若对越界页码返回同一页，继续请求只会空转，必须及时收尾。
   const seenIdsRef = useRef<Set<string>>(new Set());
+  /**
+   * loadMore 连续失败次数。
+   *
+   * 用来给自动重试上熔断：observer 在 isLoadingMore 复位后会重建，而哨兵此刻仍在视口
+   * 内，会立刻再次触发 loadMore——只要后端还在失败，就会变成“底部一直转、每秒几次请求”
+   * 的风暴（实测卡住就是这个形态：界面永远停在“正在加载更多内容…”）。连续两次失败后
+   * 置 hasMore=false，把重试交回用户点“重试”按钮。
+   */
+const loadMoreFailuresRef = useRef(0);
+
+  /**
+   * 已发起但尚未落到界面的一页（真实无限流的核心）。
+   *
+   * 旧实现是"滚到底 → 发请求 → 等回来 → 插入"，请求延迟完全暴露在滚动路径上：
+   * 观感就是"卡一会儿才出下一页"。现在把**发请求**与**提交到界面**拆成两件事——发
+   * 完就搁在这里，用户滚到底时通常它已经在途甚至已完成，提交是同步的，于是滚动不再
+   * 等待网络。
+   *
+   * 页码推进放在 `commitPage` 而不是发请求时：这样"重复发起同一页"天然被幂等吃掉
+   * （pages 算出来一样，`requestCatalog` 的 inflight 去重直接复用同一个 Promise），
+   * 而预取与正式提交撞车时也只会是同一个 in-flight，不会跳页。
+   *
+   * 预取**不登记** seenIds：登记是提交期的职责，否则预取来的卡片会在真正提交时
+   * 被自己的去重表过滤掉。
+   */
+  const pendingFetchRef = useRef<{
+    requestId: number;
+    pages: Record<string, number>;
+    promise: Promise<FetchedPage>;
+    /** 已被 loadMore 认领（正在提交）。此刻不允许再另起一页预取。 */
+    claimed: boolean;
+  } | null>(null);
 
   const requestCatalog = useCallback((cacheKey: string, filter: CatalogFilter) => {
     const existing = inflightRef.current[cacheKey];
@@ -203,6 +249,11 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
       hasMoreBySource[source] = page.hasMore;
     });
 
+    if (sources.length === 0) {
+      // 没有待请求的源（全部记为到底）。不能落到下一行：`0 === 0` 会成立，
+      // 把一次正常的到底抛成“0 个源均无响应”。
+      return { items: [], categories: [], hasMore: false, hasMoreBySource: {}, failedSources: [] };
+    }
     if (failures.length === sources.length) {
       throw new Error(`目录数据加载失败（${failures.length} 个源均无响应）`);
     }
@@ -276,8 +327,21 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     if (requestId === requestIdRef.current) setCategories(merged);
   }, []);
 
-  const loadData = useCallback(async (kw?: string) => {
+const loadData = useCallback(async (kw?: string) => {
     const requestId = ++requestIdRef.current;
+    // 复位"加载更多"的忙态。新的一轮首屏请求会作废任何在途 loadMore（它靠
+    // requestId 判定过期），而 loadMore 的 finally 也因为同一判定不会复位
+    // isLoadingMore —— 不在这里清掉，它就会永久停在 true：底部一直挂着"正在加载
+    // 更多内容…"，且 loadMore 的 `if (isLoadingMore) return` 与 ExploreView 的
+    // IntersectionObserver 都从此再不触发。切题材/排序/频道、设置页改启用源、刷新
+    // 都会走到这条路径。
+    setIsLoadingMore(false);
+    loadMoreFailuresRef.current = 0;
+    // 丢弃上一轮的预取：它的页码是按上一轮的筛选/频道算的，本轮必须重算。
+    // （不清的话，用户切题材后滚到底会拿到上一轮预取来的卡片。）
+    pendingFetchRef.current = null;
+    catalogKeywordRef.current = kw;
+    loadMoreFailuresRef.current = 0;
     const sourceKey = sources.join('+');
     const cacheKey = `${sourceKey}_${channel}_${category}_${audience}_${sort}_${kw || ''}`;
     const cached = cacheRef.current[cacheKey];
@@ -367,7 +431,11 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     loadData();
   }, [loadData]);
 
-  const setChannel = (newChannel: ChannelType) => {
+  /**
+   * `useCallback` 是必需的：它要进下方 context value 的依赖数组，不稳定就会让那份
+   * `useMemo` 每次都失效，memo 也就白做了。
+   */
+  const setChannel = useCallback((newChannel: ChannelType) => {
     setChannelState(newChannel);
     setCategoryState('全部');
     // 切频道时换成新频道"已知"的词表；未知就先只留"全部"，等目录响应或后台
@@ -376,7 +444,7 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
       categoryVocabularyRef.current[vocabularyKey(sources.join('+'), newChannel)] ?? [],
       [],
     ));
-  };
+  }, [sources]);
 
   const refreshContinueWatching = useCallback(async () => {
     try {
@@ -387,96 +455,245 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     }
   }, []);
 
+  /**
+   * 发起下一页请求（不碰界面）。
+   *
+   * 页码**不**在这里推进，而是把算出来的 `pages` 连同 Promise 一起存进
+   * `pendingFetchRef`：这样"同一页被发起两次"（预取撞上正式提交、或者失败后重试）
+   * 算出的 `pages` 完全相同，`requestCatalog` 的 inflight 去重会直接复用同一个
+   * Promise —— 幂等，且不会跳页。真正的页码推进在 `commitPage`。
+   *
+   * 返回 null 表示所有源都已到底，没有可发的请求。
+   */
+  const beginFetch = useCallback((kw?: string) => {
+    // 已有在途的一页：直接复用，不重复发。
+    const existing = pendingFetchRef.current;
+    if (existing && existing.requestId === requestIdRef.current) {
+      // 已被认领去提交的那一页：此刻正在等它落地，不允许再起一页预取。因为页码要到
+      // `commitPage` 才推进，此时算出来的会是**完全相同**的页码 —— 白白重复请求一次
+      // 同页，还会给 pendingFetchRef 留下一条已过期的记录，下一次 beginFetch 拿它去
+      // 提交会因 id 去重拿到 0 条新卡片，从而误判到底、把无限流提前掐断。
+      return existing.claimed ? null : existing;
+    }
+
+    const paging = pagingRef.current;
+    // 逐源推进页码：聚合模式下"下一页"是每个源各自的下一页。
+    // 某个源已经到底（页码记作 0）就整个跳过它——继续请求只会拿回同一页，
+    // 在 seenIds 去重后永远是 0 条新卡片，还白花一次请求。
+    // 缺省页码是 1：首屏 loadData 装的就是第 1 页，所以"下一页"是 2。
+    const pending = sources.filter(source => paging[source]?.page !== 0);
+    if (pending.length === 0) return null;
+
+    const pages: Record<string, number> = {};
+    for (const source of pending) pages[source] = (paging[source]?.page ?? 1) + 1;
+
+    const base: Omit<CatalogFilter, 'source' | 'page' | 'cursor'> = {
+      channel,
+      category,
+      audience,
+      sort,
+      keyword: kw,
+      pageSize: 30,
+    };
+    const record = {
+      requestId: requestIdRef.current,
+      pages,
+      promise: requestAllSources(pending, base, source => pages[source]),
+      claimed: false,
+    };
+    pendingFetchRef.current = record;
+    return record;
+  }, [audience, category, channel, requestAllSources, sort, sources]);
+
+  /**
+   * 把一页落到界面：登记 id、推进页码、更新题材栏与 hasMore。
+   *
+   * 与 `beginFetch` 严格分开，就是为了让预取可以在任何空闲时刻发起，而提交只在
+   * 用户真的滚到底时才发生。
+   */
+  const commitPage = useCallback((
+    res: FetchedPage,
+    pages: Record<string, number>,
+    kw: string | undefined,
+    requestId: number,
+  ) => {
+    const paging = pagingRef.current;
+    const sourceKey = sources.join('+');
+    const slotKey = `${sourceKey}_${channel}_${category}_${audience}_${sort}_`;
+
+    // 逐源收尾：本轮报"到底"的源置 0，后续直接跳过它；其余源把页码记成本轮页数。
+    // 必须逐源看 hasMoreBySource——聚合的 res.hasMore 是各源的"或"，只按它判断的
+    // 话，一个只有 30 条的源会被其余源拖着一直翻。
+    for (const source of Object.keys(pages)) {
+      paging[source] = { page: res.hasMoreBySource[source] ? pages[source] : 0 };
+    }
+
+    // 先剔除重复再落库：本次没有任何新卡片时直接终止无限滚动。
+    // 后端已把"空页"判为到底，这里是第二道防线（页码估算偏大、
+    // 站点对越界页码回退到同一页等情况都会在这里收口）。
+    // 逐个登记而不是先 filter 再 forEach：站点同一页内偶尔会出现重复卡片，
+    // 那样写法会让页内重复项一起通过过滤。
+    const fresh: SeriesItem[] = [];
+    for (const item of res.items) {
+      if (seenIdsRef.current.has(item.id)) continue;
+      seenIdsRef.current.add(item.id);
+      fresh.push(item);
+    }
+    if (fresh.length > 0) {
+      setItems(previous => [...previous, ...fresh]);
+      if (channel === 'comic') {
+        void fillEpisodeCounts(slotKey, fresh, requestId);
+      }
+    }
+    const mergedCategories = mergeCategories(
+      categoryVocabularyRef.current[vocabularyKey(sourceKey, channel)] ?? [],
+      res.categories,
+    );
+    categoryVocabularyRef.current[vocabularyKey(sourceKey, channel)] = mergedCategories;
+    setCategories(mergedCategories);
+    setHasMore(res.hasMore && fresh.length > 0);
+    // 翻页成功：清零失败计数，否则一次抖动就会把熔断阈值推满。
+    loadMoreFailuresRef.current = 0;
+  }, [category, audience, channel, sort, sources]);
+
+  /**
+   * 后台预取：空闲时就发下一页，不设任何界面状态。
+   *
+   * 这是"真正的无限流"与"滚到底才加载"的唯一差别——请求不再位于滚动路径上。
+   * 失败静默：预取失败只是下次滚动时退化成同步加载，不该打扰用户。
+   */
+  const prefetchMore = useCallback((kw?: string) => {
+    const record = beginFetch(kw);
+    if (!record) return;
+    void record.promise.catch(() => {
+      // 预取失败要把槽位释放掉，否则一次抖动会让 `beginFetch` 永远返回这个
+      // 已失败的 in-flight，用户滚到底时拿到的是同一个被 reject 的 Promise。
+      if (pendingFetchRef.current === record) pendingFetchRef.current = null;
+    });
+  }, [beginFetch]);
+
   const loadMore = useCallback(async (kw?: string) => {
     if (!hasMore || isLoadingMore) return;
     setIsLoadingMore(true);
     setError(null);
     const requestId = requestIdRef.current;
-    const sourceKey = sources.join('+');
-    const slotKey = `${sourceKey}_${channel}_${category}_${audience}_${sort}_`;
+    // 提到 try 外：catch 里也要靠它释放槽位。
+    let claimed: NonNullable<typeof pendingFetchRef.current> | null = null;
     try {
-      const base: Omit<CatalogFilter, 'source' | 'page' | 'cursor'> = {
-        channel,
-        category,
-        audience,
-        sort,
-        keyword: kw,
-        pageSize: 30,
-      };
-      // 逐源推进页码：聚合模式下"下一页"是每个源各自的下一页。
-      // 某个源已经到底（页码记作 0）就整个跳过它——继续请求只会拿回同一页，
-      // 在 seenIds 去重后永远是 0 条新卡片，还白花一次请求。
-      // 缺省页码是 1：首屏 loadData 装的就是第 1 页，所以"下一页"是 2。
-      const paging = pagingRef.current;
-      const pending = sources.filter(source => paging[source]?.page !== 0);
-      for (const source of pending) {
-        paging[source] = { page: (paging[source]?.page ?? 1) + 1 };
+      const record = beginFetch(kw);
+      claimed = record;
+      if (!record) {
+        // beginFetch 返回 null 有两种含义，不能一律宣告到底：
+        // ① 所有源都记为到底 —— 槽位是空的，该停；
+        // ② 有一页已被认领去提交（isLoadingMore 是 state，React 重渲染前可能有第二个
+        //    loadMore 挤进来）—— 槽位非空，停在这里等下一次哨兵触发即可。
+        // 把 ② 误判成 ① 就是"看几屏之后无限流突然没了"。
+        if (!pendingFetchRef.current) setHasMore(false);
+        return;
       }
-
-      const res = await requestAllSources(pending, base, source => paging[source].page);
+      record.claimed = true;
+      const res = await record.promise;
       if (requestId !== requestIdRef.current) return;
-      // 逐源收尾：本轮报"到底"的源置 0，后续 loadMore 直接跳过它。必须逐源看
-      // hasMoreBySource——聚合的 res.hasMore 是各源的"或"，只按它判断的话，
-      // 一个只有 30 条的源会被其余源拖着一直翻。
-      for (const source of pending) {
-        if (!res.hasMoreBySource[source]) paging[source] = { page: 0 };
-      }
-
-      // 先剔除重复再落库：本次没有任何新卡片时直接终止无限滚动。
-      // 后端已把"空页"判为到底，这里是第二道防线（页码估算偏大、
-      // 站点对越界页码回退到同一页等情况都会在这里收口）。
-      // 逐个登记而不是先 filter 再 forEach：站点同一页内偶尔会出现重复卡片，
-      // 那样写法会让页内重复项一起通过过滤。
-      const fresh: SeriesItem[] = [];
-      for (const item of res.items) {
-        if (seenIdsRef.current.has(item.id)) continue;
-        seenIdsRef.current.add(item.id);
-        fresh.push(item);
-      }
-      if (fresh.length > 0) {
-        setItems(previous => [...previous, ...fresh]);
-        if (channel === 'comic') {
-          void fillEpisodeCounts(slotKey, fresh, requestId);
-        }
-      }
-      const mergedCategories = mergeCategories(
-        categoryVocabularyRef.current[vocabularyKey(sourceKey, channel)] ?? [],
-        res.categories,
-      );
-      categoryVocabularyRef.current[vocabularyKey(sourceKey, channel)] = mergedCategories;
-      setCategories(mergedCategories);
-      setHasMore(res.hasMore && fresh.length > 0);
+      commitPage(res, record.pages, kw, requestId);
+      // 释放槽位，让空闲预取可以接着排下一页（页码已由 commitPage 推进）。
+      if (pendingFetchRef.current === record) pendingFetchRef.current = null;
     } catch (err) {
-      if (requestId === requestIdRef.current) setError((err as Error).message || '加载更多目录数据失败');
+      if (requestId === requestIdRef.current) {
+        setError((err as Error).message || '加载更多目录数据失败');
+        // 连续失败就停掉自动重试。observer 在 isLoadingMore 复位后会重建，而哨兵
+        // 仍在视口内 → 立刻又触发一次 loadMore，失败请求会变成一秒几次的无限风暴
+        // （实测表现为底部一直转、且各路请求都在超时）。两次失败是网络/站方问题的
+        // 强信号，此时交给用户点"重试"而不是继续自动烧请求。
+        loadMoreFailuresRef.current += 1;
+        if (loadMoreFailuresRef.current >= 2) setHasMore(false);
+      }
+      // 失败同样要释放槽位，否则下一次 beginFetch 会拿回这条已 reject 的 in-flight，
+      // 无限流从此再也推进不了。
+      if (pendingFetchRef.current === claimed) pendingFetchRef.current = null;
     } finally {
-      if (requestId === requestIdRef.current) setIsLoadingMore(false);
+      // 无条件复位：不带 requestId 判定。带上的话，过期的这一轮不会复位；而新一轮
+      // (loadData) 虽然会复位，若它自己又过期就没人复位了——isLoadingMore 卡在 true
+      // 等于无限滚动永久停摆（loadMore 首行 `if (isLoadingMore) return` 与 observer
+      // 的 `|| isLoadingMore` 都会直接短路）。loadMore 本身有 isLoadingMore 单飞，
+      // 不会出现两个在途请求互相踩。
+      setIsLoadingMore(false);
     }
-  }, [audience, category, channel, hasMore, isLoadingMore, requestAllSources, sort, sources]);
+  }, [beginFetch, channel, commitPage, hasMore, isLoadingMore]);
+
+  /**
+   * 当前这一轮的关键词（首屏可能被顶部搜索带进来），预取要沿用它。
+   */
+  const catalogKeywordRef = useRef<string | undefined>(undefined);
+
+  /**
+   * 空闲即预取：每一页落地后就排下一页，让请求不落在滚动路径上。
+   *
+   * 触发点用 `requestIdleCallback`（Chromium/WebView2 有）而不是 setTimeout：预取是
+   * 纯网络等待，不占主线程，但**发起**它会同步走一遍渲染源筛选与 IPC 组装；排在空闲
+   * 回调里不会和用户点击、切题材这些真正要紧的交互抢帧。
+   *
+   * 只预取一页（不滚到底就白拉两页），这是"用户还没表达需求"与"别浪费站方带宽"之间
+   * 的平衡点；实测一页 30 条足够覆盖中速滚动到哨兵的时间。
+   *
+   * 文档隐藏时不预取：用户切走了还在给站源打请求没有意义，也会拖慢切回来时的首屏。
+   */
+  useEffect(() => {
+    if (!hasMore || isLoading || isLoadingMore) return;
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+    // 用一个句柄类型区分两种调度器：setTimeout 在部分环境返回 number，但两条分支
+    // 需要各自取消，不能混着 clearTimeout/cancelIdleCallback（互相传对方的 id 是
+    // 无效调用，静默不生效 —— 旧代码就这么错了，只是当时没暴露）。
+    let cancel: (() => void) | null = null;
+    const win = window as Window & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    if (win.requestIdleCallback && win.cancelIdleCallback) {
+      const handle = win.requestIdleCallback(() => prefetchMore(catalogKeywordRef.current), { timeout: 1500 });
+      cancel = () => win.cancelIdleCallback!(handle);
+    } else {
+      const handle = window.setTimeout(() => prefetchMore(catalogKeywordRef.current), 200);
+      cancel = () => window.clearTimeout(handle);
+    }
+    return () => cancel?.();
+  }, [hasMore, isLoading, isLoadingMore, items.length, prefetchMore]);
+
+  /**
+   * context value 必须 memo。
+   *
+   * 目录数据是本项目变动最频繁的状态（翻页、补集数、切筛选都会改），而消费方
+   * `ExploreView` 挂着上百张卡片。不 memo 的话，光是后台补集数这种"用户看不见的更新"
+   * 就会把整页卡片重新渲染一遍。
+   */
+  const value = useMemo<CatalogContextType>(() => ({
+    channel,
+    category,
+    audience,
+    sort,
+    categories,
+    items,
+    continueWatching,
+    isLoading,
+    isLoadingMore,
+    hasMore,
+    error,
+    activeSources,
+    setChannel,
+    setCategory: setCategoryState,
+    setAudience: setAudienceState,
+    setSort: setSortState,
+    refreshCatalog: loadData,
+    loadMore,
+    prefetchMore,
+    refreshContinueWatching,
+  }), [
+    activeSources, audience, categories, category, channel, continueWatching, error, hasMore,
+    isLoading, isLoadingMore, items, loadData, loadMore, prefetchMore, refreshContinueWatching,
+    setChannel, sort,
+  ]);
 
   return (
-    <CatalogContext.Provider
-      value={{
-        channel,
-        category,
-        audience,
-        sort,
-        categories,
-        items,
-        continueWatching,
-        isLoading,
-        isLoadingMore,
-        hasMore,
-        error,
-        activeSources,
-        setChannel,
-        setCategory: setCategoryState,
-        setAudience: setAudienceState,
-        setSort: setSortState,
-        refreshCatalog: loadData,
-        loadMore,
-        refreshContinueWatching,
-      }}
-    >
+    <CatalogContext.Provider value={value}>
       {children}
     </CatalogContext.Provider>
   );

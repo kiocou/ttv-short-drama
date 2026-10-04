@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useRef, useMemo, useCallback, ReactNode } from 'react';
 
 export type AppView = 'explore' | 'anime' | 'detail' | 'player' | 'history' | 'favorites' | 'settings' | 'search';
 
@@ -90,103 +90,134 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [cardTransition, setCardTransition] = useState<CardTransitionData | null>(null);
 
-  const navigateTo = (view: AppView, seriesId?: string) => {
-    if (view !== currentView) {
-      setPreviousView(currentView);
+  /**
+   * 所有 action 都用 `useCallback` + ref 读最新 state，而不是直接从闭包里取。
+   *
+   * 原因很具体：这些函数几乎都被视图里内联的 `onClick` 依赖。只要它们每次渲染换
+   * 身份，下游所有 `React.memo` / `useMemo` 就全失效 —— 而本项目里“卡片很多”是常态。
+   * 依赖 state 的正确姿势是 state 存 ref、函数读 ref.current。
+   */
+  const currentViewRef = useRef(currentView);
+  currentViewRef.current = currentView;
+  const previousViewRef = useRef(previousView);
+  previousViewRef.current = previousView;
+  const searchHistoryRef = useRef(searchHistory);
+  searchHistoryRef.current = searchHistory;
+
+  const navigateTo = useCallback((view: AppView, seriesId?: string) => {
+    if (view !== currentViewRef.current) {
+      setPreviousView(currentViewRef.current);
     }
     if (seriesId) {
       setSelectedSeriesId(seriesId);
     }
     setCurrentView(view);
-  };
+  }, []);
 
-  const triggerCardTransition = (data: CardTransitionData) => {
+  const triggerCardTransition = useCallback((data: CardTransitionData) => {
     setCardTransition(data);
     if (data.seriesId) {
       setSelectedSeriesId(data.seriesId);
     }
-  };
+  }, []);
 
-  const clearCardTransition = () => {
+  const clearCardTransition = useCallback(() => {
     setCardTransition(null);
-  };
+  }, []);
 
-  const goBack = () => {
-    if (currentView === 'player') {
-      navigateTo(previousView === 'player' ? 'explore' : previousView);
-    } else if (currentView === 'detail') {
+  const goBack = useCallback(() => {
+    const from = previousViewRef.current || 'explore';
+    if (currentViewRef.current === 'player') {
+      navigateTo(from === 'player' ? 'explore' : from);
+    } else if (currentViewRef.current === 'detail') {
       navigateTo('explore');
     } else {
-      navigateTo(previousView || 'explore');
+      navigateTo(from);
     }
-  };
+  }, [navigateTo]);
 
-  const persistSearchHistory = (next: string[]) => {
+  const persistSearchHistory = useCallback((next: string[]) => {
     setSearchHistory(next);
     try {
       localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next));
     } catch {
       // 存储配额或隐私模式失败：历史只是便利功能，不该影响搜索本身。
     }
-  };
+  }, []);
 
   /** 记一条搜索：去重后置顶，超出上限截断。 */
-  const rememberSearch = (keyword: string) => {
+  const rememberSearch = useCallback((keyword: string) => {
     const trimmed = keyword.trim();
     if (!trimmed) return;
     persistSearchHistory(
-      [trimmed, ...searchHistory.filter(item => item !== trimmed)].slice(0, MAX_SEARCH_HISTORY),
+      [trimmed, ...searchHistoryRef.current.filter(item => item !== trimmed)].slice(0, MAX_SEARCH_HISTORY),
     );
-  };
+  }, [persistSearchHistory]);
 
-  const removeSearchHistory = (keyword: string) => {
-    persistSearchHistory(searchHistory.filter(item => item !== keyword));
-  };
+  const removeSearchHistory = useCallback((keyword: string) => {
+    persistSearchHistory(searchHistoryRef.current.filter(item => item !== keyword));
+  }, [persistSearchHistory]);
 
-  const clearSearchHistory = () => persistSearchHistory([]);
+  const clearSearchHistory = useCallback(() => persistSearchHistory([]), [persistSearchHistory]);
 
-  const toggleNavCollapsed = () => {
+  const toggleNavCollapsed = useCallback(() => {
     setIsNavCollapsed(prev => !prev);
-  };
+  }, []);
 
-  const showToast = (message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
+  const showToast = useCallback((message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
     const id = `${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
     setToasts(prev => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== id));
     }, 2800);
-  };
+  }, []);
 
-  const removeToast = (id: string) => {
+  const removeToast = useCallback((id: string) => {
     setToasts(prev => prev.filter(t => t.id !== id));
-  };
+  }, []);
+
+  /**
+   * context value 必须 `useMemo`。
+   *
+   * 这是本次性能修复的核心一行：内联对象字面量每次渲染都是**新引用**，于是 AppProvider
+   * 的任何一次 `setState`（切视图、弹个 toast、甚至搜索框敲一个字）都会广播给所有
+   * `useAppStore()` 消费者。而卡片列表是本项目最大的渲染面（首页一页 30 张、无限流
+   * 后上百张），叠加 App.tsx 把所有视图常驻 DOM（隐藏 ≠ 卸载），一次无关的状态变化
+   * 会连带重渲染**隐藏视图里的全部卡片**。
+   *
+   * `setIsFullscreen` 是 `useState` 的 setter，本身身份稳定，直接放进依赖即可。
+   */
+  const value = useMemo<AppContextType>(() => ({
+    currentView,
+    previousView,
+    selectedSeriesId,
+    searchKeyword,
+    isNavCollapsed,
+    isFullscreen,
+    setIsFullscreen,
+    toasts,
+    cardTransition,
+    navigateTo,
+    triggerCardTransition,
+    clearCardTransition,
+    goBack,
+    setSearchKeyword,
+    searchHistory,
+    rememberSearch,
+    removeSearchHistory,
+    clearSearchHistory,
+    toggleNavCollapsed,
+    showToast,
+    removeToast,
+  }), [
+    cardTransition, clearCardTransition, clearSearchHistory, currentView, goBack, isFullscreen,
+    isNavCollapsed, navigateTo, previousView, removeSearchHistory, removeToast, rememberSearch,
+    searchHistory, searchKeyword, selectedSeriesId, showToast, toasts, toggleNavCollapsed,
+    triggerCardTransition,
+  ]);
 
   return (
-    <AppContext.Provider
-      value={{
-        currentView,
-        previousView,
-        selectedSeriesId,
-        searchKeyword,
-        isNavCollapsed,
-        isFullscreen,
-        setIsFullscreen,
-        toasts,
-        cardTransition,
-        navigateTo,
-        triggerCardTransition,
-        clearCardTransition,
-        goBack,
-        setSearchKeyword,
-        searchHistory,
-        rememberSearch,
-        removeSearchHistory,
-        clearSearchHistory,
-        toggleNavCollapsed,
-        showToast,
-        removeToast,
-      }}
-    >
+    <AppContext.Provider value={value}>
       {children}
     </AppContext.Provider>
   );

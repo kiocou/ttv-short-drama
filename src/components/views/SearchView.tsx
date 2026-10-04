@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
 import { ipcService } from '../../services/ipc';
 import { CatalogFilter, SeriesItem } from '../../types/catalog';
@@ -26,6 +26,18 @@ export const SearchView: React.FC = () => {
     rememberSearch,
     navigateTo,
   } = useAppStore();
+
+  /**
+   * 全部卡片共用这一个点击回调（卡片自己带上 seriesId）。
+   *
+   * 必须是稳定的 `useCallback`：内联箭头函数会让 `SeriesCard` 的 `React.memo` 失效，
+   * 搜索结果页一次 40 张卡就会因为任何无关重渲染全部重画。`rememberSearch` /
+   * `navigateTo` 在 useAppStore 里已稳定，依赖数组因此保持不变。
+   */
+  const handleCardClick = useCallback((seriesId: string) => {
+    rememberSearch(searchKeyword.trim());
+    navigateTo('detail', seriesId);
+  }, [navigateTo, rememberSearch, searchKeyword]);
 
   const [channel] = useState<Channel>(SEARCH_CHANNEL);
   const [items, setItems] = useState<SeriesItem[]>([]);
@@ -97,15 +109,20 @@ export const SearchView: React.FC = () => {
         pageSize: 40,
       };
       filterRef.current = filter;
-      // 两段式：先出结构化来源（红果网页 + 动漫源，实测 0.3-0.6s），
-      // 再把慢的 App 联想追加到尾部。
-      //
-      // 旧实现把三者放进同一个 join! 里等，首屏被 Python 冷启动（0.6-1.9s）
-      // 拖住——网页结果早就就绪了，用户却要盯着"搜索中…"。
+      /**
+       * 两路**并行**发出，不再串联。
+       *
+       * 旧实现把联想挂在 `searchFast` 的 `.then` 里，于是总耗时 = 快路 + 联想
+       * （实测 0.3-0.6s + 0.6-1.9s，联想要冷启动一个 Python 进程）。而联想是纯补充
+       * （补网页漏掉的分季条目），从头到尾不阻塞首屏——串联唯一的作用就是让尾部凭空
+       * 多等一拍。改成并行后总耗时是两者的**最大值**，那条慢链路完整地藏进了用户读
+       * 首屏结果的时间里。
+       */
+      const suggestPromise = ipcService.catalog.searchSuggest(keyword, channel);
       ipcService.catalog
         .searchFast(filter)
         .then(page => {
-          if (requestId !== requestIdRef.current) return undefined;
+          if (requestId !== requestIdRef.current) return;
           setItems(page.items);
           setSourceNote(page.source ?? null);
           setDegraded(page.degraded === true);
@@ -114,10 +131,20 @@ export const SearchView: React.FC = () => {
           // 红果官网搜索本身有分页，此前固定只要第 1 页，hasMore / total 一直
           // 被白白丢掉：命中多页的长尾剧永远只剩首屏那几十张卡片。
           setNextPage(page.page + 1);
-          // 首屏已可用，先收掉 loading 再等联想，用户不用为补充来源继续等。
+          // 首屏已可用，先收掉 loading，用户不用为补充来源继续等。
           setIsLoading(false);
-          return ipcService.catalog.searchSuggest(keyword, channel);
         })
+        .catch((err: unknown) => {
+          if (requestId !== requestIdRef.current) return;
+          setError((err as Error).message || '搜索失败，请稍后重试。');
+          setItems([]);
+        })
+        .finally(() => {
+          if (requestId === requestIdRef.current) setIsLoading(false);
+        });
+
+      // 联想单独一条链：失败静默（它是补充来源），且必须复查 requestId。
+      void suggestPromise
         .then(suggestions => {
           if (!suggestions || requestId !== requestIdRef.current) return;
           // 联想按 id 去重后追加：它只是补齐网页漏掉的分季条目，
@@ -128,13 +155,8 @@ export const SearchView: React.FC = () => {
             return extra.length > 0 ? [...previous, ...extra] : previous;
           });
         })
-        .catch((err: unknown) => {
-          if (requestId !== requestIdRef.current) return;
-          setError((err as Error).message || '搜索失败，请稍后重试。');
-          setItems([]);
-        })
-        .finally(() => {
-          if (requestId === requestIdRef.current) setIsLoading(false);
+        .catch(() => {
+          // 联想失败不影响已有结果。
         });
     }, 300);
     return () => window.clearTimeout(timer);
@@ -251,10 +273,7 @@ export const SearchView: React.FC = () => {
                     key={`${series.id}-${index}`}
                     series={series}
                     index={index}
-                    onClick={() => {
-                      rememberSearch(searchKeyword.trim());
-                      navigateTo('detail', series.id);
-                    }}
+onClick={handleCardClick}
                   />
                 ))}
               </div>

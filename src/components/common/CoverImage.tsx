@@ -65,6 +65,80 @@ export interface CoverImageProps {
 const MAX_ATTEMPTS = 3;
 
 /**
+ * **全局共享**一个 IntersectionObserver，而不是每张封面各建一个。
+ *
+ * 一页 30 张卡、无限流之后上百张 —— 每张卡各建一个观察器意味着上百个 IO 实例、上百次
+ * 独立的 root/阈值协商与回调分发，而它们要的判定完全一样（"进入视口前 800px 了吗"）。
+ * 观察器持有元素引用，元素卸载时还要逐个 disconnect，全是浪费。
+ *
+ * 这里用一个模块级单例 + 回调表：观察器只创建一次（且是惰性的——没人用封面就不创建），
+ * 每个元素注册自己的回调，进入视口后立刻自 deregister。
+ *
+ * 注意 `root` 用 `null`（视口）而不是滚动容器：封面分布在发现/动漫/搜索/历史/收藏多个
+ * 各自滚动的容器里，而它们的 `rootMargin` 一致，用视口做根对这些容器是等价的（容器占满
+ * 内容区），且这样才能真正只建一个。`document` 根下卡片在隐藏视图里时不会相交，
+ * 切回来时再触发——正是想要的懒加载语义。
+ */
+const COVER_ROOT_MARGIN = '800px 0px';
+
+let coverObserver: IntersectionObserver | null = null;
+const coverCallbacks = new WeakMap<Element, () => void>();
+
+function observeCover(element: Element, onEnter: () => void): () => void {
+  if (typeof IntersectionObserver === 'undefined') {
+    onEnter();
+    return () => {};
+  }
+  if (!coverObserver) {
+    coverObserver = new IntersectionObserver(
+      entries => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const callback = coverCallbacks.get(entry.target);
+          if (!callback) continue;
+          // 先摘掉再回调：命中即完成，这个元素不该再看第二次。
+          coverObserver?.unobserve(entry.target);
+          coverCallbacks.delete(entry.target);
+          callback();
+        }
+      },
+      { rootMargin: COVER_ROOT_MARGIN },
+    );
+  }
+  coverCallbacks.set(element, onEnter);
+  coverObserver.observe(element);
+  return () => {
+    coverCallbacks.delete(element);
+    coverObserver?.unobserve(element);
+  };
+}
+
+/**
+ * `convertFileSrc` 的模块级缓存。
+ *
+ * 每张 guo 卡都会走到这里。动态 import 虽然被 Vite 缓存了模块，但每次调用仍是一次
+ * Promise 调度 + 一次模块查找；一页几十张卡就是几十次。把 Promise 本身缓存下来，
+ * 全应用只解析一次。
+ *
+ * 刻意保持动态引入：Web/演示模式没有 Tauri 运行时，静态 import 会直接炸构建产物。
+ */
+let convertFileSrcPromise: Promise<(path: string) => string> | null = null;
+
+function loadConvertFileSrc(): Promise<(path: string) => string> {
+  if (!convertFileSrcPromise) {
+    convertFileSrcPromise = import('@tauri-apps/api/core')
+      .then(module => module.convertFileSrc)
+      .catch(() => {
+        // 失败不该被永久缓存，否则后续所有卡片都拿不到。
+        convertFileSrcPromise = null;
+        throw new Error('convertFileSrc 不可用');
+      });
+  }
+  return convertFileSrcPromise;
+}
+
+/**
+ * 重试地址。
  * 重试地址。
  *
  * **不能无条件拼 `?r=N` 做 cache-bust**：百度图床那类地址把参数写成路径的一部分
@@ -134,24 +208,12 @@ export const CoverImage: React.FC<CoverImageProps> = ({
 
   /** 进入视口（提前一屏）才开始加载；guo 源的解析也等这个信号，避免整页一起打 IPC。 */
   useEffect(() => {
-    if (!hasSource || started || typeof IntersectionObserver === 'undefined') {
-      if (hasSource && !started && typeof IntersectionObserver === 'undefined') setStarted(true);
-      return;
-    }
+    if (!hasSource || started) return;
     const holder = holderRef.current;
     if (!holder) return;
-    const observer = new IntersectionObserver(
-      entries => {
-        if (entries.some(entry => entry.isIntersecting)) {
-          setStarted(true);
-          observer.disconnect();
-        }
-      },
-      // 提前一屏预载：滚动时不会先看到一片占位再"跳"出图。
-      { rootMargin: '800px 0px' },
-    );
-    observer.observe(holder);
-    return () => observer.disconnect();
+    // 走共享观察器（见 `observeCover` 的注释）：一页上百张卡时这是数量级差别。
+    // 提前一屏预载：滚动时不会先看到一片占位再"跳"出图。
+    return observeCover(holder, () => setStarted(true));
   }, [hasSource, started]);
 
   /**
@@ -173,8 +235,7 @@ export const CoverImage: React.FC<CoverImageProps> = ({
           setGivenUp(true);
           return;
         }
-        // 动态引入：Web/演示模式没有 Tauri 运行时，静态 import 会直接炸构建产物。
-        const { convertFileSrc } = await import('@tauri-apps/api/core');
+        const convertFileSrc = await loadConvertFileSrc();
         setResolvedUrl(convertFileSrc(path));
       } catch {
         setGivenUp(true);

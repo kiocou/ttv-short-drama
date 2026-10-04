@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Minus,
   Square,
+  Copy,
   X,
   Search,
   Clock,
@@ -21,6 +22,19 @@ const MAX_SUGGESTIONS = 10;
 // 淘汰最旧的一条（LRU 近似——联想框的翻查率极低，做真 LRU 没收益）。
 const SUGGEST_CACHE_LIMIT = 32;
 const SUGGEST_LISTBOX_ID = 'titlebar-suggest-listbox';
+
+/**
+ * 标题栏窗口控制按钮的基类。
+ *
+ * hover 底色用 `slate-500/10` 而非旧的 `slate-200/50`：标题栏本身就是 `bg-white/80`
+ * 叠 Mica 玻璃，旧配色会在浅色玻璃上渲染出一块偏脏的灰块；低透明度中性色才能保持
+ * “浮在玻璃上”的干净感。关闭键单独叠红色（Win11 惯例），由调用方拼接。
+ */
+const WIN_BUTTON_BASE =
+  'w-9 h-10 flex items-center justify-center text-slate-600 ' +
+  'hover:bg-slate-500/10 hover:text-slate-900 active:bg-slate-500/20 ' +
+  'transition-colors duration-150 outline-none focus-visible:ring-1 ' +
+  'focus-visible:ring-inset focus-visible:ring-blue-500/60';
 
 interface SearchSuggestions {
   items: SeriesItem[];
@@ -208,6 +222,49 @@ export const TitleBar: React.FC = () => {
     }
   };
 
+  /**
+   * 窗口最大化状态：决定中间那颗按钮画哪个图标。
+   *
+   * **不能像旧实现那样写死一个 `<Square/>`**：那样无论窗口处于什么状态都显示
+   * “最大化”，用户点完图标纹丝不动，只能猜刚才那下到底生效没有（用户反馈的
+   * “全屏/最大化后图标没变”就是这个）。而最大化状态还会被系统手势改变——
+   * 双击标题栏、Win+↑、拖到屏幕上沿、任务栏按钮——所以状态必须以窗口真实查询
+   * 为准，不能只在点击时乐观写一次。
+   */
+  const [isMaximized, setIsMaximized] = useState(false);
+
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
+    const sync = async () => {
+      try {
+        const actual = await getCurrentWindow().isMaximized();
+        // 卸载后不再写状态：写入已无意义。
+        if (!cancelled) setIsMaximized(actual);
+      } catch {
+        // 查询不可用（非 Tauri 或权限缺失）时保留当前显示，不谎报状态。
+      }
+    };
+
+    void sync();
+    void getCurrentWindow()
+      .onResized(() => {
+        void sync();
+      })
+      .then((stop) => {
+        if (cancelled) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const handleWindowAction = async (action: 'minimize' | 'maximize' | 'close') => {
     if (isTauriEnvironment()) {
       try {
@@ -215,6 +272,9 @@ export const TitleBar: React.FC = () => {
         if (action === 'minimize') await appWindow.minimize();
         else if (action === 'maximize') await appWindow.toggleMaximize();
         else if (action === 'close') await appWindow.close();
+        // toggleMaximize 是异步落到窗口线程的，返回时状态未必已生效；
+        // 再查一次真实状态（onResized 也会补一次，避免图标滞后一帧）。
+        if (action === 'maximize') setIsMaximized(await appWindow.isMaximized());
       } catch (err) {
         console.warn('Tauri window action:', err);
       }
@@ -415,47 +475,58 @@ export const TitleBar: React.FC = () => {
         )}
       </div>
 
-      {/* 右侧：干净清爽的 Windows 11 控制按钮（已移除旁边的多余状态） */}
-      <div className="flex items-center -mr-2">
-        <button
-          type="button"
-          data-window-interactive
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={(event) => {
-            event.stopPropagation();
-            void handleWindowAction('minimize');
-          }}
-          className="w-11 h-10 flex items-center justify-center text-slate-600 hover:bg-slate-200/50 transition-colors"
-          title="最小化"
-        >
-          <Minus className="w-3.5 h-3.5" />
-        </button>
-        <button
-          type="button"
-          data-window-interactive
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={(event) => {
-            event.stopPropagation();
-            void handleWindowAction('maximize');
-          }}
-          className="w-11 h-10 flex items-center justify-center text-slate-600 hover:bg-slate-200/50 transition-colors"
-          title="最大化"
-        >
-          <Square className="w-3 h-3" />
-        </button>
-        <button
-          type="button"
-          data-window-interactive
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={(event) => {
-            event.stopPropagation();
-            void handleWindowAction('close');
-          }}
-          className="w-11 h-10 flex items-center justify-center text-slate-600 hover:bg-red-500 hover:text-white transition-colors"
-          title="关闭"
-        >
-          <X className="w-3.5 h-3.5" />
-        </button>
+      {/* 右侧：Windows 11 标题栏控制按钮。
+          宽度收到 w-9（原 w-11）：三颗按钮在 40px 标题栏里各占 36px 刚好，
+          既保留 Win11 的“宽阔易点区”，又不再把左边的搜索框挤得偏窄。
+          图标统一 w-3 / strokeWidth 1.75——三种字形粗细一致才像一套。 */}
+      <div className="flex items-center">
+        {(
+          [
+            {
+              key: 'minimize',
+              label: '最小化',
+              className: WIN_BUTTON_BASE,
+              icon: <Minus className="w-3 h-3" strokeWidth={1.75} />,
+              onClick: () => handleWindowAction('minimize'),
+            },
+            {
+              // 图标跟着窗口真实状态走：最大化时画“还原”（双层方框），
+              // 否则用户点了看不出有没有生效（曾经写死 Square 导致永远不变）。
+              key: 'maximize',
+              label: isMaximized ? '向下还原' : '最大化',
+              className: WIN_BUTTON_BASE,
+              icon: isMaximized ? (
+                <Copy className="w-3 h-3 -translate-x-[1.5px]" strokeWidth={1.75} />
+              ) : (
+                <Square className="w-3 h-3" strokeWidth={1.75} />
+              ),
+              onClick: () => handleWindowAction('maximize'),
+            },
+            {
+              key: 'close',
+              label: '关闭',
+              className: `${WIN_BUTTON_BASE} hover:bg-red-500 hover:text-white active:bg-red-600`,
+              icon: <X className="w-3 h-3" strokeWidth={1.75} />,
+              onClick: () => handleWindowAction('close'),
+            },
+          ] as const
+        ).map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            data-window-interactive
+            aria-label={item.label}
+            title={item.label}
+            className={item.className}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              void item.onClick();
+            }}
+          >
+            {item.icon}
+          </button>
+        ))}
       </div>
     </header>
   );
