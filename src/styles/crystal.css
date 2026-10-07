@@ -257,6 +257,55 @@
 }
 
 /* ==========================================================================
+   3.5 长按加速提示
+   ========================================================================== */
+
+/*
+  按住方向键进入临时加速时出现在画面顶部中央，松开立刻消失。
+  与全屏提示（top-6）同位置：两者不会同时出现（全屏提示是进全屏后 3.2 秒，
+  而加速只在按住方向键时才有），复用一个位置比另找一个不遮挡画面的地方简单。
+
+  刻意**不用 backdrop-filter**：本舞台内所有背景模糊都会把视频拉进合成器，
+  直接让 RTX VSR 失效（见本文件第 2 节的长注释）。这里用纯色底。
+*/
+.ttv-boost-toast {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  animation: ttv-boost-in 0.14s ease-out;
+}
+
+.ttv-boost-toast-hint {
+  font-weight: 500;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/*
+  入场只做 opacity（不碰 transform）。历史教训（不变量 26）：给播放器祖先挂任何
+  会保留的 transform/filter，都会把它钉成常驻合成层并让 NVIDIA VSR 失效。
+  这一层不是 video 祖先、且只在按住键盘时存在，风险本来极低；
+  但既然纯粹用 opacity 就能达到"出现"的效果，就没必要引入第二个变量。
+*/
+@keyframes ttv-boost-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ==========================================================================
    4. 收起态的贴边迷你进度条
    ========================================================================== */
 
@@ -270,7 +319,23 @@
   right: 0;
   bottom: 0;
   height: 3.5px;
-  background: rgba(255, 255, 255, 0.22);
+  /*
+    底轨用**中性灰**，这是这里唯一的正确解。
+    
+    旧值是一条 rgba(255,255,255,0.22) 的纯白底轨。它在黑画面下刚好够用，但这条
+    CDN 的短剧大量是白墙 / 白西装 / 雪景这类高亮近景 —— 纯白叠纯白，实测合成后
+    与背景的亮度差为 **0**，3.5px 的线等于完全不存在。用户报的「底部的进度条
+    有时候会不见」正是这种场景：换一集暗场景又正常，所以现象是"有时候"。
+
+    反之，纯黑衬底在白画面上清楚（亮度差 107），在纯黑画面上又同样归零。
+    只有 50% 上下的中性灰能与**两种极端背景**都拉开约 70 的亮度差：
+      rgba(128,128,128,0.55) 叠白 → 约 185（差 70）；叠黑 → 约 70（差 70）。
+    上缘再补一条高光，暗场景下轮廓更明确。
+  */
+  background: rgba(128, 128, 128, 0.55);
+  box-shadow:
+    0 -1px 0 rgba(255, 255, 255, 0.28),
+    0 0 5px rgba(0, 0, 0, 0.35);
   z-index: 35;
   opacity: 0;
   transform: translateY(100%);
@@ -292,16 +357,22 @@
   transform: translateY(0);
 }
 
-.is-locked .ttv-mini-progress:hover,
-.is-auto-hidden .ttv-mini-progress:hover,
-.ttv-player.is-locked .ttv-mini-progress:hover {
-  height: 6px;
-}
+/*
+  这里曾有三条 `:hover { height: 6px }` 的加粗规则，但它们**永远不会触发**：
+  本元素设了 `pointer-events: none`（纯显示件、不接手势，见上方注释），
+  不产生指针事件的元素也就没有 hover 状态。删掉以免下次有人照它抄。
+  想加粗只能在挂载点用状态类驱动（例如容器 hover），不能挂在本元素上。
+*/
 
 .ttv-mini-buffer {
   position: absolute;
   inset: 0 auto 0 0;
-  background: rgba(255, 255, 255, 0.38);
+  /*
+    缓冲段与底轨同族、只是更亮一档：它必须与底轨**互相可分**，同时自己也要在
+    极亮/极暗两种画面上都能看见。纯白（rgba(255,255,255,*)）在白底上同样会归零，
+    所以这里也走中性灰 —— 叠白约 230（与底轨 185 差 45）、叠黑约 128（与底轨 70 差 58）。
+  */
+  background: rgba(216, 216, 216, 0.92);
   transition: width 0.2s linear;
 }
 
@@ -311,11 +382,39 @@
   top: 0;
   bottom: 0;
   width: 100%;
-  background: var(--fluent-blue);
-  box-shadow: 0 0 10px rgba(0, 120, 212, 0.8);
+  /*
+    品牌蓝保留，但不再用会与亮画面糊在一起的纯色：白底叠合后只有 41 的亮度差，
+    实测那条蓝线在白西装画面上同样"看不见"。改成蓝色 + 一圈同色发光，
+    让它靠**边缘**而不是靠明度在亮背景上立住。
+  */
+  background: linear-gradient(180deg, #4da3ff, var(--fluent-blue));
+  box-shadow:
+    0 0 10px rgba(0, 120, 212, 0.85),
+    0 0 0 0.5px rgba(255, 255, 255, 0.5);
   /* 用 scaleX 而非 width：进度每帧更新时避免触发布局重排 */
   transform-origin: left center;
   will-change: transform;
+}
+
+/*
+  时长还没解析出来时的占位填充：固定铺一小段、颜色压暗，
+  明确表示"正在加载"而不是"进度为 0"。
+  它不能走 scaleX —— 那条 transform 正是用来表达进度的。
+*/
+.ttv-mini-played.is-unknown {
+  width: 28%;
+  transform: none;
+  /* 与已播段同族但更亮、并带白色外描边：时长未知时它独自出现在底轨上，
+     必须在极亮画面上也有轮廓（纯色版本实测只有 41 的亮度差，在白西装上会糊掉）。 */
+  background: linear-gradient(180deg, #7cc0ff, #3d94e8);
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.6);
+  /*
+    刻意**不做**无限循环动画。原设想是加一段 opacity 呼吸提示"还在加载"，
+    但任何持续动画都会被提升为常驻合成层，而这条播放器的合成约束极其昂贵：
+    历史上正是"恒等 transform/filter 被永久钉在 video 祖先上"让 NVIDIA VSR
+    失效过一次（AGENTS.md 不变量 26）。这里的收益（多一点"在动"的暗示）
+    远小于那个风险，所以只要静态填充能表达"这里有一条进度条"就够了。
+  */
 }
 
 /* ==========================================================================
@@ -577,6 +676,27 @@
 .btn-text-action.is-on {
   color: var(--fluent-sky);
   background: rgba(56, 189, 248, 0.18);
+}
+
+/* 长按方向键加速期间：倍速按键高亮为"Nx 加速"，与画面中央的提示条相互印证。 */
+.btn-text-action.is-boosting {
+  color: #0b1220;
+  background: var(--fluent-sky);
+  font-weight: 600;
+}
+
+/*
+  倍速菜单底部的说明行（"长按 ← / → 加速到 Nx"）。
+  它随所选档位变化，是唯一能把"加速倍率 = 档位 × 3"这件事讲清楚的地方。
+*/
+.crystal-menu-note {
+  margin-top: 4px;
+  padding: 7px 12px 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+  font-size: 11px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.62);
+  white-space: nowrap;
 }
 
 .svg-icon {

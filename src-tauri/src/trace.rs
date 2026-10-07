@@ -331,9 +331,29 @@ pub fn capture_stderr() {}
 mod tests {
     use super::*;
 
+    /// 这几个用例都在操作**同一个全局环形缓冲**，而 `cargo test` 默认多线程并行。
+    ///
+    /// 不加这把锁时 `tail_returns_only_newer_lines` 会被 `dropped_flag_reports_gaps`
+    /// 灌进去的 110 行打断（后者在同一时刻往同一个缓冲里写），于是「同一个 cursor
+    /// 不该再取到行」随机失败。这是**测试自身的缺陷**，不是被测代码的问题 —— 换一台
+    /// 机器、换一次线程调度就可能绿。现象已在 0.2.18 的版本号变更后出现一次
+    /// （新增两个用例改变了线程调度，104 passed 变成 105 passed / 1 failed）。
+    ///
+    /// 用一把静态锁把「读写全局缓冲」的用例串起来，代价是这几个用例不再并行，
+    /// 换来确定性。
+    static BUFFER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 取锁并忽略「被前一个用例 panic 污染」的情况：锁在这里只用于互斥。
+    fn lock_buffer() -> std::sync::MutexGuard<'static, ()> {
+        BUFFER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// 序号必须单调：前端每次只带上次的 cursor 回来，收到重复序号会重复渲染。
     #[test]
     fn tail_returns_only_newer_lines() {
+        let _guard = lock_buffer();
         log("测试行 A");
         let first = tail(0);
         assert!(first.next_cursor >= 1);
@@ -342,6 +362,8 @@ mod tests {
     }
 
     /// 预签名直链的 token 绝不能进日志文件，但路径要留下。
+    ///
+    /// 纯函数，不碰缓冲，因此**不需要**那把锁。
     #[test]
     fn redact_strips_query_and_userinfo() {
         assert_eq!(
@@ -358,6 +380,7 @@ mod tests {
     /// 被淘汰的行要让上层知道，否则界面静默缺段。
     #[test]
     fn dropped_flag_reports_gaps() {
+        let _guard = lock_buffer();
         let head = tail(0).next_cursor;
         for index in 0..(MAX_LINES + 10) {
             log(format!("填充 {index}"));
