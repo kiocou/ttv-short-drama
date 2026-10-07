@@ -7,7 +7,12 @@ import { enterFullscreen, leaveFullscreen, queryFullscreen } from '../../service
 // 卡在哪一段（清单未就绪 / 首个分片未到 / 解码器没起）。这些事件都不密集，
 // 且打点是 fire-and-forget，不影响渲染。
 import { tracePlayback } from '../../services/playbackTrace';
-import { createBoostController, type BoostController } from '../../services/boostController';
+import {
+  BOOST_HOLD_MS,
+  BOOST_RATE,
+  createBoostController,
+  type BoostController,
+} from '../../services/boostController';
 import { PlayerControls } from './PlayerControls';
 import { EpisodeDrawer } from './EpisodeDrawer';
 import { DiagnosticsModal } from './DiagnosticsModal';
@@ -253,7 +258,7 @@ export const VideoSurface: React.FC = () => {
   };
 
   /**
-   * 长按方向键临时 3 倍速（参考红果/果果的快捷操作）。
+   * 长按方向键临时加速（参考红果/果果的快捷操作），固定 2 倍速。
    *
    * **触发方式是「按住 ← / →」**，不是按住画面。
    * 旧实现把长按挂在 `<video>` 的 pointerdown 上，与单击（播放/暂停）、双击
@@ -263,26 +268,22 @@ export const VideoSurface: React.FC = () => {
    *
    * 行为：按住 350ms 起效（起效前松手 = 普通快退/快进 5 秒，语义不变）；
    * 起效后松手只恢复原速、**不跳转**（否则用户会先被加速、再被弹到 +5 秒处）；
-   * 失焦（窗口切走）与 Esc 也会恢复，避免倍速被永久留在 3×。
+   * 失焦（窗口切走）与 Esc 也会恢复，避免倍速被永久留在 2×。
    * 临时倍速只改 video.playbackRate，不动 store 里的用户倍速设定——
-   * 恢复时永远回到播放器菜单里选的那个值。
+   * 恢复时永远回到播放器菜单里选的那个值（在 0.5x 档长按 → 2x，松手回 0.5x）。
    */
-  const LONG_PRESS_MS = 350;
-  // 加速是**相对用户倍速的倍数**，不是固定 3x：控制栏把倍速调到 1.5x 之后，
-  // 长按应当得到 4.5x（再按上限截断）。固定值会让人觉得「长按把我设的倍速重置了」。
-  const BOOST_MULTIPLIER = 3;
-  // 上限 4x：够快又不至于让解码/音频变形太明显。2x 基准下长按即到顶。
-  const BOOST_MAX_RATE = 4;
+  // 阈值与加速速率都从 services/boostController 取，不在组件里另写一份：
+  // 菜单里那行「长按 ← / → 加速到 Nx」用的是同一个常量，两处各写一份迟早漂移。
   // 倍速的最新值。用户可能在**按住期间**去菜单里改倍速，那时恢复目标必须是新值；
   // 用 ref 而不是把 playbackRate 列进 controller 的依赖（后者会重建控制器、
   // 连带丢掉正在计时的长按定时器）。
   const playbackRateRef = useRef(playbackRate);
   playbackRateRef.current = playbackRate;
 
-  // 状态机放在 services/boostController 里：那里的三条语义（阈值、松手的归属、
-  // 恢复目标）有 20 条确定性用例覆盖（scripts/verify-boost.mjs，假时钟 + 假 video，
-  // 不依赖真实定时器）。本组件只负责把按键事件接上去——这样"验证过的逻辑"
-  // 与"线上跑的代码"是同一份，而不是另写一个仿制品来测。
+  // 状态机放在 services/boostController 里：那里的四条语义（阈值、松手的归属、
+  // 固定速率、恢复目标）有 24 条确定性用例覆盖（scripts/verify-boost.mjs，
+  // 假时钟 + 假 video，不依赖真实定时器）。本组件只负责把按键事件接上去——
+  // 这样"验证过的逻辑"与"线上跑的代码"是同一份，而不是另写一个仿制品来测。
   // 长按加速的提示条状态。用 state 而不是 ref：它要驱动 UI 显示/隐藏，
   // 而加速进入/退出本身就只发生一次（不是逐帧），不会带来重渲染压力。
   const [boostRate, setBoostRate] = useState<number | null>(null);
@@ -292,9 +293,8 @@ export const VideoSurface: React.FC = () => {
     boostRef.current = createBoostController({
       getVideo: () => videoRef.current,
       getBaseRate: () => playbackRateRef.current,
-      holdMs: LONG_PRESS_MS,
-      multiplier: BOOST_MULTIPLIER,
-      maxRate: BOOST_MAX_RATE,
+      holdMs: BOOST_HOLD_MS,
+      rate: BOOST_RATE,
       // 进入加速时把**真实生效的速率**交给提示条；退出时置空隐藏。
       onChange: (boosting, rate) => setBoostRate(boosting ? rate : null),
     });
