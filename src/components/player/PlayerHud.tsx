@@ -48,7 +48,13 @@ export const FALLBACK_QUALITY_OPTIONS: PlayerQualityOption[] = [
   { label: '自动', value: 'auto', resolution: '由播放源自动选择' },
 ];
 
-const SPEED_OPTIONS = [0.75, 1.0, 1.25, 1.5, 2.0];
+// 档位同时是「长按加速」的基准：长按得到的是**所选档位 × 倍数**（上限 4x）。
+// 因此这里同时给出慢速档（0.5/0.75）——用户明确要求在控制栏里能调长按的倍速，
+// 而慢速基准下的加速才有实际意义（0.5x 长按 → 1.5x，正好当"快速过一遍"用）。
+const SPEED_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
+/** 长按加速的倍数与上限，必须与 VideoSurface 里的 BOOST_MULTIPLIER / BOOST_MAX_RATE 一致。 */
+const BOOST_MULTIPLIER = 3;
+const BOOST_MAX_RATE = 4;
 
 export interface PlayerHudProps {
   /** 顶部标题岛：剧名。 */
@@ -72,6 +78,13 @@ export interface PlayerHudProps {
   volume: number;
   isMuted: boolean;
   playbackRate: number;
+  /**
+   * 长按方向键加速时**实际生效**的速率（已按上限截断）；未加速时为 null。
+   *
+   * 由调用方算好传进来，而不是这里拿 playbackRate × 3 再算一遍：倍速菜单里那行
+   * 「长按加速到 Nx」如果自己重算，一旦倍数或上限在别处调整，两处就会各说各话。
+   */
+  effectivePlaybackRate?: number | null;
   currentQuality: string;
   qualityOptions: PlayerQualityOption[];
 
@@ -110,6 +123,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   volume,
   isMuted,
   playbackRate,
+  effectivePlaybackRate = null,
   currentQuality,
   qualityOptions,
   onToggleLock,
@@ -405,10 +419,14 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowQualityMenu(false);
                       setShowVolumeSlider(false);
                     }}
-                    className="btn-text-action"
-                    title="切换播放倍速"
+                    className={`btn-text-action${effectivePlaybackRate !== null ? ' is-boosting' : ''}`}
+                    title="切换播放倍速（长按 ← / → 可临时加速）"
                   >
-                    {playbackRate === 1 ? '倍速' : `${playbackRate}x`}
+                    {effectivePlaybackRate !== null
+                      ? `${effectivePlaybackRate}x 加速`
+                      : playbackRate === 1
+                        ? '倍速'
+                        : `${playbackRate}x`}
                   </button>
 
                   <div className={`crystal-flyout crystal-surface${showSpeedMenu ? ' open' : ''}`}>
@@ -425,6 +443,14 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                         {rate === 1.0 ? '1.0x 正常' : `${rate}x`}
                       </button>
                     ))}
+                    {/*
+                      长按加速的落点必须在这里说清楚：加速倍率是**相对所选档位**的
+                      （档位 × 3、上限 4x），所以换一个档位，长按得到的速率也跟着变。
+                      不写这一行，用户会以为长按永远是某个固定值。
+                    */}
+                    <div className="crystal-menu-note">
+                      {`长按 ← / → 加速到 ${Math.min(BOOST_MAX_RATE, playbackRate * BOOST_MULTIPLIER)}x`}
+                    </div>
                   </div>
                 </div>
 
@@ -637,19 +663,33 @@ interface MiniProgressProps {
  *
  * 进度改用 scaleX 而非宽度：播放中它每 250ms 更新一次，改 width 会带动
  * 重排，而 transform 只在合成层。
+ *
+ * 时长尚未就绪（duration ≤ 0）时**不能把已播段也画成 0**：源刚起播的那几秒、
+ * 或后端返回的容器还没解析出时长时，整条会只剩底轨 —— 用户看到的是"进度条
+ * 不见了"。这种情况按"已加载但未知进度"处理，铺一段低饱和度填充，
+ * 至少让人看得出"控制器收起了、这里有一条进度条"。
  */
 export const MiniProgress: React.FC<MiniProgressProps> = ({
   position,
   duration,
   buffered,
 }) => {
-  const percent = duration > 0 ? Math.max(0, Math.min(100, (position / duration) * 100)) : 0;
-  const bufferPercent = duration > 0 ? Math.max(0, Math.min(100, (buffered / duration) * 100)) : 0;
+  // duration 未就绪时不算百分比（除零会得到 NaN，scaleX(NaN) 会让整条消失）。
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+  const percent = hasDuration ? Math.max(0, Math.min(100, (position / duration) * 100)) : 0;
+  const bufferPercent = hasDuration
+    ? Math.max(0, Math.min(100, (buffered / duration) * 100))
+    : 0;
 
   return (
     <div aria-hidden className="ttv-mini-progress">
       <div className="ttv-mini-buffer" style={{ width: `${bufferPercent}%` }} />
-      <div className="ttv-mini-played" style={{ transform: `scaleX(${percent / 100})` }} />
+      {hasDuration ? (
+        <div className="ttv-mini-played" style={{ transform: `scaleX(${percent / 100})` }} />
+      ) : (
+        // 时长未知：铺一段固定宽度的弱化填充，明确"在加载"而不是"什么都没有"。
+        <div className="ttv-mini-played is-unknown" />
+      )}
     </div>
   );
 };

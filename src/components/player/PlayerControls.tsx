@@ -21,6 +21,8 @@ interface PlayerControlsProps {
   onUserActivity: () => void;
   /** 指针移动统一入口（带合成事件过滤），容器层已按真实位移过滤后传入。 */
   onPointerMove?: (e: React.MouseEvent) => void;
+  /** 长按方向键加速时实际生效的速率（未加速为 null），仅用于展示。 */
+  effectivePlaybackRate?: number | null;
 }
 
 export const PlayerControls: React.FC<PlayerControlsProps> = ({
@@ -31,6 +33,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
   onToggleFullscreen,
   onUserActivity,
   onPointerMove,
+  effectivePlaybackRate = null,
 }) => {
   const {
     currentSeries,
@@ -98,6 +101,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
       volume={volume}
       isMuted={isMuted}
       playbackRate={playbackRate}
+      effectivePlaybackRate={effectivePlaybackRate}
       currentQuality={currentQuality}
       qualityOptions={availableQualities}
       onToggleLock={onToggleLock}

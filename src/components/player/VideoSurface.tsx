@@ -7,10 +7,11 @@ import { enterFullscreen, leaveFullscreen, queryFullscreen } from '../../service
 // 卡在哪一段（清单未就绪 / 首个分片未到 / 解码器没起）。这些事件都不密集，
 // 且打点是 fire-and-forget，不影响渲染。
 import { tracePlayback } from '../../services/playbackTrace';
+import { createBoostController, type BoostController } from '../../services/boostController';
 import { PlayerControls } from './PlayerControls';
 import { EpisodeDrawer } from './EpisodeDrawer';
 import { DiagnosticsModal } from './DiagnosticsModal';
-import { Loader2, AlertCircle, RefreshCw, Copy, X } from 'lucide-react';
+import { Loader2, AlertCircle, RefreshCw, Copy, X, FastForward } from 'lucide-react';
 
 /** worker 上报的解析阶段 → 用户可读文案。 */
 const STAGE_LABEL: Record<string, string> = {
@@ -252,52 +253,65 @@ export const VideoSurface: React.FC = () => {
   };
 
   /**
-   * 长按临时 3 倍速（参考红果/果果的快捷操作）。
+   * 长按方向键临时 3 倍速（参考红果/果果的快捷操作）。
    *
-   * 按住 350ms 起效，松开、失焦或指针滑出画面后恢复原速。临时倍速只改
-   * video.playbackRate，不动 store 里的用户倍速设定——恢复时永远回到
-   * 播放器菜单里选的那个值。拖动进度、多指触控不算长按。
+   * **触发方式是「按住 ← / →」**，不是按住画面。
+   * 旧实现把长按挂在 `<video>` 的 pointerdown 上，与单击（播放/暂停）、双击
+   * （全屏）共用同一个元素：鼠标用户轻轻按久一点（>350ms）就会意外进入 3 倍速，
+   * 而触屏用户想「按住画面看细节」时同样会误触加速。方向键没有这层歧义——
+   * 键盘按住的语义本身就是「持续」，而且长按期间画面不会产生任何点击手势。
+   *
+   * 行为：按住 350ms 起效（起效前松手 = 普通快退/快进 5 秒，语义不变）；
+   * 起效后松手只恢复原速、**不跳转**（否则用户会先被加速、再被弹到 +5 秒处）；
+   * 失焦（窗口切走）与 Esc 也会恢复，避免倍速被永久留在 3×。
+   * 临时倍速只改 video.playbackRate，不动 store 里的用户倍速设定——
+   * 恢复时永远回到播放器菜单里选的那个值。
    */
   const LONG_PRESS_MS = 350;
-  const TEMP_BOOST_RATE = 3;
-  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const boostedRef = useRef(false);
+  // 加速是**相对用户倍速的倍数**，不是固定 3x：控制栏把倍速调到 1.5x 之后，
+  // 长按应当得到 4.5x（再按上限截断）。固定值会让人觉得「长按把我设的倍速重置了」。
+  const BOOST_MULTIPLIER = 3;
+  // 上限 4x：够快又不至于让解码/音频变形太明显。2x 基准下长按即到顶。
+  const BOOST_MAX_RATE = 4;
+  // 倍速的最新值。用户可能在**按住期间**去菜单里改倍速，那时恢复目标必须是新值；
+  // 用 ref 而不是把 playbackRate 列进 controller 的依赖（后者会重建控制器、
+  // 连带丢掉正在计时的长按定时器）。
+  const playbackRateRef = useRef(playbackRate);
+  playbackRateRef.current = playbackRate;
 
-  const cancelLongPressBoost = useCallback(() => {
-    if (longPressTimerRef.current) {
-      clearTimeout(longPressTimerRef.current);
-      longPressTimerRef.current = null;
-    }
-    if (boostedRef.current) {
-      boostedRef.current = false;
-      if (videoRef.current) {
-        videoRef.current.playbackRate = playbackRate;
-      }
-    }
-  }, [playbackRate, videoRef]);
+  // 状态机放在 services/boostController 里：那里的三条语义（阈值、松手的归属、
+  // 恢复目标）有 20 条确定性用例覆盖（scripts/verify-boost.mjs，假时钟 + 假 video，
+  // 不依赖真实定时器）。本组件只负责把按键事件接上去——这样"验证过的逻辑"
+  // 与"线上跑的代码"是同一份，而不是另写一个仿制品来测。
+  // 长按加速的提示条状态。用 state 而不是 ref：它要驱动 UI 显示/隐藏，
+  // 而加速进入/退出本身就只发生一次（不是逐帧），不会带来重渲染压力。
+  const [boostRate, setBoostRate] = useState<number | null>(null);
 
-  const handleSurfacePointerDown = (e: React.PointerEvent<HTMLVideoElement>) => {
-    // 锁定态不认长按：临时倍速也是"操作"。
-    if (isLocked) return;
-    // 鼠标只认左键；多指触控不触发长按。
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (!e.isPrimary) return;
-    cancelLongPressBoost();
-    longPressTimerRef.current = setTimeout(() => {
-      longPressTimerRef.current = null;
-      const video = videoRef.current;
-      // 只在真正播放中临时加速：暂停时长按没有意义，还容易误触。
-      if (video && !video.paused) {
-        boostedRef.current = true;
-        video.playbackRate = TEMP_BOOST_RATE;
-      }
-    }, LONG_PRESS_MS);
-  };
+  const boostRef = useRef<BoostController | null>(null);
+  if (boostRef.current === null) {
+    boostRef.current = createBoostController({
+      getVideo: () => videoRef.current,
+      getBaseRate: () => playbackRateRef.current,
+      holdMs: LONG_PRESS_MS,
+      multiplier: BOOST_MULTIPLIER,
+      maxRate: BOOST_MAX_RATE,
+      // 进入加速时把**真实生效的速率**交给提示条；退出时置空隐藏。
+      onChange: (boosting, rate) => setBoostRate(boosting ? rate : null),
+    });
+  }
 
-  // 长按期间也要喂自动隐藏定时器：按下本身算一次用户活动。
+  const cancelLongPressBoost = useCallback(() => boostRef.current?.cancel(), []);
+
+  /** 按住方向键：计时到 350ms 且确实在播才加速。 */
+  const beginKeyBoost = useCallback(() => boostRef.current?.press(), []);
+
+  /** 松开方向键；返回 true 表示这次按下应被当作普通快退/快进。 */
+  const endKeyBoost = useCallback(() => boostRef.current?.release() ?? true, []);
+
+  // 指针离开画面时喂一次自动隐藏定时器（原来的 pointerdown/up 长按逻辑已移除，
+  // 但这个入口本身是「用户还在操作」的信号，保留）。
   const handleSurfacePointerUp = () => {
     handleUserActivity();
-    cancelLongPressBoost();
   };
 
   // 卸载与倍速变更时收掉长按加速：卸载不清理会留下一个悬空定时器，
@@ -323,14 +337,15 @@ export const VideoSurface: React.FC = () => {
           handleUserActivity();
           break;
         case 'ArrowLeft':
-          e.preventDefault();
-          seekRelative(-5);
-          handleUserActivity();
-          break;
         case 'ArrowRight':
           e.preventDefault();
-          seekRelative(5);
+          // 同一次按住只处理一次：系统的按键重复（typematic）每秒会再发十几条
+          // keydown，不加这道闸门就会不停重置长按定时器，永远到不了 350ms。
+          if (e.repeat) break;
           handleUserActivity();
+          // 按住 350ms → 进入临时 3 倍速；不到 350ms 就松手 → 普通快退/快进 5 秒。
+          // 两者共用同一次按下，所以加速起效后由 keyup 吞掉这次跳转。
+          beginKeyBoost();
           break;
         case 'ArrowUp':
           e.preventDefault();
@@ -355,6 +370,8 @@ export const VideoSurface: React.FC = () => {
           playNextEpisode();
           break;
         case 'Escape':
+          // 方向键卡在按住状态又按了 Esc 时，避免倍速留在 3×。
+          cancelLongPressBoost();
           // 纯原生全屏下浏览器不会代为处理 Esc（那是 DOM 全屏的行为），
           // 必须显式退出，否则用户会觉得"退不出全屏"。
           if (isFullscreen) {
@@ -366,7 +383,35 @@ export const VideoSurface: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity, currentView, isLocked]);
+  }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity, currentView, isLocked, beginKeyBoost, cancelLongPressBoost]);
+
+  /**
+   * 松开方向键：接管这次按下的归属。
+   *
+   * 两种情形分开处理，都是为了「一次按下只做一件事」：
+   *   - 加速已经起效 → 只恢复原速，**不跳转**。否则用户会先看到画面加速，
+   *     松手瞬间又被弹到 ±5 秒，观感是「倍速播完还顺带跳了一段」。
+   *   - 还没到 350ms → 这次按下就是一次普通快退/快进。
+   */
+  useEffect(() => {
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code !== 'ArrowLeft' && e.code !== 'ArrowRight') return;
+      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return;
+      if (currentView !== 'player') return;
+      if (isLocked) return;
+      // release() 同时收掉长按定时器并恢复倍速，并告诉你这次按下的归属：
+      // 已经用在加速上就不再跳转，未到阈值则是一次普通快退/快进。
+      if (endKeyBoost()) seekRelative(e.code === 'ArrowLeft' ? -5 : 5);
+    };
+    window.addEventListener('keyup', handleKeyUp);
+    return () => window.removeEventListener('keyup', handleKeyUp);
+  }, [seekRelative, currentView, isLocked, endKeyBoost]);
+
+  // 窗口失焦（切到别的程序）时收掉临时倍速：keyup 收不到，倍速会永久留在 3×。
+  useEffect(() => {
+    window.addEventListener('blur', cancelLongPressBoost);
+    return () => window.removeEventListener('blur', cancelLongPressBoost);
+  }, [cancelLongPressBoost]);
 
   // 全屏时给一个短暂的退出提示：纯原生全屏没有浏览器自带的全屏提示条，
   // 用户不一定会想到 Esc。
@@ -431,7 +476,6 @@ export const VideoSurface: React.FC = () => {
         playsInline
         className="w-full h-full object-contain cursor-pointer"
         onClick={handleVideoSurfaceClick}
-        onPointerDown={handleSurfacePointerDown}
         onPointerUp={handleSurfacePointerUp}
         onPointerCancel={handleSurfacePointerUp}
         onPointerLeave={handleSurfacePointerUp}
@@ -449,6 +493,21 @@ export const VideoSurface: React.FC = () => {
         onWaiting={() => tracePlayback('媒体 waiting 缓冲等待（这是「一直在加载」的关键证据）')}
         onStalled={() => tracePlayback('媒体 stalled 拉流停滞')}
       />
+
+      {/*
+        长按加速提示：按住方向键进入加速时出现，松开即消失。
+        必须给出**真实速率**（基准 × 倍数、被上限截断后的值），而不是倍数本身——
+        用户在 2x 基准下长按看到的是 4x，写死"3x"会与他的实际观感对不上。
+      */}
+      {boostRate !== null && (
+        <div className="absolute top-6 inset-x-0 z-40 pointer-events-none flex justify-center">
+          <div className="ttv-boost-toast" role="status" aria-live="polite">
+            <FastForward className="w-4 h-4" aria-hidden />
+            <span>{boostRate}x 加速播放</span>
+            <span className="ttv-boost-toast-hint">松开恢复</span>
+          </div>
+        </div>
+      )}
 
       {/* 全屏退出提示：纯原生全屏没有浏览器自带的提示条，短暂告知 Esc 可用。 */}
       {isFullscreen && showFsHint && (
@@ -659,6 +718,7 @@ export const VideoSurface: React.FC = () => {
 
       {/* 悬浮云母控制层 HUD */}
       <PlayerControls
+        effectivePlaybackRate={boostRate}
         isVisible={isControlsVisible}
         isLocked={isLocked}
         onToggleLock={() => setIsLocked((value) => !value)}
