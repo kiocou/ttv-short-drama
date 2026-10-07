@@ -65,12 +65,15 @@ impl AnimeProvider {
             .build()
             .map_err(|error| error.to_string())?;
         // 启动时探一次数据源并写进日志：否则"卡片怎么还是暴风的"没法查。
+        //
+        // 三行原先是 `println!`：本进程是 windows 子系统、没有控制台，等于没写。
+        // 用户反馈"动漫区怎么老是暴风源"时，日志里一行证据都没有。改走 trace。
         if use_dmghg() {
-            println!("[anime] 数据源: 动漫共和国（正式源）");
+            crate::trace::log("[anime] 数据源: 动漫共和国（正式源）");
         } else {
-            println!("[anime] 数据源: 暴风资源（兜底源）");
+            crate::trace::log("[anime] 数据源: 暴风资源（兜底源）");
             if let Some(error) = crate::dmghg_bridge::init_error() {
-                println!("[anime] dmghg 不可用原因: {error}");
+                crate::trace::log(format!("[anime] dmghg 不可用原因: {error}"));
             }
         }
         Ok(Self { client })

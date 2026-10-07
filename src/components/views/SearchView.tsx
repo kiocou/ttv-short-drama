@@ -34,11 +34,16 @@ export const SearchView: React.FC = () => {
    * 必须是稳定的 `useCallback`：内联箭头函数会让 `SeriesCard` 的 `React.memo` 失效，
    * 搜索结果页一次 40 张卡就会因为任何无关重渲染全部重画。`rememberSearch` /
    * `navigateTo` 在 useAppStore 里已稳定，依赖数组因此保持不变。
+   *
+   * 关键词**必须**走 ref：它在依赖数组里就等于每次输入都换一个新回调，
+   * 40 张 memo 卡的相等判定逐字失效——正是这条注释要防的那件事。
    */
+  const keywordRef = useRef(searchKeyword);
+  keywordRef.current = searchKeyword;
   const handleCardClick = useCallback((seriesId: string) => {
-    rememberSearch(searchKeyword.trim());
+    rememberSearch(keywordRef.current.trim());
     navigateTo('detail', seriesId);
-  }, [navigateTo, rememberSearch, searchKeyword]);
+  }, [navigateTo, rememberSearch]);
 
   const [channel] = useState<Channel>(SEARCH_CHANNEL);
   const [items, setItems] = useState<SeriesItem[]>([]);

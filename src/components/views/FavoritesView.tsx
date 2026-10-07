@@ -31,12 +31,17 @@ const MARK_ICONS: Record<FavoriteMark, React.ComponentType<{ className?: string 
 
 export const FavoritesView: React.FC = () => {
   const { favorites, loadFavorites, setMark } = useFavorites();
-  const { navigateTo } = useAppStore();
+  const { navigateTo, currentView } = useAppStore();
   const [markFilter, setMarkFilter] = useState<FavoriteMark | 'all'>('all');
 
-  // 视图常驻 DOM（切换只切 hidden），进入时重新拉取，
-  // 保证详情页新标的收藏立刻出现在这里。
-  useEffect(() => { void loadFavorites(); }, [loadFavorites]);
+  // 视图常驻 DOM（切换只切 hidden），所以"进入时重新拉取"不能只靠挂载那次 ——
+  // 本组件一生只挂载一次，旧实现的依赖数组 [loadFavorites] 让这次拉取永远只发生
+  // 在启动那一刻，之后的收藏变更（详情页新标/取消）全都看不到。
+  // 把 currentView 列进依赖并在进入收藏页时才拉，才是注释里说的"进入时重新拉取"。
+  useEffect(() => {
+    if (currentView !== 'favorites') return;
+    void loadFavorites();
+  }, [currentView, loadFavorites]);
 
   const visible = markFilter === 'all'
     ? favorites

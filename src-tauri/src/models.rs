@@ -246,6 +246,16 @@ pub struct UserSettings {
     /// 已废弃：补帧/增强链路已移除，保留字段兼容旧设置库记录，恒为 "off"。
     pub preferred_engine: String,
     pub target_fps: u32,
+    /// 是否启用硬件加速（WebView2 GPU 合成）。
+    ///
+    /// 前端**没有**对应的界面开关，但前端 `UserSettings` 必须带上这个字段：
+    /// `settings_save` 的入参是反序列化出来的，缺字段会在反序列化阶段整体失败，
+    /// 命令体一行都不执行——连 `set_vsr_enabled` 都轮不到。历史上前端漏了它，
+    /// 表现就是「设置页怎么改都不落库、重启回默认」。
+    ///
+    /// 这里同时补 `default_true`：既要兼容更早的设置库记录，也要让将来任何
+    /// 漏字段的调用方最多丢掉这一个开关，而不是整条保存链路。
+    #[serde(default = "default_true")]
     pub hardware_acceleration: bool,
     pub catalog_cache_mb: f64,
     pub playback_cache_mb: f64,
@@ -428,7 +438,34 @@ mod vsr_settings_tests {
         );
     }
 
-    /// 显式关闭必须被如实接受（开关要真的能关）。
+    // 缺 hardwareAcceleration 的记录也必须能反序列化。
+    //
+    // 回归用例：这个字段既没有 serde default、前端 UserSettings 也一直漏了它，
+    // 于是 settings_save 会在反序列化阶段整体失败、命令体一行都不执行 ——
+    // 表现为「设置页怎么改都不落库、重启回默认」，而且 set_vsr_enabled 也一并没跑，
+    // 用户看到的正是「开关 VSR 都没用」。
+    //
+    // 现在两侧都补上了：这里用 default_true 兜住任何漏字段的调用方，
+    // 前端 types/settings.ts 与 DEFAULT_SETTINGS 补齐字段保持同形。
+    #[test]
+    fn legacy_record_without_hardware_acceleration_still_parses() {
+        let value = serde_json::json!({
+            "defaultQuality": "auto",
+            "autoNext": true,
+            "preferredEngine": "off",
+            "targetFps": 60,
+            "catalogCacheMb": 0.0,
+            "playbackCacheMb": 1024.0
+        });
+        let settings: UserSettings =
+            serde_json::from_value(value).expect("缺 hardwareAcceleration 也必须能解析");
+        assert!(
+            settings.hardware_acceleration,
+            "缺字段时按默认开启，而不是让整条保存链路失败"
+        );
+    }
+
+    // 显式关闭必须被如实接受（开关要真的能关）。
     #[test]
     fn explicit_false_is_honored() {
         let json = r#"{

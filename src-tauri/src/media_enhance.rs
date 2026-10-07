@@ -62,6 +62,18 @@ pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> 
     if source_url.trim().is_empty() || !needs_enhancement(source_url) {
         return Err("源流地址不支持增强转码。".to_owned());
     }
+    // ⚠️ 清理与淘汰**必须排在 `ensure_server().await` 之后**。
+    //
+    // 历史坑：旧实现把 `stop(session_id)` 与"上限 8 淘汰"放在这个 await 之前，
+    // 而 Job 是等全部准备做完才 insert 进表（见本函数末尾）。于是同一个 session_id
+    // 并发 start 时（预取与前台换集几乎同时发生）：A 先过了清理、在 await 上让出；
+    // B 也过清理（表里此刻还没有 A）、也过了 await，随后 B 的 insert **覆盖** A 的 Job
+    // —— A 的 JoinHandle 被直接丢弃，既不会被 abort 也不会被淘汰，那条 ffmpeg 长进程
+    // 与它整个会话目录双双泄漏（用户连续点选可以堆到十几路）。
+    //
+    // 现在改为：await 之后再清理，并且末尾 insert 时若发现同 id 已存在，
+    // 就地 abort 旧任务并删掉旧目录。
+    let info = ensure_server().await?;
     stop(session_id);
     // 预取可能同时准备多条 guo 会话；限制任务数，避免用户连续点选后留下十几路 ffmpeg。
     while jobs().lock().map(|guard| guard.len()).unwrap_or(0) >= 8 {
@@ -75,7 +87,6 @@ pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> 
         }
     }
 
-    let info = ensure_server().await?;
     let directory = media_root().join(format!("{session_id}-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("创建增强缓存目录失败：{error}"))?;
@@ -228,7 +239,12 @@ pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> 
         task_done.store(true, Ordering::Release);
     });
 
-    jobs()
+    // 插入即替换：同 id 已经在表里说明有另一路 start 抢进了同一会话（两者都在
+    // `ensure_server().await` 上让出过，清理那一步谁都还没入表）。这里必须把被替换
+    // 掉的那一路**就地收掉**——abort 它的转码任务（`child` 带 kill_on_drop，abort
+    // 会连带杀掉 ffmpeg）并删掉它的会话目录。不这么做，被覆盖的 JoinHandle 就再也
+    // 没有引用，进程与目录一起泄漏。
+    let replaced = jobs()
         .lock()
         .map_err(|_| "增强任务表锁不可用。".to_string())?
         .insert(
@@ -239,6 +255,12 @@ pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> 
                 task: Some(task),
             },
         );
+    if let Some(previous) = replaced {
+        if let Some(task) = previous.task {
+            task.abort();
+        }
+        let _ = std::fs::remove_dir_all(previous.directory);
+    }
 
     // 快路径：首个分片落地就把地址交出去（常见 2–4 秒），与官方实现的 on_ready
     // 语义一致。

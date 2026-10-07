@@ -1,3 +1,34 @@
+## 0.2.17 - 2026-10-07
+
+### 修复
+
+- **「开关 VSR 都没用」的真正根因找到了：设置从来就没存进库。** 这是 0.2.16 里那条 `-tls_verify` 顺序问题之外的**第二条独立根因**，由发布前审查（Rust + 前端两路并行只读审查）发现。
+  - **证据**：`src-tauri/src/models.rs` 的 `UserSettings.hardware_acceleration` 既没有 `#[serde(default)]`，前端 `src/types/settings.ts` 的 `UserSettings` 也一直漏了这个字段。
+  - **机制**：`settings_save(settings: UserSettings)` 的入参是 **serde 反序列化出来的**——缺一个无默认值的字段就在反序列化阶段整体失败，命令体一行都不执行。于是：① 设置页的任何改动都「看起来生效了」（前端内存里确实变了），但从不落库、重启回到默认；② 命令体里的 `set_vsr_enabled(settings.vsr_enabled)` 也一并没跑，运行期开关自然不生效；③ 唯一的反馈是 `useSettingsStore` 里被吞成 `console.warn` 的一行。用户报告的「开关 VSR 都没用」正是 ② 的直接现象。
+  - **修法（两侧同时补）**：前端 `types/settings.ts` 补上 `hardwareAcceleration: boolean` 字段（写了长篇注释说明为什么前端不提供界面开关也必须保持字段同形），`ipc.ts` 的 `DEFAULT_SETTINGS` 补 `true`；Rust 侧给该字段加 `#[serde(default = "default_true")]`，让将来任何漏字段的调用方最多只丢掉这一个开关，而不是整条保存链路。
+  - **回归用例**：`models.rs` 新增 `legacy_record_without_hardware_acceleration_still_parses`（缺字段必须能反序列化且默认为真）。
+- **VSR 关闭时写下的「假 H.264 标记」会让增强永久失效。** `ensure_h264_cache` 在 VSR 关闭分支里写的标记内容与「转码成功」**一字不差**（都是 `h264\n`），而命中判定只看文件是否存在。
+  - **后果**：用户关掉 VSR 看一集 HEVC 旧缓存 → 那集被打上假标记；之后**重新打开 VSR**，该集被直接短路放行，HEVC 文件照原样播出去，视觉增强静默失效（不变量 25：VSR 的硬条件是 H.264）。现象是「有些集有 VSR、有些集没有」，极难排查。
+  - **修法**：新增 `marker_content_is_h264()`，只认内容为 `h264` 的标记；关闭分支改写成 `skip`。配套回归用例 `h264_marker_content_decides_migration_state`（覆盖 `h264` / `skip` / 空 / 不存在四种）。
+- **从短剧播放器直接进动漫时，短剧链路从不停止（不变量 1 的实质缺口）。** 详情页 / 发现页 / 历史页三条动漫入口都在 `currentView` 仍为 `'player'` 的情况下打开动漫播放器，而 `App.tsx` 的停播守卫是 `if (!isPlayer) stopPlayback()` —— `isPlayer` 自始至终为 true，**一次都不触发**。
+  - **后果**：短剧那块 `<video>` 只是被 `display:none` 藏起来，卡死看门狗、连播倒计时、预解池、在途 `resolveNative` 全部存活；倒计时到点会把一部用户根本看不见的短剧强行开播并出声。动漫侧的 `haltCurrent` 停的是它自己那块 video。
+  - **修法**：守卫改为 `if (!isPlayer || isAnimePlayerOpen) stopPlayback()`，并把 `isAnimePlayerOpen` 列进依赖数组。
+- **退出全屏的「进全屏前是否最大化」存在模块级变量里，异常路径不复位。** `enterFullscreen` 在 `setFullscreen(true)` 抛错或状态轮询超时时直接返回、不清状态，残留的 `true` 会被**下一次** `leaveFullscreen` 消费，走去调 `window_finish_fullscreen`——按仓库自己的注释，后果是把「还原矩形」永久钉死在整屏、标题栏「向下还原」失效。快速连按 F 时两次 enter 还会互相覆盖同一个变量。
+  - **修法**：引入自增令牌 `fullscreenToken` 做所有权判定——`enterFullscreen` 开头领取令牌、之后每步写状态前复核是否仍持有；`leaveFullscreen` 开头 `revokeFullscreenOwnership()` 作废在途 enter。失败/超时路径显式复位为 `false`。
+- **并发 `media_enhance::start` 会泄漏 ffmpeg 长进程与整个会话目录。** 同号清理（`stop(session_id)`）与「任务上限 8」淘汰都排在 `ensure_server().await` **之前**，而 Job 要等全部准备做完才入表。同一个 `session_id` 并发 start（预取与前台换集几乎同时发生）时：A 过了清理、在 await 上让出；B 也过清理（表里还没有 A）、也过了 await，随后 B 的 `insert` **覆盖** A 的 Job —— A 的 `JoinHandle` 被直接丢弃，既不会 abort 也不会被淘汰，那条 ffmpeg 进程与它整个会话目录双双泄漏（连续点选可堆到十几路）。
+  - **修法**：清理与淘汰整体后移到 `ensure_server().await` 之后；`insert` 的返回值（被替换掉的旧 Job）就地 `task.abort()` + 删除旧目录。
+- **从播放器进动漫 / 退出动漫可能留下不可见的出声源与「先跳一下」的观感。** 两处小修：① 动漫 `onError` DOM 回调漏了会话复查（本文件其它每个异步续体都有），换集时迟到的旧源错误会把新一集刷成错误页；② `AnimeVideoSurface.exitToDetail` 是 `void leaveFullscreen()` 后立刻 `close()` + 跳转，窗口还在往普通尺寸收、界面已经切页，改为串行 await。
+- **三处「无主定时器 / 无守卫轮询」补齐清理。** ① `VideoSurface` 单击判定的 220ms 定时器只在「第二次点击」那条同步路径清理，离开播放器后仍会调 `togglePlay()`，让常驻 video 在发现页重新出声；② `MiniPlayer` 的 3 秒连播预取 `setTimeout` 无 handle 无清理，小窗销毁后仍发出 `prefetch_native`（触发一次约 7.4 秒的红果整集解析）；③ `PlaybackLogPanel` 的 1.5 秒轮询没有在途守卫，IPC 慢于间隔时两次 pull 会带同一游标并发、互相覆盖，表现为日志行凭空消失或重复。
+- **动漫链路日志走 `println!` 是黑洞。** `dmghg_bridge::log_line` 与 `anime_provider` 的三行数据源探测都用 `println!`，而本进程是 `#![windows_subsystem = "windows"]`——没有控制台，输出直接丢弃。用户问「动漫区怎么老是暴风源」时日志里一行证据都没有。全部改走 `crate::trace::log`。
+- **动漫播放器音量初值与「进入视图时刷新」的守卫。** ① `useAnimePlayerStore` 的 `volumeRef` 初值是 1 而 UI state 是 0.85，首次进动漫与画中画交接会真的用 100% 音量；② 动漫起播是裸 `await video.play()`、没有有界保底，违反不变量 21（短剧侧走 `playBounded`），表现为「点进去一直转圈、进度条不走」。`playBounded` 已导出复用。
+- **收藏页 / 设置页的「进入时刷新」实际只跑了一次。** 两者都常驻 DOM、一生只挂载一次，依赖数组里没有 `currentView`，于是「进入收藏页重新拉取」「进入设置页刷新缓存占用」都只在启动那一刻执行过。补 `currentView` 守卫。
+- **搜索结果页的关键词依赖让 40 张 memo 卡整体失效。** `handleCardClick` 的依赖数组含 `searchKeyword`，与它自己上方「依赖数组因此保持不变」的注释正好相反；关键词改走 ref。
+- **「更新」文案与实现不符。** 设置页原文写「只会打开文件夹定位到安装包，不会自动安装」，而实现是下载完调 `installUpdate` 并让后端 `app.exit(0)`。按不变量 8（诚实报告边界）改为如实描述。
+
+### 改进
+
+- **发布前完成两路并行只读代码审查**（Rust 后端 + 前端），各产出一份带行号、触发条件、后果与最小修法的报告（`.workbuddy/review-rust.md`、`.workbuddy/review-frontend.md`）。两份报告的一致结论：**架构纪律执行得干净**——常驻 DOM 无多余 key、三块 video 作用域、hls.js 生命周期、全屏唯一入口、类型安全零 `any`/`@ts-ignore`、全仓 138 处锁无跨 `await` 持锁、无 IPC 可达 panic、增强服务令牌 + 白名单三重收口且路径不可穿越、`kill_on_drop` 覆盖全部子进程。上面这批修复全部来自这两份报告。
+- `short_drama_app` 的封面代理与 `hls_proxy` 的主机白名单标准此前不一致（前者校验初始 URL、后者只看 scheme），记入待办。
 ## 0.2.16 - 2026-10-07
 
 ### 修复

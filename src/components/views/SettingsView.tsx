@@ -584,7 +584,8 @@ const GuoNetworkRow: React.FC = () => {
 
 export const SettingsView: React.FC = () => {
   const { settings, updateSettings, clearCache, cacheUsage, refreshCacheUsage } = useSettingsStore();
-  const { showToast } = useAppStore();
+  // currentView 用于「进入设置页时刷新」的守卫（本组件常驻 DOM、只挂载一次）。
+  const { showToast, currentView } = useAppStore();
 
   const [isCleaning, setIsCleaning] = useState(false);
   const enabledSources = settings.enabledSources;
@@ -732,9 +733,12 @@ export const SettingsView: React.FC = () => {
   };
 
   // 进入设置页时刷新真实占用：缓存由后台自动增删，静态快照会过期。
+  // 与收藏页同理，本组件常驻 DOM、一生只挂载一次，依赖数组里必须带 currentView，
+  // 否则这段"进入设置页时刷新"只在启动瞬间执行一次，之后每次进来看到的都是旧数字。
   useEffect(() => {
+    if (currentView !== 'settings') return;
     void refreshCacheUsage();
-  }, [refreshCacheUsage]);
+  }, [currentView, refreshCacheUsage]);
 
   const cacheMb = cacheUsage.bytes / 1024 / 1024;
   const cacheLabel = cacheMb >= 1024 ? (cacheMb / 1024).toFixed(2) + ' GB' : cacheMb.toFixed(1) + ' MB';
@@ -963,8 +967,7 @@ export const SettingsView: React.FC = () => {
             title="当前版本"
             hint={
               <>
-                从 GitHub Releases 拉取最新安装包。下载完成后只会打开文件夹定位到安装包，
-                <span className="text-slate-600 font-medium">不会自动安装</span>。
+                从 GitHub Releases 拉取最新安装包，<span className="text-slate-600 font-medium">下载完成后会自动安装并重启应用</span>。
               </>
             }
           >

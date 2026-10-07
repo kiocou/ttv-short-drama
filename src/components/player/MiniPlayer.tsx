@@ -264,12 +264,20 @@ export const MiniPlayer: React.FC = () => {
    * 动漫/guo 不预取：它们走 playback.open 取直链（秒级轻请求），且直链有
    * 时效，提前拿到的 URL 到播时可能已失效。
    */
+  // 预取延时的句柄。旧实现直接把 setTimeout 丢掉、不存 handle，于是小窗在起播后
+  // 3 秒内被关掉时，这个定时器照样到点发出 prefetch_native —— 触发一次红果整集
+  // 解析（实测约 7.4 秒的签名+下载+解密），在小窗已经销毁之后继续占网络与 worker。
+  const prefetchTimerRef = useRef<number | null>(null);
+
   const prefetchNextEpisode = useCallback((plan: PipHandoff, episodeId: string) => {
     if (plan.kind !== 'drama' || plan.seriesId.startsWith('guo:')) return;
     const index = plan.episodes.findIndex(item => item.id === episodeId);
     const next = plan.episodes[index + 1];
     if (!next) return;
-    window.setTimeout(() => {
+    // 同一小窗里换集会重复调用：先把上一次还没到点的预取撤掉，避免堆积多个定时器。
+    if (prefetchTimerRef.current !== null) window.clearTimeout(prefetchTimerRef.current);
+    prefetchTimerRef.current = window.setTimeout(() => {
+      prefetchTimerRef.current = null;
       void ipcService.playback.prefetchNative(
         plan.seriesId,
         next.id,
@@ -313,9 +321,14 @@ export const MiniPlayer: React.FC = () => {
     // boot 由 useCallback 稳定（依赖 playEpisode），只在挂载时跑一次。
   }, [boot]);
 
-  // 卸载：拆掉媒体链路，避免窗口销毁后仍有解码器在跑。
+  // 卸载：拆掉媒体链路，避免窗口销毁后仍有解码器在跑；同时撤掉还没到点的连播预取
+  // 定时器（否则小窗关了还会发 prefetch_native，白占一次整集解析）。
   useEffect(() => () => {
     sessionRef.current += 1;
+    if (prefetchTimerRef.current !== null) {
+      window.clearTimeout(prefetchTimerRef.current);
+      prefetchTimerRef.current = null;
+    }
     const video = videoRef.current;
     if (video) {
       try {

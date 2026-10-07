@@ -264,7 +264,10 @@ function outcomeErrorCode(outcome: PlayOutcome, fallback = 'MEDIA_LOAD_FAILED'):
  */
 const PLAY_PENDING_TIMEOUT_MS = 8000;
 
-function playBounded(video: HTMLVideoElement): Promise<void> {
+// 导出给动漫链路复用：不变量 21 要求"起播必须有界"，而 useAnimePlayerStore 是
+// 独立 store、不引用本文件的状态。这个函数是纯 DOM 工具（只碰传入的元素），
+// 导出它不会把两条播放链路耦合起来。
+export function playBounded(video: HTMLVideoElement): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const timer = window.setTimeout(() => {
