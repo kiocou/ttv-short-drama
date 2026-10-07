@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ProgressBar } from './ProgressBar';
 import { RollingPercent, RollingTime } from './RollingNumber';
+import { BOOST_RATE } from '../../services/boostController';
 import {
   Play,
   Pause,
@@ -48,13 +49,9 @@ export const FALLBACK_QUALITY_OPTIONS: PlayerQualityOption[] = [
   { label: '自动', value: 'auto', resolution: '由播放源自动选择' },
 ];
 
-// 档位同时是「长按加速」的基准：长按得到的是**所选档位 × 倍数**（上限 4x）。
-// 因此这里同时给出慢速档（0.5/0.75）——用户明确要求在控制栏里能调长按的倍速，
-// 而慢速基准下的加速才有实际意义（0.5x 长按 → 1.5x，正好当"快速过一遍"用）。
+// 档位与「长按加速」**互不影响**：长按永远是 BOOST_RATE（2x），与所选档位无关。
+// 慢速档（0.5/0.75）保留是因为慢看本身有用；高速档（3x）保留是因为有人就想一直快放。
 const SPEED_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
-/** 长按加速的倍数与上限，必须与 VideoSurface 里的 BOOST_MULTIPLIER / BOOST_MAX_RATE 一致。 */
-const BOOST_MULTIPLIER = 3;
-const BOOST_MAX_RATE = 4;
 
 export interface PlayerHudProps {
   /** 顶部标题岛：剧名。 */
@@ -420,7 +417,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowVolumeSlider(false);
                     }}
                     className={`btn-text-action${effectivePlaybackRate !== null ? ' is-boosting' : ''}`}
-                    title="切换播放倍速（长按 ← / → 可临时加速）"
+                    title={`切换播放倍速（长按 ← / → 临时加速到 ${BOOST_RATE}x）`}
                   >
                     {effectivePlaybackRate !== null
                       ? `${effectivePlaybackRate}x 加速`
@@ -444,12 +441,13 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       </button>
                     ))}
                     {/*
-                      长按加速的落点必须在这里说清楚：加速倍率是**相对所选档位**的
-                      （档位 × 3、上限 4x），所以换一个档位，长按得到的速率也跟着变。
-                      不写这一行，用户会以为长按永远是某个固定值。
+                      长按加速的落点写在这里：它是一个**固定值**，不随所选档位变化。
+                      用户看不到键盘提示的话，这个手势等于不存在。
                     */}
                     <div className="crystal-menu-note">
-                      {`长按 ← / → 加速到 ${Math.min(BOOST_MAX_RATE, playbackRate * BOOST_MULTIPLIER)}x`}
+                      {playbackRate >= BOOST_RATE
+                        ? `当前档位已不低于 ${BOOST_RATE}x，长按不加速`
+                        : `长按 ← / → 加速到 ${BOOST_RATE}x`}
                     </div>
                   </div>
                 </div>

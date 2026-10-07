@@ -1,14 +1,14 @@
 // 「按住方向键临时加速」的确定性验证。
 //
 // 为什么不用浏览器跑：这套行为的几个关键点（阈值、松手的归属、恢复目标、
-// 加速速率与用户倍速的关系）全部与**时间**有关，而在真实浏览器里做毫秒级断言
-// 既慢又不稳；headless 下媒体元素还会因为自动播放策略停在 paused，导致
+// 速率是固定值而与所选档位无关）全部与**时间**有关，而在真实浏览器里做毫秒级
+// 断言既慢又不稳；headless 下媒体元素还会因为自动播放策略停在 paused，导致
 // 「只在播放中加速」这条前提永远不成立、测出来一律是「没反应」。
 // 这里用假时钟 + 假 video 直接验状态机本身，浏览器那边只做连通性检查。
 //
 // 运行：npm run verify:boost
 
-import { createBoostController } from '../src/services/boostController.ts';
+import { BOOST_RATE, createBoostController } from '../src/services/boostController.ts';
 
 let pass = 0;
 let fail = 0;
@@ -48,7 +48,7 @@ function fakeClock() {
   };
 }
 
-function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } = {}) {
+function harness({ paused = false, baseRate = 1 } = {}) {
   const clock = fakeClock();
   const video = { paused, playbackRate: baseRate };
   let base = baseRate;
@@ -56,14 +56,15 @@ function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } =
   const controller = createBoostController({
     getVideo: () => video,
     getBaseRate: () => base,
-    multiplier,
-    maxRate,
     onChange: (boosting, rate) => notices.push({ boosting, rate }),
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,
   });
   return { clock, video, controller, notices, setBase: (v) => { base = v; } };
 }
+
+// 0) 速率常量本身：用户要求固定 2 倍。
+check('BOOST_RATE 固定为 2', BOOST_RATE, 2);
 
 // 1) 短按（不到阈值）不加速，且这次按下算一次快退/快进。
 {
@@ -75,12 +76,12 @@ function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } =
   check('短按 120ms：归还给快进/快退', shouldSeek, true);
 }
 
-// 2) 长按（超过阈值）加速。
+// 2) 长按（超过阈值）加速到 2x。
 {
   const { clock, video, controller } = harness();
   controller.press();
   clock.tick(400);
-  check('长按 400ms：基准 1x -> 3x', video.playbackRate, 3);
+  check('长按 400ms：固定加速到 2x', video.playbackRate, 2);
   check('长按 400ms：处于加速态', controller.isBoosting(), true);
 }
 
@@ -95,37 +96,29 @@ function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } =
   check('加速后松手：退出加速态', controller.isBoosting(), false);
 }
 
-// 4) **加速速率跟随用户倍速**：这是用户明确要求的行为。
-//    控制栏把倍速设成 1.5x 之后长按，应当得到 1.5 × 3 = 4.5，再被上限截到 4。
-{
-  const { clock, video, controller, notices } = harness({ baseRate: 1.5 });
+// 4) **加速速率与所选档位无关**：这是用户明确要求的行为（固定 2x，不是「档位 × N」）。
+//    基准低于 2x 时一律加速到 2x；松手一律回到用户自己的档位。
+for (const base of [0.5, 0.75, 1, 1.25, 1.5, 2]) {
+  const { clock, video, controller } = harness({ baseRate: base });
   controller.press();
   clock.tick(400);
-  check('基准 1.5x：加速速率 = min(4, 1.5*3)', video.playbackRate, 4);
-  check('基准 1.5x：提示上报真实速率', notices, [{ boosting: true, rate: 4 }]);
+  check(`基准 ${base}x：长按固定加速到 2x`, video.playbackRate, 2);
   controller.release();
-  check('基准 1.5x：松手回到 1.5x（不是 1x）', video.playbackRate, 1.5);
+  check(`基准 ${base}x：松手回到 ${base}x（不是 1x）`, video.playbackRate, base);
 }
 
-// 5) 用户倍速 2x 时，长按应当到上限 4x（而不是 6x）。
+// 5) 基准已经是 3x（比加速值还快）时，长按不应把它**降**到 2x。
+//    这是固定速率方案特有的边界：旧版「档位 × N」不会遇到，因为结果总是更高。
 {
-  const { clock, video, controller } = harness({ baseRate: 2 });
+  const { clock, video, controller, notices } = harness({ baseRate: 3 });
   controller.press();
   clock.tick(400);
-  check('基准 2x：加速被上限截到 4x', video.playbackRate, 4);
-  controller.release();
-  check('基准 2x：松手回到 2x', video.playbackRate, 2);
+  check('基准 3x：长按不降速，仍是 3x', video.playbackRate, 3);
+  check('基准 3x：不弹出加速提示（没有加速）', notices, []);
+  check('基准 3x：不处于加速态', controller.isBoosting(), false);
 }
 
-// 6) 用户倍速 0.75x 时，长按得到 2.25x。
-{
-  const { clock, video, controller } = harness({ baseRate: 0.75 });
-  controller.press();
-  clock.tick(400);
-  check('基准 0.75x：加速到 2.25x', video.playbackRate, 2.25);
-}
-
-// 7) 暂停中长按不加速，但松手仍是一次快退/快进（用户是在找位置）。
+// 6) 暂停中长按不加速，但松手仍是一次快退/快进（用户是在找位置）。
 {
   const { clock, video, controller } = harness({ paused: true });
   controller.press();
@@ -135,7 +128,7 @@ function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } =
   check('暂停中长按：松手仍算跳转', shouldSeek, true);
 }
 
-// 8) cancel（失焦 / Esc / 卸载）必须收掉定时器与加速态，不留悬空任务。
+// 7) cancel（失焦 / Esc / 卸载）必须收掉定时器与加速态，不留悬空任务。
 {
   const { clock, video, controller } = harness();
   controller.press();
@@ -154,7 +147,7 @@ function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } =
   check('加速中 cancel：定时器已清', clock.pending(), 0);
 }
 
-// 9) 连续按下只留一个定时器（异常重复按下不应叠加）。
+// 8) 连续按下只留一个定时器（异常重复按下不应叠加）。
 {
   const { clock, video, controller } = harness();
   controller.press();
@@ -163,11 +156,11 @@ function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } =
   clock.tick(200);
   check('重复按下：尚未加速（定时器被重置）', video.playbackRate, 1);
   clock.tick(200);
-  check('重复按下后再等满阈值：加速', video.playbackRate, 3);
+  check('重复按下后再等满阈值：加速', video.playbackRate, 2);
   check('重复按下：只留一个定时器', clock.pending(), 0);
 }
 
-// 10) 视频元素尚未挂载（切集/退出播放器）时不崩、不加速。
+// 9) 视频元素尚未挂载（切集/退出播放器）时不崩、不加速。
 {
   const clock = fakeClock();
   const controller = createBoostController({
@@ -182,7 +175,7 @@ function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } =
   check('无 video：不抛异常且视为未加速', shouldSeek, true);
 }
 
-// 11) 用户倍速在按住期间被改动：恢复目标与加速速率都取最新值。
+// 10) 用户倍速在按住期间被改动：恢复目标取最新值（getBaseRate 用函数的原因）。
 {
   const { clock, video, controller, setBase } = harness();
   controller.press();
@@ -192,16 +185,16 @@ function harness({ paused = false, baseRate = 1, multiplier = 3, maxRate = 4 } =
   check('按住期间改倍速：恢复到最新的 2x', video.playbackRate, 2);
 }
 
-// 12) 提示回调：进入与退出各一次，退出时上报基准速率（供 UI 隐藏提示）。
+// 11) 提示回调：进入与退出各一次，加速速率恒为 2。
 {
   const { clock, controller, notices } = harness({ baseRate: 1.25 });
   controller.press();
   clock.tick(400);
   controller.release();
-  check('提示回调顺序与速率', notices, [{ boosting: true, rate: 3.75 }, { boosting: false, rate: 1.25 }]);
+  check('提示回调：加速速率恒为 2', notices, [{ boosting: true, rate: 2 }, { boosting: false, rate: 1.25 }]);
 }
 
-// 13) 短按不应触发任何提示（一次普通快进不该闪出加速提示）。
+// 12) 短按不应触发任何提示（一次普通快进不该闪出加速提示）。
 {
   const { clock, controller, notices } = harness();
   controller.press();
