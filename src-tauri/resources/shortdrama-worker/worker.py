@@ -32,9 +32,11 @@ import binascii
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 
@@ -304,6 +306,69 @@ def is_compatible_codec(item: dict) -> bool:
     return "bytevc2" not in codec
 
 
+def is_h264_codec(codec: str) -> bool:
+    """源档是否已是 H.264（可直接 -c:v copy 重封装，不必整集重编码）。
+
+    判定用「先排除、再包含」，而不是全等匹配——真实数据里 codec 常常不是
+    干净的 h264 三个字母：video_meta.codec_type 缺失时 variant_codec 会把
+    整串 gear_des_key 交上来，实测形如
+
+        0:mp4|1:encrypt|2:h265_hvc1|4:1080p|5:normal|6:only_roi_vcube_improve_1
+
+    全等匹配对这类串一律判 False：源明明是 H.264 也要白花一次整集重编码
+    （本机实测多花约 4 秒、文件膨胀十几倍）。反过来，先排掉 h265/hevc/
+    bytevc2 这些明确的非 H.264 标识，再找 h264/avc，既不会漏判，也不会把
+    HEVC 误判成 H.264——后者是功能故障：输出 HEVC 则 RTX VSR 不触发
+    （AGENTS.md 不变量 25）。
+    """
+    value = (codec or "").strip().lower()
+    if not value:
+        return False
+    for marker in ("h265", "hvc1", "hevc", "h266", "bytevc2"):
+        if marker in value:
+            return False
+    return ("h264" in value) or ("avc" in value)
+
+
+def vsr_enabled() -> bool:
+    """设置页「RTX VSR 视频增强」开关的当前值（由 Rust 侧注入 TTV_SD_VSR）。
+
+    缺省按**开**处理：这条链路在开关落地之前的行为就是"一律转 H.264"，
+    不注入时保持原行为才不会让老路径悄悄降级（与 Rust 侧 AtomicBool 初值
+    为 true 一致）。
+    """
+    return os.getenv("TTV_SD_VSR", "1").strip() != "0"
+
+
+def should_copy_video(codec: str) -> bool:
+    """这一次是否只重封装（-c:v copy）、不重编码。
+
+    这就是设置页「RTX VSR 视频增强」开关在红果链路里的落地语义：
+
+      * 开关**关** → 完全回到引入 RTX VSR 之前的播放链路。那条链路对红果
+        整集用的就是 `-c copy` 重封装（见 .workbuddy/memory/2026-10-07.md
+        的实测：同一条链路 copy 是 0.87s / 10.8MB）。播放器只要求"WebView2
+        能解出画面"，本机已开 PlatformHEVCDecoderSupport，H.265 源也照播，
+        因此这里不再为了一样用不上的 VSR 去做整集重编码。
+      * 开关**开** → 这条链路必须产出 H.264（RTX VSR 的硬条件，AGENTS.md
+        不变量 25）。源本来就是 H.264 时 copy 出来的仍然是 H.264，直接
+        copy 即可，省掉整集重编码；源不是 H.264 才真的重编码。
+
+    也就是说两档共用同一条判定：**输出必须是 H.264，且能 copy 就 copy**；
+    区别只在"源不是 H.264 时"——开关开时重编成 H.264（否则 VSR 不触发），
+    开关关时保持源编码原样（否则就该叫增强转码而不是回旧链路了）。
+
+    源档是 bytevc2 时永远重编码：它在 select_best_quality 里已被排除，走到
+    这里说明是缺失 codec_type 的兜底路径，宁可慢也不能产出解不出的文件。
+    """
+    if is_h264_codec(codec):
+        return True
+    if vsr_enabled():
+        return False
+    # 开关关：回到旧链路，源是什么编码就存什么编码（bytevc2 除外）。
+    return "bytevc2" not in (codec or "").strip().lower()
+
+
 def select_best_quality(video_list: dict) -> tuple[str, dict]:
     """挑最高可用档。
 
@@ -419,6 +484,11 @@ def decode_quality_variant(key: str, item: dict, key_seed: bytes) -> dict | None
         "width": int(item.get("vwidth", 0) or 0),
         "height": variant_height(item),
         "bitrate": int(item.get("bitrate", 0) or 0),
+        # codec 一路带到 resolve：直连那一步要按它决定"重封装还是重编码"
+        # （见 _ffmpeg_direct_decrypt 的 copy_video 参数）。写进日志也是必要的
+        # ——"首开为什么慢"完全取决于选中档是 H.264（可 copy，几秒）还是
+        # HEVC/bytevc2（必须整集重编），不把这一项记下来就只能猜。
+        "codec": variant_codec(item),
     }
 
 
@@ -780,21 +850,92 @@ def fetch_stream(session: requests.Session, vid: str, device_id: str,
         "width": best["width"],
         "height": best["height"],
         "duration_ms": duration_ms,
+        # 选中档（默认最高档）的编码，随 stream 结果一起进 Rust 的预签名缓存，
+        # 再由 TTV_SD_DIRECT_CODEC 交回 resolve。
+        "codec": str(best.get("codec") or ""),
         "variants": variants,
     }
 
 
+# 两条编码路径的唯一区别就在这几项上；其余参数（音轨、faststart）两条共用。
+#
+# libx264/ultrafast/CRF20/zerolatency 是官方客户端同款参数，兼容性最好但纯
+# CPU——本机实测整集重编要 3.7~4.0 秒，是与下载并列的第二大块首开开销。
+# h264_nvenc 走 NVIDIA 专用编码硬件：输出同样是 H.264（VSR 只认编码格式，
+# 不认谁编的），但几乎不占 CPU。
+_X264_ARGS = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+              "-tune", "zerolatency", "-pix_fmt", "yuv420p"]
+_NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "26",
+               "-pix_fmt", "yuv420p", "-profile:v", "high"]
+
+# 单个 worker 进程内只探测一次（每次播放都会起新进程，跨进程缓存没意义）。
+_ENCODER_CHOICE: list[list[str]] = []
+
+
+def video_encoder_args(ffmpeg: str) -> list[str]:
+    """挑一组可用的 H.264 视频编码参数：优先 NVIDIA 硬件编码，回落 libx264。
+
+    为什么需要它：源档是 H.265/bytevc2 时**必须**重编码成 H.264（RTX VSR
+    的硬条件，AGENTS.md 不变量 25）。这段成本在首开时间里占比很高，而显卡
+    上的编码器是白躺着的。
+
+    判定必须"真跑一次"，不能读 `-encoders` 列表：编译进去的 h264_nvenc 在
+    没有 N 卡、驱动过旧或编码会话占满时照样会列出来，只有实际初始化才会
+    暴露。探测只编码 2 帧到 null muxer，不写盘。
+
+    失效一律回落 libx264：兼容性优先，VSR 只要求"H.264"，不要求谁编的。
+    可用 TTV_SD_ENCODER=nvenc|x264 强制指定，用于对照实测。
+    """
+    if _ENCODER_CHOICE:
+        return _ENCODER_CHOICE[0]
+    forced = os.getenv("TTV_SD_ENCODER", "").strip().lower()
+    if forced == "x264":
+        _ENCODER_CHOICE.append(_X264_ARGS)
+        return _ENCODER_CHOICE[0]
+    probe_ok = False
+    if forced != "x264":
+        # 尺寸不能太小：实测 64x64 会被 NVENC 直接拒（"Frame Dimension less
+        # than the minimum supported value"，返回码 -22），于是探针给出假阴性、
+        # 永远回落 CPU 编码。640x360 已实测可用（本机 311ms 完成 2 帧）。
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error",
+                   "-f", "lavfi", "-i", "color=black:s=640x360",
+                   "-frames:v", "2", "-an"] + _NVENC_ARGS + ["-f", "null", "-"]
+        try:
+            probe = subprocess.run(command, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, text=True,
+                                   timeout=25, **_no_window())
+            probe_ok = probe.returncode == 0
+            if not probe_ok:
+                emit({"event": "progress", "stage": "encoder",
+                      "message": "硬件编码不可用，改用 CPU 编码"})
+        except (OSError, subprocess.SubprocessError):
+            probe_ok = False
+    _ENCODER_CHOICE.append(_NVENC_ARGS if probe_ok else _X264_ARGS)
+    return _ENCODER_CHOICE[0]
+
+
+def _h264_output_args(ffmpeg: str) -> list[str]:
+    """固定输出 WebView2/RTX VSR 可用的 H.264，分辨率保持不变。"""
+    # 实测同一段 1920x1080 漫剧：HEVC 直连/MSE 都不触发 VSR，H.264 稳定触发。
+    # 音轨统一转 AAC（源音频编码不确定，转 AAC 才不会有画面没声音）。
+    return video_encoder_args(ffmpeg) + [
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+    ]
+
 def _ffmpeg_direct_decrypt(ffmpeg: str, url: str, key_hex: str | None,
                            out_path: Path, duration_ms: int,
-                           with_app_headers: bool) -> bool:
+                           with_app_headers: bool,
+                           copy_video: bool = False) -> bool:
     """让 ffmpeg 直连 CDN 完成"拉流 + CENC 解密 + 转存"，一步到位。
 
     旧路径是"python 下载到 .source.tmp（8.8MB 写盘）→ ffmpeg 读 tmp 解密转存
     （再写 8.8MB）"，实测 3.4s。直连把两步合一，实测 1.2s，且不再产生临时
     整集文件（省一次写 + 一次读 + 一次删除）。
 
-    -tls_verify 0 不可省略：随包 ffmpeg 没有 CA 证书链，直连 https 必然以
-    "certificate verify failed / Error opening input: I/O error" 失败。
+    -tls_verify 0 不可省略，且必须写在 -i 之前：随包 ffmpeg 没有 CA 证书链，
+    直连 https 必然以 "certificate verify failed / Error opening input: I/O error"
+    失败；而写在 -i 之后时该选项会被解析到输出侧，对输入完全不生效，
+    这个快速路径就永远退化成慢路径（详见下方命令拼接处的实测记录）。
 
     进度用 ffmpeg 的 -progress 输出换算：out_time_us 对已知总时长。这样
     百分比与真实拉取进度同源，不会退化成假的"匀速进度条"。
@@ -802,18 +943,44 @@ def _ffmpeg_direct_decrypt(ffmpeg: str, url: str, key_hex: str | None,
     partial = out_path.with_name(out_path.name + ".part.mp4")
     partial.unlink(missing_ok=True)
     command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-               "-tls_verify", "0",
-               "-rw_timeout", "60000000",
                "-progress", "pipe:1", "-nostats"]
     if with_app_headers:
         command += ["-user_agent", DOWNLOAD_UA,
                     "-headers", f"Referer: {DOWNLOAD_REFERER}\r\n"]
     if key_hex:
         command += ["-decryption_key", key_hex]
-    # 刻意不加 -movflags +faststart：源本身已是 faststart 布局，而重新排布
-    # moov 要整文件二次读写（实测约 0.5s，网络波动时更多），换来的只是把
-    # moov 从尾部挪到头部——本地文件播放器自己会 seek 到尾部读它，不值得。
-    command += ["-i", url, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", str(partial)]
+    # H.264 重编码会重写整个容器，因此这里保留 faststart：WebView2 从 asset
+    # 协议起播与拖动时直接读到 moov，不依赖文件尾寻址。
+    #
+    # copy_video：源档本身就是 H.264 时**不重编码**，只把解密后的裸流重新封装。
+    # 这一条只改 CPU 占用，不改下载时间——但正是它把"整集重编"这笔成本变成零：
+    # 历史实测同一条链路 -c copy 是 0.87s / 10.8MB，而 libx264/ultrafast 整集
+    # 重编是 9.99s / 157.5MB（膨胀 15 倍，见 .workbuddy/memory/2026-10-07.md）。
+    # 输出仍是 H.264，RTX VSR 的硬条件（AGENTS.md 不变量 25）不受影响。
+    #
+    # 音轨仍然转 AAC：音频重编的代价可以忽略，而源音频是什么编码我们并不
+    # 每次都清楚，统一成 AAC 才不会出现"画面有了、声音没有"。
+    out_args = (
+        ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+        if copy_video
+        else _h264_output_args(ffmpeg)
+    )
+    # `-tls_verify 0` 与 `-rw_timeout` 必须写在 **`-i` 之前**。
+    #
+    # 这是整条链路最隐蔽的一处坑，实测（.workbuddy/probe-tls.ps1）：
+    #   * 写成 `-i <url> -tls_verify 0 ...` → ffmpeg 在**打开输入**时用的是
+    #     默认的证书校验，直接 `error:0A000086:lib(20)::reason(134)` +
+    #     `Error opening input: I/O error`，115ms 就失败。它被解析成了输出侧
+    #     选项，而这次没有任何输出网络流，于是这个选项对输入毫无作用。
+    #   * 写成 `-tls_verify 0 ... -i <url>` → 704ms 成功产出 5.9MB。
+    #
+    # 后果正好对应用户的实机日志：6 集**无一例外**都出现
+    # 「带应用请求头直连失败，改用裸直连重试」→「改用本地下载模式」，
+    # 也就是这条"拉流+解密+转存一步到位"的快速路径从未真正生效过，
+    # 每一集都退回到 python 完整下载整集写盘、再由 ffmpeg 读盘解密转存
+    # 的慢路径（多一次整集写盘 + 一次整集读盘）。
+    command += ["-tls_verify", "0", "-rw_timeout", "60000000",
+                "-i", url, "-map", "0:v:0", "-map", "0:a:0?"] + out_args + [str(partial)]
 
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", **_no_window())
@@ -1007,13 +1174,14 @@ def resolve_prefix(vid: str, out_path: Path, device_id: str, install_id: str,
     """
     session = http_session()
     stream_info = load_stream_info(session, vid, device_id, install_id, content_type, aid)
-    real_url, key_hex, width, height = pick_stream_variant(stream_info)
+    real_url, key_hex, width, height, codec = pick_stream_variant(stream_info)
     content_key = None
     if key_hex:
         try:
             content_key = binascii.unhexlify(key_hex)
         except (binascii.Error, ValueError):
             content_key = None
+    copy_video = should_copy_video(codec)
 
     limit_bytes = max(512 * 1024, int(os.getenv("TTV_SD_PREFIX_BYTES", str(2 * 1024 * 1024))))
     emit({"event": "progress", "stage": "prefix", "message": "正在预取开头片段"})
@@ -1030,8 +1198,12 @@ def resolve_prefix(vid: str, out_path: Path, device_id: str, install_id: str,
             command += ["-decryption_key", content_key.hex()]
         # 截断的输入会让 ffmpeg 在末尾报 packet corrupt，但那几帧之后的完整部分
         # 全部可用——产物是正常可播的（实测 1.5MB 前缀解出 28.16 秒）。
-        command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
-                    "-movflags", "+faststart", str(partial)]
+        prefix_args = (
+            ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+            if copy_video
+            else _h264_output_args(ffmpeg)
+        )
+        command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?"] + prefix_args + [str(partial)]
         proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                               **_no_window())
         if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
@@ -1063,6 +1235,9 @@ def load_stream_info(session: requests.Session, vid: str, device_id: str, instal
             "width": int(os.getenv("TTV_SD_DIRECT_WIDTH", "0") or 0),
             "height": int(os.getenv("TTV_SD_DIRECT_HEIGHT", "0") or 0),
             "duration_ms": int(os.getenv("TTV_SD_DIRECT_DURATION", "0") or 0),
+            # 预签名缓存里也存了选中档的编码：命中这条路是详情页预热铺出来的
+            # 最常见路径，缺了这一项它会永远走整集重编码。
+            "codec": os.getenv("TTV_SD_DIRECT_CODEC", "").strip(),
             "variants": [],
         }
     return fetch_stream(session, vid, device_id, install_id, content_type, aid)
@@ -1094,7 +1269,11 @@ def preferred_quality_height(requested: str, variants: list) -> int | None:
 
 
 def pick_stream_variant(stream_info: dict) -> tuple:
-    """按请求的清晰度挑一路流，返回 (url, content_key_hex, width, height)。
+    """按请求的清晰度挑一路流，返回 (url, content_key_hex, width, height, codec)。
+
+    第 5 项 codec 只用于决定直连那一步能否 -c:v copy（见
+    _ffmpeg_direct_decrypt）。取不到时给空串，语义是「未知」——未知一律按
+    需要重编码处理，宁可多花 CPU 也不能产出 WebView2 解不出的文件。
 
     指定档位优先该档；缺档时选择不高于目标的最高档（若全部更高则保留其中
     最低档）——与果果 preferredDownloadQuality 的回退规则一致，而不是旧版
@@ -1115,32 +1294,59 @@ def pick_stream_variant(stream_info: dict) -> tuple:
         return (selected["url"],
                 selected.get("content_key") or stream_info.get("content_key"),
                 int(selected.get("width", 0) or 0),
-                int(selected.get("height", 0) or 0))
+                int(selected.get("height", 0) or 0),
+                str(selected.get("codec") or ""))
     return (stream_info["url"], stream_info["content_key"],
-            stream_info["width"], stream_info["height"])
+            stream_info["width"], stream_info["height"],
+            str(stream_info.get("codec") or ""))
 
 
 def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: str,
             content_type: int, aid: int) -> dict:
     session = http_session()
     stream_info = load_stream_info(session, vid, device_id, install_id, content_type, aid)
-    real_url, key_hex, width, height = pick_stream_variant(stream_info)
+    real_url, key_hex, width, height, codec = pick_stream_variant(stream_info)
     content_key = None
     if key_hex:
         try:
             content_key = binascii.unhexlify(key_hex)
         except (binascii.Error, ValueError):
             content_key = None
+    # 输出格式由 **RTX VSR 开关**（TTV_SD_VSR）与源档编码共同决定——见
+    # should_copy_video 的说明。红果这条链路完全不经过 media_enhance，
+    # 所以这里是开关唯一的落点。
+    copy_video = should_copy_video(codec)
     # ===== 主路径：ffmpeg 直连，拉流 + 解密 + 转存一步完成 =====
+    # 把编码与"重封装/重编码"直接写进 message：Rust 侧的阶段日志只转发
+    # message，附加字段会被吞掉，而"这集为什么十几秒"恰恰就是这一项决定的。
+    if copy_video:
+        _mode = "重封装（保留源编码）"
+    elif vsr_enabled():
+        _mode = "整集重编码为 H.264（VSR 需要）"
+    else:
+        _mode = "整集重编码为 H.264（源不可直接播放）"
     emit({"event": "progress", "stage": "download",
-          "message": f"正在下载并解密源流（{height}p）"})
+          "message": f"正在下载并解密源流（{height}p，编码={codec or '未知'}，{_mode}）",
+          "codec": codec, "copy": copy_video})
     key_hex = content_key.hex() if content_key else None
     direct_error = ""
-    for with_app_headers in (False, True):
+    # 顺序：**先带红果 App 的 UA/Referer，再退回裸直连**。
+    #
+    # 旧写法是反的，注释里写「第一轮不带请求头（实测最快）」——那条实测在
+    # 2026-10-07 的实机日志（ttv-playback.log）里已经不成立：6 集无一例外
+    # 都走了 fallback，每一集都要先白等一次注定失败的拉流。实测这次白等的
+    # 代价是 0.23–0.30s（vid=7691682052302703640：14.270s 开始下载，14.499s
+    # 报「直连失败」），量不大但纯浪费，而且每集都会在界面上闪一次
+    # 「直连失败」的进度文案，看起来像网络出了问题。CDN 现在要求 UA/Referer，
+    # 第一轮带头上才是"最快那一轮"。
+    #
+    # 保留第二轮而不是直接删掉：将来若某种源流反过来拒绝带头请求，这条链路
+    # 仍能退到裸直连，最坏情况与旧版持平，不会更糟。
+    for with_app_headers in (True, False):
         try:
             if _ffmpeg_direct_decrypt(ffmpeg, real_url, key_hex, out_path,
                                       int(stream_info.get("duration_ms") or 0),
-                                      with_app_headers):
+                                      with_app_headers, copy_video):
                 size = out_path.stat().st_size
                 emit({"event": "done", "ok": True, "file": str(out_path), "width": width,
                       "height": height, "size": size})
@@ -1148,11 +1354,9 @@ def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: s
                         "height": height, "size": size}
         except Exception as exc:  # noqa: BLE001 - 任何失败都要能回退
             direct_error = str(exc)
-        if not with_app_headers:
-            # 第一轮不带请求头（实测最快）；被 CDN 拒绝时再带红果 App 的
-            # UA/Referer 重试一次，兼顾速度与兼容性。
+        if with_app_headers:
             emit({"event": "progress", "stage": "fallback",
-                  "message": "直连失败，改用应用请求头重试"})
+                  "message": "带应用请求头直连失败，改用裸直连重试"})
 
     # ===== 回退路径：下载到本地再解密（直连被 CDN 拒绝时使用）=====
     emit({"event": "progress", "stage": "fallback", "message": "改用本地下载模式"})
@@ -1168,8 +1372,12 @@ def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: s
         command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
         if content_key:
             command += ["-decryption_key", content_key.hex()]
-        command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
-                    "-movflags", "+faststart", str(partial)]
+        fallback_args = (
+            ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+            if copy_video
+            else _h264_output_args(ffmpeg)
+        )
+        command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?"] + fallback_args + [str(partial)]
         proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                               **_no_window())
         if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
@@ -1194,6 +1402,13 @@ def stream_cmd(vid: str, device_id: str, install_id: str, content_type: int, aid
         "width": stream_info["width"],
         "height": stream_info["height"],
         "variants": stream_info.get("variants") or [],
+        # duration_ms 一并透出：Rust 的 store_stream 会读它塞进 CachedStream，
+        # 再经 TTV_SD_DIRECT_DURATION 交给 resolve。缺了它，直连解密那条链路
+        # 换算不出下载百分比（out_time_us / 总时长），界面上只能退化成
+        # "只有阶段提示、没有百分比"，看起来就像卡住不动。
+        "duration_ms": int(stream_info.get("duration_ms") or 0),
+        # codec 同理：它决定 resolve 是重封装还是整集重编码。
+        "codec": str(stream_info.get("codec") or ""),
         "download_ua": DOWNLOAD_UA,
         "download_referer": DOWNLOAD_REFERER,
     }
@@ -1351,10 +1566,242 @@ def counts_cmd(series_ids: list[str], device_id: str, install_id: str, aid: int)
     result = {"ok": True, "counts": counts}
     emit({"event": "done", **result})
     return result
+# ---------------------------------------------------------------------------
+# 「更多」页的分区数据源：红果榜单 / 最新上架
+# ---------------------------------------------------------------------------
+# 逆向自官方 PC 客户端 `backend/hongguo.py`（见仓库根目录
+# 「红果短剧客户端逆向分析报告.md」§四）：
+#   榜单  GET  /reading/bookapi/bookmall/cell/change/v   → sub_selected_items 换榜
+#   上架  POST /reading/distribution/category/landpage/v → select_items.sort 换排序
+#
+# 官方自己对这两条接口默认**不发签名**（注释称实测红果不校验 X-Argus）。TTV 这里
+# 仍然走既有的六代签名 —— 签名是更严的一侧，不会因此被拒，也就不必为「免签」
+# 再分一条代码路径出来。
+#
+# 分页模型两边不同，统一收敛成「不透明游标」（opaque cursor）交给调用方原样回传：
+#   榜单  游标要同时带 session_uuid（同一会话贯穿整个榜单）与 next_offset
+#   上架  游标只是 offset（offset += 本页条数）
+# 编码成 `{"o":<offset>,"s":"<uuid>"}`；调用方不解析它，只负责带回来。
+CELL_CHANGE_PATH = "/reading/bookapi/bookmall/cell/change/v"
+LANDPAGE_PATH = "/reading/distribution/category/landpage/v"
+
+# 漫剧榜单（cell + tab_type 固定，三个子榜靠 sub_selected_items 区分）。
+FEED_RANK_CELL = "7470092475068071998"
+FEED_RANK_BOARDS = {
+    "recommend": "comic_series_hot_rank",
+    "hot": "comic_series_hot_play",
+    "new": "comic_series_new_rank",
+}
+# 体裁 → landpage 的 req_scene / genre，与官方 GENRES 同值。
+FEED_GENRES = {
+    "short_play": "default",
+    "comic_series": "comic_series",
+    "ai_series": "ai_series",
+}
+FEED_SORTS = ("online_time", "hot_score", "hot_collect")
+FEED_PAGE_SIZE = 18
+
+# sub_title_list 里这些文案不是题材：热度/播放量/集数/季数，以及"今日上新"标记。
+_FEED_SUB_NOISE = re.compile(r"^\d+集$|^第.+季$")
+
+
+def _feed_int(value, fallback: int) -> int:
+    """宽松取非负整数：拿不到或为负一律回落。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed >= 0 else fallback
+
+
+def _feed_item(entry) -> dict | None:
+    """榜单/上架条目 → `SeriesItem` 的原料。
+
+    刻意在 worker 侧就把脏数据处理掉（HTML 标签、题材噪声、"今日上新"标记），
+    Rust 侧只做类型与字段名的搬运 —— 与 `search_cmd` 的分工一致。
+    """
+    if not isinstance(entry, dict):
+        return None
+    sid = str(entry.get("series_id") or entry.get("book_id") or "").strip()
+    if not sid.isdigit():
+        return None
+    title = re.sub(r"<[^>]+>", "", str(entry.get("title") or "")).strip()
+    if not title:
+        return None
+
+    subs = [
+        str(sub.get("content") or "").strip()
+        for sub in (entry.get("sub_title_list") or [])
+        if isinstance(sub, dict)
+    ]
+    # 分类优先取 category_schema（源数据里可能同时有"玄幻/逆袭/异界"多个），
+    # sub_title_list 只有一个，只作兜底。
+    tags: list[str] = []
+    for name in re.findall(r'"name":"([^"]+)"', str(entry.get("category_schema") or "")):
+        if name and name not in tags:
+            tags.append(name)
+    if not tags:
+        for name in subs:
+            if (not name or name == "今日上新" or name == title
+                    or "热度" in name or "播放" in name
+                    or _FEED_SUB_NOISE.match(name)):
+                continue
+            if name not in tags:
+                tags.append(name)
+
+    return {
+        "id": sid,
+        "title": title,
+        "cover": str(entry.get("cover") or "").strip(),
+        "episodeCount": _feed_int(entry.get("episode_cnt"), 0),
+        "score": str(entry.get("score") or "").strip(),
+        "copyright": str(entry.get("copyright") or "").strip(),
+        "brief": str(entry.get("video_desc") or "").strip()[:120],
+        "tags": tags[:3],
+        # 短剧的 landpage 有真"今日上新"标记，漫剧/AI 没有（官方也没有更细粒度）。
+        "today": "今日上新" in subs,
+    }
+
+
+def _feed_request(session, path, device_id, install_id, aid, *, query=None, body=None):
+    """主备域名轮询一次请求。业务性拒绝（PermissionError）不换线，直接抛。"""
+    last_error: Exception | None = None
+    for url in player_urls(path, install_id, device_id, aid):
+        try:
+            if body is None:
+                return signed_get(session, url, query or {}, device_id, install_id)
+            return signed_post(session, url, body, device_id, install_id)
+        except PermissionError:
+            raise
+        except (requests.RequestException, ValueError, json.JSONDecodeError) as error:
+            last_error = error
+            continue
+    raise last_error or RuntimeError("红果接口不可用")
+
+
+def _feed_rank(session, board, offset, session_uuid, device_id, install_id, aid):
+    """漫剧榜单一页。返回 (items, hasMore, nextOffset)。"""
+    query = {
+        "cell_id": FEED_RANK_CELL,
+        "tab_type": "26",
+        "client_req_type": "2",
+        "client_template": "2",
+        "screen_width_px": "1350",
+        "selected_items": "comic_series_rank",
+        "sub_selected_items": FEED_RANK_BOARDS[board],
+        "session_uuid": session_uuid,
+    }
+    if offset:
+        query["offset"] = str(offset)
+    payload = _feed_request(session, CELL_CHANGE_PATH, device_id, install_id, aid, query=query)
+    view = (payload.get("data") or {}).get("cell_view") or {}
+    raw = view.get("cell_data") or []
+    items = []
+    for entry in raw:
+        value = entry.get("video_data") if isinstance(entry, dict) else None
+        # video_data 既可能是对象也可能是数组（官方客户端同样两种都兜）。
+        if isinstance(value, list):
+            value = value[0] if value else None
+        mapped = _feed_item(value)
+        if mapped:
+            items.append(mapped)
+    has_more = bool(view.get("has_more"))
+    next_offset = _feed_int(view.get("next_offset"), offset + len(raw))
+    return items, has_more, next_offset
+
+
+def _feed_list(session, genre, sort, offset, device_id, install_id, aid):
+    """landpage 一页（最新上架 / 按热度）。返回 (items, hasMore, nextOffset)。"""
+    body = {
+        "filter_ids": "",
+        "req_scene": FEED_GENRES[genre],
+        "offset": offset,
+        "need_selector_panel": False,
+        "limit": FEED_PAGE_SIZE,
+        "select_items": {
+            "category_dim_epoch": [],
+            "online_time": [],
+            "gender": [],
+            "category_dim_role": [],
+            "genre": [genre],
+            "sort": [sort],
+            "category_dim_theme": [],
+        },
+        "session_id": "",
+        "req_type": "only_content",
+        "client_req_type": 3,
+    }
+    payload = _feed_request(session, LANDPAGE_PATH, device_id, install_id, aid, body=body)
+    data = payload.get("data") or {}
+    raw = data.get("video_data") or []
+    items = [mapped for mapped in (_feed_item(entry) for entry in raw) if mapped]
+    has_more = bool(data.get("has_more"))
+    # offset 用**原始条数**推进（不是过滤后的条数）：服务端的分页按它的返回条数算，
+    # 用过滤后的数量会让下一次请求重复拉回同一段。
+    return items, has_more, offset + len(raw)
+
+
+def feed_cmd(spec: dict, device_id: str, install_id: str, aid: int) -> dict:
+    """「更多」页的分区列表。
+
+    spec:
+      {"mode":"rank","board":"hot",     "cursor":"{\\"o\\":0,\\"s\\":\\"<uuid>\\"}"}
+      {"mode":"list","genre":"short_play","sort":"online_time","cursor":"{\\"o\\":0}"}
+
+    cursor 由本函数产出、调用方原样回传；首次不带 cursor 即从第一页开始。
+    """
+    mode = str(spec.get("mode") or "").strip()
+    state: dict = {}
+    cursor = spec.get("cursor")
+    if isinstance(cursor, str) and cursor.strip():
+        try:
+            parsed = json.loads(cursor)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            state = parsed
+    offset = _feed_int(state.get("o"), 0)
+
+    session = http_session()
+    emit({"event": "progress", "stage": "shelf", "message": "正在获取列表"})
+
+    if mode == "rank":
+        board = str(spec.get("board") or "hot").strip()
+        if board not in FEED_RANK_BOARDS:
+            raise ValueError(f"榜单无效：{board}")
+        # session_uuid 必须贯穿整个榜单会话（服务端靠它串起分页），所以它进游标。
+        session_uuid = str(state.get("s") or "").strip() or str(uuid.uuid4())
+        items, has_more, next_offset = _feed_rank(
+            session, board, offset, session_uuid, device_id, install_id, aid)
+        next_state = {"o": next_offset, "s": session_uuid}
+    elif mode == "list":
+        genre = str(spec.get("genre") or "short_play").strip()
+        if genre not in FEED_GENRES:
+            raise ValueError(f"体裁无效：{genre}")
+        sort = str(spec.get("sort") or "online_time").strip()
+        if sort not in FEED_SORTS:
+            sort = "online_time"
+        items, has_more, next_offset = _feed_list(
+            session, genre, sort, offset, device_id, install_id, aid)
+        next_state = {"o": next_offset}
+    else:
+        raise ValueError(f"模式无效：{mode}")
+
+    result = {
+        "ok": True,
+        "items": items,
+        # 一页都过滤空了就不该继续翻：空页即到底。
+        "hasMore": has_more and len(items) > 0,
+        "nextCursor": json.dumps(next_state, separators=(",", ":")),
+    }
+    emit({"event": "done", **result})
+    return result
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if not argv:
-        emit({"ok": False, "error": "用法: worker.py resolve|stream <vid> / album <series_id> / counts <id,id,...>"})
+        emit({"ok": False, "error": "用法: worker.py resolve|stream <vid> / album <series_id> / counts <id,id,...> / feed <json>"})
         return 2
     subcommand = argv[0]
     if subcommand == "selftest":
@@ -1441,12 +1888,13 @@ def main() -> int:
         assert extract_episode_counts({"video_detail_data": []}) == {}
         emit({"ok": True, "event": "done", "hosts": [urlsplit(item2).netloc for item2 in urls]})
         return 0
-    if subcommand not in ("resolve", "resolve-prefix", "stream", "album", "search", "counts") or len(argv) < 2:
+    if subcommand not in ("resolve", "resolve-prefix", "stream", "album", "search", "counts", "feed") or len(argv) < 2:
         emit({"ok": False, "error": f"未知子命令: {subcommand or '(空)'}"})
         return 2
     target = argv[1].strip()
-    # search 的目标是关键词（可含中文），其余子命令要求是纯数字 ID。
-    if not target or (subcommand not in ("search", "counts") and not target.isdigit()):
+    # 各子命令的 target 形态不同：search 是关键词（可含中文）、feed 是一段 JSON、
+    # counts 是逗号列表，其余都要求是纯数字 ID。
+    if not target or (subcommand not in ("search", "counts", "feed") and not target.isdigit()):
         emit({"ok": False, "error": f"缺少有效的 {subcommand} 目标。"})
         return 2
     device_id = os.getenv("TTV_SD_DEVICE_ID", "").strip()
@@ -1475,6 +1923,8 @@ def main() -> int:
             search_cmd(target, device_id, install_id, aid)
         elif subcommand == "counts":
             counts_cmd(target.split(","), device_id, install_id, aid)
+        elif subcommand == "feed":
+            feed_cmd(json.loads(target), device_id, install_id, aid)
         else:
             album_cmd(target, device_id, install_id, aid)
         return 0

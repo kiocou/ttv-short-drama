@@ -224,6 +224,9 @@ export const AnimeVideoSurface: React.FC = () => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      // 锁定态：快捷键全部失效，唯一出口是解锁（PlayerHud 里的 Esc 监听负责）。
+      // 与短剧播放器同一语义——锁住后连"Esc 退全屏/离开播放器"都没有，先解锁再操作。
+      if (isLocked) return;
       switch (event.code) {
         case 'Space':
           event.preventDefault();
@@ -258,12 +261,11 @@ export const AnimeVideoSurface: React.FC = () => {
           playNext();
           break;
         case 'Escape':
-          // 优先级：先关选集弹层；控制器处于收起态时 Esc 交给 HUD 解锁（它自己
-          // 监听）；再退全屏；最后才离开播放器——用户最不想在按 Esc 时直接退出。
+          // 优先级：先关选集弹层，再退全屏，最后才离开播放器——用户最不想在按
+          // Esc 时直接退出。控制器收起态走不到这里（上方已按 isLocked 拦下），
+          // Esc 由 HUD 自己的解锁监听消费。
           if (showEpisodes) {
             setShowEpisodes(false);
-          } else if (isLocked) {
-            return;
           } else if (isFullscreen) {
             void exitFullscreen();
           } else {
@@ -294,7 +296,9 @@ export const AnimeVideoSurface: React.FC = () => {
   ]);
 
   // 单击播放/暂停，双击全屏。
+  // 锁定态一律忽略：锁的语义就是"除解锁外一切输入失效"，点画面不许再暂停/全屏。
   const handleSurfaceClick = () => {
+    if (isLocked) return;
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
@@ -335,10 +339,8 @@ export const AnimeVideoSurface: React.FC = () => {
 
   return (
     <div
-      // `ttv-player`：把整棵播放器子树标记为"舞台"，crystal.css 里据此关闭
-      // 作用域内的 backdrop-filter。见那里的注释——背景模糊会让视频失去独立
-      // 呈现平面，RTX 视频增强（VSR）随之失效。
-      className="ttv-player w-full h-full bg-black relative overflow-hidden select-none"
+      // 与短剧共用视频合成约束；ttv-player 仍只负责既有布局/控制器样式。
+      className="ttv-player ttv-video-stage w-full h-full bg-black relative overflow-hidden select-none"
       onMouseMove={handlePointerMove}
     >
       {/*

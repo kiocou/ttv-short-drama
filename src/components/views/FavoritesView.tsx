@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useFavorites } from '../../stores/useFavoritesStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { FAVORITE_MARK_LABEL, FavoriteMark } from '../../types/favorite';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
+import { BackToTop } from '../common/BackToTop';
 import { CoverImage } from '../common/CoverImage';
 import {
   Heart,
@@ -46,8 +47,11 @@ export const FavoritesView: React.FC = () => {
     navigateTo('detail', seriesId);
   };
 
+  /** 回到顶部要自己拿得到滚动容器。与发现页 / 动漫专区同一套交互。 */
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
   return (
-    <div className="flex-1 h-full overflow-y-auto p-8 max-w-5xl mx-auto flex flex-col gap-6 select-none">
+    <div ref={scrollRef} className="flex-1 h-full overflow-y-auto p-8 max-w-5xl mx-auto flex flex-col gap-6 select-none">
       {/* 头部 */}
       <div className="flex items-center justify-between pb-4 border-b border-black/[0.05]">
         <div>
@@ -109,9 +113,13 @@ export const FavoritesView: React.FC = () => {
               >
                 <div className="flex items-center gap-4 min-w-0">
                   {/* 封面缩略图 */}
+                  {/* 3:4 = 64×88。必须写 `h-[88px]`：`h-22` 不在 Tailwind 的
+                      spacing 刻度里（…/20/24/…），从来没被生成过——占位层是
+                      `absolute inset-0`，父级没有高度时它会塌成 0px，封面加载
+                      失败的小图会整个消失。 */}
                   <div
                     onClick={() => handleResume(item.seriesId)}
-                    className="relative w-16 h-22 rounded-xl overflow-hidden shadow-sm flex-shrink-0 cursor-pointer group-hover:scale-105 transition-transform duration-300"
+                    className="relative w-16 h-[88px] rounded-xl overflow-hidden shadow-sm flex-shrink-0 cursor-pointer group-hover:scale-105 transition-transform duration-300"
                   >
                     <CoverImage
                       src={item.cover}
@@ -183,6 +191,8 @@ export const FavoritesView: React.FC = () => {
           })}
         </div>
       )}
+
+      <BackToTop targetRef={scrollRef} />
     </div>
   );
 };

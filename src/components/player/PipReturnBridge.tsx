@@ -10,7 +10,7 @@ import {
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { useHistoryStore } from '../../stores/useHistoryStore';
-import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { usePlaybackActions } from '../../stores/usePlaybackStore';
 
 /**
  * 画中画小窗的"回流"处理（主窗口侧，不渲染任何界面）。
@@ -30,7 +30,7 @@ import { usePlaybackStore } from '../../stores/usePlaybackStore';
  */
 
 interface PipBridgeContext {
-  playback: ReturnType<typeof usePlaybackStore>;
+  playback: ReturnType<typeof usePlaybackActions>;
   anime: ReturnType<typeof useAnimePlayer>;
   navigateTo: (view: 'player') => void;
   loadHistory: () => Promise<void>;
@@ -113,7 +113,8 @@ async function handleReturned(ctx: PipBridgeContext, payload: PipReturnedPayload
 }
 
 export const PipReturnBridge: React.FC = () => {
-  const playback = usePlaybackStore();
+  // 低频动作专线：本组件没有任何位置/时间读数，不该跟着播放进度重渲染。
+  const playback = usePlaybackActions();
   const anime = useAnimePlayer();
   const { navigateTo } = useAppStore();
   const { loadHistory } = useHistoryStore();

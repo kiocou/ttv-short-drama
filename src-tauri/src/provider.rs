@@ -247,23 +247,64 @@ pub struct DramaProvider {
     client: Client,
 }
 
+/// 构造目录/详情用的 HTTP 客户端。
+///
+/// `use_proxy` 决定是否挂 Windows 系统代理。两条分支的其余参数必须完全一致 ——
+/// 兜底路径不该是一台"另一台机器"，否则请求超时行为都会不一样。
+fn build_client(use_proxy: bool) -> Result<Client, String> {
+    let mut builder = Client::builder();
+    if use_proxy {
+        // reqwest 不读 Windows 的「Internet 设置」，见 `update::system_proxy`。
+        builder = crate::update::with_system_proxy(builder);
+    } else {
+        // **必须显式 `no_proxy()`**：这条分支是"直连兜底"，而 reqwest 默认还会去读
+        // `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。不写这一句，所谓直连其实还是走代理，
+        // 兜了个寂寞。
+        builder = builder.no_proxy();
+    }
+    builder
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+        )
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
+        // 连接池保活：目录/详情每次翻页与换剧都是同一主机的新请求，
+        // 默认池空闲 90s 就关连接，再次请求要重新 TLS 握手（1-2 RTT）。
+        // 拉长空闲窗口让翻页/换剧复用已建立的连接，首字节快一截。
+        .pool_idle_timeout(Duration::from_secs(600))
+        .pool_max_idle_per_host(4)
+        .tcp_nodelay(true)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// 直连兜底客户端（进程内单例、惰性创建）。
+///
+/// 只在**确实挂着系统代理**时才需要它：没挂代理的机器上这条路径永远走不到，
+/// 白白多一个连接池。绝大多数请求也用不到它，所以等到真失败那一刻再建。
+fn fallback_direct_client() -> Option<&'static Client> {
+    static DIRECT_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
+    DIRECT_CLIENT
+        .get_or_init(|| {
+            if !crate::update::has_system_proxy() {
+                return None;
+            }
+            match build_client(false) {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    eprintln!("[ttv] 直连兜底客户端创建失败：{error}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 impl DramaProvider {
     pub fn new() -> Result<Self, String> {
-        // 挂系统代理：reqwest 不读 Windows 的「Internet 设置」。这条链路目前实测直连可
-        // 通，但换台机器就不保证（见 update::system_proxy 的实测记录）。
-        let client = crate::update::with_system_proxy(Client::builder())
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36")
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(20))
-            // 连接池保活：目录/详情每次翻页与换剧都是同一主机的新请求，
-            // 默认池空闲 90s 就关连接，再次请求要重新 TLS 握手（1-2 RTT）。
-            // 拉长空闲窗口让翻页/换剧复用已建立的连接，首字节快一截。
-            .pool_idle_timeout(Duration::from_secs(600))
-            .pool_max_idle_per_host(4)
-            .tcp_nodelay(true)
-            .build()
-            .map_err(|error| error.to_string())?;
-        Ok(Self { client })
+        Ok(Self {
+            client: build_client(true)?,
+        })
     }
 
     pub async fn catalog(&self, filter: &CatalogFilter) -> Result<CatalogPage, String> {
@@ -805,23 +846,90 @@ impl DramaProvider {
     }
 }
 
-async fn fetch_page_with_client(client: Client, path: String) -> Result<String, String> {
+/// 把一次请求失败连同**整条 source 链**展开成一句能排查的话。
+///
+/// reqwest 的 `Display` 只给最外层那句 `error sending request for url (...)`——
+/// 信息量近乎为零：连不上、代理挂了、TLS 证书不对、超时，四种原因长得一模一样。
+/// 真正的原因全在 `std::error::Error::source()` 链里
+/// （典型是 `proxy connect error` / `tcp connect error` /
+/// `invalid peer certificate` / `operation timed out`）。
+///
+/// 这条链路值得多花二十行：用户上一次截图上只有"1 个源均无响应"，
+/// 拿到真实原因后才把范围收死到唯一那一个源。
+fn describe_request_error(prefix: &str, error: &reqwest::Error) -> String {
+    let mut text = format!("{prefix}：{error}");
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        text.push_str(" ← ");
+        text.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    text
+}
+
+/// 用指定客户端抓一页。
+async fn fetch_page_once(client: &Client, path: &str) -> Result<String, String> {
     let response = client
         .get(format!("{HONGGUO_BASE}{path}"))
         .send()
         .await
-        .map_err(|error| format!("目录请求失败：{error}"))?;
+        .map_err(|error| describe_request_error("目录请求失败", &error))?;
     if !response.status().is_success() {
         return Err(format!("目录服务返回 HTTP {}。", response.status()));
     }
     let bytes = response
         .bytes()
         .await
-        .map_err(|error| format!("读取目录响应失败：{error}"))?;
+        .map_err(|error| describe_request_error("读取目录响应失败", &error))?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err("目录响应超过安全大小限制。".into());
     }
     String::from_utf8(bytes.to_vec()).map_err(|_| "目录响应不是 UTF-8。".into())
+}
+
+/// 抓一页；**系统代理不通时自动直连兜底**。
+///
+/// ## 为什么必须有这条兜底
+///
+/// `update::with_system_proxy()` 会把注册表里的系统代理**无条件**挂到客户端上
+/// （`system_proxy()` 连 `ProxyOverride` 绕过表都没读）。而
+/// "Windows 系统代理开着、但那个端口其实已经不通"是极常见的状态——实测本机
+/// （2026-10-07）：
+///
+/// ```text
+/// 注册表 ProxyEnable=1 / ProxyServer=127.0.0.1:10808
+/// curl -x http://127.0.0.1:10808 https://hongguoduanju.com/category/comic-drama
+///   → exit 7（连接被拒）
+/// curl --noproxy '*' 同一个 URL
+///   → 200 / 317 KB / 1.1 s
+/// ```
+///
+/// 没有兜底时，用户看到的是"浏览器打得开、应用报目录加载失败（1 个源均无响应）"，
+/// 而错误里只有一句 `error sending request`，完全指不到代理头上——那一轮排查
+/// 就是这么耗掉的。
+///
+/// ## 边界
+///
+/// 兜底**只做一次**，且只在本机确实配了系统代理时才有对端（见
+/// `fallback_direct_client`），不会把失败请求翻倍打给站方。
+async fn fetch_page_with_client(client: Client, path: String) -> Result<String, String> {
+    match fetch_page_once(&client, &path).await {
+        Ok(body) => Ok(body),
+        Err(proxied_error) => {
+            let Some(direct) = fallback_direct_client() else {
+                return Err(proxied_error);
+            };
+            match fetch_page_once(direct, &path).await {
+                Ok(body) => {
+                    eprintln!("[ttv] 系统代理不可用，已直连取回目录：{path}");
+                    Ok(body)
+                }
+                Err(direct_error) => {
+                    Err(format!("{proxied_error}；直连兜底同样失败：{direct_error}"))
+                }
+            }
+        }
+    }
 }
 
 /// 生成搜索关键词的候选形式：原词 + 阿拉伯数字转中文数字的变体。

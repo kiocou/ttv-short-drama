@@ -1,12 +1,22 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useCatalogStore } from '../../stores/useCatalogStore';
-import { useAppStore } from '../../stores/useAppStore';
-import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { useAppStore, ShelfKind } from '../../stores/useAppStore';
+import { usePlaybackActions } from '../../stores/usePlaybackStore';
+import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useSettingsStore } from '../../stores/useSettingsStore';
+import { ipcService } from '../../services/ipc';
+import { shelfFeedSupports } from '../../stores/useShelfFeed';
 import { StatusBadge } from '../common/StatusBadge';
 import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
 import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
+import { HomeShelf } from '../common/HomeShelf';
+import { HomeShelfSection } from '../common/HomeShelfSection';
+import { RandomWatchSection, hasRandomCandidates, PICK_CARD_SHELL } from '../common/RandomWatchSection';
+import { CategoryBar } from '../common/CategoryBar';
+import { BackToTop } from '../common/BackToTop';
+import { SeriesItem } from '../../types/catalog';
+import { SeriesDetail } from '../../types/series';
 import {
   Flame,
   Sparkles,
@@ -14,7 +24,6 @@ import {
   TrendingUp,
   Clock,
   Moon,
-  X
 } from 'lucide-react';
 
 /**
@@ -30,6 +39,25 @@ const CHANNEL_COPY: Record<string, { title: string; noun: string }> = {
   adult: { title: '神秘小窝', noun: '内容' },
   anime: { title: '动漫推荐', noun: '动漫' },
 };
+
+/**
+ * 「还剩 8 分 20 秒」。
+ *
+ * 续播卡上真正有用的数字是"还要花多久"，不是"已经花了多少"——后者进度条已经
+ * 画出来了。拿不到时长（源没上报、`durationSeconds` 为 0）时返回空串，由调用方
+ * 决定不渲染，而不是硬凑一个"还剩 0 秒"。
+ */
+function formatRemaining(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  const total = Math.round(seconds);
+  if (total < 60) return `还剩 ${total} 秒`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) {
+    const rest = total % 60;
+    return rest > 0 ? `还剩 ${minutes} 分 ${rest} 秒` : `还剩 ${minutes} 分钟`;
+  }
+  return `还剩 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
 
 export const ExploreView: React.FC = () => {
   const {
@@ -54,8 +82,10 @@ export const ExploreView: React.FC = () => {
     refreshContinueWatching,
   } = useCatalogStore();
 
-  const { currentView, navigateTo, triggerCardTransition } = useAppStore();
-  const { openEpisode } = usePlaybackStore();
+  const { currentView, navigateTo, openShelf } = useAppStore();
+  // 只订阅低频动作专线。整表订阅会让本页上百张卡片跟着播放进度（约 4 次/秒）重渲染。
+  const { openEpisode } = usePlaybackActions();
+  const { open: openAnimeEpisode } = useAnimePlayer();
   const { settings } = useSettingsStore();
   const showAdultSources = settings.showAdultSources;
 
@@ -76,9 +106,20 @@ export const ExploreView: React.FC = () => {
     if (currentView === 'explore') void refreshContinueWatching();
   }, [currentView, refreshContinueWatching]);
 
-  // 允许用户点击叉号隐藏继续观看条，卡片自动顶上去
-  const [isContinueDismissed, setIsContinueDismissed] = useState(false);
+  /**
+   * 列表滚动容器。
+   *
+   * 这里曾经还有一个 `isContinueDismissed`：让用户叉掉「继续观看」横幅。并轨之后
+   * 那个叉号被移除了 —— 它原本是"可选横幅"时代的交互，而现在这一行是页首固定的
+   * "为你"区，叉掉一张只会让另一张变宽，语义上不成立。状态随之删除，别再加回来。
+   */
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // 切换筛选后必须回到页首：筛选栏是当前结果的上下文，若保留旧滚动位置，
+  // 用户会看到新结果却找不到刚才点过的题材，像页面没有真正更新。
+  useEffect(() => {
+    scrollContainerRef.current?.scrollTo({ top: 0, behavior: 'instant' });
+  }, [channel, category, sort]);
 
   /**
    * 封面不可得的卡片 id：从当前列表移除、不再展示。
@@ -115,6 +156,22 @@ export const ExploreView: React.FC = () => {
   const handleCardClick = useCallback((seriesId: string) => {
     navigateTo('detail', seriesId);
   }, [navigateTo]);
+  const handleCardPrefetch = useCallback((seriesId: string) => {
+    void ipcService.series.getDetail(seriesId).catch(() => {});
+  }, []);
+  /**
+   * 进入某个分区的「更多」页。
+   *
+   * 频道是这一步的全部难点：`ShelfMoreView` 内部挂的是**另一份** `CatalogProvider`，
+   * 它读不到发现页的频道状态，所以必须在这一刻把当前频道一起交出去。
+   * 少传这一下，用户从「漫剧次元」点进去会看到短剧列表。
+   *
+   * 不再有刷新动作：两颗刷新按钮已按要求移除（它们刷新的是首屏那 6 张预览卡，
+   * 而用户真正要的是"这一栏还有什么"，入口交给「更多」）。
+   */
+  const handleShelfMore = useCallback((kind: ShelfKind) => {
+    openShelf(kind, channel);
+  }, [openShelf, channel]);
 
   /**
    * 实际展示的卡片：无封面地址的条目直接过滤（guo 源的封面不来自该字段，
@@ -125,19 +182,104 @@ export const ExploreView: React.FC = () => {
     if (!item.id.startsWith('guo:') && !(item.cover || '').trim()) return false;
     return true;
   });
-  const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
-  const searchReadyRef = useRef(false);
-  const refreshCatalogRef = useRef(refreshCatalog);
-  refreshCatalogRef.current = refreshCatalog;
+  /**
+   * 货架的数据源分两路。
+   *
+   * 短剧 / 漫剧走**红果 App 的榜单与最新上架**（与「更多」页同源、同一份首屏
+   * 缓存）；18+ 没有对应的红果口径（那是本机侧"只启用成人源"的聚合概念），
+   * 继续从本机启用源聚合出来的目录里切。
+   *
+   * 切出来那一套只服务神秘小窝；短剧/漫剧两栏不再碰 `visibleItems` —— 这也是
+   * 用户报告"货架与它「更多」页内容对不上"的根源。
+   */
+  const feedShelves = shelfFeedSupports(channel);
+  const showHomeSections = visibleItems.length >= 3;
+  const hotItems = showHomeSections ? visibleItems.slice(0, 6) : [];
+  const newItems = visibleItems.length >= 10 ? visibleItems.slice(6, 12) : [];
+  const catalogStart = newItems.length > 0 ? 12 : showHomeSections ? 6 : 0;
+  /**
+   * 目录网格要不要让出前 12 条。
+   *
+   * 旧逻辑把这些条目藏起来，只因为"它们已经出现在货架上"；货架换成独立数据源后
+   * 两者再无关系，继续让位等于**凭白吞掉 12 部剧**。
+   */
+  const catalogItems = feedShelves ? visibleItems : visibleItems.slice(catalogStart);
 
-  // 响应全局搜索关键词
+  /**
+   * 「继续观看」与「猜你喜欢」并轨成同一栏的排布判定。
+   *
+   * `hasRandomCandidates` 用的是 `RandomWatchSection` 导出的**同一个筛选口径**，
+   * 不是宿主自己再写一遍 `item.id && item.title`：口径一旦分叉，宿主会按"有内容"
+   * 排成两列，而组件实际返回 `null`，结果「继续观看」孤零零占着半屏。
+   *
+   * 只剩一块时那一块独占整行——不为了对齐而留半屏空白。
+   */
+  const showContinueSlot = Boolean(continueWatching);
+  const showRandomSlot = hasRandomCandidates(visibleItems);
+  const mergedTwoColumns = showContinueSlot && showRandomSlot;
+
+  /**
+   * 进度条入场：从 0 长到真实进度，而不是一上来就杵在那儿。
+   *
+   * 两条约束必须守住：
+   *   1. **用 transition，不用 keyframes。** 视图是常驻 DOM + `display:none` 的，
+   *      在隐藏祖先里创建的 CSS animation 会永久卡在 0% 帧（见 `tailwind.config.js`
+   *      里 `fluent-card-in` 那条长注释）。
+   *   2. **先落回 0，隔一帧再抬起。** 同一批 state 更新会被 React 合并成一次渲染，
+   *      合并后宽度根本没有"从 A 变到 B"的过程，过渡不会触发。
+   *
+   * 依赖里带 `currentView`：切回发现页时重放一次 —— 那才是用户真正看见它的时刻，
+   * 而组件挂载时视图还是 `display:none`，那时跑动画等于白跑。
+   */
+  const [progressSettled, setProgressSettled] = useState(false);
   useEffect(() => {
-    if (!searchReadyRef.current) {
-      searchReadyRef.current = true;
+    if (currentView !== 'explore' || !continueWatching) {
+      setProgressSettled(false);
       return;
     }
-    void refreshCatalogRef.current('');
-  }, []);
+    const timer = window.setTimeout(() => setProgressSettled(true), 60);
+    return () => window.clearTimeout(timer);
+  }, [currentView, continueWatching?.updatedAt]);
+
+  /**
+   * 「继续观看」那一行的文案。
+   *
+   * `WatchHistoryItem` 里有四个字段一直是死的，这里把它们捡回来：
+   *   - `totalEpisodes` → "共 86 集"。用户续播时最想知道的就是"还剩多少要看"，
+   *     而原来只给了"看到第 12 集"，缺的正是分母；
+   *   - `durationSeconds - positionSeconds` → "还剩 8 分 20 秒"。这是续播场景里
+   *     唯一真正有用的数字，比"已看 42%"有用得多；
+   *   - 原来那行 `已看 42%` 和下面的进度条**说的是同一件事**，纯冗余，删掉；
+   *   - `isFinished` → 看完的剧不该再喊"断点续播"，那是"重新播放"。
+   */
+  const resume = (() => {
+    if (!continueWatching) return null;
+    const totalEpisodes = continueWatching.totalEpisodes || 0;
+    const remaining = Math.max(
+      0,
+      (continueWatching.durationSeconds || 0) - (continueWatching.positionSeconds || 0),
+    );
+    return {
+      episodeLabel: totalEpisodes > 0
+        ? `第 ${continueWatching.episodeNumber} 集 · 共 ${totalEpisodes} 集`
+        : `第 ${continueWatching.episodeNumber} 集`,
+      remainingLabel: continueWatching.isFinished ? '已看完' : formatRemaining(remaining),
+      actionLabel: continueWatching.isFinished ? '重新播放' : '断点续播',
+    };
+  })();
+
+  const handleRandomWatch = useCallback((series: SeriesItem, detail: SeriesDetail) => {
+    const episode = detail.episodes.find(item => (item.watchedSeconds || 0) > 0 && !item.isFinished)
+      || detail.episodes[0];
+    if (!episode) return;
+    if (detail.type === 'anime') {
+      void openAnimeEpisode(detail.id, episode.id, episode.watchedSeconds || 0);
+      return;
+    }
+    navigateTo('player', series.id);
+    openEpisode(series.id, episode.id, episode.watchedSeconds || 0);
+  }, [navigateTo, openAnimeEpisode, openEpisode]);
+  const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
 
   /**
    * 补一次提交后的自检：卡片追加后如果哨兵**仍在**可视区，就直接再提交一页。
@@ -197,7 +339,14 @@ if (!sentinel || !root || !hasMore) return;
 
 
   return (
-    <div ref={scrollContainerRef} className="flex-1 h-full overflow-y-auto p-5 flex flex-col gap-5 select-none">
+    <div ref={scrollContainerRef} className="relative flex-1 h-full overflow-y-auto p-5 flex flex-col gap-5 select-none" aria-busy={isLoading}>
+      {isLoading && (
+        <div className="pointer-events-none sticky top-0 z-30 -mb-5 h-0">
+          <div className="relative h-0.5 w-full overflow-hidden rounded-full bg-blue-100/60">
+            <div className="absolute inset-y-0 left-0 w-1/3 animate-[loading-progress_1.2s_ease-in-out_infinite] rounded-full bg-blue-500" />
+          </div>
+        </div>
+      )}
       {/* 顶部：频道 Tab 与 核心筛选 */}
       <div className="flex flex-col gap-3.5">
         {/* 频道切换大药丸与排序 */}
@@ -288,111 +437,177 @@ if (!sentinel || !root || !hasMore) return;
           </div>
         </div>
 
-        {/* 题材分类标签栏（站点官方题材；点击走服务端题材路由，结果完整可分页） */}
-        <div className="flex flex-col gap-2 p-2.5 bg-slate-100/80 rounded-2xl border border-slate-200/70 shadow-inner">
-          {/* 题材分类 */}
-          <div className="flex items-center gap-1.5 flex-wrap text-xs">
-            <span className="text-slate-400 font-semibold mr-1 text-[11px]">题材:</span>
-            <div className="p-0.5 bg-white/60 rounded-xl border border-slate-200/60 shadow-inner flex items-center gap-1 flex-wrap">
-              {categories.map((cat) => (
-                <button
-                  key={cat}
-                  type="button"
-                  onClick={() => setCategory(cat)}
-                  className={`px-2.5 py-1 rounded-lg transition-all text-xs cursor-pointer ${
-                    category === cat
-                      ? 'fluent-convex-tab text-blue-600 font-bold'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
-                  }`}
-                >
-                  {cat}
-                </button>
-              ))}
-            </div>
-          </div>
-
-        </div>
+        {/* 题材筛选（站点官方题材；点击走服务端题材路由，结果完整可分页）
+            容器/排序/溢出规则全部收口在 CategoryBar 里，见那里的注释。 */}
+        <CategoryBar categories={categories} value={category} onChange={setCategory} />
       </div>
 
-      {/* “继续观看”智能断点推荐横幅 (凸起悬浮质感磨砂浮岛，支持点击叉号关闭隐藏) */}
-      {!isContinueDismissed && continueWatching && (
-        <div 
-          onClick={() => {
-            navigateTo('player', continueWatching.seriesId);
-            openEpisode(continueWatching.seriesId, continueWatching.episodeId, continueWatching.positionSeconds);
-          }}
-          className="relative min-h-[78px] overflow-hidden rounded-2xl border border-white/90 bg-gradient-to-r from-blue-50/70 via-white/85 to-indigo-50/60 p-3 shadow-fluent-lg fluent-raised-island flex items-center justify-between gap-4 transition-all duration-300 hover:-translate-y-0.5 animate-fluent-card-in cursor-pointer group"
-        >
-          <div className="flex items-center gap-3.5 min-w-0">
-            {/* 核心海报：3:4 黄金竖屏比例 (48px x 64px 固定尺寸，坚决防止压缩变形) */}
-            <div className="relative w-12 h-16 rounded-xl overflow-hidden shadow-xs flex-shrink-0 border border-white/90 bg-slate-100">
-              <CoverImage
-                src={continueWatching.seriesCover}
-                title={continueWatching.title}
-                placeholderTextClassName="text-base"
-                className="group-hover:scale-105 transition-transform duration-300"
-                loading="eager"
-              />
-              <div className="absolute inset-0 bg-black/10 group-hover:bg-black/0 transition-colors" />
-            </div>
+      {/*
+        「继续观看」+「猜你喜欢」并轨成同一栏。
 
-            <div className="flex flex-col justify-center gap-1 min-w-0">
-              <div className="flex items-center gap-2 flex-wrap min-w-0">
-                <StatusBadge label="继续观看" variant="blue" size="sm" dot />
-                <span className="text-xs sm:text-sm font-bold text-slate-800 truncate max-w-xs sm:max-w-md md:max-w-lg" title={continueWatching.title}>
-                  {continueWatching.title}
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-500 font-medium">
-                看到第 {continueWatching.episodeNumber} 集 · 已看 {continueWatching.progressPercent || 0}%
-              </p>
-              {/* 进度条 */}
-              <div className="w-36 sm:w-52 h-1.5 bg-slate-200/80 rounded-full overflow-hidden mt-0.5">
-                <div
-                  className="h-full bg-blue-600 rounded-full transition-all duration-300"
-                  style={{ width: `${Math.max(continueWatching.progressPercent || 0, continueWatching.positionSeconds > 0 ? 3 : 0)}%` }}
-                />
-              </div>
-            </div>
-          </div>
+        这两块原本各占一整行：上面那条横幅右侧本来就是一大片空白，下面那个随机推荐
+        又被压在 100px 的小条带里、封面只有 48×64、字号 10–11px。并轨后共用同一行
+        高度——页面纵向预算不但没增加，还少了一个独立区段。
 
-          <div className="flex items-center gap-2 flex-shrink-0">
-            <FluentButton
-              variant="primary"
-              size="sm"
-              icon={<Play className="w-3.5 h-3.5 fill-current" />}
-              onClick={(e) => {
-                e.stopPropagation();
+        两张卡共用 `PICK_CARD_SHELL`（从 `RandomWatchSection` 导出，见那里的注释），
+        差异只允许留在配色：**蓝 = 进度语义，紫 = 随机语义**。左侧那条 3px 色标是
+        并排时唯一需要被看见的区别，其余骨架逐字一致。
+
+        这一轮去掉了两样东西：
+          - **继续观看的叉号**。它是"可选横幅"时代的遗留 —— 现在这一行是页首固定的
+            "为你"区，收起一张卡只会让另一张变宽，语义上不成立。
+          - 外层的 `justify-between`。动作区靠 `flex-1` 的信息列自然顶到右边，不需要
+            外层再分一次位置。
+
+        窄窗口（<1180px）自动退回上下堆叠，信息层级与合并前一致。
+      */}
+      {(showContinueSlot || showRandomSlot) && (
+        <div className={`grid shrink-0 grid-cols-1 gap-4 ${mergedTwoColumns ? 'min-[1180px]:grid-cols-2' : ''}`}>
+          {showContinueSlot && continueWatching && resume && (
+            <div
+              onClick={() => {
                 navigateTo('player', continueWatching.seriesId);
                 openEpisode(continueWatching.seriesId, continueWatching.episodeId, continueWatching.positionSeconds);
               }}
+              className={`${PICK_CARD_SHELL} cursor-pointer bg-gradient-to-r from-blue-50/80 via-white/92 to-white/88`}
             >
-              断点续播
-            </FluentButton>
+              {/* 左侧色标：与「猜你喜欢」的紫条对称，是并排时唯一允许存在的语义色差 */}
+              <span aria-hidden="true" className="absolute inset-y-3 left-0 w-[3px] rounded-r-full bg-blue-500" />
 
-            {/* 点击叉号关闭隐藏横幅，随后下方卡片区域自动顶上去 */}
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setIsContinueDismissed(true);
-              }}
-              className="w-8 h-8 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 flex items-center justify-center transition-colors cursor-pointer active:scale-90"
-              title="隐藏此条推荐"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
+              {/* 封面：严格 3:4（128×96），与「猜你喜欢」逐像素等高 */}
+              <div className="relative h-32 w-24 shrink-0 overflow-hidden rounded-xl border border-white/90 bg-slate-100 shadow-xs">
+                <CoverImage
+                  src={continueWatching.seriesCover}
+                  title={continueWatching.title}
+                  placeholderTextClassName="text-2xl"
+                  className="transition-transform duration-300 group-hover:scale-105"
+                  loading="eager"
+                />
+                <div className="absolute inset-0 bg-black/10 transition-colors group-hover:bg-black/0" />
+              </div>
+
+              <div className="flex min-w-0 flex-1 flex-col justify-center gap-1.5">
+                {/* `self-start`：徽章是 inline-flex，不给它定位就会被列方向拉伸成整条 */}
+                <StatusBadge
+                  label={continueWatching.isFinished ? '已看完' : '继续观看'}
+                  variant="blue"
+                  size="sm"
+                  dot
+                  className="self-start"
+                />
+                <span
+                  className="truncate text-base font-extrabold tracking-tight text-slate-900"
+                  title={continueWatching.title}
+                >
+                  {continueWatching.title}
+                </span>
+                <p className="truncate text-[11.5px] font-medium text-slate-500">
+                  {resume.episodeLabel}
+                </p>
+                {/* 进度条宽度跟着并轨栏一起收放；右侧补上真正有用的那个数字。
+                    宽度由 `progressSettled` 驱动做一次 0 → 真实值的入场，
+                    所以这里给 700ms 而不是常用的 300ms。 */}
+                <div className="mt-0.5 flex items-center gap-2.5">
+                  <div className="h-1.5 min-w-0 max-w-[280px] flex-1 overflow-hidden rounded-full bg-slate-200/80 sm:max-w-[360px]">
+                    <div
+                      className="h-full rounded-full bg-blue-600 transition-all duration-700 ease-out"
+                      style={{
+                        width: progressSettled
+                          ? `${Math.max(continueWatching.progressPercent || 0, continueWatching.positionSeconds > 0 ? 3 : 0)}%`
+                          : '0%',
+                      }}
+                    />
+                  </div>
+                  {resume.remainingLabel ? (
+                    <span className="shrink-0 text-[10.5px] font-semibold text-slate-400">
+                      {resume.remainingLabel}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="flex shrink-0 items-center">
+                <FluentButton
+                  variant="primary"
+                  size="sm"
+                  icon={<Play className="w-3.5 h-3.5 fill-current" />}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    navigateTo('player', continueWatching.seriesId);
+                    openEpisode(continueWatching.seriesId, continueWatching.episodeId, continueWatching.positionSeconds);
+                  }}
+                >
+                  {resume.actionLabel}
+                </FluentButton>
+              </div>
+            </div>
+          )}
+
+          {showRandomSlot && (
+            <RandomWatchSection items={visibleItems} onWatch={handleRandomWatch} />
+          )}
         </div>
+      )}
+
+      {/* 参考主流桌面播放器的内容货架：首屏先看热播，再接新剧，底部才进入完整目录。 */}
+      {feedShelves ? (
+        <>
+          {/* 两栏直接吃红果 App 的榜单 / 最新上架（与各自「更多」页同源）。
+              `key` 必须带 channel：换频道要整体重挂，否则会有一帧显示上一频道的
+              内容（`useShelfFeed` 的状态只随挂载初始化）。 */}
+          <HomeShelfSection
+            key={`hot-${channel}`}
+            kind="hot"
+            channel={channel}
+            title="正在热播"
+            subtitle={`红果热播榜 · ${CHANNEL_COPY[channel].noun}`}
+            onMore={() => handleShelfMore('hot')}
+            onClick={handleCardClick}
+          />
+
+          <HomeShelfSection
+            key={`new-${channel}`}
+            kind="new"
+            channel={channel}
+            title="新剧"
+            subtitle={`红果最新上架 · ${CHANNEL_COPY[channel].noun}`}
+            accent="blue"
+            onMore={() => handleShelfMore('new')}
+            onClick={handleCardClick}
+          />
+        </>
+      ) : (
+        <>
+          {/* 神秘小窝：红果 App 接口没有 18+ 口径，仍从本机启用源聚合出来的目录切。 */}
+          <HomeShelf
+            title="正在热播"
+            subtitle={`当前专区热度靠前的${CHANNEL_COPY[channel].noun}`}
+            items={hotItems}
+            onClick={handleCardClick}
+            onUnavailable={markSeriesUnavailable}
+            onMore={() => handleShelfMore('hot')}
+          />
+
+          <HomeShelf
+            title="新剧"
+            subtitle="最近加入的内容"
+            items={newItems}
+            onClick={handleCardClick}
+            onUnavailable={markSeriesUnavailable}
+            onMore={() => handleShelfMore('new')}
+            accent="blue"
+          />
+        </>
       )}
 
       {/* 剧集目录网格 (更舒展大气的卡片尺寸：4~6列排布) */}
       <div className="flex flex-col gap-3">
-        <div className="flex items-center justify-between">
+        <div className={`flex items-center justify-between ${showHomeSections && catalogItems.length === 0 ? 'hidden' : ''}`}>
           <h2 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
-            <span>{CHANNEL_COPY[channel].title}</span>
-            <span className="text-xs font-normal text-slate-400">({visibleItems.length} 部)</span>
+            <span>发现更多{CHANNEL_COPY[channel].noun}</span>
+            <span className="text-xs font-normal text-slate-400">({catalogItems.length} 部)</span>
           </h2>
+          <span className="text-[11px] text-slate-400">向下滚动自动加载</span>
         </div>
 
         {/* 骨架屏加载态 (保持相同舒适比例) */}
@@ -409,6 +624,10 @@ if (!sentinel || !root || !hasMore) return;
         ) : error && items.length === 0 ? (
           <div className="py-20 flex flex-col items-center justify-center text-center gap-3">
             <p className="text-sm font-medium text-slate-600">目录加载失败</p>
+            {/* 真实原因必须露出来。原来只有上面那一行通用文案，用户截图里只剩
+                "目录加载失败"四个字 —— 到底是源全挂了、超时、还是命令不存在，
+                一个都分不出来，只能靠猜。 */}
+            <p className="text-xs text-slate-400 max-w-lg leading-relaxed break-words">{error}</p>
             <FluentButton size="sm" onClick={() => refreshCatalog('')}>重试</FluentButton>
           </div>
         ) : items.length === 0 ? (
@@ -443,13 +662,14 @@ if (!sentinel || !root || !hasMore) return;
           <div className={`${SERIES_GRID_CLASS} transition-opacity duration-150 ${
             isLoading ? 'opacity-40 saturate-50 pointer-events-none' : ''
           }`}>
-            {visibleItems.map((series, index) => (
+            {catalogItems.map((series, index) => (
               <SeriesCard
                 key={series.id}
                 series={series}
                 index={index}
                 onClick={handleCardClick}
                 onUnavailable={markSeriesUnavailable}
+                onPrefetch={handleCardPrefetch}
               />
             ))}
           </div>
@@ -479,6 +699,9 @@ if (!sentinel || !root || !hasMore) return;
           )}
         </div>
       </div>
+
+      {/* 回到顶部：滚过阈值才出现。作为滚动容器的最后一个粘性子元素，不占独立行高。 */}
+      <BackToTop targetRef={scrollContainerRef} />
     </div>
   );
 };

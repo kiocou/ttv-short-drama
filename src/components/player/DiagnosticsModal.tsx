@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { usePlaybackActions, usePlaybackStore } from '../../stores/usePlaybackStore';
 import { X, Activity, Cpu, HardDrive, Wifi, ShieldCheck } from 'lucide-react';
 
 /** WebView 真正能测到的播放指标。 */
@@ -22,16 +22,10 @@ type FrameVideo = HTMLVideoElement & {
 };
 
 export const DiagnosticsModal: React.FC = () => {
-  const {
-    sessionId,
-    currentSeries,
-    currentEpisode,
-    position,
-    duration,
-    buffered,
-    isDiagnosticsOpen,
-    toggleDiagnostics,
-  } = usePlaybackStore();
+  // 指标面板需要实时读数（position/buffered），所以**必须**继续用整表。
+  const { sessionId, position, duration, buffered } = usePlaybackStore();
+  // 低频动作与身份走专线，避免把整表的订阅面再扩大一份。
+  const { currentSeries, currentEpisode, isDiagnosticsOpen, toggleDiagnostics } = usePlaybackActions();
 
 
   // 指标直接从 <video> 采样：后端没有增强引擎上报的 actual_fps / 丢帧，

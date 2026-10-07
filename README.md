@@ -2,7 +2,7 @@
 
 **Windows 专属**的短剧 / 漫剧 / 动漫桌面播放器。无边框窗口 + Windows 11 Mica 纯白玻璃质感，播放内核是 WebView2 里的 `<video>`。
 
-当前版本：`0.2.13`（Windows x64）。安装包发布在 [GitHub Releases](https://github.com/kiocou/ttv-short-drama/releases)，应用内的「设置 → 版本与更新」可以直接拉取最新包。
+当前版本：`0.2.16`（Windows x64）。安装包发布在 [GitHub Releases](https://github.com/kiocou/ttv-short-drama/releases)，应用内的「设置 → 版本与更新」可以直接拉取最新包。
 
 > ⚠️ **仅供个人学习与技术研究**。本项目不托管任何内容，所有剧集数据与视频流均来自公开的第三方站点 / 接口，版权归各自权利人所有。请勿用于商业用途或二次分发。详见文末[免责声明](#免责声明)。
 

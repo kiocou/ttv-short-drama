@@ -4,6 +4,7 @@ import { ipcService } from '../../services/ipc';
 import { CatalogFilter, SeriesItem } from '../../types/catalog';
 import { ArrowLeft, Loader2 } from 'lucide-react';
 import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
+import { BackToTop } from '../common/BackToTop';
 import { FluentButton } from '../common/FluentButton';
 
 type Channel = 'drama' | 'comic';
@@ -201,8 +202,11 @@ export const SearchView: React.FC = () => {
 
   const hasKeyword = searchKeyword.trim().length > 0;
 
+  /** 回到顶部要自己拿得到滚动容器。与发现页 / 动漫专区同一套交互。 */
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
   return (
-    <div className="w-full h-full overflow-y-auto select-none p-6 sm:p-8">
+    <div ref={scrollRef} className="w-full h-full overflow-y-auto select-none p-6 sm:p-8">
       <div className="max-w-5xl mx-auto flex flex-col gap-5 pb-24">
         {/* 结果页头部：返回 + 当前关键词 + 计数（搜索输入与历史都在顶部搜索框） */}
         <div className="flex items-center gap-3">
@@ -304,6 +308,8 @@ onClick={handleCardClick}
           </>
         )}
       </div>
+
+      <BackToTop targetRef={scrollRef} />
     </div>
   );
 };

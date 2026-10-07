@@ -31,6 +31,7 @@ export const NavigationRail: React.FC = () => {
   return (
     <aside
       style={{ transform: 'translateZ(0)' }}
+      data-launch-part="rail"
       className={`relative h-full flex flex-col justify-between py-3 px-2.5 select-none bg-[#fbfcfd] border-r border-slate-200/75 z-40 overflow-hidden transition-[width] duration-150 ease-out ${
         isNavCollapsed ? 'w-16' : 'w-56'
       }`}

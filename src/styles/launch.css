@@ -1,0 +1,172 @@
+/* ==========================================================================
+   TTV Short Drama · 启动进入动画（方案 05「轨道汇聚」）
+   --------------------------------------------------------------------------
+   6 张迷你海报绕品牌公转 1.1 圈（角速度由快到慢），然后依次被吸进中心；
+   品牌承接六次撞击、回弹一次，再淡出让位给主界面。总长 2150ms。
+
+   几何与时间参数全在 LaunchAnimation.tsx 里，这里只放静态样式。
+   轨道椭圆 600×392（RX 300 / RY 196），卡片 80×112 —— 卡轨比 0.27。
+   整组按窗口大小用 --launch-k 缩放（1080×720 的最小窗口下取 0.85）。
+
+   三条必须保持的约定：
+
+   1. 动画一律走 element.animate + fill:'both'，跑完 cancel()。
+      **不要**换成 CSS animation + fill:forwards —— 项目已经因为 forwards
+      把 transform/filter 永久钉在元素上（NVIDIA VSR 失效）踩过一次。
+      fill:'both' 是为了让延迟期间也停在 0% 帧（否则元素会先闪一下原样），
+      cancel() 才是真正的收尾。
+
+   2. 底衬必须原样抄 .mica-backdrop 的四个渐变。少抄/改序都会让"撤层"那一帧
+      背景跳色 —— 动画层和真实界面的底必须是同一块底。
+
+   3. z-index 一律显式给。只靠 DOM 顺序的话前后面会乱（卡片会永远从品牌上面
+      压过去，前后关系就是假的）。
+
+   命名沿用 crystal.css 的约定：结构件用 ttv- 前缀，不与其它视图冲突。
+   ========================================================================== */
+
+.ttv-launch {
+  position: absolute;
+  inset: 0;
+  z-index: 70;                 /* 盖住 TitleBar(z-50) 与 UpdatePrompt(z-60) */
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  cursor: pointer;
+  /* 抄自 src/styles/mica.css 的 .mica-backdrop，逐字一致 */
+  background:
+    radial-gradient(1200px 800px at 15% 10%, rgba(224, 239, 255, 0.75) 0%, transparent 60%),
+    radial-gradient(1000px 700px at 85% 85%, rgba(240, 246, 255, 0.85) 0%, transparent 60%),
+    radial-gradient(800px 600px at 50% 50%, rgba(255, 255, 255, 0.9) 0%, transparent 80%),
+    #f2f4f7;
+}
+
+/* 跳过的淡出不用 class 管：动画层自身的 opacity 由 WAAPI 的 fill 占着，
+   类里的 opacity 会被动画的 "animation origin" 压过去。
+   实现在 LaunchAnimation.tsx 的 skip() —— 先把壳层 cancel 回终态，
+   再从那**一刻的真实不透明度**补一段新动画到 0，所以无论第几毫秒跳过都不闪回。 */
+
+.ttv-launch-hint {
+  position: absolute;
+  right: 22px;
+  bottom: 16px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #94a3b8;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ── 轨道组：132×132 的居中盒，子元素全部绝对定位，靠 grid 对齐居中 ── */
+.ttv-launch-orbit {
+  position: relative;
+  width: 132px;
+  height: 132px;
+  display: grid;
+  place-items: center;
+  transform: scale(var(--launch-k, 1));
+}
+
+.ttv-launch-glow {
+  position: absolute;
+  width: 480px;
+  height: 480px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(139, 108, 246, 0.30), rgba(56, 189, 248, 0.16) 46%, transparent 70%);
+  opacity: 0;
+  z-index: 0;
+}
+
+/* 椭圆导轨：给"公转"一个可读的轨道，收束时缩进品牌 */
+.ttv-launch-guide {
+  position: absolute;
+  width: 600px;
+  height: 392px;
+  border-radius: 50%;
+  border: 1px solid rgba(109, 71, 230, 0.22);
+  opacity: 0;
+  z-index: 0;
+}
+
+.ttv-launch-logo-wrap {
+  position: absolute;
+  width: 132px;
+  height: 132px;
+  display: grid;
+  place-items: center;
+  z-index: 2;                  /* 后方卡片(1) 与前方卡片(3) 之间 */
+  transform-origin: center center;
+}
+
+.ttv-launch-logo {
+  width: 118px;
+  height: 118px;
+  display: block;
+  /* 这条影子会被 JS 里的 filter 补间一起带上（LOGO_SH 常量）。
+     只写 blur() 的话 fill 会把影子永久顶掉，品牌从此没有投影。 */
+  filter: drop-shadow(0 10px 26px rgba(109, 71, 230, 0.34));
+}
+
+/* ── 迷你海报卡 ── */
+.ttv-launch-frame {
+  position: absolute;
+  width: 80px;
+  height: 112px;
+  border-radius: 11px;
+  overflow: hidden;
+  opacity: 0;
+  z-index: 1;
+  transform-origin: center center;
+  will-change: transform, opacity, filter;
+  box-shadow:
+    0 12px 30px -8px rgba(15, 23, 42, 0.36),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.58);
+}
+
+/* 底部压暗，让标题线读得出来（和真实海报卡的下缘压暗同一个做法） */
+.ttv-launch-frame::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 58%;
+  background: linear-gradient(0deg, rgba(15, 23, 42, 0.66), rgba(15, 23, 42, 0.12) 62%, transparent);
+}
+
+.ttv-launch-frame-title {
+  position: absolute;
+  left: 10px;
+  bottom: 26px;
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.ttv-launch-frame-meta {
+  position: absolute;
+  left: 10px;
+  bottom: 15px;
+  width: 24px;
+  height: 3.5px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.52);
+}
+
+/* 最后一次撞击的冲击波 */
+.ttv-launch-ring {
+  position: absolute;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  border: 1px solid rgba(109, 71, 230, 0.52);
+  opacity: 0;
+  z-index: 4;
+}
+
+/* 系统开了"减少动态效果"时组件会整个不渲染，这里只是兜底 */
+@media (prefers-reduced-motion: reduce) {
+  .ttv-launch { display: none; }
+}

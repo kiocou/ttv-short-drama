@@ -4,11 +4,14 @@ mod anime_provider;
 mod dmghg_bridge;
 mod guo_provider;
 mod hls_proxy;
+mod media_enhance;
 mod models;
 mod pip;
 mod provider;
 mod short_drama_app;
 mod storage;
+// 播放链路的诊断日志（内存环形缓冲 + 落盘 ttv-playback.log + 接管原生 stderr）。
+mod trace;
 mod update;
 
 use crate::models::{
@@ -19,23 +22,28 @@ use crate::pip::{pip_close, pip_dismiss, pip_handoff, pip_is_open, pip_open, pip
 use crate::provider::DramaProvider;
 use crate::short_drama_app::{
     short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
-    short_drama_app_episode_counts, short_drama_app_prefetch_stream, short_drama_app_qualities,
-    short_drama_app_resolve, short_drama_app_set_device, short_drama_app_status,
+    short_drama_app_cover_proxy, short_drama_app_episode_counts, short_drama_app_prefetch_stream,
+    short_drama_app_qualities, short_drama_app_resolve, short_drama_app_resolve_prefix,
+    short_drama_app_set_device, short_drama_app_shelf_feed, short_drama_app_status,
     short_drama_app_stream,
 };
 use crate::storage::Database;
+use crate::trace::{trace_clear, trace_tail, trace_ui_log};
 use crate::update::{app_version, update_check, update_download, update_install, update_reveal};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 
 struct AppState {
     provider: DramaProvider,
     anime_provider: crate::anime_provider::AnimeProvider,
-    guo_provider: crate::guo_provider::GuoProvider,
+    /// Arc 是给 [`GuoProvider::catalog`] 的 SWR 后台刷新递 `Arc<Self>` 用的；
+    /// 其余方法照常经 Deref 调用，调用点无感。
+    guo_provider: Arc<crate::guo_provider::GuoProvider>,
     database: Database,
     sessions: Mutex<HashMap<u64, PlaybackSession>>,
     cache_dir: PathBuf,
@@ -342,17 +350,41 @@ async fn merge_search_sources(
     Ok(page)
 }
 
+/// `force` 是**用户手动刷新**的唯一入口：只有它为 true 时才允许穿透站源缓存。
+///
+/// 背景（2026-10 用户报告「正在热播 / 新剧的刷新按钮点了没反应」）：19 个 guo
+/// 站源的目录走的是「缓存优先 + SWR」——TTL（15min）内直接回盘上缓存，过期则
+/// 立即回旧值、后台再刷新。于是这个刷新按钮对 guo 源是一个纯转圈的假动作：
+/// 发出的请求照样命中缓存，返回的与屏幕上已有的完全一致。红果与动漫两条链路
+/// 本来就是每次走网络，force 对它们无意义，这里不做分支。
 #[tauri::command]
 async fn catalog_list(
     app: tauri::AppHandle,
     mut filter: CatalogFilter,
+    force: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<CatalogPage, String> {
     // 18+ 门闩：受控源被关掉时把 source 置空 → 静默回落红果（理由见 gated_source）。
     filter.source = gated_source(filter.source.as_deref(), adult_sources_allowed(&state));
     if let Some(source) = filter.source.as_deref() {
         if source != "hongguo" {
-            return state.guo_provider.catalog(&filter);
+            // guo 调用是阻塞 FFI 且 guo-core 内部超时长达 60s（死源要跑满内部
+            // 重试），async 命令里直接调会占死一个 tokio worker。挪进
+            // spawn_blocking：worker 只在等 JoinHandle，阻塞池承压且可扩张。
+            let provider = state.guo_provider.clone();
+            let force = force.unwrap_or(false);
+            return tauri::async_runtime::spawn_blocking(move || {
+                if force {
+                    // 无视磁盘缓存直接拉一次（`force: true`），顺手把结果写回缓存
+                    // 供后续的缓存读预热。冷却中的源会 0ms 快速失败——手动刷新
+                    // 也不该把死源从冷却里放出来狂打。
+                    provider.catalog_refresh(&filter)
+                } else {
+                    provider.catalog(&filter)
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())?;
         }
     }
     // 动漫专区走独立数据源（暴风资源），不与短剧目录共享链路。
@@ -381,7 +413,11 @@ async fn catalog_fast_search(
     filter.source = gated_source(filter.source.as_deref(), adult_sources_allowed(&state));
     if let Some(source) = filter.source.as_deref() {
         if source != "hongguo" {
-            return state.guo_provider.catalog(&filter);
+            // 同 catalog_list：spawn_blocking 承接可能长至 60s 的阻塞 FFI。
+            let provider = state.guo_provider.clone();
+            return tauri::async_runtime::spawn_blocking(move || provider.catalog(&filter))
+                .await
+                .map_err(|error| error.to_string())?;
         }
     }
     if filter.channel == "anime" {
@@ -447,7 +483,12 @@ async fn catalog_categories(
     let source = gated_source(source.as_deref(), adult_sources_allowed(&state));
     if let Some(source) = source.as_deref() {
         if source != "hongguo" {
-            return state.guo_provider.categories(source);
+            // 冷缓存时这里会真走网络（死源 25-60s），同 catalog_list 挪进阻塞池。
+            let provider = state.guo_provider.clone();
+            let source = source.to_owned();
+            return tauri::async_runtime::spawn_blocking(move || provider.categories(&source))
+                .await
+                .map_err(|error| error.to_string())?;
         }
     }
     // 动漫专区是独立数据源，不参与红果目录索引。
@@ -467,7 +508,13 @@ async fn anime_qualities(
         // 画质探测内部会真起一次 resolve（拿完档位就 release），它拿得到的是
         // 这一集的档位元信息，所以按"直达"口径报错而不是回落。
         ensure_series_source_allowed(&series_id, &state)?;
-        return state.guo_provider.qualities(&series_id, &episode_id);
+        // resolve 同样是可能跑满 60s 内部超时的阻塞 FFI，同 catalog_list 处理。
+        let provider = state.guo_provider.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            provider.qualities(&series_id, &episode_id)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
     }
     state
         .anime_provider
@@ -477,9 +524,10 @@ async fn anime_qualities(
 
 /// guo 源的封面解析：返回本地缓存文件路径（前端 convertFileSrc 后呈现）。
 ///
-/// 必须是 async —— cover 下载在 guo-core 侧最长 25 秒（首次还要过源站传输层、
-/// 解密、校验），同步命令跑在主线程上会把窗口整个卡住。async 命令在异步运行时
-/// 线程池里执行，阻塞的是那把 guo bridge 锁，而不是 UI。
+/// cover 下载在 guo-core 侧最长 25 秒（首次还要过源站传输层、解密、校验），
+/// 同步命令跑在主线程上会把窗口整个卡住；async 命令里裸调又会占死 worker
+/// ——封面一页几十张，worker 全被占住时连毫不相干的 IPC 都会排队。挪进
+/// spawn_blocking：阻塞发生在专用阻塞池，worker 数量不受影响。
 #[tauri::command]
 async fn guo_cover(
     series_id: String,
@@ -489,7 +537,10 @@ async fn guo_cover(
     // 门闩漏在这里的表现最隐蔽——目录和详情都挡住了，列表里却还有一排 18+
     // 缩略图（很可能是用户上次开着开关时留下的缓存图），等于没关。
     ensure_series_source_allowed(&series_id, &state)?;
-    state.guo_provider.cover(&series_id)
+    let provider = state.guo_provider.clone();
+    tauri::async_runtime::spawn_blocking(move || provider.cover(&series_id))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// 19 个 guo 源的站源任务/健康度状态（go 侧 `nativeSourceStatus`，原样透传）。
@@ -570,7 +621,11 @@ async fn series_detail(
         // 按 id 直达：剧集已经在手上了，回落红果只会拿一部同 id 的别的剧，
         // 所以这里必须报错。
         ensure_series_source_allowed(&series_id, &state)?;
-        return state.guo_provider.detail(&series_id);
+        // detail 对死源要陪 guo-core 跑满 60s 内部超时，同 catalog_list 挪进阻塞池。
+        let provider = state.guo_provider.clone();
+        return tauri::async_runtime::spawn_blocking(move || provider.detail(&series_id))
+            .await
+            .map_err(|error| error.to_string())?;
     }
     // 动漫项按 id 前缀判定，而不是只看 channel：前端的 channelBySeriesId 是内存
     // Map，页面重载 / HMR 后为空（从收藏、历史进入时也不会填），此时 channel 缺失，
@@ -582,6 +637,64 @@ async fn series_detail(
         return state.anime_provider.detail(&series_id).await;
     }
     state.provider.detail(&series_id, channel.as_deref()).await
+}
+
+/// VSR 播放链路开关（设置页「播放体验 → RTX VSR 视频增强」）。
+///
+/// 为什么用进程级 `AtomicBool` 而不是 `AppState` 字段：
+/// `enhance_short_drama_session` 是自由函数，两处调用点（`playback_open` 的 guo
+/// 分支与红果分支）手里只有 `session`。改成收 `&AppState` 意味着起播热路径上多传
+/// 一个参数，而 `adult_sources_allowed` 那种「每次读库」的写法会把 SQLite 连接锁
+/// 拖进起播路径。AtomicBool 单字读、无锁、不跨 await，开销可忽略，且天然满足
+/// 「settings_save 后立刻生效、无需重启」。
+///
+/// 默认 `true`：进程刚起、`setup` 还没把落库值灌进来之前若已有起播，行为必须与
+/// 旧版本（默认走 VSR）一致，不能因初始化时序让首播悄悄降级。
+pub(crate) fn vsr_enabled() -> &'static AtomicBool {
+    static VSR_ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+    VSR_ENABLED.get_or_init(|| AtomicBool::new(true))
+}
+
+/// 供其它模块读取的布尔视图（跨模块只暴露 bool，不把 AtomicBool 泄漏出去）。
+pub(crate) fn vsr_is_enabled() -> bool {
+    vsr_enabled().load(Ordering::Relaxed)
+}
+
+/// 落库值 → 运行期开关。`setup`（启动）与 `settings_save`（改设置）各调一次。
+fn set_vsr_enabled(enabled: bool) {
+    vsr_enabled().store(enabled, Ordering::Relaxed);
+}
+
+/// 非动漫链路统一转成 H.264 分片流。失败保留原 URL，由前端既有备份链路播放。
+async fn enhance_short_drama_session(mut session: PlaybackSession) -> PlaybackSession {
+    // 开关关闭：完全回到引入 `media_enhance` 之前的旧链路——原始源 URL 直接播，
+    // 不做任何 HTTP(S) 转码。这条判定必须排在 `needs_enhancement` **之前**：
+    // 后者只按 URL 形态决定「能不能转」，与用户开不开增强无关。
+    if !vsr_enabled().load(Ordering::Relaxed) {
+        // 开关自身也要留证：用户报"开关没用"时，第一件事就是确认此刻读到的值。
+        crate::trace::log(format!(
+            "[vsr] 开关=关，会话 {} 跳过增强，直接用原流 {}",
+            session.session_id,
+            crate::trace::redact_url(&session.url)
+        ));
+        return session;
+    }
+    if !media_enhance::needs_enhancement(&session.url) {
+        crate::trace::log(format!(
+            "[vsr] 开关=开但源不是 http(s)（{}），走原链路",
+            crate::trace::redact_url(&session.url)
+        ));
+        return session;
+    }
+    match media_enhance::start(session.session_id, &session.url).await {
+        Ok(enhanced_url) => {
+            session.backup_url = Some(session.backup_url.unwrap_or_else(|| session.url.clone()));
+            session.url = enhanced_url;
+            session.stream_kind = Some("hls".to_owned());
+        }
+        Err(error) => crate::trace::log(format!("[vsr] 增强转码未启动，回退原流：{error}")),
+    }
+    session
 }
 
 #[tauri::command]
@@ -596,13 +709,14 @@ async fn playback_open(
         // 它们全部——目录被挡住时用户手里仍然可能攥着一条旧 id（历史、收藏、
         // 复制来的链接），那正是这条命令存在的理由。
         ensure_series_source_allowed(&input.series_id, &state)?;
-        let session = state.guo_provider.open_episode(
+        let session = enhance_short_drama_session(state.guo_provider.open_episode(
             input.session_id,
             &input.series_id,
             &input.episode_id,
             &input.quality,
             input.position,
-        )?;
+        )?)
+        .await;
         let mut sessions = state
             .sessions
             .lock()
@@ -632,16 +746,19 @@ async fn playback_open(
         sessions.insert(session.session_id, session.clone());
         return Ok(session);
     }
-    let session = state
-        .provider
-        .open_episode(
-            input.session_id,
-            &input.series_id,
-            &input.episode_id,
-            &input.quality,
-            input.position,
-        )
-        .await?;
+    let session = enhance_short_drama_session(
+        state
+            .provider
+            .open_episode(
+                input.session_id,
+                &input.series_id,
+                &input.episode_id,
+                &input.quality,
+                input.position,
+            )
+            .await?,
+    )
+    .await;
     let mut sessions = state
         .sessions
         .lock()
@@ -659,6 +776,7 @@ fn playback_command(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     if action == "stop" {
+        media_enhance::stop(session_id);
         state.guo_provider.release(session_id);
     }
     let sessions = state
@@ -704,6 +822,16 @@ fn history_list(state: State<'_, AppState>) -> Result<Vec<WatchHistoryItem>, Str
     state.database.list_history()
 }
 
+/// 进全屏前窗口的"常规位置"（即标题栏"向下还原"的目标矩形）。
+///
+/// `window_prepare_fullscreen` 为做到"原地解除最大化、无还原动画"，会把常规位置
+/// 覆盖成最大化时的**整屏矩形**；不暂存原值的话，Windows 的还原目标从此就是整屏，
+/// 退出全屏后"向下还原"永远还原回整屏大小（放大缩小一个样，原始尺寸只能靠拖边
+/// 或重启找回）。退出全屏时由 `window_finish_fullscreen` 取走写回——两端必须成对。
+#[cfg(windows)]
+static PRE_FULLSCREEN_NORMAL_RECT: Mutex<Option<windows_sys::Win32::Foundation::RECT>> =
+    Mutex::new(None);
+
 /**
  * 进全屏前，**静默**解除窗口的最大化状态。
  *
@@ -743,6 +871,18 @@ fn window_prepare_fullscreen(window: tauri::Window) -> Result<bool, String> {
         if GetWindowPlacement(hwnd, &mut placement) == 0 {
             return Err("读取窗口位置失败。".into());
         }
+        // 「退出全屏回弹」的排查依据（2026-10 用户报告）。
+        // 回弹只有两种可能来源，日志能把它们分开：
+        //   a) 矩形真的跳变 —— prepare 前/后两个矩形不一致；
+        //   b) 矩形没变但窗口被系统播放了最大化过渡动画 —— 三个矩形完全一致。
+        crate::trace::log(format!(
+            "[窗口] prepare 前 状态={} 常规矩形={}x{}@({},{})",
+            placement.showCmd,
+            placement.rcNormalPosition.right - placement.rcNormalPosition.left,
+            placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
+            placement.rcNormalPosition.left,
+            placement.rcNormalPosition.top
+        ));
         // 没最大化就不用管（例如窗口本来就只是普通尺寸）。
         if placement.showCmd != SW_MAXIMIZE as u32 {
             return Ok(false);
@@ -758,11 +898,30 @@ fn window_prepare_fullscreen(window: tauri::Window) -> Result<bool, String> {
         SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_MAXIMIZE as isize));
 
         // 2) 显示状态改回普通，但"常规位置"保持当前矩形——窗口原地不动，无动画。
+        //    覆盖前先把真实的还原矩形暂存起来（此刻 placement 里还是进全屏前的值），
+        //    退出全屏时由 window_finish_fullscreen 写回；不写回，"向下还原"的目标
+        //    就永远是整屏——用户看到的"最大化/还原按钮放大缩小一样大"正是这个。
+        if let Ok(mut stash) = PRE_FULLSCREEN_NORMAL_RECT.lock() {
+            *stash = Some(placement.rcNormalPosition);
+        }
         placement.showCmd = SW_SHOWNORMAL as u32;
         placement.rcNormalPosition = rect;
         if SetWindowPlacement(hwnd, &placement) == 0 {
             return Err("应用窗口位置失败。".into());
         }
+
+        crate::trace::log(format!(
+            "[窗口] prepare 后 状态={} 当前矩形={}x{}@({},{}) 常规矩形={}x{}@({},{})",
+            placement.showCmd,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            rect.left,
+            rect.top,
+            placement.rcNormalPosition.right - placement.rcNormalPosition.left,
+            placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
+            placement.rcNormalPosition.left,
+            placement.rcNormalPosition.top
+        ));
 
         // 3) 让非客户区重新计算：客户区立刻按"非最大化"的规则铺满，不必等下一次窗口变化。
         SetWindowPos(
@@ -781,6 +940,142 @@ fn window_prepare_fullscreen(window: tauri::Window) -> Result<bool, String> {
 #[cfg(not(windows))]
 #[tauri::command]
 fn window_prepare_fullscreen(_window: tauri::Window) -> Result<bool, String> {
+    Ok(false)
+}
+
+/**
+ * 退出全屏的收尾：写回 `window_prepare_fullscreen` 暂存的还原矩形，并直接以
+ * 最大化状态显示。返回是否做了这件事。
+ *
+ * ## 为什么不能让前端在退出全屏后直接 `maximize()`
+ *
+ * prepare 阶段为"原地解除最大化"把"常规位置"覆盖成了整屏矩形，此后 Windows 的
+ * 还原目标就是整屏——前端若直接最大化，标题栏的"向下还原"会把窗口还原回整屏
+ * 大小，放大缩小一个样，原始窗口尺寸只能靠拖边或重启找回（2026-10 用户报告：
+ * "最大化/还原按钮放大缩小都一样大"）。这里先把暂存的矩形写回
+ * `rcNormalPosition` 再最大化，还原尺寸就接回来了。
+ *
+ * `SetWindowPlacement` 一次带 `SW_MAXIMIZE`：窗口从"普通状态的整屏矩形"直接进入
+ * 最大化，没有"先缩回原尺寸再撑开"的中间帧。返回 false 表示没有暂存（进全屏前
+ * 本来就没最大化，或走了 unmaximize 回退——那条路不覆盖还原矩形），前端按普通
+ * 路径自行最大化即可。
+ */
+#[cfg(windows)]
+#[tauri::command]
+fn window_finish_fullscreen(window: tauri::Window) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, IsZoomed, SetWindowLongPtrW,
+        SetWindowPlacement, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOZORDER, SW_MAXIMIZE, WINDOWPLACEMENT, WS_MAXIMIZE,
+    };
+
+    let stash = PRE_FULLSCREEN_NORMAL_RECT
+        .lock()
+        .map_err(|_| "读取全屏前状态失败。".to_string())?
+        .take();
+    let Some(original_rect) = stash else {
+        return Ok(false);
+    };
+
+    let hwnd: HWND = window.hwnd().map_err(|error| error.to_string())?.0;
+
+    unsafe {
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut placement) == 0 {
+            return Err("读取窗口位置失败。".into());
+        }
+        // 收尾前后各读一次真实矩形：这两行合起来回答「退出全屏后到底有没有弹」。
+        // 进入前 = 退出全屏瞬间（tao 已把窗口恢复成普通状态的整屏矩形）；
+        // 收尾后 = 写回还原矩形并以最大化显示之后。两者的尺寸差就是用户看到的那一下。
+        let mut before_rect = RECT::default();
+        GetWindowRect(hwnd, &mut before_rect);
+
+        // 【2026-10 用户第二次报告"退出全屏先缩小、再放大、才回到原位置"】
+        // 日志实测把这个动作拆成了三次尺寸变化：
+        //   2560x1537（tao 撤掉全屏后的普通铺满态，与全屏几乎同尺寸，看不出来）
+        //   → 2160x1380（局部尺寸）→ 2560x1528（最大化客户区）。
+        // 中间那一跳是**系统最大化动画的中间帧**，来源正是 SetWindowPlacement 带
+        // SW_MAXIMIZE：目标状态是"普通窗口"，请求"最大化"，Windows 于是播一段从当前
+        // 尺寸撑到最大的过渡动画。用户看到的就是"先缩小（其实是动画起点与目标不
+        // 一致造成的缩放错觉）、再放大"。
+        //
+        // 改法：**不用 SetWindowPlacement 触发最大化，改为手动最大化**。
+        //   1) 补上 WS_MAXIMIZE 样式（IsZoomed 随之返回 true，tao 的 is_maximized 认得）；
+        //   2) SetWindowPos 一次性设到目标矩形——SetWindowPos 不走 WM_SYSCOMMAND，
+        //      不受"窗口最大化/最小化时动画"系统设置影响，没有中间帧；
+        //   3) 最后才写回真实还原矩形：此刻窗口**已经**是最大化状态，
+        //      SetWindowPlacement 请求的状态与当前一致，是幂等调用，不会再播动画。
+        //      （顺序不能反：先写还原矩形等于先把窗口缩回原尺寸，那才是真的"缩小"。）
+        //
+        // 目标矩形直接取当前（全屏时）的窗口矩形：实测它就是本显示器上最大化应有的
+        // 窗口矩形（2582x1550@(-11,-11)），四边含无边框窗口的阴影扩展，比 rcMonitor 准。
+        let target_left = before_rect.left;
+        let target_top = before_rect.top;
+        let target_width = before_rect.right - before_rect.left;
+        let target_height = before_rect.bottom - before_rect.top;
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style | (WS_MAXIMIZE as isize));
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            target_left,
+            target_top,
+            target_width,
+            target_height,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        // 写回真实还原矩形。此刻窗口已是最大化状态，请求的状态与当前一致，是幂等
+        // 调用——不会再有"从普通尺寸撑到最大"的过渡。
+        placement.rcNormalPosition = original_rect;
+        placement.showCmd = SW_MAXIMIZE as u32;
+        if SetWindowPlacement(hwnd, &placement) == 0 {
+            return Err("应用窗口位置失败。".into());
+        }
+        // 再钉一次目标矩形。上面两条理论上都不播动画，但"理论上"不够——实测里
+        // 只要系统插入一帧中间尺寸，用户就会看到回弹。多这一次幂等的 SetWindowPos
+        // 保证最终位置立刻落定，代价只有一次 SWP。
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            target_left,
+            target_top,
+            target_width,
+            target_height,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        crate::trace::log(format!(
+            "[窗口] finish 状态校验 showCmd={} 已最大化={}",
+            placement.showCmd,
+            IsZoomed(hwnd) != 0
+        ));
+        let mut after_rect = RECT::default();
+        GetWindowRect(hwnd, &mut after_rect);
+        crate::trace::log(format!(
+            "[窗口] finish 收尾 前={}x{}@({},{}) 后={}x{}@({},{}) 还原矩形={}x{}@({},{})",
+            before_rect.right - before_rect.left,
+            before_rect.bottom - before_rect.top,
+            before_rect.left,
+            before_rect.top,
+            after_rect.right - after_rect.left,
+            after_rect.bottom - after_rect.top,
+            after_rect.left,
+            after_rect.top,
+            original_rect.right - original_rect.left,
+            original_rect.bottom - original_rect.top,
+            original_rect.left,
+            original_rect.top
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn window_finish_fullscreen(_window: tauri::Window) -> Result<bool, String> {
     Ok(false)
 }
 
@@ -872,13 +1167,30 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
     settings.default_quality = "auto".into();
     settings.preferred_engine = "off".into();
     settings.catalog_cache_mb = 0.0;
-    settings.playback_cache_mb = 0.0;
+    // 剧集缓存上限是真实用户设置：清洗旧版 0 哨兵后立即写入清理器，保存即生效。
+    settings.playback_cache_mb =
+        if settings.playback_cache_mb.is_finite() && settings.playback_cache_mb > 0.0 {
+            settings.playback_cache_mb.clamp(256.0, 16_384.0)
+        } else {
+            1024.0
+        };
+    short_drama_app::set_cache_budget_mb(settings.playback_cache_mb);
     // 启用源列表：去重 + 丢弃未知 id（源表在前端，后端不认也得挡住脏 id 进库），
     // 全空时回落到红果，否则用户会存下一个"零可用源"的设置。
     // ⚠️ 这里**不**剔除 18+ 源：设置页的设计决策是关闭总开关时置灰而非取消勾选，
     // 内容侧的拦截由 `gated_source` / `ensure_series_source_allowed` 按请求负责。
     settings.enabled_sources = normalize_enabled_sources(&settings.enabled_sources);
-    state.database.settings_save(&settings)
+    // VSR 播放链路开关：运行期即时生效——写库之前先灌进 AtomicBool，
+    // 无需重启进程，下一次 `playback_open` 就走新链路。
+    // 注意这里**不做任何强制改写**：它是真实可用的用户设置，不是不变量 8
+    // 里那批「能力受限、如实归零」的字段。
+    set_vsr_enabled(settings.vsr_enabled);
+    let saved = state.database.settings_save(&settings);
+    if saved.is_ok() {
+        // 文件删除不能拖住设置保存的 IPC 返回，放到独立线程立即收敛。
+        std::thread::spawn(short_drama_app::enforce_cache_budget_now);
+    }
+    saved
 }
 
 /// 清空缓存（设置页按钮）。
@@ -890,6 +1202,8 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
 /// 由它清理真实的剧集缓存并返回释放量。
 #[tauri::command]
 fn cache_clear(state: State<'_, AppState>) -> Result<CacheClearResult, String> {
+    // 增强 HLS 是临时转码产物，清缓存时正在播的流也一并释放；下次打开会重新起。
+    media_enhance::cleanup_all();
     // 应用自有缓存目录（SQLite 快照等）一并清理。
     let own = clear_directory(&state.cache_dir).unwrap_or(0);
     let report = short_drama_app_cache_clear()?;
@@ -1127,7 +1441,10 @@ fn main() {
                 .path()
                 .resource_dir()
                 .unwrap_or_else(|_| app_dir.join("resources"));
-            let guo_provider = crate::guo_provider::GuoProvider::new(&resource_dir, &app_dir)?;
+            let guo_provider = Arc::new(crate::guo_provider::GuoProvider::new(
+                &resource_dir,
+                &app_dir,
+            )?);
             // guo 源的封面由 guo-core 下载到 `<app_dir>/guo-core/covers-v1` 后经
             // asset 协议呈现：dev 态这个目录在项目内（.app-data），不在默认的
             // `$APPLOCALDATA` scope 里，不显式放行生产/dev 两端都会 403。
@@ -1135,6 +1452,21 @@ fn main() {
                 .asset_protocol_scope()
                 .allow_directory(app_dir.join("guo-core"), true);
             let database = Database::open(&app_dir.join("short-drama.sqlite3"))?;
+            // 自动清理必须按用户上限启动，不能在后台线程里写死 1GB。
+            let saved_cache_mb = database
+                .settings_get()
+                .map(|settings| settings.playback_cache_mb)
+                .unwrap_or(1024.0);
+            short_drama_app::set_cache_budget_mb(saved_cache_mb);
+            // VSR 播放链路开关同样按落库值初始化：`vsr_enabled()` 的初值是 true，
+            // 这里把用户真实选择灌进去（旧记录缺字段时 `settings_get` 反序列化会走
+            // `default_true`，与前端 `!== false` 的判定一致）。
+            set_vsr_enabled(
+                database
+                    .settings_get()
+                    .map(|settings| settings.vsr_enabled)
+                    .unwrap_or(true),
+            );
             app.manage(AppState {
                 provider,
                 anime_provider,
@@ -1155,6 +1487,12 @@ fn main() {
                     if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                         crate::pip::dismiss_on_main_close(&handle);
                     }
+                    // 全屏进出会在几百毫秒内连发多次 Resized，「退出全屏回弹」的
+                    // 真相就藏在这条时间线里：只看首尾矩形分不清中间弹了几次。
+                    // 节流在 trace 侧（尺寸未变丢弃 + 每 500ms 最多 12 条）。
+                    if let tauri::WindowEvent::Resized(size) = event {
+                        crate::trace::log_window_size(size.width, size.height);
+                    }
                 });
             }
 
@@ -1166,12 +1504,21 @@ fn main() {
                 }
             });
 
+            // 让界面有日志可看之前，先把日志通道本身立起来。
+            //
+            // 顺序很关键：capture_stderr 必须在其它子进程（ffmpeg、worker）被拉起
+            // 之前调用，否则它们继承的是那个不存在的 STD_ERROR_HANDLE，错误输出
+            // 就永远丢掉了。
+            crate::trace::capture_stderr();
+            crate::trace::log_environment();
+
             // 启动即自动整理缓存，无需用户确认。
             //
             // 处理三件事：清掉 worker 中断留下的半成品、删除超过保留期（7 天）
-            // 的陈旧剧集、并把总占用压回全局预算（1GB）内。放在独立线程里执行，
+            // 的陈旧剧集、并把总占用压回用户设置的缓存上限内。放在独立线程里执行，
             // 避免在缓存很大时拖慢窗口创建（首次启动可能要删掉上 GB 文件）。
             std::thread::spawn(|| {
+                media_enhance::cleanup_all();
                 let report = short_drama_app::auto_clean_cache_on_start();
                 if report.removed_files > 0 {
                     eprintln!(
@@ -1201,6 +1548,8 @@ fn main() {
             short_drama_app_status,
             short_drama_app_set_device,
             short_drama_app_resolve,
+            // 前缀先行开播：与整集同参数的另一条快链路，前端先拿它出画。
+            short_drama_app_resolve_prefix,
             short_drama_app_cache_clear,
             short_drama_app_cache_usage,
             short_drama_app_stream,
@@ -1208,6 +1557,8 @@ fn main() {
             short_drama_app_album,
             short_drama_app_prefetch_stream,
             short_drama_app_episode_counts,
+            short_drama_app_shelf_feed,
+            short_drama_app_cover_proxy,
             history_list,
             history_save,
             history_remove,
@@ -1216,6 +1567,7 @@ fn main() {
             favorites_save,
             favorites_remove,
             window_prepare_fullscreen,
+            window_finish_fullscreen,
             settings_get,
             settings_save,
             cache_clear,
@@ -1230,6 +1582,9 @@ fn main() {
             update_reveal,
             update_install,
             app_version,
+            trace_ui_log,
+            trace_tail,
+            trace_clear,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run TTV Short Drama");

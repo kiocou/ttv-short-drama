@@ -55,7 +55,17 @@ export interface CoverImageProps {
   /** 语义仍是"要不要立即加载"：`eager` 跳过视口判断直接开始。 */
   loading?: 'eager' | 'lazy';
   fetchPriority?: 'high' | 'auto' | 'low';
-  /** 异步解析真实封面（guo 源：返回本地缓存文件路径）。提供后忽略 `src`。 */
+  /**
+   * 异步解析真实封面地址。提供后忽略 `src`。
+   *
+   * 返回值有两种形态，两种都要支持：
+   * - **本地文件路径**（guo 封面：guo-core 带源侧 Referer 下载后落盘的文件），
+   *   由这里经 `convertFileSrc` 转成 `asset:` 地址；
+   * - **已经可直接使用的地址**（`data:` / `blob:` / `http(s):`）—— 红果封面走
+   *   这条（后端把 HEIC 转成 JPEG 后以 data URL 返回，见
+   *   `short_drama_app_cover_proxy`）。识别靠 `RESOLVED_URL_PATTERN`，否则会把
+   *   data URL 当成路径拼出垃圾地址。
+   */
   resolveSrc?: () => Promise<string | null>;
   /** 封面确定不可得（解析失败 / 重试耗尽）时回调一次，宿主可据此移除卡片。 */
   onUnavailable?: () => void;
@@ -63,6 +73,13 @@ export interface CoverImageProps {
 
 /** 重试上限（含首次）：CDN 抖动两次还不行，就没必要继续折腾用户。 */
 const MAX_ATTEMPTS = 3;
+
+/**
+ * `resolveSrc` 返回值已经是**可直接使用的地址**的判定。
+ *
+ * 只有落在这里面之外的才当作本地文件路径去走 `convertFileSrc`。
+ */
+const RESOLVED_URL_PATTERN = /^(data|blob|https?|asset|ipc):/i;
 
 /**
  * **全局共享**一个 IntersectionObserver，而不是每张封面各建一个。
@@ -230,13 +247,17 @@ export const CoverImage: React.FC<CoverImageProps> = ({
     const request = resolveSrc;
     void (async () => {
       try {
-        const path = await request();
-        if (!path) {
+        const resolved = await request();
+        if (!resolved) {
           setGivenUp(true);
           return;
         }
+        if (RESOLVED_URL_PATTERN.test(resolved)) {
+          setResolvedUrl(resolved);
+          return;
+        }
         const convertFileSrc = await loadConvertFileSrc();
-        setResolvedUrl(convertFileSrc(path));
+        setResolvedUrl(convertFileSrc(resolved));
       } catch {
         setGivenUp(true);
       }

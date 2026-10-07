@@ -1,4 +1,5 @@
 import { isTauriEnvironment } from './ipc';
+import { tracePlayback } from './playbackTrace';
 
 /**
  * 原生窗口全屏的唯一入口。
@@ -91,10 +92,32 @@ async function clearMaximizedSilently(): Promise<boolean> {
 }
 
 /** 进入全屏。返回**已核实**的全屏状态。 */
+/** 记一行「窗口此刻的真实状态」，供全屏时间线使用。 */
+async function describeWindow(win: {
+  isFullscreen: () => Promise<boolean>;
+  isMaximized: () => Promise<boolean>;
+}): Promise<string> {
+  try {
+    const [fullscreen, maximized] = await Promise.all([
+      win.isFullscreen(),
+      win.isMaximized(),
+    ]);
+    return '全屏=' + fullscreen + ' 最大化=' + maximized;
+  } catch {
+    return '全屏=? 最大化=?';
+  }
+}
+
 export async function enterFullscreen(): Promise<boolean> {
   if (!isTauriEnvironment()) return true;
   const { getCurrentWindow } = await import('@tauri-apps/api/window');
   const win = getCurrentWindow();
+
+  // 用户报「退出全屏有诡异的回弹」：界面上只看到弹一下，日志里必须能分辨成因——
+  // 是 maximize 状态被改了、还是矩形跳了、还是 tao 的还原动画在跑。
+  // 因此进出的每一步都打点，和时间线（Rust 侧 [窗口] 尺寸变化）对得上。
+  const startedAt = performance.now();
+  tracePlayback('全屏 进入开始 ' + (await describeWindow(win)));
 
   // 关键步骤：先静默解除最大化，否则客户区会被裁到工作区（任务栏之上）。
   try {
@@ -103,20 +126,32 @@ export async function enterFullscreen(): Promise<boolean> {
     wasMaximizedBeforeFullscreen = false;
   }
   if (wasMaximizedBeforeFullscreen) {
-    await clearMaximizedSilently();
+    const cleared = await clearMaximizedSilently();
+    tracePlayback(
+      '全屏 静默解除最大化 返回=' + cleared + ' ' + (await describeWindow(win)),
+    );
   }
 
   try {
     await win.setFullscreen(true);
   } catch {
     // 权限或环境不支持：如实返回当前真实状态。
+    tracePlayback('全屏 setFullscreen(true) 抛错，改用真实查询');
     try {
       return await win.isFullscreen();
     } catch {
       return false;
     }
   }
-  return waitForState(win, true);
+  const actual = await waitForState(win, true);
+  tracePlayback(
+    '全屏 进入完成 结果=' +
+      actual +
+      ' 耗时=' +
+      Math.round(performance.now() - startedAt) +
+      'ms',
+  );
+  return actual;
 }
 
 /** 退出全屏，并还原进入前的最大化状态。返回**已核实**的全屏状态。 */
@@ -125,15 +160,54 @@ export async function leaveFullscreen(): Promise<boolean> {
   const { getCurrentWindow } = await import('@tauri-apps/api/window');
   const win = getCurrentWindow();
 
+  const startedAt = performance.now();
+  tracePlayback(
+    '全屏 退出开始 ' +
+      (await describeWindow(win)) +
+      ' 进全屏前曾最大化=' +
+      wasMaximizedBeforeFullscreen,
+  );
+
   try {
     if (await win.isFullscreen()) await win.setFullscreen(false);
-    await waitForState(win, false);
-    if (wasMaximizedBeforeFullscreen) await win.maximize();
+    // 收尾必须紧跟 setFullscreen(false)，不能等状态轮询跑完。
+    //
+    // 2026-10 用户报告「退出全屏有诡异回弹」。tao 的 set_fullscreen(false) 走
+    // ShowWindow(SW_RESTORE)，系统会播一段"从全屏缩回窗口"的过渡动画；旧实现
+    // 先 waitForState 轮询最多 6×90ms（≈0.5 秒）才做收尾，动画基本播完了，用户
+    // 完整看到"先缩一下、再弹回去"。这里改成短等待（2 次，够了就让 tao 把状态
+    // 切过去）后**立刻**用一次 SetWindowPlacement 把窗口钉到最终状态，动画刚起
+    // 头就被打断；剩下的轮询只作事后校验，不再决定收尾时机。
+    await waitForState(win, false, 2);
+    if (wasMaximizedBeforeFullscreen) {
+      // 收尾必须走后端：prepare 已把窗口"常规位置"覆盖成整屏矩形（原地解除最大化
+      // 的代价），这里直接 maximize() 会把还原尺寸永久钉死在整屏——标题栏的
+      // "向下还原"从此还原回整屏，放大缩小一个样。后端把进全屏前暂存的矩形写回，
+      // 再一步最大化。返回 false 表示没有暂存（进全屏前没最大化，或走了
+      // unmaximize 回退——那条路不覆盖还原矩形），按旧路径普通最大化即可。
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const restored = await invoke<boolean>('window_finish_fullscreen');
+        tracePlayback('全屏 收尾 window_finish_fullscreen 返回=' + restored);
+        if (!restored) await win.maximize();
+      } catch {
+        // 旧版本后端没有该命令：退回普通最大化，不阻塞退出全屏。
+        await win.maximize();
+      }
+    }
+    const stillFullscreen = await waitForState(win, false, 4);
+    if (stillFullscreen) {
+      // 极少数情况（窗口线程忙）：如实记一笔，别让日志谎报已退出。
+      tracePlayback('全屏 退出后仍为全屏状态（轮询超时）');
+    }
   } catch {
     // 忽略：下次进入播放器时会重新校正。
   } finally {
     wasMaximizedBeforeFullscreen = false;
   }
+  tracePlayback(
+    '全屏 退出完成 耗时=' + Math.round(performance.now() - startedAt) + 'ms',
+  );
   return false;
 }
 

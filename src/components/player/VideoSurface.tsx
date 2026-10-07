@@ -3,6 +3,10 @@ import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { isTauriEnvironment } from '../../services/ipc';
 import { enterFullscreen, leaveFullscreen, queryFullscreen } from '../../services/windowFx';
+// 起播链路的媒体事件打点：用户报的「一直在加载等待」只有在事件时间线上才看得出
+// 卡在哪一段（清单未就绪 / 首个分片未到 / 解码器没起）。这些事件都不密集，
+// 且打点是 fire-and-forget，不影响渲染。
+import { tracePlayback } from '../../services/playbackTrace';
 import { PlayerControls } from './PlayerControls';
 import { EpisodeDrawer } from './EpisodeDrawer';
 import { DiagnosticsModal } from './DiagnosticsModal';
@@ -57,10 +61,12 @@ export const VideoSurface: React.FC = () => {
     errorDetail,
     stallNotice,
     dismissStallNotice,
+    finishedAll,
   } = usePlaybackStore();
 
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
-  const { isFullscreen, setIsFullscreen, showToast, currentView } = useAppStore();
+  // 返回详情页也在这里发起（而非 store 内部）：导航权归组件层，store 只出信号。
+  const { isFullscreen, setIsFullscreen, showToast, currentView, navigateTo } = useAppStore();
 
   const [isControlsVisible, setIsControlsVisible] = useState(true);
   // 控制器锁定（用户主动收起）状态；Esc 可解锁（PlayerControls 内部监听）。
@@ -69,6 +75,8 @@ export const VideoSurface: React.FC = () => {
   const [etaTick, setEtaTick] = useState<number | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // 起播计时基准。用 ref 而不是 state：它只喂给日志，不该引发任何重渲染。
+  const surfaceReadyAt = useRef<number>(performance.now());
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
 
@@ -108,6 +116,28 @@ export const VideoSurface: React.FC = () => {
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     };
   }, [isPlaying, handleUserActivity]);
+
+  // 全剧播完 → 返回详情页。
+  //
+  // store 在"连播开启 + 最后一集正常播完"时置位 finishedAll（闸门判定只能在
+  // store 做：交接期的旧源 ended、连播闩锁这些只有它分得清）。这里留 2 秒再走，
+  // 让最后一集的收尾和提示被看到，而不是播完瞬间就把画面抽走；期间用户的任何
+  // 接管（拖进度、重新开播、选集、离开播放器）都会把 finishedAll 复位，本定时器
+  // 随 cleanup 作废。全屏不用管：App 在离开播放视图时会自动退全屏。
+  // currentView 是双保险——即使 finishedAll 尚未来得及复位，人已不在播放器
+  // 也不该再触发导航。
+  useEffect(() => {
+    if (!finishedAll || !currentSeries) return;
+    showToast('本剧已播完', 'success');
+    const timer = setTimeout(() => {
+      if (currentView !== 'player') return;
+      const video = videoRef.current;
+      // 用户已把进度拖回重新看：不再自动返回（配合 store 的复位，双保险）。
+      if (video && !video.ended) return;
+      navigateTo('detail', currentSeries.id);
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [finishedAll, currentSeries, currentView, navigateTo, showToast, videoRef]);
 
 
   /**
@@ -190,8 +220,10 @@ export const VideoSurface: React.FC = () => {
     };
   }, [setIsFullscreen]);
 
-  // 视频单击播放/暂停，双击全屏优化
+  // 视频单击播放/暂停，双击全屏优化。
+  // 锁定态一律忽略：锁的语义就是"除解锁外一切输入失效"，点画面不许再暂停/全屏。
   const handleVideoSurfaceClick = () => {
+    if (isLocked) return;
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
@@ -231,6 +263,8 @@ export const VideoSurface: React.FC = () => {
   }, [playbackRate, videoRef]);
 
   const handleSurfacePointerDown = (e: React.PointerEvent<HTMLVideoElement>) => {
+    // 锁定态不认长按：临时倍速也是"操作"。
+    if (isLocked) return;
     // 鼠标只认左键；多指触控不触发长按。
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     if (!e.isPrimary) return;
@@ -264,6 +298,9 @@ export const VideoSurface: React.FC = () => {
       // 不挡住的话，在发现/详情页按空格会"操控看不见的视频"——暂停/续播、
       // [] 换集都会在后台真实生效。
       if (currentView !== 'player') return;
+      // 锁定态：快捷键全部失效，唯一出口是解锁（PlayerHud 里的 Esc 监听负责）。
+      // 与动漫播放器同一语义——锁住后连"Esc 退全屏"都没有，先解锁再操作。
+      if (isLocked) return;
 
       switch (e.code) {
         case 'Space':
@@ -315,7 +352,7 @@ export const VideoSurface: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity, currentView]);
+  }, [togglePlay, seekRelative, setVolume, volume, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity, currentView, isLocked]);
 
   // 全屏时给一个短暂的退出提示：纯原生全屏没有浏览器自带的全屏提示条，
   // 用户不一定会想到 Esc。
@@ -372,7 +409,7 @@ export const VideoSurface: React.FC = () => {
     <div
       ref={containerRef}
       onMouseMove={handlePointerMove}
-      className="relative w-full h-full bg-black flex items-center justify-center overflow-hidden select-none"
+      className="ttv-video-stage relative w-full h-full bg-black flex items-center justify-center overflow-hidden select-none"
     >
       {/* 核心 HTML5 视频渲染宿主 */}
       <video
@@ -384,6 +421,19 @@ export const VideoSurface: React.FC = () => {
         onPointerUp={handleSurfacePointerUp}
         onPointerCancel={handleSurfacePointerUp}
         onPointerLeave={handleSurfacePointerUp}
+        onLoadStart={() => {
+          // 基准重置点必须挂在 loadstart 上：loadstart 属于媒体加载算法的一部分，
+          // 换源时必然触发，比在 React 层订阅 sessionId 更贴近真实的"这一集从哪一刻开始拉"。
+          surfaceReadyAt.current = performance.now();
+          tracePlayback('媒体 loadstart 开始加载');
+        }}
+        onLoadedData={event =>
+          tracePlayback(`媒体 loadeddata 首帧就绪 readyState=${event.currentTarget.readyState} 耗时=${Math.round(performance.now() - surfaceReadyAt.current)}ms`)
+        }
+        onCanPlay={() => tracePlayback('媒体 canplay 可播放')}
+        onPlaying={() => tracePlayback('媒体 playing 开始播放')}
+        onWaiting={() => tracePlayback('媒体 waiting 缓冲等待（这是「一直在加载」的关键证据）')}
+        onStalled={() => tracePlayback('媒体 stalled 拉流停滞')}
       />
 
       {/* 全屏退出提示：纯原生全屏没有浏览器自带的提示条，短暂告知 Esc 可用。 */}

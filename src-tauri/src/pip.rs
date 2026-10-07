@@ -314,6 +314,34 @@ fn destroy_window(app: &AppHandle) {
     });
 }
 
+/// 把主窗口提到前台：还原（最小化时）+ 激活。
+///
+/// ## 为什么「回到播放器」必须显式做这一步
+///
+/// 小窗是 `always_on_top`，它的典型用法就是「小窗挂在那儿，人切到别的软件干活」
+/// （浏览器、资源管理器、游戏都算）。此时主窗口既不激活也不 topmost，只是在 z 序
+/// 底部排着；小窗一关，z 序回到本来状态——主窗口仍压在那个软件底下。用户看到的
+/// 就是「片子已经在主窗口里放起来了，界面却跑到最下面，得去任务栏里翻」。
+///
+/// 最小化同一性质：主窗口在小窗开着时被最小化是常规操作，不先还原的话
+/// `set_focus` 只激活一个最小化窗口，画面依然不出来。
+///
+/// 时机必须选在**小窗还活着、进程还持有前台权**的这一刻：用户刚点了小窗里的按钮，
+/// 最后一个输入事件属于本进程，Windows 的 `SetForegroundWindow` 限制能被满足。
+/// 拖到小窗 `Destroyed` 之后就晚了——那时前台权可能已让给别的窗口，设置会被
+/// Windows 拒绝，只剩任务栏图标闪一下。因此调用点在 `report_closed` 之后、
+/// `destroy_window` 之前（hide 只藏起小窗，不影响本进程的前台权）。
+fn raise_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return;
+    };
+    // 三步都刻意不因失败而回滚：这是界面便利动作，失败的最坏结果也不过是维持原状
+    // （用户自己去点任务栏），比因此打断「回到播放器」这条主链路划算。
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
 /// 打开（或复用）画中画小窗并下发交接包。
 ///
 /// **必须是 `async` 命令**：Tauri 的同步命令跑在主线程上，而 `WebviewWindowBuilder::build()`
@@ -400,6 +428,13 @@ pub fn pip_close(app: AppHandle, mode: String, progress: PipProgress) -> Result<
         *guard = progress;
     }
     report_closed(&app, &mode);
+    // 「回到播放器」是唯一需要抢前台的出口：小窗常驻置顶期间用户多半已切到别的
+    // 软件（甚至最小化了主窗口），不显式把主窗口带回前台，回来看到的是一片
+    // 「压在下面、还得去任务栏翻」的界面。而 `close` 只表示关掉小窗，用户可能
+    // 还在别的窗口里忙，抢焦点反而打扰；系统路径关闭小窗同样不抢。
+    if mode == "return" {
+        raise_main_window(&app);
+    }
     destroy_window(&app);
     Ok(())
 }

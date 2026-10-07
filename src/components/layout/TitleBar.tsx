@@ -24,17 +24,32 @@ const SUGGEST_CACHE_LIMIT = 32;
 const SUGGEST_LISTBOX_ID = 'titlebar-suggest-listbox';
 
 /**
- * 标题栏窗口控制按钮的基类。
+ * 标题栏窗口控制按钮的基类：只放三颗按钮共有的尺寸 / 字形 / 焦点环，
+ * **刻意不含任何 hover / active 底色**。
  *
  * hover 底色用 `slate-500/10` 而非旧的 `slate-200/50`：标题栏本身就是 `bg-white/80`
  * 叠 Mica 玻璃，旧配色会在浅色玻璃上渲染出一块偏脏的灰块；低透明度中性色才能保持
- * “浮在玻璃上”的干净感。关闭键单独叠红色（Win11 惯例），由调用方拼接。
+ * “浮在玻璃上”的干净感。
+ *
+ * 为什么底色必须拆成下面两个成品类、不能拼在 BASE 里：同一个元素上并存两个
+ * `hover:bg-*` 时，谁能生效由 **Tailwind 的输出顺序**决定，与 className 里的书写
+ * 顺序无关（两者特异性相同，都是 0-2-0）。实测 tailwindcss 3.4.17 的产物里
+ * `.hover\:bg-red-500:hover` 排在 `.hover\:bg-slate-500\/10:hover` **之前**
+ * （默认调色板 slate/gray/zinc 一族在 red 一族之后），于是关闭键的红色恒被这里的
+ * 灰色盖掉——三颗按钮的悬停高亮一直是灰的，`active` 态同理。
  */
 const WIN_BUTTON_BASE =
   'w-9 h-10 flex items-center justify-center text-slate-600 ' +
-  'hover:bg-slate-500/10 hover:text-slate-900 active:bg-slate-500/20 ' +
   'transition-colors duration-150 outline-none focus-visible:ring-1 ' +
   'focus-visible:ring-inset focus-visible:ring-blue-500/60';
+
+/** 最小化 / 最大化的中性悬停底色。 */
+const WIN_BUTTON_NEUTRAL =
+  `${WIN_BUTTON_BASE} hover:bg-slate-500/10 hover:text-slate-900 active:bg-slate-500/20`;
+
+/** 关闭键：Win11 惯例的红色悬停底色（#C42B1C 系的近似值）。 */
+const WIN_BUTTON_CLOSE =
+  `${WIN_BUTTON_BASE} hover:bg-red-500 hover:text-white active:bg-red-600`;
 
 interface SearchSuggestions {
   items: SeriesItem[];
@@ -232,6 +247,7 @@ export const TitleBar: React.FC = () => {
    * 为准，不能只在点击时乐观写一次。
    */
   const [isMaximized, setIsMaximized] = useState(false);
+  const windowActionRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     if (!isTauriEnvironment()) return;
@@ -266,24 +282,34 @@ export const TitleBar: React.FC = () => {
   }, []);
 
   const handleWindowAction = async (action: 'minimize' | 'maximize' | 'close') => {
+    // 窗口线程的状态切换是异步的。连续双击最大化会把两个 toggle 排队，
+    // 第二个 toggle 读到的仍是旧状态，最终表现成按钮闪烁或尺寸回弹。
+    if (windowActionRef.current) return;
     if (isTauriEnvironment()) {
-      try {
-        const appWindow = getCurrentWindow();
-        if (action === 'minimize') await appWindow.minimize();
-        else if (action === 'maximize') await appWindow.toggleMaximize();
-        else if (action === 'close') await appWindow.close();
-        // toggleMaximize 是异步落到窗口线程的，返回时状态未必已生效；
-        // 再查一次真实状态（onResized 也会补一次，避免图标滞后一帧）。
-        if (action === 'maximize') setIsMaximized(await appWindow.isMaximized());
-      } catch (err) {
-        console.warn('Tauri window action:', err);
-      }
+      const task = (async () => {
+        try {
+          const appWindow = getCurrentWindow();
+          if (action === 'minimize') await appWindow.minimize();
+          else if (action === 'maximize') await appWindow.toggleMaximize();
+          else if (action === 'close') await appWindow.close();
+          // toggleMaximize 是异步落到窗口线程的，返回时状态未必已生效；
+          // 再查一次真实状态（onResized 也会补一次，避免图标滞后一帧）。
+          if (action === 'maximize') setIsMaximized(await appWindow.isMaximized());
+        } catch (err) {
+          console.warn('Tauri window action:', err);
+        }
+      })();
+      windowActionRef.current = task;
+      await task.finally(() => {
+        if (windowActionRef.current === task) windowActionRef.current = null;
+      });
     }
   };
 
   return (
     <header 
       onMouseDown={handleDragStart}
+      data-launch-part="titlebar"
       className="h-10 w-full flex items-center justify-between px-3 select-none bg-white/80 backdrop-blur-xl border-b border-black/[0.04] z-50 transition-colors duration-200"
     >
       {/* 左侧应用标识 */}
@@ -485,7 +511,7 @@ export const TitleBar: React.FC = () => {
             {
               key: 'minimize',
               label: '最小化',
-              className: WIN_BUTTON_BASE,
+              className: WIN_BUTTON_NEUTRAL,
               icon: <Minus className="w-3 h-3" strokeWidth={1.75} />,
               onClick: () => handleWindowAction('minimize'),
             },
@@ -494,7 +520,7 @@ export const TitleBar: React.FC = () => {
               // 否则用户点了看不出有没有生效（曾经写死 Square 导致永远不变）。
               key: 'maximize',
               label: isMaximized ? '向下还原' : '最大化',
-              className: WIN_BUTTON_BASE,
+              className: WIN_BUTTON_NEUTRAL,
               icon: isMaximized ? (
                 <Copy className="w-3 h-3 -translate-x-[1.5px]" strokeWidth={1.75} />
               ) : (
@@ -505,7 +531,7 @@ export const TitleBar: React.FC = () => {
             {
               key: 'close',
               label: '关闭',
-              className: `${WIN_BUTTON_BASE} hover:bg-red-500 hover:text-white active:bg-red-600`,
+              className: WIN_BUTTON_CLOSE,
               icon: <X className="w-3 h-3" strokeWidth={1.75} />,
               onClick: () => handleWindowAction('close'),
             },

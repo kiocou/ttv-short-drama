@@ -1,4 +1,4 @@
-import { CatalogFilter, CatalogPage, SeriesItem } from '../types/catalog';
+import { CatalogFilter, CatalogPage, SeriesItem, ShelfFeedPage, ShelfKind, ChannelType } from '../types/catalog';
 import { SeriesDetail } from '../types/series';
 import { PlaybackSession, PlaybackSnapshot } from '../types/playback';
 import { WatchHistoryItem } from '../types/history';
@@ -6,8 +6,59 @@ import { FavoriteItem } from '../types/favorite';
 import { UserSettings } from '../types/settings';
 import { MOCK_SERIES_LIST, getSeriesDetail, INITIAL_WATCH_HISTORY } from './mockData';
 
+/** 后端 trace_tail 的一次增量拉取结果（字段名与 Rust 侧 camelCase 一致）。 */
+export interface TraceTail {
+  lines: string[];
+  nextCursor: number;
+  /** true 表示环形缓冲淘汰了旧行，本次拉取之前有日志被挤掉了。 */
+  dropped: boolean;
+}
+
 export function isTauriEnvironment(): boolean {
   return typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
+}
+
+/**
+ * 把任意抛出物转成可读文案。
+ *
+ * **Tauri 的 `invoke` 被后端 `Err(String)` 拒绝时，抛出来的是那个原字符串，不是
+ * `Error` 对象。** 于是 `(err as Error).message` 恒为 `undefined` —— 后端辛苦拼出来的
+ * 错误详情（"红果接口错误 111104：…" 之类）会被静默换成一句通用兜底，排查时等于
+ * 什么都没拿到。这里统一收口，新增的 catch 一律用它。
+ */
+export function errorText(error: unknown, fallback: string): string {
+  if (error instanceof Error) return error.message.trim() || fallback;
+  const text = typeof error === 'string' ? error : String(error ?? '');
+  return text.trim() || fallback;
+}
+
+/**
+ * 封面该走哪条解析通道。
+ *
+ * 三条路都有各自的硬理由，**不能合并成一个"万能代理"**：
+ * - **guo 站源**（`guo:` 前缀）：封面直连不可用（黄果视频有 Cloudflare 防护、
+ *   部分源封面是加密的），必须经 guo-core 带源侧 Referer 下载后取本地缓存文件。
+ * - **红果的 HEIC**：图片服务给的是 `image/heic`，WebView2 / Chromium **解不了**，
+ *   直接把地址交给 `<img>` 只会得到一块空白。必须经后端转码（见
+ *   `short_drama_app_cover_proxy`）。判定用地址模板后缀 —— 红果的封面地址形如
+ *   `…-aifit:400:0.heic?lk3s=…`。
+ * - 其余（官网 HTML 抓来的 jpg/webp 等）：直接用原地址，别白白绕一次 IPC。
+ *
+ * 抽成公共函数是因为**首页货架与「更多」页都要用**：第一版只接进了「更多」页的
+ * 行卡，首页那两栏走的是 `SeriesCard`，于是同一批剧在首页是空白、点进「更多」
+ * 才有图（用户报告的"海报出不来"）。
+ */
+export function coverResolver(
+  seriesId: string,
+  cover: string,
+): (() => Promise<string | null>) | undefined {
+  if (seriesId.startsWith('guo:')) {
+    return () => ipcService.catalog.guoCover(seriesId);
+  }
+  if (/\.heic(\?|$)/i.test(cover)) {
+    return () => ipcService.shelf.cover(cover);
+  }
+  return undefined;
 }
 
 async function invokeBackend<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -45,6 +96,31 @@ function rememberGuoCover(seriesId: string, path: string | null): void {
 }
 
 /**
+ * 红果封面解析结果的会话内缓存（值是 `data:` URL）。
+ *
+ * 与上面 guo 封面那份同构、同样封顶，但**只缓存成功**：guo 那份把 null 也记下来
+ * 是因为"这个源确实没有封面"，重试纯属白打一次 IPC；红果这边拿到 null 更可能是
+ * 一次网络抖动（后端要下载 + 转码），不记下来才有重试的机会。
+ *
+ * 封顶比 guo 那份更必要：每个值都是几十 KB 的 base64。
+ */
+const SHELF_COVER_CACHE_LIMIT = 120;
+const shelfCoverCache = new Map<string, string>();
+const shelfCoverInflight = new Map<string, Promise<string | null>>();
+
+function rememberShelfCover(url: string, dataUrl: string): void {
+  shelfCoverCache.set(url, dataUrl);
+  if (shelfCoverCache.size <= SHELF_COVER_CACHE_LIMIT) return;
+  const excess = shelfCoverCache.size - SHELF_COVER_CACHE_LIMIT;
+  let removed = 0;
+  for (const key of shelfCoverCache.keys()) {
+    shelfCoverCache.delete(key);
+    removed += 1;
+    if (removed >= excess) break;
+  }
+}
+
+/**
  * 记住剧集来源。
  *
  * 只在**有值**时写入：channel 缺失不代表来源是短剧，无脑覆盖反而会把已知的
@@ -57,6 +133,7 @@ function rememberChannel(seriesId: string, channel?: string | null): void {
 // 会话级详情缓存：同一部剧换集/切清晰度时跳过网络往返，直接复用详情。
 // 独立缓存不过期，重新打开应用自然刷新。
 const detailCache = new Map<string, SeriesDetail>();
+const detailInflight = new Map<string, Promise<SeriesDetail>>();
 
 export function invalidateSeriesCache(seriesId?: string): void {
   if (seriesId) detailCache.delete(seriesId);
@@ -80,9 +157,13 @@ export const DEFAULT_SETTINGS: UserSettings = {
   preferredEngine: 'off',
   targetFps: 60,
   catalogCacheMb: 0,
-  playbackCacheMb: 0,
+  playbackCacheMb: 1024,
   showAdultSources: false,
   enabledSources: ['hongguo'],
+  launchSound: true,
+  // 默认开：现状（引入 media_enhance 之后）默认就走 VSR 转码链路，
+  // 默认关会让老用户升级后行为突变。详见 types/settings.ts 的字段注释。
+  vsrEnabled: true,
 };
 
 function loadStorage<T>(key: string, fallback: T): T {
@@ -128,6 +209,28 @@ async function mockCatalogList(filter: CatalogFilter): Promise<CatalogPage> {
     hasMore: start + items.length < list.length,
     page: filter.page,
     categories: ['全部', ...[...new Set(list.flatMap(item => item.tags))].slice(0, 12)],
+  };
+}
+
+/**
+ * Web 演示模式下的分区列表：从 mock 目录里切一段。
+ *
+ * 这条链路在 Tauri 下走的是红果 App-API（榜单/最新上架），mock 里没有那套数据，
+ * 所以按分区做一次排序近似 —— 保证「更多」页在浏览器里也能点开、能翻页。
+ */
+async function mockShelfFeed(kind: ShelfKind, channel: ChannelType, cursor?: string): Promise<ShelfFeedPage> {
+  await new Promise(resolve => setTimeout(resolve, 120));
+  const pageSize = 6;
+  let list = MOCK_SERIES_LIST.filter(item => item.type === channel);
+  if (kind === 'hot') list = [...list].sort((a, b) => (b.heat || 0) - (a.heat || 0));
+  if (kind === 'new') list = [...list].reverse();
+  const start = Number.parseInt(cursor || '0', 10) || 0;
+  const items = list.slice(start, start + pageSize);
+  const next = start + items.length;
+  return {
+    items,
+    hasMore: next < list.length,
+    nextCursor: next < list.length ? String(next) : undefined,
   };
 }
 
@@ -197,9 +300,17 @@ export interface GuoSourceStep {
 
 export const ipcService = {
   catalog: {
-    async list(filter: CatalogFilter): Promise<CatalogPage> {
+    /**
+     * 目录拉取。
+     *
+     * `force = true` 只由**用户手动刷新**（首页两颗货架的刷新按钮）传入，用于
+     * 让 guo 站源绕过 guo-core 的 TTL 磁盘缓存。guo 源默认是「缓存优先 + SWR」：
+     * TTL 内直接回缓存、过期则回旧值后台刷新——不 force 的话，刷新按钮发出的
+     * 请求拿回来的和屏幕上已有的完全一样，观感就是「点了没反应」。
+     */
+    async list(filter: CatalogFilter, force = false): Promise<CatalogPage> {
       if (isTauriEnvironment()) {
-        const page = await invokeBackend<CatalogPage>('catalog_list', { filter });
+        const page = await invokeBackend<CatalogPage>('catalog_list', { filter, force });
         page.items.forEach(item => channelBySeriesId.set(item.id, item.type));
         return page;
       }
@@ -367,19 +478,90 @@ async guoCover(seriesId: string): Promise<string | null> {
     },
   },
 
+  /**
+   * 首页货架「更多」页的分区列表。
+   *
+   * 走的是**红果 App-API**（榜单 / 最新上架），不是 `catalog.list` 那条多源聚合
+   * 链路：官方客户端的「热播」与「新剧」本来就是两条不同接口，而不是同一份列表
+   * 切两段（逆向结论见仓库根目录「红果短剧客户端逆向分析报告.md」§四）。
+   *
+   * 分页是**游标式**：`cursor` 由后端产出、这里原样回传，前端不要解析它的内容。
+   */
+  shelf: {
+    async feed(kind: ShelfKind, channel: ChannelType, cursor?: string): Promise<ShelfFeedPage> {
+      if (isTauriEnvironment()) {
+        const page = await invokeBackend<ShelfFeedPage>('short_drama_app_shelf_feed', {
+          kind,
+          channel,
+          // 显式传 null：Tauri 的 Option<String> 形参缺键时虽然也能反序列化成 None，
+          // 但把"没有下一页"写成显式 null 比依赖缺省语义更不容易被后来的改动踩坏。
+          cursor: cursor ?? null,
+        });
+        // 与 catalog.list 一致：记住来源，`SeriesCard` 之外的地方靠它判断频道。
+        page.items.forEach(item => channelBySeriesId.set(item.id, item.type));
+        return page;
+      }
+      return mockShelfFeed(kind, channel, cursor);
+    },
+
+    /**
+     * 红果封面 → 可直接喂给 `<img>` 的 `data:` URL。
+     *
+     * **为什么不是直接用原始地址**：红果图片服务给的是 **HEIC**，WebView2 解不了，
+     * 直接把地址丢给 `<img>` 只会得到一块空白（用户报告的"视频海报出不来"）。
+     * 后端负责下载、必要时用随包 ffmpeg 转 JPEG、落盘缓存，再把 JPEG 以 data URL
+     * 回给前端 —— 细节见 `short_drama_app_cover_proxy` 的注释。
+     *
+     * 失败返回 `null`（封面渲染不了不该影响列表），且**不缓存失败**。
+     */
+    async cover(url: string): Promise<string | null> {
+      if (!isTauriEnvironment() || !url.trim()) return null;
+      const cached = shelfCoverCache.get(url);
+      if (cached !== undefined) return cached;
+      const inflight = shelfCoverInflight.get(url);
+      if (inflight) return inflight;
+
+      const request = invokeBackend<string>('short_drama_app_cover_proxy', { url })
+        .then(dataUrl => {
+          rememberShelfCover(url, dataUrl);
+          return dataUrl;
+        })
+        .catch(() => null)
+        .finally(() => {
+          shelfCoverInflight.delete(url);
+        });
+      shelfCoverInflight.set(url, request);
+      return request;
+    },
+  },
+
   series: {
     async getDetail(seriesId: string): Promise<SeriesDetail> {
       const cached = detailCache.get(seriesId);
       if (cached) return cached;
-      if (isTauriEnvironment()) {
-        const detail = await invokeBackend<SeriesDetail>('series_detail', { seriesId, channel: channelBySeriesId.get(seriesId) });
-        detailCache.set(seriesId, detail);
+      const inflight = detailInflight.get(seriesId);
+      if (inflight) return inflight;
+      const request = (async () => {
+        if (isTauriEnvironment()) {
+          return invokeBackend<SeriesDetail>('series_detail', {
+            seriesId,
+            channel: channelBySeriesId.get(seriesId),
+          });
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+        const detail = getSeriesDetail(seriesId);
+        if (!detail) throw new Error('未找到该剧集。');
         return detail;
-      }
-      await new Promise(resolve => setTimeout(resolve, 100));
-      const detail = getSeriesDetail(seriesId);
-      if (!detail) throw new Error('未找到该剧集。');
-      return detail;
+      })()
+        .then(detail => {
+          detailCache.set(seriesId, detail);
+          return detail;
+        })
+        .finally(() => {
+          if (detailInflight.get(seriesId) === request) detailInflight.delete(seriesId);
+        });
+      detailInflight.set(seriesId, request);
+      return request;
     },
   },
 
@@ -408,9 +590,45 @@ async guoCover(seriesId: string): Promise<string | null> {
 
     async resolveNative(seriesId: string, vid: string, contentType?: number, quality = 'auto'): Promise<{ playUrl: string; width: number; height: number; sizeBytes: number; cached: boolean }> {
       if (!isTauriEnvironment()) throw new Error('原生短剧播放仅在桌面应用中可用。');
-      return invokeBackend('short_drama_app_resolve', {
-        input: { seriesId, vid, contentType, quality },
-      });
+      // 打点放在这个唯一出口上，而不是各调用点：红果整集的"首次加载很长时间"
+      // 全部发生在这一个 await 里，这里记耗时最省事，也保证 MiniPlayer / 预取
+      // 走的是同一条记录口径。
+      const started = performance.now();
+      void ipcService.diagnostics.uiLog(`resolve 请求开始 vid=${vid} 档位=${quality}`);
+      try {
+        const result = await invokeBackend<{ playUrl: string; width: number; height: number; sizeBytes: number; cached: boolean }>('short_drama_app_resolve', {
+          input: { seriesId, vid, contentType, quality },
+        });
+        const ms = Math.round(performance.now() - started);
+        const mb = ((result?.sizeBytes ?? 0) / 1048576).toFixed(1);
+        void ipcService.diagnostics.uiLog(`resolve 返回 耗时=${ms}ms 字节=${mb}MB 缓存=${result?.cached === true}`);
+        return result;
+      } catch (error) {
+        void ipcService.diagnostics.uiLog(`resolve 失败 耗时=${Math.round(performance.now() - started)}ms ${errorText(error, '未知错误')}`);
+        throw error;
+      }
+    },
+
+    // 前缀先行开播：与 resolveNative 参数、返回结构完全一致，但产物是
+    // `{vid}.prefix.mp4`——只含开头一小段，几秒内就能出画。整集是另一条并发请求，
+    // 调用方拿到前缀先播、等整集落盘再切过去，用户不必盯着加载卡等满 6-11 秒。
+    // 后端在整集已在盘上时直接返回整集（cached=true），调用方按"这就是最终文件"处理。
+    async resolveNativePrefix(seriesId: string, vid: string, contentType?: number, quality = 'auto'): Promise<{ playUrl: string; width: number; height: number; sizeBytes: number; cached: boolean }> {
+      if (!isTauriEnvironment()) throw new Error('原生短剧播放仅在桌面应用中可用。');
+      const started = performance.now();
+      void ipcService.diagnostics.uiLog(`前缀 resolve 请求开始 vid=${vid} 档位=${quality}`);
+      try {
+        const result = await invokeBackend<{ playUrl: string; width: number; height: number; sizeBytes: number; cached: boolean }>('short_drama_app_resolve_prefix', {
+          input: { seriesId, vid, contentType, quality },
+        });
+        const ms = Math.round(performance.now() - started);
+        const mb = ((result?.sizeBytes ?? 0) / 1048576).toFixed(1);
+        void ipcService.diagnostics.uiLog(`前缀 resolve 返回 耗时=${ms}ms 字节=${mb}MB 缓存=${result?.cached === true}`);
+        return result;
+      } catch (error) {
+        void ipcService.diagnostics.uiLog(`前缀 resolve 失败 耗时=${Math.round(performance.now() - started)}ms ${errorText(error, '未知错误')}`);
+        throw error;
+      }
     },
 
     // 后台预取：只暖缓存，不接管播放器。命中缓存时后端零开销直接返回。
@@ -603,6 +821,48 @@ async guoCover(seriesId: string): Promise<string | null> {
       if (isTauriEnvironment()) return invokeBackend<{ freedMb: number }>('cache_clear');
       await new Promise(resolve => setTimeout(resolve, 300));
       return { freedMb: 0 };
+    },
+  },
+
+  /**
+   * 播放诊断日志（与后端 trace.rs 的环形缓冲 + 落盘日志同一份数据）。
+   *
+   * 为什么要有这一组：用户反馈「视频首次加载很长时间」「开关 VSR 都没用」这两个
+   * 问题都发生在 *用户自己的机器* 上，开发机上复现不了。后端早就把日志写进了
+   * `%LOCALAPPDATA%\com.ttv.shortdrama\ttv-playback.log`，但要求用户去翻文件等于
+   * 没有诊断——必须让日志在应用里就能看见、能复制、能一键导出。
+   *
+   * `tail(cursor)` 是**增量**接口：传上次拿到的 nextCursor，只回新增行。轮询时
+   * 千万别每次传 0，那样每 1.5 秒会把 2000 行全量搬过 IPC 一次。
+   */
+  diagnostics: {
+    /** 前端打点。写进与后端同一条日志流，方便按时间顺序拼出完整起播链路。 */
+    async uiLog(message: string): Promise<void> {
+      if (!isTauriEnvironment()) return;
+      try {
+        await invokeBackend('trace_ui_log', { message });
+      } catch {
+        // 打点本身绝不能影响播放。
+      }
+    },
+
+    async tail(cursor = 0): Promise<TraceTail> {
+      if (!isTauriEnvironment()) return { lines: [], nextCursor: cursor, dropped: false };
+      try {
+        const r = await invokeBackend<TraceTail>('trace_tail', { cursor });
+        return r ?? { lines: [], nextCursor: cursor, dropped: false };
+      } catch {
+        return { lines: [], nextCursor: cursor, dropped: false };
+      }
+    },
+
+    async clear(): Promise<void> {
+      if (!isTauriEnvironment()) return;
+      try {
+        await invokeBackend('trace_clear');
+      } catch {
+        // 清空失败不阻塞界面。
+      }
     },
   },
 };

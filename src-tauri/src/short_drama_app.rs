@@ -9,19 +9,44 @@
 //! 设备凭据存放在数据目录 `short-drama-device.json`。
 //! 首次启动若文件不存在，会自动生成 19 位 deviceId/installId 与 cdid/openudid 并落盘。
 //! 已有凭据不会被覆盖。deviceToken（x-tt-dt）只在文件里已有时使用，不会本地编造。
+//!
+//! ## 这里为什么要跟随 VSR 开关（曾经的 bug 根因）
+//!
+//! 设置页的「RTX VSR 视频增强」开关原先只作用于 `media_enhance`（guo 与公开
+//! 直链那条转码链路），而红果短剧走的是本模块：worker 直接把源流转存成本地 mp4，
+//! **根本不经过 media_enhance**。于是用户点红果时开关怎么拨都没用——这正是
+//! 「开关 VSR 都没用」那条反馈的真实根因。
+//!
+//! 正确语义应当按「两种模式下这条链路还要不要为 VSR 服务」来定：
+//!   * 开关**开**：输出必须是 H.264（RTX VSR 的硬条件，AGENTS.md 不变量 25），
+//!     并且这层就该承担重编码成本——为了把这段成本压下来，输出编码走
+//!     `h264_nvenc`（不可用时回落 libx264），实测整集重编从 4.0s 降到 1.6s。
+//!   * 开关**关**：回到引入 VSR 之前的播放链路。那时播放器只要求「WebView2
+//!     能解出画面」，源档是 H.264 就直接 `-c:v copy` 重封装（实测 0.87s、体积
+//!     与源基本一致），不再为了一样用不上的 VSR 把整集重编成十几倍大的文件。
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Runtime};
+
+use crate::models::SeriesItem;
 
 /// 进度事件名（stage: sign/model/fallback/download/transcode/done）。
 pub const RESOLVE_EVENT: &str = "shortdrama://app-resolve";
 const WORKER_TIMEOUT: Duration = Duration::from_secs(300);
 /// stream/album 只签名取模型，不必等整集下载；卡死时尽快回退网页直链。
 const STREAM_WORKER_TIMEOUT: Duration = Duration::from_secs(25);
+/// 前缀解析（`resolve-prefix`）的上限。
+///
+/// 比整集短得多是有意的：前缀只是"先给一个能马上出画的短片段"，实测 4.2 秒就
+/// 有产物。超过两分钟还没回来，说明这条加速路径本身出了问题——此时前端早就退回
+/// 整集链路了，继续挂着这个 worker 只会白占带宽和 CPU。
+const PREFIX_WORKER_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ===== resolve 在途去重（leader / follower）=====
 // key = "{cache_namespace}:{quality}:{vid}"。
@@ -47,6 +72,12 @@ struct CachedStream {
     width: u32,
     height: u32,
     duration_ms: i64,
+    /// 选中档的编码标识（h264 / hevc / bytevc2 / ""）。
+    ///
+    /// worker 用它决定直连那一步是「重封装」还是「整集重编码」：源档已是 H.264
+    /// 时只 copy，省掉实测约 10 秒的整集重编。不带这一项，预签名命中的那条
+    /// 最常见路径会永远走最慢的分支。
+    codec: String,
     cached_at: std::time::Instant,
 }
 
@@ -91,6 +122,11 @@ fn store_stream(vid: &str, payload: &serde_json::Value) {
             .get("duration_ms")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0),
+        codec: payload
+            .get("codec")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         cached_at: std::time::Instant::now(),
     };
     if let Ok(mut guard) = stream_cache().lock() {
@@ -439,7 +475,7 @@ fn device_config_path() -> PathBuf {
     data_dir().join("short-drama-device.json")
 }
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     data_dir().join("short-drama-cache")
 }
 
@@ -467,6 +503,16 @@ pub fn resource_base() -> Option<PathBuf> {
     })
 }
 
+pub(crate) fn ffmpeg_path() -> Result<PathBuf, String> {
+    let base = resource_base()
+        .ok_or_else(|| "未找到随包 ffmpeg 资源目录。请重新安装或完整打包应用。".to_owned())?;
+    let ffmpeg = base.join("mpv/ffmpeg.exe");
+    if ffmpeg.is_file() {
+        Ok(ffmpeg)
+    } else {
+        Err(format!("ffmpeg 不存在：{}", ffmpeg.display()))
+    }
+}
 fn worker_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let base = resource_base().ok_or_else(|| {
         "未找到短剧解析 worker 资源目录（shortdrama-worker）。请重新安装或完整打包应用。".to_owned()
@@ -669,13 +715,36 @@ fn sweep_cache_dir(dir: &std::path::Path, stale_after: Duration, now: std::time:
     }
 }
 
-/// 缓存**全局**预算（字节），短剧 + 漫剧合计。
+/// 缓存默认预算（字节），短剧 + 漫剧合计。
 ///
-/// 为什么从"单频道 1.5GB"改成"全局 1.0GB"：旧预算按频道独立计算，两个频道
-/// 各自都能长到 1.5GB，实际占用上限是 3GB——实测本机已达到 2.25GB（216 个文件）。
-/// 对一款短剧播放器来说这个体积明显偏大，且用户无法感知它为何一直增长。
-/// 现在改成全局合计 1.0GB，并由启动清理与每次解析后的自动收敛共同保证。
-const CACHE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+/// 默认 1GB 是容量、保留期与回看体验的平衡点：旧版按频道各留 1.5GB，实际占用
+/// 上限 3GB（实测本机已达到 2.25GB、216 个文件）。用户在设置页可以调整。
+const DEFAULT_CACHE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// 运行期缓存预算。保存设置后立即生效，不需要重启。
+fn cache_budget_bytes() -> &'static AtomicU64 {
+    static BUDGET: OnceLock<AtomicU64> = OnceLock::new();
+    BUDGET.get_or_init(|| AtomicU64::new(DEFAULT_CACHE_BUDGET_BYTES))
+}
+
+/// 旧设置库里 `playbackCacheMb=0` 是 0.2.x 的"不做字节统计"哨兵，不是用户要禁用
+/// 缓存。这里把它解释成默认 1GB，同时限制过小/过大的极端值，避免误配把清理线程
+/// 变成永久删除器或让缓存无界增长。
+fn normalize_cache_budget_mb(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        1024
+    } else {
+        value.clamp(256.0, 16_384.0).round() as u64
+    }
+}
+
+/// 从用户设置写入运行期缓存预算。
+pub fn set_cache_budget_mb(value: f64) {
+    cache_budget_bytes().store(
+        normalize_cache_budget_mb(value) * 1024 * 1024,
+        Ordering::Relaxed,
+    );
+}
 
 /// 缓存保留期（秒）。超过此时长且未被访问的整集会被自动清理。
 ///
@@ -758,10 +827,18 @@ fn evict_channels_to_budget_unthrottled(keep: &std::path::Path) {
             cache_dir().join("motion-comic"),
         ],
         keep,
-        CACHE_BUDGET_BYTES,
+        cache_budget_bytes().load(Ordering::Relaxed),
         CACHE_MAX_AGE_SECONDS,
         std::time::SystemTime::now(),
     );
+}
+
+/// 用户保存缓存上限后立即收敛一次，不等下一次解析或重启。
+///
+/// 不能复用 `enforce_cache_budget` 的 90 秒节流：用户刚把上限从 4GB 调到 512MB，
+/// 正是希望马上释放空间。宽限期仍然生效，正在播放/下载的新文件不会被误删。
+pub fn enforce_cache_budget_now() {
+    evict_channels_to_budget_unthrottled(&cache_dir().join("__settings_change__"));
 }
 
 /// 自动清理的统计结果。
@@ -926,7 +1003,7 @@ pub fn auto_clean_cache_on_start() -> CacheSweepReport {
     evict_channels_to_budget(
         &[root.join("short-series"), root.join("motion-comic")],
         &sentinel,
-        CACHE_BUDGET_BYTES,
+        cache_budget_bytes().load(Ordering::Relaxed),
         CACHE_MAX_AGE_SECONDS,
         std::time::SystemTime::now(),
     )
@@ -954,6 +1031,87 @@ fn normalize_requested_quality(raw: &str) -> String {
         "2160" => "4k".into(),
         value => format!("{value}p"),
     }
+}
+
+/// 把历史缓存补齐成 H.264。旧版本会把 bytevc1/HEVC 原样留下；没有这个迁移，
+/// 升级后重播旧缓存仍然走不到 RTX VSR。新 worker 产物本身已是 H.264，但用同
+/// 一个 sidecar 标记避免每次命中都重转一遍。
+async fn ensure_h264_cache(
+    path: &std::path::Path,
+    ffmpeg: &std::path::Path,
+    enabled: bool,
+) -> Result<(), String> {
+    let marker = path.with_extension("h264");
+    if marker.is_file() {
+        return Ok(());
+    }
+    // 用户关掉了 RTX VSR：不再把整集重编一遍。
+    //
+    // 这不是"省一点 CPU"——旧缓存迁移是在**起播路径上同步跑**的：一集 1920×1080
+    // 实测要重编几秒到十几秒，而缓存里可能积累了几十集旧缓存（HEVC/bytevc1）。
+    // 开着开关时这笔成本换的是 VSR；关掉之后它换不到任何东西，只剩"点一集转一次"。
+    // 直接写标记跳过：产物保持 HEVC，直连播放（VSR 本来也不认 HEVC，见不变量 25）。
+    if !enabled {
+        let _ = std::fs::write(&marker, b"h264\n");
+        return Ok(());
+    }
+    let partial = path.with_file_name(format!(
+        "{}.h264.part.mp4",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let _ = std::fs::remove_file(&partial);
+    let mut command = tokio::process::Command::new(ffmpeg);
+    command
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .arg("-i")
+        .arg(path);
+    command
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "20",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&partial);
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let status = command
+        .status()
+        .await
+        .map_err(|error| format!("旧缓存 H.264 转码失败：{error}"))?;
+    if !status.success()
+        || !partial.is_file()
+        || partial
+            .metadata()
+            .map(|meta| meta.len() == 0)
+            .unwrap_or(true)
+    {
+        let _ = std::fs::remove_file(&partial);
+        return Err("旧缓存 H.264 转码失败。".to_owned());
+    }
+    std::fs::rename(&partial, path).map_err(|error| format!("写回 H.264 缓存失败：{error}"))?;
+    std::fs::write(&marker, b"h264\n").map_err(|error| format!("写入缓存标记失败：{error}"))?;
+    Ok(())
 }
 
 /// 解析一集：命中缓存直接返回；否则拉起 worker.py（下载+解密+转存）并转发进度。
@@ -1014,14 +1172,6 @@ pub async fn short_drama_app_resolve<R: Runtime>(
             cached: true,
         })
     };
-    if out_path.is_file()
-        && out_path
-            .metadata()
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false)
-    {
-        return cached_payload(&out_path);
-    }
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建缓存目录失败：{error}"))?;
     }
@@ -1059,10 +1209,34 @@ pub async fn short_drama_app_resolve<R: Runtime>(
             }
         };
         if acquired {
+            // 旧缓存迁移也必须在 leader/follower 闸门内做：否则悬停预热与前台打开
+            // 会同时转码同一文件，两边的 .h264.part.mp4 会互相覆盖。
+            if out_path.is_file()
+                && out_path
+                    .metadata()
+                    .map(|meta| meta.len() > 0)
+                    .unwrap_or(false)
+            {
+                match ensure_h264_cache(&out_path, &ffmpeg, crate::vsr_is_enabled()).await {
+                    Ok(()) => return cached_payload(&out_path),
+                    Err(error) => {
+                        // 旧缓存损坏不能永久卡死：删掉它，让下面的 worker 重新下载。
+                        eprintln!("[ttv] 旧缓存转 H.264 失败，重新解析：{error}");
+                        let _ = std::fs::remove_file(&out_path);
+                    }
+                }
+            }
             break; // 本请求为 leader，跑 worker
         }
         // follower：轮询缓存等 leader 落盘，或等 leader 摘除表项后接管。
         follower_waited += 1;
+        if follower_waited == 1 {
+            // 悬停预热与前台打开撞在同一集时，前台会变成 follower 干等。日志里
+            // 必须能区分"真的在下载"与"其实在排队"，否则会把排队误判成网络慢。
+            crate::trace::log(format!(
+                "[红果] 同一集已有解析在途，本请求排队等待 vid={vid}"
+            ));
+        }
         let deadline = tokio::time::Instant::now()
             + if follower_waited <= 2 {
                 WORKER_TIMEOUT + Duration::from_secs(15)
@@ -1072,12 +1246,13 @@ pub async fn short_drama_app_resolve<R: Runtime>(
             };
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if out_path.is_file()
+            if out_path.with_extension("h264").is_file()
                 && out_path
                     .metadata()
                     .map(|meta| meta.len() > 0)
                     .unwrap_or(false)
             {
+                ensure_h264_cache(&out_path, &ffmpeg, crate::vsr_is_enabled()).await?;
                 return cached_payload(&out_path);
             }
             let leader_alive = {
@@ -1098,6 +1273,15 @@ pub async fn short_drama_app_resolve<R: Runtime>(
     // 用户既不会看到过期直链导致的错误，也不必自己手动重试。
     // 只有请求 auto 且确实复用了预签名直链时，失败才需要清缓存重跑；
     // 指定档位走的是现场解析，缓存与这一轮的成败无关。
+    // 解析这一段通常是首开时间里最长的一段：worker 要把整集下载、解密、再转存成
+    // 本地 H.264。把它单独计时并记下"是否已有缓存 / 是否复用预签名直链"，因为
+    // 这两点直接决定后面要等几秒还是几十秒。
+    crate::trace::log(format!(
+        "[红果] resolve 开始 vid={vid} 档位={requested_quality} 复用预签名={} 产物路径={}",
+        requested_quality == "auto" && peek_stream(&vid).is_some(),
+        out_path.display()
+    ));
+    let resolve_started = std::time::Instant::now();
     let had_prefetched = requested_quality == "auto" && peek_stream(&vid).is_some();
     let mut attempt = 0;
     let result = loop {
@@ -1120,6 +1304,23 @@ pub async fn short_drama_app_resolve<R: Runtime>(
         clear_stream(&vid);
     };
     // 无论成败都摘除 leader 位：follower 读到产物则返回，否则自行接管重跑。
+    match &result {
+        Ok(playback) => crate::trace::log(format!(
+            "[红果] resolve 完成 vid={vid} 耗时={}ms 尺寸={}x{} 字节={}（整集文件，播放器要等它落盘）",
+            resolve_started.elapsed().as_millis(),
+            playback.width,
+            playback.height,
+            playback.size_bytes
+        )),
+        Err(error) => crate::trace::log(format!(
+            "[红果] resolve 失败 vid={vid} 耗时={}ms 原因={error}",
+            resolve_started.elapsed().as_millis()
+        )),
+    }
+    if result.is_ok() {
+        // worker 新产物已是 H.264，只补标记，不再把刚生成的文件重转一遍。
+        let _ = std::fs::write(out_path.with_extension("h264"), b"h264\n");
+    }
     {
         let map = resolve_inflight();
         if let Ok(mut guard) = map.lock() {
@@ -1127,6 +1328,163 @@ pub async fn short_drama_app_resolve<R: Runtime>(
         }
     }
     result
+}
+
+/// 前缀先行开播：只取开头一小段（worker 侧按 `TTV_SD_PREFIX_BYTES` 截断）解密
+/// 转存成 `{vid}.prefix.mp4`，让播放器几秒内先出画面；整集仍由
+/// `short_drama_app_resolve` 在后台照常下载，落盘后前端再切到完整文件。
+///
+/// 参数与 `short_drama_app_resolve` 完全一致——前端把两条链路当成"同一件事的
+/// 快慢两档"。差别只在产物与生命周期：前缀是**独立产物**（与整集并存、可被覆盖
+/// 重建），所以在途去重键带 `:prefix` 后缀，与整集互不阻塞、可以并发。
+///
+/// 整集已在盘上时直接返回整集（`cached: true`）：前缀的全部意义就是省掉整集的
+/// 等待，盘上已有整集就没必要再多下一个 ~2MB 的前缀。
+#[tauri::command]
+pub async fn short_drama_app_resolve_prefix(
+    input: ShortDramaAppResolveInput,
+) -> Result<ShortDramaAppPlayback, String> {
+    let vid = input.vid.trim().to_owned();
+    if vid.is_empty() || !vid.chars().all(|c| c.is_ascii_digit()) {
+        return Err("缺少有效的集 vid。".into());
+    }
+    let profile = HongguoAppProfile::from_input(input.content_type, input.app_id)?;
+    let raw_quality = input
+        .quality
+        .as_deref()
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase();
+    let requested_quality = normalize_requested_quality(&raw_quality);
+
+    // 整集寻址与 short_drama_app_resolve 同构（含旧版本直接写在根目录下的副本）。
+    let namespace_path =
+        cache_dir()
+            .join(profile.cache_namespace)
+            .join(if requested_quality == "auto" {
+                format!("{vid}.mp4")
+            } else {
+                format!("{vid}-{requested_quality}.mp4")
+            });
+    let legacy_path = (requested_quality == "auto").then(|| cache_dir().join(format!("{vid}.mp4")));
+    let existing_full = std::iter::once(namespace_path.clone())
+        .chain(legacy_path)
+        .into_iter()
+        .find(|path| path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false));
+    if let Some(path) = existing_full {
+        touch_cache_entry(&path);
+        return Ok(ShortDramaAppPlayback {
+            play_url: path.to_string_lossy().to_string(),
+            width: 0,
+            height: 0,
+            size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
+            cached: true,
+        });
+    }
+
+    let (python, worker, ffmpeg) = worker_paths()?;
+    let credentials = ensure_credentials()?;
+    // 前缀产物与整集并存：`{vid}.prefix.mp4`。`with_extension` 只替换最后一段
+    // 扩展名，所以指定档位的 `{vid}-{quality}.prefix.mp4` 与 auto 的
+    // `{vid}.prefix.mp4` 天然分开，不会互相覆盖。
+    let out_path = namespace_path.with_extension("prefix.mp4");
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("创建缓存目录失败：{error}"))?;
+    }
+    // 与整集链路同样的缓存卫生：清掉上次中断留下的半成品（mtime 门槛保护正在写的那份）。
+    sweep_cache_dir(
+        out_path.parent().unwrap_or(&cache_dir()),
+        Duration::from_secs(PARTIAL_STALE_SECONDS),
+        std::time::SystemTime::now(),
+    );
+
+    // 在途去重：键比整集多一个 `:prefix`，因此"前缀"与"整集"可以同时跑；
+    // 同一集的两个前缀请求（预取与前台打开撞车）仍然只跑一个 worker。
+    let inflight_key = format!(
+        "{}:{}:{vid}:prefix",
+        profile.cache_namespace, requested_quality
+    );
+    let acquired = {
+        let map = resolve_inflight();
+        let mut guard = map.lock().map_err(|_| "解析在途表锁不可用。".to_string())?;
+        if guard.contains(&inflight_key) {
+            false
+        } else {
+            guard.insert(inflight_key.clone());
+            true
+        }
+    };
+    if !acquired {
+        // 已经在途：轮询等它落盘即可，再拉一个 worker 只会让两份半成品互删。
+        for _ in 0..120u32 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Some(payload) = prefix_payload(&out_path) {
+                return Ok(payload);
+            }
+            let alive = {
+                let map = resolve_inflight();
+                map.lock()
+                    .map(|guard| guard.contains(&inflight_key))
+                    .unwrap_or(false)
+            };
+            if !alive {
+                break;
+            }
+        }
+        return prefix_payload(&out_path).ok_or_else(|| "前缀解析在途但未产出文件。".to_owned());
+    }
+
+    crate::trace::log(format!(
+        "[红果] 前缀解析开始 vid={vid} 档位={requested_quality} 产物路径={}",
+        out_path.display()
+    ));
+    let started = std::time::Instant::now();
+    let result = run_prefix_worker(
+        python,
+        worker,
+        ffmpeg,
+        credentials,
+        profile,
+        vid.clone(),
+        &requested_quality,
+        out_path.clone(),
+    )
+    .await;
+    match &result {
+        Ok(playback) => crate::trace::log(format!(
+            "[红果] 前缀解析完成 vid={vid} 耗时={}ms 字节={}（前缀先行，整集仍在后台下载）",
+            started.elapsed().as_millis(),
+            playback.size_bytes
+        )),
+        Err(error) => crate::trace::log(format!(
+            "[红果] 前缀解析失败 vid={vid} 耗时={}ms 原因={error}",
+            started.elapsed().as_millis()
+        )),
+    }
+    {
+        let map = resolve_inflight();
+        if let Ok(mut guard) = map.lock() {
+            guard.remove(&inflight_key);
+        }
+    }
+    result
+}
+
+/// 前缀产物已落盘则组装返回载荷；文件不存在或为空返回 None。
+fn prefix_payload(path: &std::path::Path) -> Option<ShortDramaAppPlayback> {
+    let size = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if size == 0 {
+        return None;
+    }
+    Some(ShortDramaAppPlayback {
+        play_url: path.to_string_lossy().to_string(),
+        width: 0,
+        height: 0,
+        size_bytes: size,
+        // 前缀**不是**整集：cached 必须为 false，否则前端会以为自己拿到了整集，
+        // 不再等后台那条整集链路，播完十几秒就没了。
+        cached: false,
+    })
 }
 
 /// leader 专属：拉起 worker 进程完成下载+解密+转存，转发进度事件。
@@ -1150,6 +1508,10 @@ async fn run_resolve_worker<R: Runtime>(
         RESOLVE_EVENT,
         serde_json::json!({"vid": vid, "stage": "start", "message": "正在启动云端解析"}),
     );
+    crate::trace::log(format!(
+        "[红果] worker 启动 vid={vid} 档位={requested_quality} 复用预签名={}",
+        requested_quality == "auto" && peek_stream(&vid).is_some()
+    ));
 
     let mut command = tokio::process::Command::new(&python);
     command.arg(&worker).arg("resolve").arg(&vid);
@@ -1170,7 +1532,8 @@ async fn run_resolve_worker<R: Runtime>(
                 .env("TTV_SD_DIRECT_KEY", &cached.content_key)
                 .env("TTV_SD_DIRECT_WIDTH", cached.width.to_string())
                 .env("TTV_SD_DIRECT_HEIGHT", cached.height.to_string())
-                .env("TTV_SD_DIRECT_DURATION", cached.duration_ms.to_string());
+                .env("TTV_SD_DIRECT_DURATION", cached.duration_ms.to_string())
+                .env("TTV_SD_DIRECT_CODEC", &cached.codec);
         }
     }
     command
@@ -1178,6 +1541,13 @@ async fn run_resolve_worker<R: Runtime>(
         .env("TTV_SD_OUT", &out_path)
         .env("PYTHONNOUSERSITE", "1")
         .env("PYTHONIOENCODING", "utf-8")
+        // VSR 开关必须交给 worker：红果链路不经过 media_enhance，这是开关
+        // 唯一的落点（详见模块头注释）。开=输出 H.264 走硬件编码；
+        // 关=能 copy 就 copy，回到未引入 VSR 时的重封装语义。
+        .env(
+            "TTV_SD_VSR",
+            if crate::vsr_is_enabled() { "1" } else { "0" },
+        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -1203,6 +1573,10 @@ async fn run_resolve_worker<R: Runtime>(
         let mut lines = BufReader::new(stdout).lines();
         let mut final_payload: Option<serde_json::Value> = None;
         let mut error_text = String::new();
+        // worker 的 stage 会一路告诉我们它卡在哪一步（解析 / 下载 / 解密 / 转存），
+        // 这正是"一直在加载等待"要定位的东西。但 percent 每次变化都上报会刷屏，
+        // 所以只在 stage 变化时落一行，带上该 stage 的首个百分比。
+        let mut last_stage: Option<String> = None;
         while let Ok(Some(line)) = lines.next_line().await {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -1215,6 +1589,27 @@ async fn run_resolve_worker<R: Runtime>(
             };
             match value.get("event").and_then(serde_json::Value::as_str) {
                 Some("progress") => {
+                    let stage = value
+                        .get("stage")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    if last_stage.as_deref() != Some(stage.as_str()) {
+                        last_stage = Some(stage.clone());
+                        crate::trace::log(format!(
+                            "[红果] worker 阶段 vid={} stage={} message={} percent={}",
+                            emit_vid,
+                            stage,
+                            value
+                                .get("message")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default(),
+                            value
+                                .get("percent")
+                                .map(|percent| percent.to_string())
+                                .unwrap_or_else(|| "-".to_owned())
+                        ));
+                    }
                     let _ = emit_app.emit(
                         RESOLVE_EVENT,
                         serde_json::json!({
@@ -1236,11 +1631,22 @@ async fn run_resolve_worker<R: Runtime>(
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines = BufReader::new(stderr).lines();
         let mut collected = String::new();
+        let mut count: usize = 0;
         while let Ok(Some(line)) = lines.next_line().await {
+            // 首行必须留证：worker 崩在导入阶段（缺依赖、Python 版本不对）时，
+            // stderr 只有一行，而这一行会被后面的 8000 字节截断逻辑保留下来，
+            // 却从来没被人看到过——过去排查只能靠猜。
+            if count == 0 && !line.trim().is_empty() {
+                crate::trace::log(format!("[红果] worker stderr 首行：{}", line.trim()));
+            }
+            count += 1;
             if collected.len() < 8000 {
                 collected.push_str(&line);
                 collected.push('\n');
             }
+        }
+        if count > 1 {
+            crate::trace::log(format!("[红果] worker stderr 共 {count} 行（末尾已存档）"));
         }
         collected
     });
@@ -1255,6 +1661,10 @@ async fn run_resolve_worker<R: Runtime>(
         Err(_) => {
             let _ = child.kill().await;
             reader.abort();
+            crate::trace::log(format!(
+                "[红果] worker 超时被杀 vid={vid} 上限={}s（这一条意味着用户会看到很久的加载）",
+                WORKER_TIMEOUT.as_secs()
+            ));
             return Err("云端解析超时（300 秒），请稍后重试。".into());
         }
     };
@@ -1294,6 +1704,7 @@ async fn run_resolve_worker<R: Runtime>(
             RESOLVE_EVENT,
             serde_json::json!({"vid": vid, "stage": "error", "message": detail}),
         );
+        crate::trace::log(format!("[红果] worker 失败 vid={vid} 原因={detail}"));
         // 半成品文件清理
         let _ = std::fs::remove_file(&out_path);
         return Err(if detail.is_empty() {
@@ -1316,6 +1727,9 @@ async fn run_resolve_worker<R: Runtime>(
         .get("size")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    crate::trace::log(format!(
+        "[红果] worker 完成 vid={vid} 尺寸={width}x{height} 字节={size}"
+    ));
     let _ = app.emit(
         RESOLVE_EVENT,
         serde_json::json!({"vid": vid, "stage": "done", "message": "解析完成"}),
@@ -1326,6 +1740,190 @@ async fn run_resolve_worker<R: Runtime>(
         height,
         size_bytes: size,
         cached: false,
+    })
+}
+
+/// leader 专属：拉起 worker 的 `resolve-prefix` 子命令，产出 `{vid}.prefix.mp4`。
+///
+/// 与整集链路（`run_resolve_worker`）的差别是刻意保留的：
+/// - **不发进度事件**：前缀只是"抢先出画"的加速手段，它若往 RESOLVE_EVENT 上写
+///   进度，会覆盖整集链路的百分比与剩余时间估算（前端只有一个加载提示卡）。
+///   用户看到的那条进度仍然是整集进度——这正是"前面已经在播、后面继续下"的语义。
+/// - **不写 `.h264` 标记、不做旧缓存迁移**：worker 已按 TTV_SD_VSR 产出正确编码，
+///   前缀又是短命产物（会被缓存预算淘汰、也会被整集链路取代），不需要那一层。
+#[allow(clippy::too_many_arguments)]
+async fn run_prefix_worker(
+    python: PathBuf,
+    worker: PathBuf,
+    ffmpeg: PathBuf,
+    credentials: DeviceCredentials,
+    profile: HongguoAppProfile,
+    vid: String,
+    requested_quality: &str,
+    out_path: PathBuf,
+) -> Result<ShortDramaAppPlayback, String> {
+    crate::trace::log(format!(
+        "[红果] 前缀 worker 启动 vid={vid} 档位={requested_quality} 复用预签名={}",
+        requested_quality == "auto" && peek_stream(&vid).is_some()
+    ));
+
+    let mut command = tokio::process::Command::new(&python);
+    command.arg(&worker).arg("resolve-prefix").arg(&vid);
+    apply_hongguo_worker_env(&mut command, &credentials, profile);
+    command.env("TTV_SD_QUALITY", requested_quality);
+    // 与整集链路同一套预签名注入：命中悬停预热留下的直链时，worker 直接跳过
+    // 两次 App API 往返（实测固定 2.16s）——前缀要抢的正是这几秒。
+    if requested_quality == "auto" {
+        if let Some(cached) = peek_stream(&vid) {
+            command
+                .env("TTV_SD_DIRECT_URL", &cached.url)
+                .env("TTV_SD_DIRECT_KEY", &cached.content_key)
+                .env("TTV_SD_DIRECT_WIDTH", cached.width.to_string())
+                .env("TTV_SD_DIRECT_HEIGHT", cached.height.to_string())
+                .env("TTV_SD_DIRECT_DURATION", cached.duration_ms.to_string())
+                .env("TTV_SD_DIRECT_CODEC", &cached.codec);
+        }
+    }
+    command
+        .env("TTV_SD_FFMPEG", &ffmpeg)
+        .env("TTV_SD_OUT", &out_path)
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        // VSR 开关同样要交给前缀：输出编码必须和整集产物一致，否则切源那一刻
+        // 画面从"增强过"变回原始，用户会以为切源把画质弄坏了。
+        .env(
+            "TTV_SD_VSR",
+            if crate::vsr_is_enabled() { "1" } else { "0" },
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动前缀 worker 失败：{error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "前缀 worker stdout 不可读".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "前缀 worker stderr 不可读".to_owned())?;
+
+    let reader = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(stdout).lines();
+        let mut final_payload: Option<serde_json::Value> = None;
+        let mut error_text = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                error_text.push_str(trimmed);
+                error_text.push('\n');
+                continue;
+            };
+            match value.get("event").and_then(serde_json::Value::as_str) {
+                // progress 一律吞掉，不上报（理由见函数头注释）。
+                Some("progress") => {}
+                Some("done") => final_payload = Some(value),
+                _ => error_text.push_str(trimmed),
+            }
+        }
+        (final_payload, error_text)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(stderr).lines();
+        let mut collected = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if collected.len() < 4000 {
+                collected.push_str(&line);
+                collected.push('\n');
+            }
+        }
+        collected
+    });
+
+    match tokio::time::timeout(PREFIX_WORKER_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => {
+            if !status.success() {
+                crate::trace::log(format!(
+                    "[红果] 前缀 worker 退出码非零 vid={vid} status={status}"
+                ));
+            }
+        }
+        Ok(Err(error)) => {
+            reader.abort();
+            return Err(format!("前缀 worker 退出异常：{error}"));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            reader.abort();
+            crate::trace::log(format!(
+                "[红果] 前缀 worker 超时被杀 vid={vid} 上限={}s",
+                PREFIX_WORKER_TIMEOUT.as_secs()
+            ));
+            return Err("前缀解析超时，请稍后重试。".into());
+        }
+    }
+    let (final_payload, error_text) = reader
+        .await
+        .map_err(|error| format!("读取前缀解析输出失败：{error}"))?;
+    let stderr_text = stderr_reader.await.unwrap_or_else(|_| String::new());
+
+    // 成败**以文件为准**，不以退出码或 done 载荷为准：worker 的 emit 不带 vid，
+    // 而且历史上有过"done 已发、文件随后被后一轮覆盖"的窗口——产物在盘上就是
+    // 可播的，没有产物才算失败。
+    if let Some(mut playback) = prefix_payload(&out_path) {
+        if let Some(value) = final_payload.as_ref() {
+            playback.width = value
+                .get("width")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            playback.height = value
+                .get("height")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+        }
+        return Ok(playback);
+    }
+
+    let detail = final_payload
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let mut combined = error_text.trim().to_owned();
+            let stderr_tail = stderr_text.trim().to_owned();
+            if !stderr_tail.is_empty() {
+                if !combined.is_empty() {
+                    combined.push_str(" | ");
+                }
+                combined.push_str(
+                    &stderr_tail
+                        .lines()
+                        .rev()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join(" / "),
+                );
+            }
+            combined
+        });
+    let _ = std::fs::remove_file(&out_path);
+    Err(if detail.is_empty() {
+        "前缀解析失败（worker 未返回结果）。".to_owned()
+    } else {
+        format!("前缀解析失败：{}", explain_hongguo_api_error(&detail))
     })
 }
 
@@ -1523,6 +2121,371 @@ pub async fn short_drama_app_episode_counts<R: Runtime>(
 ) -> Result<HashMap<String, u32>, String> {
     Ok(episode_counts(&app, &series_ids).await)
 }
+
+// ---------------------------------------------------------------------------
+// 「更多」页的分区数据源
+// ---------------------------------------------------------------------------
+
+/// 一页分区列表。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShelfFeedPage {
+    pub items: Vec<SeriesItem>,
+    pub has_more: bool,
+    /// **不透明游标**：调用方原样回传即可，不要尝试解析它的内容。
+    ///
+    /// 红果两条接口的分页模型不同（榜单是 `session_uuid + next_offset`、上架是
+    /// `offset`），worker 把两者都编码进这个字符串，前端只负责带回来。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// 分区 × 频道 → 红果 App 查询参数。
+///
+/// 这张表来自对官方 PC 客户端的逆向（见仓库根目录
+/// 「红果短剧客户端逆向分析报告.md」§四）。**核心结论是官方的「热播」与「新剧」
+/// 本来就是两条不同的接口**，不是同一份列表切两段：
+///
+/// | 分区 | 频道 | 接口 | 判别参数 |
+/// | --- | --- | --- | --- |
+/// | 热播 | 漫剧 | 榜单 `cell/change` | `board=hot` → `comic_series_hot_play` |
+/// | 热播 | 短剧 | 上架 `landpage` | `sort=hot_score`（短剧没有 cell 榜） |
+/// | 新剧 | 短剧 | 上架 `landpage` | `sort=online_time` |
+/// | 新剧 | 漫剧 | 上架 `landpage` | `sort=online_time` |
+///
+/// `sort` 必须用它自己的词表（`online_time` / `hot_score` / `hot_collect`），
+/// 不能把 TTV 前端的 `recommend/latest/heat` 直接透传。
+fn shelf_feed_spec(
+    kind: &str,
+    channel: &str,
+    cursor: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let (mode, genre, board, sort) = match (kind, channel) {
+        ("hot", "comic") => ("rank", "", "hot", ""),
+        ("hot", "drama") => ("list", "short_play", "", "hot_score"),
+        ("new", "comic") => ("list", "comic_series", "", "online_time"),
+        ("new", "drama") => ("list", "short_play", "", "online_time"),
+        (_, "adult") => {
+            return Err("红果 App 接口没有 18+ 口径，神秘小窝不走这条链路。".to_owned());
+        }
+        ("hot" | "new", other) => {
+            return Err(format!("该分区暂不支持频道 {other}。"));
+        }
+        (other, _) => return Err(format!("未知分区：{other}")),
+    };
+
+    let mut spec = serde_json::json!({ "mode": mode });
+    let object = spec.as_object_mut().expect("刚构造的对象字面量");
+    for (key, value) in [("genre", genre), ("board", board), ("sort", sort)] {
+        if !value.is_empty() {
+            object.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+        }
+    }
+    if let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) {
+        object.insert(
+            "cursor".to_owned(),
+            serde_json::Value::String(cursor.to_owned()),
+        );
+    }
+    Ok(spec)
+}
+
+/// worker 条目 → `SeriesItem`。
+///
+/// 脏数据（HTML 标签、题材噪声）已经在 worker 侧处理掉，这里只做类型与字段名的
+/// 搬运 —— 与 `search_suggest` 的分工一致。
+fn shelf_feed_item(entry: &serde_json::Value, channel: &str) -> Option<SeriesItem> {
+    let id = entry.get("id")?.as_str()?.trim();
+    let title = entry.get("title")?.as_str()?.trim();
+    if id.is_empty() || title.is_empty() {
+        return None;
+    }
+    // 评分源给的是字符串（"9.4"），解析不了就当"源没给"。**绝不能填 0**：
+    // 前端是 `{series.rating && …}`，0 既会渲染成"0.0 分"角标，也是凭空造分
+    // （不变量 8：不要把不存在的东西显示成存在）。
+    let rating = entry
+        .get("score")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| *value > 0.0);
+    Some(SeriesItem {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        cover: entry
+            .get("cover")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        // 漫剧走 comic，其余走 drama：`SeriesCard` 靠它决定角标配色与悬停色。
+        item_type: if channel == "comic" { "comic" } else { "drama" }.to_owned(),
+        episodes_count: entry
+            .get("episodeCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        latest_episode_title: None,
+        tags: entry
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        origin: entry
+            .get("copyright")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+        brief: entry
+            .get("brief")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        rating,
+    })
+}
+
+/// 拉一页分区列表。
+pub async fn shelf_feed<R: Runtime>(
+    app: &AppHandle<R>,
+    kind: &str,
+    channel: &str,
+    cursor: Option<&str>,
+) -> Result<ShelfFeedPage, String> {
+    let spec = shelf_feed_spec(kind, channel, cursor)?;
+    // 恒用短剧档（content_type 1 / aid 8662）：实测 aid 8662 的列表接口同时服务
+    // 短剧与漫剧（漫剧由 `select_items.genre` 表达），而 8704 已被网关静默拒绝
+    // （HTTP 200 + 空 body）。与 `search_suggest` 的结论一致。
+    let profile = HongguoAppProfile::from_input(Some(1), None)?;
+    let payload = run_worker_subcommand(app, "feed", &spec.to_string(), "shelf", profile).await?;
+    let items = payload
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| shelf_feed_item(entry, channel))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ShelfFeedPage {
+        items,
+        has_more: payload
+            .get("hasMore")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        next_cursor: payload
+            .get("nextCursor")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+    })
+}
+
+/// 前端「更多」页调用：按分区拉一页。
+#[tauri::command]
+pub async fn short_drama_app_shelf_feed<R: Runtime>(
+    app: AppHandle<R>,
+    kind: String,
+    channel: String,
+    cursor: Option<String>,
+) -> Result<ShelfFeedPage, String> {
+    shelf_feed(&app, &kind, &channel, cursor.as_deref()).await
+}
+
+// ---------------------------------------------------------------------------
+// 红果封面代理（HEIC → JPEG）
+// ---------------------------------------------------------------------------
+
+/// 封面转码缓存目录。刻意与 guo-core 的 `covers-v1` 分开：两套命名与淘汰策略
+/// 互不相干，混在一起以后想清一边就得小心另一边。
+fn cover_cache_dir() -> PathBuf {
+    resolve_data_dir().join("hongguo-covers-v1")
+}
+
+/// 用 URL 的 64 位散列做缓存文件名。
+///
+/// 没为这个缓存引入 sha2/md5：目录里几千张图的量级下 64 位碰撞可以忽略，真撞了
+/// 也只是缓存回一张错图（下次启动重新生成），不值得为它加依赖。
+fn cover_cache_key(url: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// 图片字节的容器类型。决定要不要转码，以及 `data:` URL 的 mime。
+fn image_kind(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        match &bytes[8..12] {
+            b"heic" | b"heix" | b"heim" | b"heis" | b"mif1" | b"msf1" => return "heic",
+            _ => {}
+        }
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "jpeg";
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "png";
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "webp";
+    }
+    if bytes.starts_with(b"GIF8") {
+        return "gif";
+    }
+    if bytes.first() == Some(&b'<') {
+        return "html";
+    }
+    "unknown"
+}
+
+fn image_data_url(bytes: &[u8], ext: &str) -> String {
+    let mime = match ext {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "image/jpeg",
+    };
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+/// HEIC → JPEG（用随包的 ffmpeg，实测单张 0.39s）。
+///
+/// 走临时文件而不是管道：ffmpeg 的 image2 输出走管道要自己拼封装，为几十 KB 的图
+/// 不值得；临时文件就写在缓存目录旁边，转完无论成败都清掉。
+async fn convert_heic_to_jpeg(
+    cache_dir: &std::path::Path,
+    key: &str,
+    bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let ffmpeg = ffmpeg_path()?;
+    let source = cache_dir.join(format!("{key}.heic.tmp"));
+    let target = cache_dir.join(format!("{key}.jpg"));
+    std::fs::write(&source, bytes).map_err(|error| format!("写入临时封面失败：{error}"))?;
+    let mut command = tokio::process::Command::new(&ffmpeg);
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(&source)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-q:v")
+        .arg("4")
+        .arg("-y")
+        .arg(&target);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // 别弹控制台黑窗
+    let output = command.output().await;
+    let _ = std::fs::remove_file(&source);
+    let output = output.map_err(|error| format!("封面转码失败：{error}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&target);
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "封面转码失败：{}",
+            detail.lines().last().unwrap_or("未知原因")
+        ));
+    }
+    std::fs::read(&target).map_err(|error| format!("读取转码结果失败：{error}"))
+}
+
+/// 命令的实体。独立出来是为了能被下面 `#[ignore]` 的联网测试直接调用 ——
+/// 那条测试不需要 Tauri 运行时，只验证"下载 → 识别 → 转码 → data URL"这一串。
+async fn cover_to_data_url(url: &str, cache_dir: &std::path::Path) -> Result<String, String> {
+    let url = url.trim();
+    if !url.starts_with("https://") {
+        return Err("封面地址无效。".to_owned());
+    }
+    let host_ok = {
+        let rest = url.trim_start_matches("https://");
+        let authority = rest.split(['/', '?']).next().unwrap_or("");
+        let host_only = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host_only
+            .split(':')
+            .next()
+            .unwrap_or(host_only)
+            .to_ascii_lowercase();
+        host.ends_with(".fqnovelpic.com")
+            || host.ends_with(".byteimg.com")
+            || host.ends_with(".snssdk.com")
+    };
+    if !host_ok {
+        return Err("该封面来源不支持代理。".to_owned());
+    }
+
+    std::fs::create_dir_all(cache_dir).map_err(|error| format!("创建封面缓存目录失败：{error}"))?;
+    let key = cover_cache_key(url);
+
+    // 命中缓存直接读盘。缓存里存的是**已转码**的格式，所以不需要原地址。
+    for ext in ["jpg", "png", "webp", "gif"] {
+        if let Ok(bytes) = std::fs::read(cache_dir.join(format!("{key}.{ext}"))) {
+            return Ok(image_data_url(&bytes, ext));
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("封面下载失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("封面下载失败：HTTP {}", response.status()));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("封面读取失败：{error}"))?;
+
+    match image_kind(&bytes) {
+        "heic" => {
+            let jpeg = convert_heic_to_jpeg(cache_dir, &key, &bytes).await?;
+            Ok(image_data_url(&jpeg, "jpg"))
+        }
+        "unknown" | "html" => Err("封面不是可识别的图片。".to_owned()),
+        kind => {
+            let ext = if kind == "jpeg" { "jpg" } else { kind };
+            let _ = std::fs::write(cache_dir.join(format!("{key}.{ext}")), &bytes);
+            Ok(image_data_url(&bytes, ext))
+        }
+    }
+}
+
+/// 红果封面 → `data:` URL。
+///
+/// **为什么必须转**：红果图片服务给的是 HEIC（实测 `content-type: image/heic`、
+/// 文件头 `ftypheic`），而 WebView2/Chromium 解不了 HEIC —— 前端直接把地址丢给
+/// `<img>`，只会得到一块解码失败的空白（用户报告的"视频海报出不来"）。官方 PC
+/// 客户端做的是同一件事，它的 `/img?url=` 注释写着"红果封面常返回 HEIC，浏览器
+/// 不支持时转成 JPEG"，只是它用 Pillow，我们用随包的 ffmpeg。
+///
+/// **为什么返回 data URL 而不是本地文件路径**：`asset:` 协议的作用域在开发态
+/// （数据目录是项目内 `.app-data`）与打包后（`app_data_dir()`）并不一致，写文件
+/// 要么动 scope、要么挑一个两边都在的目录，都不如直接把 JPEG 塞回前端干净 ——
+/// CSP 的 `img-src` 本来就有 `data:`。缓存仍落盘，所以重复进入某一页只是读文件。
+///
+/// 只代理字节系的图片域名：这是唯一会回 HEIC 的一族；放开成任意 URL 会让它变成
+/// 一个人人可用的代理（SSRF）。
+#[tauri::command]
+pub async fn short_drama_app_cover_proxy(url: String) -> Result<String, String> {
+    cover_to_data_url(&url, &cover_cache_dir()).await
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrefetchStreamInput {
@@ -1635,6 +2598,9 @@ async fn run_worker_subcommand<R: Runtime>(
         .ok_or_else(|| "解析 worker stderr 不可读".to_owned())?;
 
     let emit_app = app.clone();
+    // tokio::spawn 要求闭包是 'static：subcommand 是借用参数，必须先把归属搬到
+    // 闭包外的 String 里（日志要用它）；action 本身已是 &'static str，不用动。
+    let subcommand_log = subcommand.to_owned();
     let reader = tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines = BufReader::new(stdout).lines();
@@ -1652,6 +2618,16 @@ async fn run_worker_subcommand<R: Runtime>(
             };
             match value.get("event").and_then(serde_json::Value::as_str) {
                 Some("progress") => {
+                    // 目录/详情/合集这类子命令也要留证：用户报"切页面卡"时，
+                    // 常常是这里在等云端，而不是界面本身慢。
+                    crate::trace::log(format!(
+                        "[红果] worker {} stage={}",
+                        subcommand_log,
+                        value
+                            .get("stage")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                    ));
                     let _ = emit_app.emit(
                         RESOLVE_EVENT,
                         serde_json::json!({
@@ -2048,7 +3024,20 @@ pub async fn short_drama_app_album<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_requested_quality, HongguoAppProfile};
+    use super::{
+        cover_to_data_url, normalize_cache_budget_mb, normalize_requested_quality,
+        HongguoAppProfile,
+    };
+    use base64::Engine;
+
+    #[test]
+    fn cache_budget_defaults_and_clamps_user_values() {
+        assert_eq!(normalize_cache_budget_mb(0.0), 1024);
+        assert_eq!(normalize_cache_budget_mb(f64::NAN), 1024);
+        assert_eq!(normalize_cache_budget_mb(128.0), 256);
+        assert_eq!(normalize_cache_budget_mb(2048.0), 2048);
+        assert_eq!(normalize_cache_budget_mb(999_999.0), 16_384);
+    }
 
     #[test]
     fn reads_device_token_aliases_from_credentials_json() {
@@ -2338,5 +3327,41 @@ mod tests {
         assert_eq!(normalize_requested_quality(" 1080P "), "1080p");
         // 认不出来的串退回 auto，而不是去打一个并不存在的档位。
         assert_eq!(normalize_requested_quality("高清"), "auto");
+    }
+
+    /// 联网冒烟：真去拉一张红果封面，走完"下载 → 识别 HEIC → ffmpeg 转码 → data URL"。
+    ///
+    /// 默认不跑（`#[ignore]`），因为它依赖网络与随包 ffmpeg，不适合放进 CI 的
+    /// 纯逻辑单测。跑法：
+    /// `cargo test --bins -- --ignored cover_proxy --nocapture`
+    ///
+    /// 存在的意义：`cover_to_data_url` 里任何一步坏掉（域名白名单、HEIC 识别、
+    /// ffmpeg 参数、base64），前端只会表现为"海报又变成空白占位"，看不出原因；
+    /// 这条测试把整条链路的失败点直接打印出来。
+    #[test]
+    #[ignore = "需要联网与随包 ffmpeg"]
+    fn cover_proxy_converts_real_heic_into_jpeg_data_url() {
+        // 这张地址来自红果榜单实测返回（HEIC，400px 宽模板）。
+        const URL: &str = "https://p3-reading-sign.fqnovelpic.com/novel-pic/98484d0e3cf06d85d2d29712d0465a5f~tplv-81nmtwyey9-superreso-aifit:400:0.heic?lk3s=64477e16&x-expires=1796531569&x-signature=z69dWJ7phEinpeez2diQeyx%2BPXQ%3D";
+        let cache_dir = std::env::temp_dir().join("ttv-cover-proxy-test");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let runtime = tokio::runtime::Runtime::new().expect("tokio 运行时");
+        let data_url = runtime
+            .block_on(cover_to_data_url(URL, &cache_dir))
+            .expect("封面代理应当成功");
+        println!("data URL 长度 = {}", data_url.len());
+        assert!(
+            data_url.starts_with("data:image/jpeg;base64,"),
+            "前缀不对：{}",
+            &data_url[..40.min(data_url.len())]
+        );
+        let encoded = data_url.trim_start_matches("data:image/jpeg;base64,");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64 应当可解");
+        // JPEG 的 SOI 标记，说明 ffmpeg 真的产出了图而不是把 HEIC 原样塞回来。
+        assert_eq!(&decoded[..3], &[0xFF, 0xD8, 0xFF], "转码结果不是 JPEG");
+        println!("转码后 JPEG 字节数 = {}", decoded.len());
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }
