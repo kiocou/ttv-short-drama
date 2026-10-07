@@ -715,11 +715,26 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
       const index = currentSeries.episodes.findIndex(item => item.id === currentEpisode.id);
       if (index >= 0 && index + 1 < currentSeries.episodes.length) {
         void openRef.current(currentSeries.id, currentSeries.episodes[index + 1].id, 0);
+        return;
       }
+      // 已经是最后一集：没有下一集可进，画面停在 ended 上就是黑屏。稍作停留
+      // （让收尾和提示被看到）后走与手动返回相同的出口（close + 回详情页）。
+      // 全屏不用管：App 在离开播放视图时会自动退全屏。
+      const finishedSession = sessionRef.current;
+      const finishedSeriesId = currentSeries.id;
+      window.setTimeout(() => {
+        // 期间用户开了新一集或已退出播放器：session 已变，本次返回作废。
+        if (sessionRef.current !== finishedSession) return;
+        // 用户已把进度拖回重新看：不再自动返回。
+        const el = videoRef.current;
+        if (el && !el.ended) return;
+        close();
+        navigateTo('detail', finishedSeriesId);
+      }, 2000);
     };
     video.addEventListener('ended', onEnded);
     return () => video.removeEventListener('ended', onEnded);
-  }, [videoEl, persistHistory]);
+  }, [videoEl, persistHistory, close, navigateTo]);
 
   /** 组件卸载（退出应用）时确保不留后台声音。 */
   useEffect(() => () => {

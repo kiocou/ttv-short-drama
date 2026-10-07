@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
-import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useFavorites } from '../../stores/useFavoritesStore';
 import { ipcService } from '../../services/ipc';
@@ -26,7 +26,8 @@ import {
 
 export const DetailView: React.FC = () => {
   const { selectedSeriesId, navigateTo, goBack, showToast } = useAppStore();
-  const { openEpisode, prewarmEpisode } = usePlaybackStore();
+  // 详情页挂在常驻 DOM 上：走低频动作专线，整表订阅会让选集网格跟着播放进度重渲染。
+  const { openEpisode, prewarmEpisode } = usePlaybackActions();
   const { open: openAnimeEpisode } = useAnimePlayer();
   const { markBySeriesId, setMark } = useFavorites();
   const detailCacheRef = useRef<Record<string, SeriesDetail>>({});

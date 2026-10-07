@@ -7,7 +7,11 @@ interface ProgressBarProps {
   onSeek: (seconds: number) => void;
 }
 
-function formatTime(seconds: number): string {
+/**
+ * 秒 → mm:ss。两个播放面（主进度条与画中画小窗）共用同一份格式化，
+ * 免得两处各写一遍、格式悄悄分叉（如 "5:03" vs "05:03"）。
+ */
+export function formatTime(seconds: number): string {
   if (isNaN(seconds) || seconds < 0) return '00:00';
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);

@@ -1,9 +1,10 @@
-import React, { createContext, useContext, useState, useRef, useEffect, useCallback, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useRef, useEffect, useCallback, useMemo, ReactNode } from 'react';
 import { PlaybackUiState, PlaybackSession } from '../types/playback';
 import { SeriesDetail, EpisodeItem } from '../types/series';
 import { ipcService, isTauriEnvironment } from '../services/ipc';
 import { attachSource, isHlsUrl, detachSource } from '../services/hlsAttach';
 import { dismissPip, openPip } from '../services/pip';
+import { tracePlayback } from '../services/playbackTrace';
 import { useSettingsStore } from './useSettingsStore';
 
 /**
@@ -52,6 +53,16 @@ function disposePrepared(prepared: PreparedSource | null): void {
 /** 首帧预解池的容量。3 = 下一集 + 下两集，与 warmAdjacentEpisodes 的下三集对齐。 */
 const PREPARED_POOL_MAX = 3;
 
+/**
+ * 前缀片段能覆盖到的秒数，用来决定这次起播值不值得走前缀先行。
+ *
+ * 前缀就是开头一小段（worker 按 `TTV_SD_PREFIX_BYTES` 截断），实测落盘十几秒。
+ * 从这个位置往后续播时，前缀文件播几下就到头，反而会先送一次 ended —— 对
+ * 继续观看这种场景得不偿失，直接等整集。取 3 秒是保守值：只有从片头（或片头
+ * 附近）开播才走前缀，而这正是红果点开就看的那个主路径。
+ */
+const PREFIX_COVERAGE_SECONDS = 3;
+
 interface PlaybackContextType {
   sessionId: number;
   currentSeries: SeriesDetail | null;
@@ -83,6 +94,11 @@ interface PlaybackContextType {
   toggleDiagnostics: (open?: boolean) => void;
   /** 离开播放器工作区时调用：暂停画面、取消后台连播并落盘进度。 */
   stopPlayback: () => void;
+  /**
+   * 全部剧集已播完（连播开启、最后一集正常 ended）。宿主读到后应返回详情页；
+   * 任何新的用户接管都会把它复位。
+   */
+  finishedAll: boolean;
   /** 显式设置静音（从小窗回播放器时接回音频状态用）。 */
   setMuted: (value: boolean) => void;
   /**
@@ -114,6 +130,30 @@ interface PlaybackContextType {
   /** 用户手动关掉卡死提示。 */
   dismissStallNotice: () => void;
 }
+
+/**
+ * 与时间无关的「动作 + 会话身份」。**专供非播放器宿主消费**（App 壳层、发现页、
+ * 历史、详情、选集抽屉、PipReturnBridge、诊断面板）。
+ *
+ * ## 为什么要拆出这一份
+ *
+ * `PlaybackContext` 里混着高频变化的值：`position` 每次 `timeupdate` 都变（约 4 次/秒）、
+ * `buffered` 每次 `progress` 都变。而 React 的 context 是**按引用**广播的，
+ * 所以只要订阅了整表，这些消费者的重渲染频率就等于播放进度更新频率。
+ * `AppContent` 是所有视图的父节点、`ExploreView` 下面有上百张卡片——它们跟着
+ * 每秒重渲染 4 次，正是用户反馈「切换页面 / 进出播放器发涩」的直接来源。
+ *
+ * 这里只放低频字段：换剧/换集会变、开关抽屉与诊断会变，都发生在用户点击时。
+ * 于是下面这些调用方从「每秒 4 次」降到「每次交互 1 次」，而播放器自身
+ * （`VideoSurface` / `PlayerControls` / `AnimeVideoSurface`）继续用整表，行为不变。
+ *
+ * ⚠️ 不要往里加 `position` / `buffered` / `duration` / `uiState` / `prepareStatus`：
+ * 它们会把这条专线的全部收益立刻抵消。
+ */
+type PlaybackActionsContextType = Omit<PlaybackContextType,
+  | 'position' | 'duration' | 'buffered' | 'uiState' | 'prepareStatus'
+  | 'isSwitching' | 'errorDetail' | 'stallNotice' | 'finishedAll' | 'videoRef' | 'sessionId'
+>;
 
 /** 原生解析 worker 上报的进度（Rust 转发的 `shortdrama://app-resolve` 事件）。 */
 export interface PrepareStatus {
@@ -385,6 +425,9 @@ function startDramaStallWatchdog(
 
 const PlaybackContext = createContext<PlaybackContextType | null>(null);
 
+/** 低频动作专线。见 PlaybackActionsContextType 的说明。 */
+const PlaybackActionsContext = createContext<PlaybackActionsContextType | null>(null);
+
 export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   // 接通用户设置：默认清晰度、自动连播、倒计时秒数此前全是死代码——
   // SettingsView 能改、能存盘，但播放器从不读取，等于摆设。
@@ -477,6 +520,15 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 也不报错，界面就永远停在转圈。
   const nativeResolveSessionRef = useRef<number>(0);
   /**
+   * 当前画面是不是"前缀片段"（而不是完整文件）。
+   *
+   * 前缀只含开头一小段，播到它的末尾会派发一次 `ended`——而这一集其实远没
+   * 播完。`handleEnded` 必须能分辨"真播完"与"前缀播到头"，否则会把用户半路
+   * 甩进下一集，甚至把这一集记成"已看完"。谁把源换成了完整文件，就由谁清掉
+   * 这个标记（切整集成功、整集链路起播成功）。
+   */
+  const prefixSourceRef = useRef<{ episodeId: string; sessionId: number } | null>(null);
+  /**
    * 是否正在把新源接管到主播放器（`adoptPreparedSource` / `playDirect`）。
    *
    * 这期间主 <video> 派发的任何 `error` 都属于**本次接管的内部事务**：
@@ -493,6 +545,21 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const saveProgressThrottledRef = useRef<(pos: number, dur: number, force?: boolean) => void>(() => {});
 
   const [stallNotice, setStallNotice] = useState<string | null>(null);
+
+  /**
+   * 全剧播完信号：连播开启时最后一集正常 ended。
+   *
+   * 常驻 `<video>` 没有"剧集播完"的呈现，停在 ended 上就是一块黑屏——所以由
+   * 宿主（VideoSurface）读到它后返回详情页。判定放在 store 里是因为只有这里
+   * 拿得到完整的闸门（autoNext、连播闩锁、迟到事件过滤，见 handleEnded）；
+   * 组件层自己看 `uiState === 'ended'` 判断会把交接期的旧源 ended 误判进来。
+   * 任何用户接管（seek / 重新开播 / 换集 / 离开播放器）都必须把它复位，
+   * 否则 2 秒后的返回会在用户已经另有安排时突然发生。
+   */
+  const [finishedAll, setFinishedAll] = useState<boolean>(false);
+  // 最后一集的 ended 事件在部分 WebView2 版本会重复派发一次。
+  // 记住已经处理过的末集，避免第二次事件把末集重新装载或再次触发收尾。
+  const finishedAllEpisodeRef = useRef<string | null>(null);
 
   /**
    * 卡死看门狗的停止函数。
@@ -880,6 +947,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         video.addEventListener('loadeddata', done, { once: true });
         video.addEventListener('error', done, { once: true });
       });
+      detachSource(video);
       video.src = prepared.url;
       // 从这一刻起，画面属于这一集——自动跳集只认这个事实来源。
       markSourceCommitted(sessionId, episodeId);
@@ -957,6 +1025,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         video.addEventListener('loadeddata', done, { once: true });
         video.addEventListener('error', done, { once: true });
       });
+      detachSource(video);
       video.src = assetUrl;
       markSourceCommitted(sessionId, episodeId);
       video.load();
@@ -990,6 +1059,22 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
   };
 
+  /**
+   * 红果起播：**前缀先行，整集后到替身**。
+   *
+   * 用户点上"播放"之后，等待全部发生在"整集下载+解密+转存"这一个 await 里
+   * （实测 6.1–11.2 秒），而 resolve 返回后到首帧只要毫秒级。所以把这一件事拆成
+   * 两条并发链路：前缀（开头一小段）先出画，整集在后台照常下，落盘后把同一块
+   * <video> 悄悄换到完整文件上。
+   *
+   * 三条硬性前提：
+   *   1. **不能多等**。整集请求与原来完全一样（同样的缓存登记、同样的失败语义），
+   *      整集先到就用整集，前缀只是"先到先得"的另一档，绝不叠加延迟。
+   *   2. **不能黑屏、不能弹错**。前缀没来 / 播不起来 / 切源失败，一律静默退回原
+   *      链路；切换走 `adoptPreparedSource`（不调 `load()`，旧帧保留到新源就绪）。
+   *   3. **不能换会话**。全程同一个 sessionId、同一个 episodeId，`markSourceCommitted`
+   *      与 `pauseIfStale` 的语义原样复用，自动跳集四重闸门不受影响。
+   */
   const playNativeResolvedFile = async (
     seriesId: string,
     episodeId: string,
@@ -999,32 +1084,132 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     sessionId: number,
     startPosition = 0,
   ): Promise<PlayOutcome> => {
-    try {
-      const resolved = await ipcService.playback.resolveNative(
-        seriesId,
-        episodeId,
-        contentType,
-        quality,
-      );
-      // 解析成功立刻登记本地文件路径：换集/切清晰度第二次进入同一集时秒开。
-      if (resolved.cached || resolved.sizeBytes > 0) {
-        resolvedFileByVidRef.current.set(
-          episodeCacheKey(seriesId, episodeId, quality),
-          resolved.playUrl,
-        );
+    const cacheKey = episodeCacheKey(seriesId, episodeId, quality);
+
+    /**
+     * 整集链路本体（即改造前的全部行为），只在"必须等完整文件"时才走：
+     * 前缀被跳过 / 前缀没命中 / 前缀播不起来 / 起播那一刻整集已经落盘。
+     * 复用同一个 `fullPromise`，所以无论走到这里几次，整集都只下载一次。
+     */
+    const runFull = async (): Promise<PlayOutcome> => {
+      try {
+        const resolved = await fullPromise;
+        if (activeSessionRef.current !== sessionId) return `stale`;
+        const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition, episodeId, seriesId);
+        // 画面已经换成完整文件：前缀标记必须撤掉，否则这一集真播完时会被当成
+        // "前缀播到头"再重载一次。
+        if (outcome === `ok` && prefixSourceRef.current?.episodeId === episodeId) {
+          prefixSourceRef.current = null;
+        }
+        // 只有"源本身有问题"才撤掉登记。自动播放被拦（autoplay-blocked）时
+        // 文件是完好的，撤掉会导致下次重下一整集——白等 7 秒。
+        if (outcome === `error` && activeSessionRef.current === sessionId) {
+          resolvedFileByVidRef.current.delete(cacheKey);
+        }
+        return outcome;
+      } catch (error) {
+        noteFailure(`本地解析失败 ${seriesId}/${episodeId}`, error);
+        return `error`;
       }
-      if (activeSessionRef.current !== sessionId) return 'stale';
-      const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition, episodeId, seriesId);
-      // 只有"源本身有问题"才撤掉登记。自动播放被拦（autoplay-blocked）时
-      // 文件是完好的，撤掉会导致下次重下一整集——白等 7 秒。
-      if (outcome === 'error' && activeSessionRef.current === sessionId) {
-        resolvedFileByVidRef.current.delete(episodeCacheKey(seriesId, episodeId, quality));
-      }
-      return outcome;
-    } catch (error) {
-      noteFailure(`本地解析失败 ${seriesId}/${episodeId}`, error);
-      return 'error';
+    };
+    // 走原来的整集链路，并把它在途的 promise 记回 ref 上——`handleError` 的
+    // "本地解析在途就别弹错误页"闸门读的正是这个 ref，前缀先行不能让这道闸门
+    // 失效（整集没落盘之前，任何源错误都还该被兜住）。
+    const startFull = (): Promise<PlayOutcome> => {
+      const attempt = runFull();
+      nativeResolveInFlightRef.current = attempt;
+      nativeResolveSessionRef.current = sessionId;
+      return attempt.finally(() => {
+        if (nativeResolveInFlightRef.current === attempt) nativeResolveInFlightRef.current = null;
+      });
+    };
+
+    // 整集链路**先发车、先不 await**：Rust 侧两条链路是并发 worker（在途去重键
+    // 带 `:prefix` 后缀），谁先落盘谁先被用上。这里的 promise 是"最终一定会拿到
+    // 的完整文件"，也是唯一会写进 resolvedFileByVidRef 的东西——前缀路径永远不
+    // 登记，否则下次换集会命中一个只剩开头十几秒的短命文件。
+    const fullPromise = ipcService.playback.resolveNative(seriesId, episodeId, contentType, quality)
+      .then(resolved => {
+        // 解析成功立刻登记本地文件路径：换集/切清晰度第二次进入同一集时秒开。
+        if (resolved.cached || resolved.sizeBytes > 0) {
+          resolvedFileByVidRef.current.set(cacheKey, resolved.playUrl);
+        }
+        return resolved;
+      });
+    // 前缀路径可能在拿到整集之前就返回（stale / 失败回退）：那之后没人 await
+  
+    // fullPromise 在极端情况下（会话早已切换）没人 await，必须自己挂一个
+    // no-op 捕获，否则会冒出 unhandled rejection。
+    void fullPromise.catch(() => {});
+    // 续播时，前缀文件几乎立刻播到头，反而会先触发一次 ended —— 对"继续观看"
+    // 这条路径，老老实实等整集才是对的。
+    if (startPosition > PREFIX_COVERAGE_SECONDS) {
+      tracePlayback(`前缀起播 跳过（续播位置 ${startPosition.toFixed(1)}s 超出前缀覆盖范围）`);
+      return startFull();
     }
+
+    // 前缀失败不是错误，只是没享受到加速：整集链路早就在跑，继续等它就行。
+    const prefixStarted = performance.now();
+    const prefix = await ipcService.playback
+      .resolveNativePrefix(seriesId, episodeId, contentType, quality)
+      .catch((error: unknown) => {
+        tracePlayback(`前缀起播 未命中（继续等整集） ${describeError(error)}`);
+        return null;
+      });
+    if (!prefix) return startFull();
+    // 整集已在盘上时后端直接把整集当"前缀"还回来：没有第二条链路要等。
+    if (prefix.cached === true) return startFull();
+    if (activeSessionRef.current !== sessionId) return `stale`;
+
+    const prefixOutcome = await playLocalFile(prefix.playUrl, video, sessionId, startPosition, episodeId, seriesId);
+    if (prefixOutcome === `stale`) return `stale`;
+    if (prefixOutcome !== `ok`) {
+      // 前缀播不起来（片段解码失败、自动播放被拦）：**不弹错误页**，把结果交给
+      // 整集链路重新决定。此时整集多半已经在路上，不会比原实现更慢。
+      tracePlayback(`前缀起播 失败（outcome=${prefixOutcome}，回退整集）`);
+      return startFull();
+    }
+    prefixSourceRef.current = { episodeId, sessionId };
+    tracePlayback(`前缀起播 耗时=${Math.round(performance.now() - prefixStarted)}ms 字节=${(prefix.sizeBytes / 1048576).toFixed(1)}MB（整集仍在后台下载）`);
+
+    // 画面已经在前缀上了：后台等整集，落盘后把同一会话、同一 <video> 切到完整
+    // 文件。这段刻意 fire-and-forget —— 上层的 isSettled / 预取落点不该为一个
+    // "锦上添花"的切源多等 7 秒，而切源本身自带完整的失败退让。
+    void (async () => {
+      try {
+        const resolved = await fullPromise;
+        if (activeSessionRef.current !== sessionId) return;
+        if (!resolved.playUrl || resolved.playUrl === prefix.playUrl) return;
+        const { convertFileSrc } = await import(`@tauri-apps/api/core`);
+        const assetUrl = convertFileSrc(resolved.playUrl);
+        // 先让隐藏探针把整集解到可播，再交给 adoptPreparedSource：不调 load()、
+        // 旧帧一直保留到新源 loadeddata —— 这是"切源不黑屏"的全部依据。
+        const probe = await preloadSource(assetUrl, 0, 8000);
+        if (!probe) return;
+        if (activeSessionRef.current !== sessionId) {
+          disposePrepared({ url: assetUrl, element: probe });
+          return;
+        }
+        // 从前缀当前播放位置续上：两个文件同一源同一编码，直接按秒对齐即可。
+        const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+        const switchedAt = performance.now();
+        const outcome = await adoptPreparedSource(
+          { url: assetUrl, element: probe }, video, sessionId, resumeAt, episodeId,
+        );
+        disposePrepared({ url: assetUrl, element: probe });
+        if (outcome !== `ok`) {
+          // 切不过去就继续播前缀：用户已经看了十几秒画面，不该因为这次替换
+          // 失败而弹错或变黑。下次换集/重开会命中整集缓存，问题自然消失。
+          tracePlayback(`整集切换未完成（outcome=${outcome}，继续播前缀）`);
+          return;
+        }
+        prefixSourceRef.current = null;
+        tracePlayback(`整集切换完成 耗时=${Math.round(performance.now() - switchedAt)}ms 位置=${resumeAt.toFixed(1)}s 字节=${(resolved.sizeBytes / 1048576).toFixed(1)}MB`);
+      } catch (error) {
+        tracePlayback(`整集切换异常（继续播前缀） ${describeError(error)}`);
+      }
+    })();
+    return `ok`;
   };
 
   // 统一的本地解析入口：把在途 promise 记到 ref 上，供 error 事件链等待复用。
@@ -1451,6 +1636,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 又点了一集，主窗口这边必须先把小窗拆掉，否则两路声音会同时响。同理，从小窗
   // "回到播放器"时这一步是空操作（窗口已经关掉了）。
   const runOpenEpisode = async (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string) => {
+    // H.264 增强任务会持续读取上一集源流，换集时必须显式停掉；否则旧 ffmpeg 会和新会话抢 CPU/带宽。
+    if (activeSessionRef.current > 0) {
+      void ipcService.playback.command(activeSessionRef.current, 'stop').catch(() => undefined);
+    }
     dismissPip();
     const qualitySwitchRequested = Boolean(
       qualityOverride
@@ -2001,6 +2190,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const resolveRetriedRef = useRef<Set<string>>(new Set());
   const openInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
   const openEpisode = (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string): Promise<void> => {
+    // 新的播放意图即刻撤销"全剧播完自动返回详情"的安排：用户可能在 2 秒返回窗口
+    // 内从选集抽屉点了下一部/另一集，不撤销的话返回会把正在打开的播放打断。
+    setFinishedAll(false);
+    finishedAllEpisodeRef.current = null;
     const key = `${seriesId}|${episodeId || ''}|${Math.round(startPosition)}|${qualityOverride || ''}`;
     const inflight = openInFlightRef.current.get(key);
     if (inflight) return inflight;
@@ -2064,6 +2257,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
 
   const seek = (seconds: number) => {
     if (!videoRef.current) return;
+    // 用户手动拖进度 = 接管播放：撤销"全剧播完自动返回详情"的安排（若有）。
+    setFinishedAll(false);
+    finishedAllEpisodeRef.current = null;
     const clamped = Math.max(0, Math.min(seconds, duration || 0));
     videoRef.current.currentTime = clamped;
     setPosition(clamped);
@@ -2170,6 +2366,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 同时强制落盘进度，避免"看了半集、退出后进度丢失"。
    */
   const stopPlayback = useCallback(() => {
+    // 会话号即将作废，先把增强转码与 guo 会话停掉；只停 <video> 不够，ffmpeg 还在后台读源。
+    if (activeSessionRef.current > 0) {
+      void ipcService.playback.command(activeSessionRef.current, 'stop').catch(() => undefined);
+    }
     // 离开播放器 = 当前会话作废：在途的 openEpisode/预热续体全部按 stale 处理。
     // 不作废的后果（实测）：换集长期卡在切线重试 → 用户返回主界面 → worker
     // 稍后成功 → 旧会话续体照常 setSrc/play()，常驻 <video> 被隐藏着出声。
@@ -2193,8 +2393,14 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 旧实现用 `Number.isFinite(duration)` 直接跳过保存，那类源于是永远
       // 留不下历史记录——漫剧里最容易中。
       saveProgressThrottledRef.current(video.currentTime, usableDuration(video), true);
+      // 增强流是 hls.js/MSE 接管，只 pause 会把上一集的 SourceBuffer 留在常驻 video 上；
+      // 下次直接播放本地 mp4 时必须先解除接管。
+      detachSource(video);
     }
     setIsPlaying(false);
+    // 已置位的"全剧播完"信号一并撤销：用户已离开播放器，别再自动把人拉去详情页。
+    setFinishedAll(false);
+    finishedAllEpisodeRef.current = null;
     // 回到 idle 而不是保留 playing/buffering：否则重新进入播放器时
     // 界面会先闪一下上一集的加载遮罩。
     setUiState(prev => (prev.kind === 'idle' ? prev : { kind: 'idle' }));
@@ -2367,7 +2573,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const video = videoRef.current;
     if (!video) return;
 
+    // 起播打点「首帧-宿主」这个基准值。正常应该远小于 2000ms（本地文件是
+    // 毫秒级）。若它显示出「画面在走、进度条 00:00」那种脱钩症状，这个数会
+    // 一直停在装载那一刻之后很久不再刷新 —— 即 <video> 被重挂、而这份只绑定
+    // 一次的监听器还挂在被丢弃的旧元素上。
+    const mountedAt = performance.now();
+    let firstTickAt: number | null = null;
+    tracePlayback('首帧-宿主 监听器已绑定 video');
+
     const handleTimeUpdate = () => {
+      if (firstTickAt === null) {
+        firstTickAt = performance.now();
+        tracePlayback(`首帧-宿主 首次 timeupdate 距装载=${Math.round(firstTickAt - mountedAt)}ms 时长=${usableDuration(video).toFixed(1)}s`);
+      }
       const cur = video.currentTime;
       const dur = usableDuration(video);
       setPosition(cur);
@@ -2394,6 +2612,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     };
 
     const handlePlaying = () => {
+      // 播完后又重新开播（用户把进度拖回再播）即撤销"全剧播完自动返回详情"的安排。
+      setFinishedAll(false);
       // 真正开播这一刻才武装看门狗（装载等待期里没有帧是正常的）。
       armStallWatchdog();
       // 画面真的回来了就收回卡死提示。第 1 级原地重试恢复时由看门狗的 onHealthy
@@ -2424,8 +2644,26 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       //
       // 旧实现无条件按 currentEpisode 写 100% 完成：交接期 currentEpisode 已经是
       // 下一集，于是一次播放结束会把下一集标成"已看完"，历史页随即显示错误的集数。
-      const committed = videoCommittedRef.current;
       const ctxEnded = handlerCtxRef.current;
+      // 前缀先行开播的副作用：前缀文件只有开头一小段（实测十几秒）。画面还挂在
+      // 前缀上就播到头时，这一集其实远没播完，而整集多半刚好落盘。就地重载同一集
+      // 接住它：openEpisode 会命中刚登记好的整集路径秒起，而且此时播放位置已远超
+      // `PREFIX_COVERAGE_SECONDS`，会**自动跳过前缀**——不存在"前缀播完 → 重载 →
+      // 又播前缀"的循环。放在落盘判定之前，是因为这一次 ended 并不代表看完。
+      const prefixSource = prefixSourceRef.current;
+      if (
+        prefixSource
+        && prefixSource.sessionId === activeSessionRef.current
+        && prefixSource.episodeId === (videoCommittedRef.current?.episodeId ?? ``)
+        && ctxEnded.currentSeries
+      ) {
+        prefixSourceRef.current = null;
+        const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+        tracePlayback(`前缀片段播到末尾 位置=${resumeAt.toFixed(1)}s，就地接整集`);
+        void openEpisodeRef.current(ctxEnded.currentSeries.id, prefixSource.episodeId, resumeAt);
+        return;
+      }
+      const committed = videoCommittedRef.current;
       const endedEpisodeId = committed?.episodeId ?? ctxEnded.currentEpisode?.id ?? null;
       if (endedEpisodeId && endedEpisodeId === ctxEnded.currentEpisode?.id) {
         const endedDuration = usableDuration(video);
@@ -2444,6 +2682,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 「一次跳好几集」这个历史上反复出现的故障就没有第二条路径可钻了。
       if (!ctxEnded.autoNext) return;
       if (!tryClaimAutoAdvance(endedEpisodeId)) return;
+      // 已经是最后一集：连播链到头，没有"下一集"可进。置位交给宿主返回详情页
+      // ——常驻 <video> 停在 ended 上就是黑屏，不能什么都不做。
+      const endedSeries = ctxEnded.currentSeries;
+      const endedIndex = endedSeries
+        ? endedSeries.episodes.findIndex(e => e.id === endedEpisodeId)
+        : -1;
+      if (endedSeries && endedIndex >= 0 && endedIndex >= endedSeries.episodes.length - 1) {
+        if (finishedAllEpisodeRef.current === endedEpisodeId) return;
+        finishedAllEpisodeRef.current = endedEpisodeId;
+        setFinishedAll(true);
+        return;
+      }
       playNextEpisodeRef.current();
     };
 
@@ -2475,6 +2725,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         video.pause();
         const preferredMuted = ctx.isMuted;
         video.muted = true;
+        detachSource(video);
         video.src = backupUrl;
         if (ctx.currentEpisode) markSourceCommitted(activeSessionRef.current, ctx.currentEpisode.id);
         video.load();
@@ -2508,6 +2759,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           .then(blob => {
             if (activeSessionRef.current !== Number(video.dataset.sessionId)) return;
             objectUrlRef.current = URL.createObjectURL(blob);
+            detachSource(video);
             video.src = objectUrlRef.current;
             const blobCtx = handlerCtxRef.current;
             if (blobCtx.currentEpisode) markSourceCommitted(activeSessionRef.current, blobCtx.currentEpisode.id);
@@ -2597,10 +2849,31 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       });
     };
 
+    /**
+     * 首帧真的出来了：把「云端解析中…」那条进度提示收掉。
+     *
+     * 为什么需要单独一条：解析进度来自 worker 的 `shortdrama://app-resolve` 事件，
+     * 而 worker 是在**下载整集**的过程中上报的。现在的链路是"worker 一边下载、
+     * 播放器一边播"（增强转码流尤其如此：第一段分片落地就能出画，此后 worker 还在
+     * 为后续分片继续拉源）。于是进度提示会一直挂到整集下完为止 —— 用户看到的正是
+     * 「视频都开始播了，还在转圈等我」，而它等的其实是一件**已经不影响当前播放**
+     * 的后台任务。
+     *
+     * 判定用 `currentTime > 0` 而不是单纯 `playing`：`playing` 在缓冲挖坑后
+     * 恢复播放时也会触发，那时进度提示还有意义；只有真的推进了播放位置才说明
+     * 首帧已经渲染出来了。
+     */
+    const clearResolveOverlay = () => {
+      if (video.currentTime <= 0) return;
+      downloadSampleRef.current = null;
+      setPrepareStatus(null);
+    };
+
     video.addEventListener('timeupdate', handleTimeUpdate);
     video.addEventListener('progress', handleProgress);
     video.addEventListener('waiting', handleWaiting);
     video.addEventListener('playing', handlePlaying);
+    video.addEventListener('playing', clearResolveOverlay);
     video.addEventListener('ended', handleEnded);
     video.addEventListener('error', handleError);
 
@@ -2609,6 +2882,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       video.removeEventListener('progress', handleProgress);
       video.removeEventListener('waiting', handleWaiting);
       video.removeEventListener('playing', handlePlaying);
+      video.removeEventListener('playing', clearResolveOverlay);
       video.removeEventListener('ended', handleEnded);
       video.removeEventListener('error', handleError);
     };
@@ -2620,9 +2894,55 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return (
-    <PlaybackContext.Provider
-      value={{
+  /**
+   * 两条 context 的拆分（见 PlaybackActionsContextType 的说明）。
+   *
+   * `actionsRef` 每次渲染刷新，让下面 memo 出来的专线里放的是**稳定转发层**：
+   * 调用时永远转发到最新实现，所以既不会拿到过期闭包，也不需要把每次渲染都
+   * 新建的函数列进依赖（列了就等于没有 memo）。
+   */
+  const actionsRef = useRef<PlaybackActionsContextType | null>(null);
+  actionsRef.current = {
+    currentSeries,
+    currentEpisode,
+    isPlaying,
+    volume,
+    isMuted,
+    playbackRate,
+    currentQuality,
+    availableQualities,
+    isSideDrawerOpen,
+    isDiagnosticsOpen,
+    openEpisode,
+    togglePlay,
+    seek,
+    seekRelative,
+    setVolume,
+    toggleMute,
+    setPlaybackRate,
+    setQuality,
+    playNextEpisode,
+    playPrevEpisode,
+    toggleSideDrawer: (open) => setIsSideDrawerOpen(prev => open ?? !prev),
+    toggleDiagnostics: (open) => setIsDiagnosticsOpen(prev => open ?? !prev),
+    stopPlayback,
+    setMuted,
+    prewarmEpisode,
+    enterPip,
+    dismissStallNotice,
+  };
+
+  /**
+   * 全量 value：**只给播放器自己**（VideoSurface / PlayerControls）。
+   *
+   * 它刻意不 memo：里面 12 个动作函数（openEpisode / seek / setVolume …）都是每次
+   * 渲染新建的普通函数，把它们列进依赖等于没有 memo，只会让人误以为这里已经是
+   * 「只在必要时才换引用」。真实语义就是「每次渲染一份新的」，写成一个普通对象
+   * 更诚实 —— 而它的消费者本来就依赖 position 级别的刷新。
+   *
+   * 代价被限定在播放器自己的那两棵子树里：其它调用方走下一份 `actionsValue`。
+   */
+  const playbackValue: PlaybackContextType = {
         sessionId,
         currentSeries,
         currentEpisode,
@@ -2653,6 +2973,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         toggleDiagnostics: (open) => setIsDiagnosticsOpen(prev => open ?? !prev),
         stopPlayback,
         setMuted,
+        finishedAll,
         isSwitching,
         prepareStatus,
         errorDetail,
@@ -2660,9 +2981,54 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         enterPip,
         stallNotice,
         dismissStallNotice,
-      }}
-    >
-      {children}
+  };
+
+  /**
+   * 低频动作专线：只有换剧 / 换集 / 开关抽屉 / 音量切档这类**用户操作**才会变，
+   * 播放进度（position / buffered / duration）刻意不在其中。
+   *
+   * 依赖里只列低频 state —— 方法走 actionsRef 转发，所以不必（也不能）列进来。
+   */
+  const actionsValue = useMemo<PlaybackActionsContextType>(() => ({
+    currentSeries,
+    currentEpisode,
+    isPlaying,
+    volume,
+    isMuted,
+    playbackRate,
+    currentQuality,
+    availableQualities,
+    isSideDrawerOpen,
+    isDiagnosticsOpen,
+    openEpisode: (seriesId, episodeId, startPosition, qualityOverride) =>
+      actionsRef.current!.openEpisode(seriesId, episodeId, startPosition, qualityOverride),
+    togglePlay: () => actionsRef.current!.togglePlay(),
+    seek: (seconds) => actionsRef.current!.seek(seconds),
+    seekRelative: (delta) => actionsRef.current!.seekRelative(delta),
+    setVolume: (value) => actionsRef.current!.setVolume(value),
+    toggleMute: () => actionsRef.current!.toggleMute(),
+    setPlaybackRate: (rate) => actionsRef.current!.setPlaybackRate(rate),
+    setQuality: (quality) => actionsRef.current!.setQuality(quality),
+    playNextEpisode: () => actionsRef.current!.playNextEpisode(),
+    playPrevEpisode: () => actionsRef.current!.playPrevEpisode(),
+    toggleSideDrawer: (open) => actionsRef.current!.toggleSideDrawer(open),
+    toggleDiagnostics: (open) => actionsRef.current!.toggleDiagnostics(open),
+    stopPlayback: () => actionsRef.current!.stopPlayback(),
+    setMuted: (value) => actionsRef.current!.setMuted(value),
+    prewarmEpisode: (seriesId, episodeId, contentType) =>
+      actionsRef.current!.prewarmEpisode(seriesId, episodeId, contentType),
+    enterPip: () => actionsRef.current!.enterPip(),
+    dismissStallNotice: () => actionsRef.current!.dismissStallNotice(),
+  }), [
+    currentSeries, currentEpisode, isPlaying, volume, isMuted, playbackRate, currentQuality,
+    availableQualities, isSideDrawerOpen, isDiagnosticsOpen,
+  ]);
+
+  return (
+    <PlaybackContext.Provider value={playbackValue}>
+      <PlaybackActionsContext.Provider value={actionsValue}>
+        {children}
+      </PlaybackActionsContext.Provider>
     </PlaybackContext.Provider>
   );
 };
@@ -2673,7 +3039,29 @@ export function usePlaybackStore(): PlaybackContextType {
   return ctx;
 }
 
-/** 仅读取一个字段的选择器版本（避免订阅整个 context 造成无关重渲染）。 */
+/**
+ * 低频动作专线：给**非播放器宿主**用（App 壳层、发现页、历史、详情、选集抽屉、
+ * PipReturnBridge、诊断面板）。
+ *
+ * 用它可以避免「播放进度一变、整棵树跟着重渲染」：这一份里没有 position/buffered，
+ * 只在换剧、换集、开关抽屉/诊断、音量切档这些**用户操作**时才换引用。
+ *
+ * 需要 position 级别的实时读数（进度条、时间码、诊断面板）请继续用
+ * `usePlaybackStore()`——那是它存在的理由，不是漏网之鱼。
+ */
+export function usePlaybackActions(): PlaybackActionsContextType {
+  const ctx = useContext(PlaybackActionsContext);
+  if (!ctx) throw new Error('usePlaybackActions must be used within PlaybackProvider');
+  return ctx;
+}
+
+/**
+ * 仅读取一个字段的选择器版本。
+ *
+ * ⚠️ 它**只省掉解构、不省重渲染**：`useContext` 仍然订阅整个 `PlaybackContext`，
+ * 播放进度一变照样重渲染。真正要摘掉高频扇出请用 `usePlaybackActions()`。
+ * 保留这个 API 是因为「语义更清楚」本身有价值，但别指望它提速。
+ */
 export function usePlaybackSelector<T>(selector: (context: PlaybackContextType) => T): T {
   const ctx = useContext(PlaybackContext);
   if (!ctx) throw new Error('usePlaybackStore must be used within PlaybackProvider');

@@ -5,6 +5,9 @@ interface MicaCardProps {
   className?: string;
   hoverable?: boolean;
   onClick?: (e: React.MouseEvent<HTMLDivElement>) => void;
+  onMouseEnter?: (e: React.MouseEvent<HTMLDivElement>) => void;
+  onFocus?: (e: React.FocusEvent<HTMLDivElement>) => void;
+  tabIndex?: number;
   style?: React.CSSProperties;
 }
 
@@ -13,11 +16,17 @@ export const MicaCard: React.FC<MicaCardProps> = ({
   className = '',
   hoverable = false,
   onClick,
+  onMouseEnter,
+  onFocus,
+  tabIndex,
   style,
 }) => {
   return (
     <div
       onClick={onClick}
+      onMouseEnter={onMouseEnter}
+      onFocus={onFocus}
+      tabIndex={tabIndex}
       style={style}
       // 这里刻意不用 backdrop-filter：卡片是**成批重复**的高频元素，首屏就有
       // 24 张、滚动加载后可达上百张。每个 backdrop-filter 元素都会强制合成器

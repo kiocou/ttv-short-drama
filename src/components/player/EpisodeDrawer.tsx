@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { X, CheckCircle2, Search, Layers } from 'lucide-react';
 
 /**
@@ -17,7 +17,7 @@ export const EpisodeDrawer: React.FC = () => {
     toggleSideDrawer,
     openEpisode,
     prewarmEpisode,
-  } = usePlaybackStore();
+  } = usePlaybackActions();
 
   const [filterKeyword, setFilterKeyword] = useState('');
   const [activeGroupIndex, setActiveGroupIndex] = useState(0);

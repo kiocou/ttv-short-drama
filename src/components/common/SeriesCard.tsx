@@ -1,6 +1,6 @@
 import React from 'react';
 import { Bookmark, Play, Star } from 'lucide-react';
-import { ipcService } from '../../services/ipc';
+import { coverResolver } from '../../services/ipc';
 import { SeriesItem } from '../../types/catalog';
 import { FAVORITE_MARK_LABEL, type FavoriteMark } from '../../types/favorite';
 import { useFavoriteMark } from '../../stores/useFavoritesStore';
@@ -34,9 +34,25 @@ const MARK_CHIP_CLASS: Record<FavoriteMark, string> = {
 export const SERIES_GRID_CLASS =
   'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 sm:gap-4.5';
 
+/**
+ * 榜单序号（金/银/铜三档 + 中性黑）在 2026-10 被整体移除。
+ *
+ * 移除理由：用户要求去掉卡片上的「1、2、3」序号，把两栏的入口统一改成「更多」。
+ * 序号原本只服务"这一栏是榜单"的叙事，而两栏的数据其实是同一份目录的相邻切片
+ * （真正的分区数据源见 `红果短剧客户端逆向分析报告.md` §七），序号反而在暗示
+ * 一个并不存在的排名。留着金/银/铜只会让"新剧"那一栏看起来像热度榜。
+ */
+
 interface SeriesCardProps {
   series: SeriesItem;
   index: number;
+  /**
+   * 货架栏目的强调色，与栏目标题左侧那道色条同色。只有首页两颗货架会传，
+   * 用于在卡片顶部压一条 3px 色条，把"编辑精选"和下面的完整目录区分开
+   * （用户报告："和目录卡没区别，缺精选感"）。不传则完全不渲染。
+   */
+  accent?: 'rose' | 'blue';
+
   /**
    * 点击回调。**签名收 seriesId 而不是无参**：卡片自己知道自己的 id，这样宿主只需传
    * **一个** `useCallback` 给全部卡片，而不是每张卡新建一个闭包。
@@ -45,6 +61,8 @@ interface SeriesCardProps {
    * 不相等，memo 等于没写。首页上百张卡时这个差别就是"滑动掉帧"与"顺滑"的差别。
    */
   onClick: (seriesId: string) => void;
+  /** 鼠标悬停时预取详情，不预取媒体，避免影响滚动和带宽。 */
+  onPrefetch?: (seriesId: string) => void;
 /**
    * 封面确定不可得时把整张卡移出列表。发现页要，搜索/动漫保留首字占位。
    * 同样收 seriesId，理由同 `onClick`。
@@ -52,7 +70,7 @@ interface SeriesCardProps {
   onUnavailable?: (seriesId: string) => void;
 }
 
-export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index, onClick, onUnavailable }) => {
+export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index, accent, onClick, onUnavailable, onPrefetch }) => {
   const isAnime = series.type === 'anime';
   /** 徽章占了 tags[0]，副标题只展示剩下的标签；没有就干脆空着。 */
   const tagLine = series.tags.slice(1, 3).join(' · ');
@@ -69,6 +87,9 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
     <MicaCard
       hoverable
       onClick={() => onClick(series.id)}
+      onMouseEnter={() => onPrefetch?.(series.id)}
+      onFocus={() => onPrefetch?.(series.id)}
+      tabIndex={0}
       className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
     >
       {/* 海报封面 (3:4 黄金竖屏比例) */}
@@ -76,28 +97,50 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
         {/* 封面缺失时露出剧名首字，而不是留一个空框。guo 源的封面直连不可用
             （Cloudflare/加密），交给 resolveSrc 从 guo-core 换本地缓存；两种
             封面都确定拿不到时，onUnavailable 让宿主把卡片从列表移除。 */}
+        {/* 悬停放大用 `scale-[1.08]` 而不是 `scale-108`：后者不在 Tailwind 的
+            scale 刻度里（0/50/75/90/95/100/105/110/125/150），**这个类根本没被
+            生成过** —— 拿 dev server 的编译产物核对过，`.group-hover\:scale-108`
+            零命中，也就是说封面悬停其实一直不放大。只有任意值写法才会真的生成。 */}
         <CoverImage
           src={series.cover}
           title={series.title}
           fallbackChar={isAnime ? '漫' : '剧'}
           placeholderClassName={isAnime ? 'bg-gradient-to-br from-violet-50 to-slate-200' : undefined}
-          className="transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-108"
+          className="transition-transform duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] group-hover:scale-[1.08]"
           loading={index < 8 ? 'eager' : 'lazy'}
           fetchPriority={index < 4 ? 'high' : 'auto'}
-          resolveSrc={series.id.startsWith('guo:') ? () => ipcService.catalog.guoCover(series.id) : undefined}
+          // guo 封面走 guo-core、红果的 HEIC 走后端转码 —— 见 `coverResolver`。
+          // 少了这一条，首页货架（红果榜单/最新上架）的封面会全是空白：
+          // 那些地址是 `image/heic`，WebView2 解不了。
+          resolveSrc={coverResolver(series.id, series.cover)}
           onUnavailable={onUnavailable ? () => onUnavailable(series.id) : undefined}
         />
         <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-transparent to-transparent opacity-80 group-hover:opacity-95 transition-opacity duration-300" />
 
-        {/* 顶部标签：动漫紫，短剧/漫剧蓝。取不到标签就不渲染徽章——
-            这里此前兜底成「动漫」或「热门」，是在替源数据编造源没说过的断言
-            （"热门"更是在伪造热度），与不变量 8「不要把不存在的东西显示成存在」
-            同一类。频道类型已由徽章配色、封面占位字、标题悬停色三处传达，
-            再补一个中性词只是零信息量的重复。 */}
+        {/* 货架精选标识：3px 顶部色条，与栏目标题左侧那道色条同色。只在货架卡
+            上渲染（传了 accent）——目录网格/搜索/动漫不传，那些位置不需要跟
+            栏目呼应，多压一条线只是噪音。 */}
+        {accent && (
+          <span
+            aria-hidden="true"
+            className={`absolute inset-x-0 top-0 z-10 h-[3px] ${
+              accent === 'rose' ? 'bg-rose-500/90' : 'bg-blue-500/90'
+            }`}
+          />
+        )}
+
+        {/* 顶部左侧：题材 chip。
+            取不到标签就整块不渲染。这里此前兜底成「动漫」或「热门」，是在替源
+            数据编造源没说过的断言（"热门"更是在伪造热度），与不变量 8 同一类；
+            频道类型已由徽章配色、封面占位字、标题悬停色三处传达。
+
+            `max-w-[7.5rem]` + `truncate`：窄卡（货架在 xl 是 6 列）上长题材名
+            会一直顶到右上角的评分/追剧竖列上去。写死上限比让它自然换行 / 溢出
+            更可控。 */}
         {series.tags[0] && (
-          <div className="absolute top-2 left-2 flex gap-1">
+          <div className="absolute inset-x-2 top-2 z-10 flex items-center gap-1.5">
             <span
-              className={`px-2 py-0.5 rounded-md text-[10px] font-bold text-white shadow-xs ${
+              className={`truncate rounded-md px-2 py-0.5 text-[10px] font-bold text-white shadow-xs max-w-[7.5rem] ${
                 isAnime ? 'bg-violet-600/95' : 'bg-blue-600/95'
               }`}
             >
@@ -175,6 +218,11 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
         {tagLine && (
           <div className="flex items-center gap-1.5 text-[11px] text-slate-400 truncate">
             <span>{tagLine}</span>
+          </div>
+        )}
+        {series.heat && series.heat > 0 && (
+          <div className="text-[10px] font-medium text-slate-400">
+            {series.heat >= 10_000 ? `${Math.round(series.heat / 10_000)}万热度` : `${series.heat.toLocaleString()} 热度`}
           </div>
         )}
       </div>

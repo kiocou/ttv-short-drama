@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { generateNextSessionId, ipcService } from '../../services/ipc';
 import { attachAnimeSource, detachAnimeSource, streamKindOf } from '../../services/animePlayback';
+import { formatTime } from './ProgressBar';
 import {
   closePip,
   listenPip,
@@ -69,13 +70,6 @@ const RESIZE_HANDLES: Array<{ direction: ResizeDir; className: string }> = [
   { direction: 'SouthWest', className: 'bottom-0 left-0 w-3 h-3 cursor-nesw-resize' },
   { direction: 'SouthEast', className: 'bottom-0 right-0 w-3 h-3 cursor-nwse-resize' },
 ];
-
-function formatTime(seconds: number): string {
-  const safe = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
-  const minutes = Math.floor(safe / 60);
-  const rest = safe % 60;
-  return `${minutes}:${String(rest).padStart(2, '0')}`;
-}
 
 /** 集数文案：标题与"第 N 集"等价时不再重复拼接（与两个主播放器同一规则）。 */
 function episodeLabel(episodeNumber: number, title?: string): string {

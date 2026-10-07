@@ -35,6 +35,11 @@ short-drama-device.json
 .har-analysis/
 # 调试会话的临时工作区（空壳目录，实际内容在 @wingsky-* 子目录里）。
 .dsh/
+# AI 协作工区：本项目的调试脚本、实测产物（含真实源地址、临时 mp4 与截图）与
+# 会话记录，属于排查材料而不是项目内容；公开仓库里不应该出现它们（同类教训见
+# 上面 .zcode/ 那条：漏一条规则就会把含逆向计划的会话文档提交上去）。
+.workbuddy/
+.learnings/
 # 设计提案的交互预览稿：单文件 HTML，不参与构建，体积大且随时可重新生成。
 design-proposals/random-pick/
 

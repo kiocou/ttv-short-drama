@@ -77,7 +77,7 @@
 }
 
 /*
- * **动漫播放器**舞台内禁用一切背景模糊（backdrop-filter）—— 为 RTX 视频增强让路。
+ * 所有主播放器舞台内禁用背景模糊（backdrop-filter），为 RTX 视频增强让路。
  *
  * 为什么必须这么做：`backdrop-filter` 要求合成器把**该元素背后的像素**取样出来
  * 做高斯模糊，一旦视频被这个区域盖住，Chromium 就必须把视频内容复制成普通纹理
@@ -90,28 +90,24 @@
  * 带 blur(32px)）之后，同样的机器、同样的驱动设置，VSR 不再生效。去掉这批背景
  * 模糊后 VSR 恢复——这条规则就是那次修复。
  *
- * **作用范围只限动漫播放器。** 短剧/漫剧的宿主 `VideoSurface` 刻意**不加**
- * `.ttv-player`：它俩共用同一套 HUD，曾顺手给它加过同一个类，实机确认短剧页面
- * 并不会因此让 RTX 视频增强生效（原因不在这层——短剧源是竖屏 1080x1920，在横屏
- * 输出上属于**缩小**显示，与 VSR 生效所需的放大场景不符，是可查方向之一，但未
- * 确证）。拿不到收益就不该牺牲那层玻璃质感，故已还原。以后想"让短剧也用 VSR"，
- * 先确证根因，别把这个类直接加回去。
+ * 历史上只给短剧加 `.ttv-player`、去掉 HUD 模糊仍未生效，因此曾撤回；当时
+ * 怀疑竖屏视频缩小显示，但没有确证。2026-10-06 在真实 WebView2 中用同一段
+ * HEVC 视频做四组对照：原布局、只去模糊、只去动画均无 NVIDIA 超分调用；同时
+ * 去模糊并移除 App.tsx 播放器祖先的 fluentScaleIn/forwards 后，2 秒采样出现
+ * 34 次 ToggleNvidiaVpSuperResolution(on=true)。干净布局下 H.264/HEVC 均可触发。
+ * 两处约束必须一起保留，不能再把“只改一处无效”误判为短剧本身不支持 VSR。
  *
  * 视觉代价可控：面板本身的半透明底色、边框与阴影都保留，只是不再模糊画面。
  * 播放场景下"看清视频"优先于"玻璃质感"，而列表/详情等页面不受这条规则影响。
  *
- * **一个如实记录的副作用**：`.ttv-player` 这个类名同时还承载着本文件下面那一整组
- * 锁定/收起态规则（`.ttv-player.is-locked .ttv-hud` / `.ttv-lock` /
- * `.ttv-mini-progress` 等）。短剧宿主不带它，那组规则对短剧就
- * 不生效——**这不是本次改动引入的**：改动前它就是一个没有任何宿主的遗留写法
- * （全仓库只有本文件在写这个类名）。想吃回短剧的锁定态样式，正确做法是把
- * "布局/锁定态"与"关闭背景模糊"拆成两个类名，而不是把这个类整体加回去。
+ * 用独立的 `.ttv-video-stage` 承载合成约束，不把 `.ttv-player` 的历史布局/
+ * 锁定态规则顺带引入短剧。动漫保留原布局类，两个播放器共用这里的去模糊规则。
  */
-.ttv-player .crystal-surface,
-.ttv-player .crystal-surface-deep,
-.ttv-player .ttv-drawer-overlay,
-.ttv-player .crystal-drawer-box,
-.ttv-player [class*='backdrop-blur'] {
+.ttv-video-stage .crystal-surface,
+.ttv-video-stage .crystal-surface-deep,
+.ttv-video-stage .ttv-drawer-overlay,
+.ttv-video-stage .crystal-drawer-box,
+.ttv-video-stage [class*='backdrop-blur'] {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
@@ -264,6 +260,10 @@
    4. 收起态的贴边迷你进度条
    ========================================================================== */
 
+/*
+  纯显示件：不接受任何操作（锁定态的语义是"除解锁外一切输入失效"，
+  这里若能拖动跳转就是漏网的操作入口），所以不给 pointer 光标。
+*/
 .ttv-mini-progress {
   position: absolute;
   left: 0;
@@ -272,11 +272,9 @@
   height: 3.5px;
   background: rgba(255, 255, 255, 0.22);
   z-index: 35;
-  cursor: pointer;
   opacity: 0;
   transform: translateY(100%);
   pointer-events: none;
-  touch-action: none;
   transition:
     opacity 0.28s var(--curve-fluent),
     transform 0.28s var(--curve-fluent),
@@ -284,15 +282,14 @@
 }
 
 /*
-  收起（锁定）态。is-locked 由 PlayerControls 挂在 HUD 容器上；
-  .ttv-player.is-locked 前缀是历史遗留写法，一并保留兼容。
+  收起（锁定）态与自动隐藏态下露出。is-locked 由 PlayerControls 挂在
+  HUD 容器上；.ttv-player.is-locked 前缀是历史遗留写法，一并保留兼容。
 */
 .is-locked .ttv-mini-progress,
 .is-auto-hidden .ttv-mini-progress,
 .ttv-player.is-locked .ttv-mini-progress {
   opacity: 1;
   transform: translateY(0);
-  pointer-events: auto;
 }
 
 .is-locked .ttv-mini-progress:hover,

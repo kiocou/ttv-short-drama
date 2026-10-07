@@ -9,6 +9,28 @@
  */
 export type ChannelType = 'drama' | 'comic' | 'anime' | 'adult';
 
+/**
+ * 首页货架的两个分区：正在热播 / 新剧。
+ *
+ * 定义在这里而不是 store 里，是因为 service 层（`ipcService.shelf`）也要用它 ——
+ * 让 service 反向依赖 store 会把分层搞乱。`useAppStore` 只做转出。
+ */
+export type ShelfKind = 'hot' | 'new';
+
+/**
+ * 「更多」页的一页分区列表。
+ *
+ * 与 `CatalogPage` 的关键差别是**分页模型**：这条链路是游标式的
+ * （`nextCursor` 原样回传，不解析内容），不是页码式的。红果榜单要
+ * `session_uuid + next_offset`、最新上架要 `offset`，两者都由后端编码进同一个
+ * 不透明游标。
+ */
+export interface ShelfFeedPage {
+  items: SeriesItem[];
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
 export interface SeriesItem {
   id: string;
   title: string;

@@ -3,10 +3,10 @@ use crate::models::{
     VideoQualityOption,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub const GUO_ID_PREFIX: &str = "guo:";
 
@@ -428,8 +428,9 @@ fn stream_kind(url: &str) -> &'static str {
 mod ffi {
     use super::Path;
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::ffi::{c_char, CStr, CString};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 
     type RequestFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
@@ -438,7 +439,23 @@ mod ffi {
     pub struct GuoBridge {
         request: RequestFn,
         free: FreeFn,
-        lock: Mutex<()>,
+        /// 按站源分片的调用锁（键 = 站源 id；空串 = 全局片，给带不出站源的
+        /// action 用）。**只护 FFI 入口，不护任何 Rust 侧数据**。
+        ///
+        /// 原来是一把全局锁：任何一个源的调用没回来，其余 18 个源的目录、封面、
+        /// 起播全部排队。实测（2026-10-06，直连）神秘小窝 6 个 18+ 源里 3 个已死
+        /// （野果 25s、帝果 16s、黄果 AI 6 镜像跑满 60s 才认输），打开该专区 =
+        /// 6 个目录请求在全局锁里串行 ≈ 104s 才出首屏；期间连其它 tab 的封面与
+        /// 播放 resolve 都被一起冻住。分片后互不拖拽：一个源死，只有它自己的
+        /// 后续调用在它自己的片里等 Go 侧 60s 超时。
+        ///
+        /// 分片对 guo-core 是安全的：c-shared 每次调用本来就跑在独立 goroutine
+        /// 上，共享状态（catalogs / categories / covers / sessions）在 Go 侧全部
+        /// 有 `engine.mu` 或每源锁；上游 LAN 模式的 HTTPS 服务也是多 goroutine
+        /// 并发进同一批 handler。带不出站源的 action（initialize /
+        /// resourceSettings / saveResourceSettings / release / cancelRead 这类
+        /// 全局语义）仍共享同一把全局片，保持互相独占。
+        locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     }
 
     unsafe impl Send for GuoBridge {}
@@ -467,15 +484,29 @@ mod ffi {
                 free: unsafe {
                     std::mem::transmute::<unsafe extern "system" fn() -> isize, FreeFn>(free)
                 },
-                lock: Mutex::new(()),
+                locks: Mutex::new(HashMap::new()),
             })
+        }
+
+        /// 拿到这次调用该排在哪把片锁上。**外层表锁只护 HashMap 几微秒，绝不
+        /// 跨 FFI**（不变量 15 的锁内不 await 在这里同样成立）。
+        fn shard_for(&self, input: &Value) -> Result<Arc<Mutex<()>>, String> {
+            let key = bridge_lock_key(input);
+            let mut locks = self
+                .locks
+                .lock()
+                .map_err(|_| "guo-core 调用锁不可用。".to_string())?;
+            Ok(locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone())
         }
 
         pub fn request(&self, input: &Value) -> Result<Value, String> {
             let body = serde_json::to_string(input).map_err(|error| error.to_string())?;
             let raw = CString::new(body).map_err(|_| "guo-core 请求包含无效字符。".to_string())?;
-            let _guard = self
-                .lock
+            let shard = self.shard_for(input)?;
+            let _guard = shard
                 .lock()
                 .map_err(|_| "guo-core 调用锁不可用。".to_string())?;
             let output = unsafe { (self.request)(raw.as_ptr()) };
@@ -499,6 +530,39 @@ mod ffi {
             }
             Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
         }
+    }
+
+    /// 这次桥接调用落在哪个分片上。
+    ///
+    /// 取站源的三条路（与 guo-core 各 action 的入参习惯一一对应）：
+    /// `catalog` / `cached` / `categories` / `sourceJob` 顶层带 `source`；
+    /// `detail` / `resolve` / `cover` 带 `drama.source`；兜底从 `drama.id`
+    /// （`"源:裸id"`，见 `cover()` / `detail_raw()` 的拼法）剥前缀。三条都带
+    /// 不出来（initialize / resourceSettings / saveResourceSettings / release /
+    /// cancelRead 这类全局语义）回空串 = 全局片。
+    ///
+    /// 键只要求**一致**不要求规范：同一源两种写法顶多少并行一点，不会错。
+    pub(super) fn bridge_lock_key(input: &Value) -> String {
+        let non_empty = |value: Option<&str>| -> Option<String> {
+            let trimmed = value?.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        };
+        if let Some(source) = non_empty(input.get("source").and_then(Value::as_str)) {
+            return source;
+        }
+        let Some(drama) = input.get("drama") else {
+            return String::new();
+        };
+        if let Some(source) = non_empty(drama.get("source").and_then(Value::as_str)) {
+            return source;
+        }
+        non_empty(
+            drama
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.split(':').next()),
+        )
+        .unwrap_or_default()
     }
 
     fn text(value: &Value, keys: &[&str]) -> String {
@@ -538,6 +602,8 @@ pub struct GuoProvider {
     category_index: Mutex<HashMap<String, Vec<(String, String)>>>,
     /// 处于冷却期的站源（id → 失败时刻），见 [`CATALOG_COOLDOWN`]。
     catalog_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
+    /// 正在后台刷新的 `"源|分类"` 集合（SWR 去重），见 [`GuoProvider::catalog`]。
+    revalidating: Mutex<HashSet<String>>,
 }
 
 impl GuoProvider {
@@ -551,6 +617,7 @@ impl GuoProvider {
             playback_sequence: AtomicU64::new(0),
             category_index: Mutex::new(HashMap::new()),
             catalog_cooldowns: Mutex::new(HashMap::new()),
+            revalidating: Mutex::new(HashSet::new()),
         };
         provider.bridge.request(&json!({
             "action": "initialize",
@@ -635,7 +702,34 @@ impl GuoProvider {
     /// 关键词搜索与第 2 页以后**不查缓存**，直接走网络：`cached` 的 `items`
     /// 是逐页 merge 出来的**整份累计剧库**（`saveCatalogCache`），既不是搜
     /// 索结果也不是某一页，当结果返回会整库重复或把整库当成搜索命中。
-    pub fn catalog(&self, filter: &CatalogFilter) -> Result<CatalogPage, String> {
+    /// 目录：缓存优先；**过期但有货的缓存立即返回，后台再刷新（SWR）**。
+    ///
+    /// `self: Arc<Self>` 是为了把 `Arc` 递进后台刷新任务（`catalog_refresh`
+    /// 需要 `&self` 活过本次调用）；调用方手里本来就是 `Arc<GuoProvider>`，
+    /// `clone()` 一次即可。
+    ///
+    /// 这里原来一直写死 `force: true`（后来改成"15min TTL 内读缓存、过期即
+    /// 全量网络"），但实测（2026-10-06）还不够：神秘小窝 6 个 18+ 源里 3 个
+    /// 已死（野果 25s / 帝果 16s / 黄果 AI 60s 才吐超时），TTL 一过（15 分钟），
+    /// 每次打开都要陪死源把重试跑满；失败又不写缓存，10 分钟冷却一过再陪一遍
+    /// ——用户看到的"栏目加载非常久"就是这条链。
+    ///
+    /// 现在的三级：
+    /// 1. 缓存新鲜（guo-core 自己的 `fresh`，15min TTL）→ 直接返回；
+    /// 2. 缓存过期但**有 items** → 立即返回旧数据（0ms），同时后台起一次
+    ///    `force` 刷新为下次预热。死源若已进冷却则连后台刷新都不起（起也是
+    ///    0ms 快速失败，白占一个线程）；刷新失败自然落入既有冷却记录；
+    /// 3. 完全没缓存 → 才在前台走 [`GuoProvider::catalog_refresh`]（首次
+    ///    访问该源的代价，躲不掉，但有分片锁与冷却兜着）。
+    ///
+    /// 第 2 级刻意**不置 `degraded`**：这个字段在搜索链路里的语义是"来源真的
+    /// 挂了"，而"缓存过期"不代表源死了（可能只是 15min TTL 自然过期，后台
+    /// 正在刷新）。旧的可见、详情点进去该报错就报错，这是当下最诚实的表达。
+    ///
+    /// 关键词搜索与第 2 页以后**不查缓存**，直接走网络：`cached` 的 `items`
+    /// 是逐页 merge 出来的**整份累计剧库**（`saveCatalogCache`），既不是搜
+    /// 索结果也不是某一页，当结果返回会整库重复或把整库当成搜索命中。
+    pub fn catalog(self: Arc<Self>, filter: &CatalogFilter) -> Result<CatalogPage, String> {
         let source = filter.source.as_deref().unwrap_or_default();
         if source.is_empty() {
             return Err("缺少站源。".to_string());
@@ -652,18 +746,62 @@ impl GuoProvider {
                 if cached_is_usable(&data) {
                     return Ok(self.map_page(source, &data, filter.page));
                 }
+                if cached_has_items(&data) {
+                    Self::spawn_revalidate(&self, filter.clone());
+                    return Ok(self.map_page(source, &data, filter.page));
+                }
             }
         }
         self.catalog_refresh(filter)
     }
 
+    /// 后台刷新一份过期缓存（SWR 的 R），给 [`GuoProvider::catalog`] 用。
+    ///
+    /// 同一 `"源|分类"` 同时只排一个刷新（`revalidating` 去重）——用户在题材
+    /// 栏来回点十次不该排十个后台任务。冷却中的源直接跳过：`catalog_refresh`
+    /// 会 0ms 快速失败，起了也是白占线程；冷却到期后的下一次 SWR 读自然再排。
+    /// 刷新成败都不向前台反馈——前台拿的已经是旧数据，刷新只是为下一次预热；
+    /// 失败会由 `catalog_refresh` 自己记进冷却表。
+    ///
+    /// 写成关联函数而不是方法：`&Arc<Self>` 不是合法的 receiver 形态，而
+    /// `catalog` 手里正好是 `Arc`，传引用即可。
+    fn spawn_revalidate(me: &Arc<Self>, filter: CatalogFilter) {
+        let source = filter.source.clone().unwrap_or_default();
+        let key = format!("{source}|{}", filter.category);
+        let cooling = me
+            .catalog_cooldowns
+            .lock()
+            .map(|cooldowns| catalog_cooldown_active(&cooldowns, &source))
+            .unwrap_or(false);
+        if cooling {
+            return;
+        }
+        let claimed = me
+            .revalidating
+            .lock()
+            .map(|mut pending| pending.insert(key.clone()))
+            .unwrap_or(false);
+        if !claimed {
+            return;
+        }
+        let provider = Arc::clone(me);
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = provider.catalog_refresh(&filter);
+            // 无论成败都撤在途标记：失败已进冷却，成功则缓存已新鲜，
+            // 两条路都允许下一次过期读再排新任务。
+            if let Ok(mut pending) = provider.revalidating.lock() {
+                pending.remove(&key);
+            }
+        });
+    }
+
     /// 无视磁盘缓存直接拉一次目录（`force: true`），并让 guo-core 顺手把结果
     /// 写进 `catalogs.json`。`catalog` 的未命中分支与"显式刷新"都走这里。
     ///
-    /// 冷却的检查与记录都在这一层（唯一调用方是 [`GuoProvider::catalog`] 的
-    /// 未命中分支，main.rs 未单独暴露）：首页、翻页、搜索任何一条浏览路径撞上
-    /// 冷却中的死源都 0ms 快速失败，而不是每次都陪 guo-core 把 25-60s 的内部
-    /// 重试跑满。
+    /// 冷却的检查与记录都在这一层（调用方是 [`GuoProvider::catalog`] 的未命中
+    /// 分支与 [`GuoProvider::spawn_revalidate`]，main.rs 未单独暴露）：首页、
+    /// 翻页、搜索任何一条浏览路径撞上冷却中的死源都 0ms 快速失败，而不是每次
+    /// 都陪 guo-core 把 25-60s 的内部重试跑满。
     pub fn catalog_refresh(&self, filter: &CatalogFilter) -> Result<CatalogPage, String> {
         let source = filter.source.as_deref().unwrap_or_default();
         if source.is_empty() {
@@ -1092,6 +1230,17 @@ fn cached_is_usable(data: &Value) -> bool {
         && data.get("fresh").and_then(Value::as_bool) == Some(true)
 }
 
+/// 缓存过期但手里有货——SWR 第 2 级的判据（见 [`GuoProvider::catalog`]）。
+///
+/// 只要求 `items` 是非空数组：空数组走前台 `catalog_refresh`（`fresh` 为 false
+/// 时 `items` 为空必然是"这个源还没缓存过"，不能当"没有内容"返回——那会让
+/// 首次访问永久空白，理由见 [`cached_is_usable`] 的注释）。
+fn cached_has_items(data: &Value) -> bool {
+    data.get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+}
+
 /// guo-core 的 `categories` action 返回 `{"items": [{id, name}, ...]}`。
 /// 首项恒为 `{name: "全部"}`（`nativeCategories` 塞的，id 为空）：`categories()`
 /// 会去重掉它，`category_id` 也提前拦掉了"全部"，原样带出来即可。
@@ -1370,6 +1519,48 @@ mod tests {
         // 原生数字字段照旧直读。
         assert_eq!(super::number(&json!({ "n": 5u64 }), &["n"]), 5);
         assert_eq!(super::number(&json!({}), &["n"]), 0);
+    }
+
+    /// 桥接调用锁的分片键：三类入参各取一条路，带不出站源的落全局片（空串）。
+    ///
+    /// 分片错了不会崩溃但会退化：本该同片互斥的两个 action（如同源的 catalog
+    /// 与 cover）落进不同片，就失去了"同源串行"的保守保障。所以三类入参、
+    /// 两种 drama id 拼法、空白串全都要钉住。
+    #[test]
+    fn bridge_lock_key_follows_source_shape() {
+        use super::ffi::bridge_lock_key;
+        // 顶层 source：catalog / cached / categories / sourceJob。
+        assert_eq!(
+            bridge_lock_key(&json!({ "action": "catalog", "source": "yeguo" })),
+            "yeguo"
+        );
+        // drama.source：detail / resolve / cover。
+        assert_eq!(
+            bridge_lock_key(
+                &json!({ "action": "detail", "drama": { "id": "dsd:42", "source": "dsd" } })
+            ),
+            "dsd"
+        );
+        // 兜底：drama.id 剥前缀（cover 的拼法没有单独的 source 字段时）。
+        assert_eq!(
+            bridge_lock_key(&json!({ "action": "cover", "drama": { "id": "huangdou:9" } })),
+            "huangdou"
+        );
+        // guo: 前缀的双冒号 id 剥出的键粗一点（"guo"），但**一致**——不会错，只会少并行。
+        assert_eq!(
+            bridge_lock_key(&json!({ "action": "cover", "drama": { "id": "guo:dsd:42" } })),
+            "guo"
+        );
+        // 空串 / 空白串 / 缺失一律全局片。
+        assert_eq!(bridge_lock_key(&json!({ "action": "initialize" })), "");
+        assert_eq!(
+            bridge_lock_key(&json!({ "action": "catalog", "source": "  " })),
+            ""
+        );
+        assert_eq!(
+            bridge_lock_key(&json!({ "action": "release", "session": "s1" })),
+            ""
+        );
     }
 
     /// 错误脱敏（不变量 12）：样例全部来自 2026-09-30 真机实测——花果死链把

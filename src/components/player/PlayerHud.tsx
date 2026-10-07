@@ -189,11 +189,9 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
         放在 HUD 之外：HUD 整体淡出时它才刚登场，必须独立于那层透明度。
       */}
       <MiniProgress
-        isLocked={isLocked}
         position={position}
         duration={duration}
         buffered={buffered}
-        onSeek={onSeek}
       />
 
       {/*
@@ -625,86 +623,31 @@ export const VolumeControl: React.FC<VolumeControlProps> = ({
    ========================================================================== */
 
 interface MiniProgressProps {
-  isLocked: boolean;
   position: number;
   duration: number;
   buffered: number;
-  onSeek: (seconds: number) => void;
 }
 
 /**
  * 控制器收起后贴着窗口最底部的一条 3.5px 进度条。
  *
- * 比设计稿多做了两件事：
- *   1. 支持按住拖动（稿子里只能点击）——收起态的意图就是"少遮挡、但要能找位置"，
- *      只能点击等于逼用户一遍遍点。
- *   2. 进度改用 scaleX 而非宽度：播放中它每 250ms 更新一次，改 width 会带动
- *      重排，而 transform 只在合成层。
+ * **只作进度显示，不接受任何操作**——锁定态的语义是"除解锁外一切输入失效"
+ * （单击/双击画面、快捷键、长按倍速都已屏蔽，这里若还能拖动跳转就成了漏网
+ * 的操作入口）。历史版本曾支持收起态拖动找位置，与锁定语义冲突，已收回。
+ *
+ * 进度改用 scaleX 而非宽度：播放中它每 250ms 更新一次，改 width 会带动
+ * 重排，而 transform 只在合成层。
  */
 export const MiniProgress: React.FC<MiniProgressProps> = ({
-  isLocked,
   position,
   duration,
   buffered,
-  onSeek,
 }) => {
-  const barRef = useRef<HTMLDivElement | null>(null);
-  const [dragging, setDragging] = useState(false);
-
   const percent = duration > 0 ? Math.max(0, Math.min(100, (position / duration) * 100)) : 0;
   const bufferPercent = duration > 0 ? Math.max(0, Math.min(100, (buffered / duration) * 100)) : 0;
 
-  const applyFromClientX = useCallback((clientX: number) => {
-    const el = barRef.current;
-    if (!el || duration <= 0) return;
-    const rect = el.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    onSeek(ratio * duration);
-  }, [duration, onSeek]);
-
   return (
-    <div
-      ref={barRef}
-      role="slider"
-      tabIndex={isLocked ? 0 : -1}
-      aria-label="播放进度"
-      aria-valuemin={0}
-      aria-valuemax={100}
-      aria-valuenow={Math.round(percent)}
-      aria-hidden={!isLocked}
-      onClick={(e) => e.stopPropagation()}
-      onPointerDown={(e) => {
-        if (!isLocked) return;
-        e.stopPropagation();
-        e.currentTarget.setPointerCapture(e.pointerId);
-        setDragging(true);
-        applyFromClientX(e.clientX);
-      }}
-      onPointerMove={(e) => {
-        if (!dragging) return;
-        applyFromClientX(e.clientX);
-      }}
-      onPointerUp={(e) => {
-        if (!dragging) return;
-        try {
-          e.currentTarget.releasePointerCapture(e.pointerId);
-        } catch {
-          // 已释放则忽略
-        }
-        setDragging(false);
-      }}
-      onKeyDown={(e) => {
-        if (!isLocked) return;
-        if (e.key === 'ArrowLeft') {
-          e.preventDefault();
-          onSeek(Math.max(0, position - 5));
-        } else if (e.key === 'ArrowRight') {
-          e.preventDefault();
-          onSeek(Math.min(duration, position + 5));
-        }
-      }}
-      className="ttv-mini-progress"
-    >
+    <div aria-hidden className="ttv-mini-progress">
       <div className="ttv-mini-buffer" style={{ width: `${bufferPercent}%` }} />
       <div className="ttv-mini-played" style={{ transform: `scaleX(${percent / 100})` }} />
     </div>

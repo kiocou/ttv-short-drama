@@ -202,6 +202,14 @@ pub(crate) fn with_system_proxy(builder: reqwest::ClientBuilder) -> reqwest::Cli
         .fold(builder, |builder, proxy| builder.proxy(proxy))
 }
 
+/// 本机是否配了可用的系统代理。
+///
+/// 给调用方判断"要不要准备一条直连兜底"用：没配代理的机器上，代理路径与直连路径
+/// 本来就是同一条，兜底只会白建一个连接池。见 `provider::fallback_direct_client`。
+pub(crate) fn has_system_proxy() -> bool {
+    system_proxy().is_some()
+}
+
 /// 下载进度事件的名称（前端订阅它画进度条）。
 pub const EVENT_DOWNLOAD: &str = "update://download";
 

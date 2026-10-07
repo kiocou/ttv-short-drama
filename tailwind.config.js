@@ -31,6 +31,17 @@ export default {
         'slide-up': 'slideUp 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards',
         'slide-right': 'slideRight 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards',
         'pulse-subtle': 'pulseSubtle 2s infinite ease-in-out',
+        // 与 fluent-card-in 同一条结论：入场动画不碰 opacity。
+        //
+        // 这条动画挂在 8 个常驻视图层上（App.tsx 每个视图一行，视图只被 display
+        // 切换、从不卸载），所以比卡片那条更关键：
+        //   - opacity 一旦进关键帧，forwards 会把恒等值 opacity:1 永久钉在那 8 层上，
+        //     等于 8 个常驻合成层。项目已因同类残留让 NVIDIA VSR 失效过一次
+        //     （见 AGENTS.md 不变量 26 与启动动画必须 cancel 的规矩）。
+        //   - 更糟的是隐藏层：元素在 display:none 的祖先里创建时动画会卡在 0% 帧，
+        //     而 0% 的 opacity:0 会被当真 —— 切到该视图先是一片透明，
+        //     只能等悬停/重绘才现形（卡片那条长注释记的就是这个坑）。
+        // 去掉 opacity 后入场仍有 8px 位移与 0.22s 缓动，观感几乎不变。
         'fluent-page-in': 'fluentPageIn 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards',
         'fluent-hero-poster': 'fluentHeroPoster 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards',
         // **入场动画刻意不碰 opacity，也不要给卡片加 animation-delay。**
@@ -72,9 +83,10 @@ export default {
           '0%, 100%': { opacity: '1' },
           '50%': { opacity: '0.6' },
         },
+        // 只做位移，没有 opacity：理由见上方 fluent-page-in 的注释。
         fluentPageIn: {
-          '0%': { opacity: '0', transform: 'translateY(8px)' },
-          '100%': { opacity: '1', transform: 'translateY(0)' },
+          '0%': { transform: 'translateY(8px)' },
+          '100%': { transform: 'translateY(0)' },
         },
         fluentHeroPoster: {
           '0%': { opacity: '0', transform: 'scale(0.92) translateY(12px)' },

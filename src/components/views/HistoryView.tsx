@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useHistoryStore } from '../../stores/useHistoryStore';
-import { usePlaybackStore } from '../../stores/usePlaybackStore';
+import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { MicaCard } from '../common/MicaCard';
+import { BackToTop } from '../common/BackToTop';
 import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
 import { StatusBadge } from '../common/StatusBadge';
@@ -35,7 +36,8 @@ function formatRelativeTime(timestamp: number): string {
 
 export const HistoryView: React.FC = () => {
   const { records, loadHistory, removeRecord, clearHistory } = useHistoryStore();
-  const { openEpisode } = usePlaybackStore();
+  // 只订阅低频动作专线：整表订阅会让历史列表跟着播放进度重渲染。
+  const { openEpisode } = usePlaybackActions();
   const { open: openAnimeEpisode } = useAnimePlayer();
   const { currentView, navigateTo, showToast } = useAppStore();
 
@@ -76,8 +78,11 @@ export const HistoryView: React.FC = () => {
     ? records.filter(item => item.title.toLowerCase().includes(keyword))
     : records;
 
+  /** 回到顶部要自己拿得到滚动容器。与发现页 / 动漫专区同一套交互。 */
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
   return (
-    <div className="flex-1 h-full overflow-y-auto p-8 max-w-5xl mx-auto flex flex-col gap-6 select-none">
+    <div ref={scrollRef} className="flex-1 h-full overflow-y-auto p-8 max-w-5xl mx-auto flex flex-col gap-6 select-none">
       {/* 头部：标题与清空按钮 */}
       <div className="flex items-center justify-between pb-4 border-b border-black/[0.05]">
         <div>
@@ -178,10 +183,12 @@ export const HistoryView: React.FC = () => {
               className="p-4 flex items-center justify-between gap-4 animate-fluent-card-in group"
             >
               <div className="flex items-center gap-4 min-w-0">
-                {/* 封面缩略图 */}
+                {/* 封面缩略图 3:4 = 64×88。`h-22` 不是合法的 Tailwind 类
+                    （spacing 刻度里只有 …/20/24/…），从来没被生成过，父级高度
+                    塌成 auto —— 占位层是 `absolute inset-0`，封面失败时整块消失。 */}
                 <div
                   onClick={() => handleResume(item.seriesId, item.episodeId, item.positionSeconds, item.channel)}
-                  className="relative w-16 h-22 rounded-xl overflow-hidden shadow-sm flex-shrink-0 cursor-pointer group-hover:scale-105 transition-transform duration-300"
+                  className="relative w-16 h-[88px] rounded-xl overflow-hidden shadow-sm flex-shrink-0 cursor-pointer group-hover:scale-105 transition-transform duration-300"
                 >
                   <CoverImage
                     src={item.seriesCover}
@@ -300,6 +307,8 @@ export const HistoryView: React.FC = () => {
           </div>
         </div>
       )}
+
+      <BackToTop targetRef={scrollRef} />
     </div>
   );
 };

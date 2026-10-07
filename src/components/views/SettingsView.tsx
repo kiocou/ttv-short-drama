@@ -15,6 +15,9 @@ import {
   type UpdateInfo,
 } from '../../services/updater';
 import { isTauriEnvironment, ipcService, type GuoSourceCheck, type GuoSourceStatus } from '../../services/ipc';
+// 播放诊断日志面板：放在「客户端信息与诊断」卡片里，与已有的导出按钮同一处——
+// 用户诉求是「根据日志一步一步优化」，日志必须能在应用里直接看到。
+import { PlaybackLogPanel } from '../common/PlaybackLogPanel';
 import { GUO_SOURCES, type GuoSource } from '../../services/guoSources';
 import {
   Settings,
@@ -806,6 +809,39 @@ export const SettingsView: React.FC = () => {
               />
             </SettingRow>
           </div>
+
+          {/* 启动音效：声音不走任何资源文件，是 Web Audio 现场合成的
+              （services/launchAudio.ts），这里只是一个开关键。
+              关掉它不会影响播放器的音量与音频，两者完全独立。 */}
+          <div className="pt-4 border-t border-black/[0.04]">
+            <SettingRow
+              title="启动音效"
+              hint="打开程序时的进场音与底噪。与播放器音量无关，关掉只影响启动动画。"
+            >
+              <Toggle
+                checked={settings.launchSound !== false}
+                onChange={value => updateSettings({ launchSound: value })}
+                label="启动音效"
+              />
+            </SettingRow>
+          </div>
+
+          {/* RTX VSR 播放链路：开 = 源流转 H.264 分片（让驱动触发 VSR，首次起播
+              稍慢），关 = 原始源直连（起播更快、无 VSR 增强）。文案必须如实——
+              增强是完全由转码换来的，没有"档位"可选，见 AGENTS.md 不变量 8。
+              与「视频清晰度」那行的"档位来自源流实测"是同一套诚实边界。 */}
+          <div className="pt-4 border-t border-black/[0.04]">
+            <SettingRow
+              title="RTX VSR 视频增强"
+              hint="打开：源流转码成 H.264 分片，让 NVIDIA 驱动做 RTX VSR 增强（首次起播多等一次转码）。关闭：回到原始源直连，起播更快，但没有 RTX VSR 增强。"
+            >
+              <Toggle
+                checked={settings.vsrEnabled !== false}
+                onChange={value => updateSettings({ vsrEnabled: value })}
+                label="RTX VSR 视频增强"
+              />
+            </SettingRow>
+          </div>
         </SectionCard>
 
         {/* 2. 视频源（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
@@ -877,7 +913,7 @@ export const SettingsView: React.FC = () => {
               <>
                 播放过的剧集会缓存到本地，以便回看与换集时秒开。
                 <span className="text-slate-600 font-medium">已开启全自动清理</span>
-                ：超过 7 天未播放的剧集、以及总量超过 1 GB 时最旧的剧集，都会自动移除，无需手动操作。
+                ：超过 7 天未播放的剧集、以及总量超过下方上限时最旧的剧集，都会自动移除，无需手动操作。
               </>
             }
           >
@@ -888,6 +924,25 @@ export const SettingsView: React.FC = () => {
               )}
             </div>
           </SettingRow>
+
+          <div className="pt-4 border-t border-black/[0.04]">
+            <SettingRow
+              title="自动清理上限"
+              hint="短剧与漫剧缓存合计达到上限后，自动保留最近使用的剧集并淘汰最旧内容。默认 1 GB。"
+            >
+              <select
+                value={settings.playbackCacheMb}
+                onChange={event => updateSettings({ playbackCacheMb: Number(event.target.value) })}
+                className="h-9 rounded-xl border border-slate-200/80 bg-white px-3 text-xs font-semibold text-slate-700 shadow-xs outline-none focus:ring-2 focus:ring-blue-400/40 cursor-pointer"
+                aria-label="剧集缓存自动清理上限"
+              >
+                <option value="512">512 MB</option>
+                <option value="1024">1 GB</option>
+                <option value="2048">2 GB</option>
+                <option value="4096">4 GB</option>
+              </select>
+            </SettingRow>
+          </div>
 
           <div className="flex justify-end">
             <FluentButton
@@ -1041,6 +1096,8 @@ export const SettingsView: React.FC = () => {
               </FluentButton>
             </div>
           </SettingRow>
+
+          <PlaybackLogPanel />
         </SectionCard>
       </div>
     </div>

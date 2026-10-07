@@ -16,7 +16,7 @@ export interface PlaybackSession {
   url: string;
   backupUrl?: string;
   /**
-   * 源流形态（只有动漫链路下发）。
+   * 源流形态（动漫链路与短剧/漫剧 H.264 增强流下发）。
    *
    * 为什么必须由后端给：动漫的所有地址都会经本地代理重写成 `/stream?u=…`，
    * 前端无法从外观区分 m3u8 与整段 MP4；而 WebView2 的

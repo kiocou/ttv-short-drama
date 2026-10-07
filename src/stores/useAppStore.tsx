@@ -1,6 +1,17 @@
 import React, { createContext, useContext, useState, useRef, useMemo, useCallback, ReactNode } from 'react';
+import type { ChannelType, ShelfKind } from '../types/catalog';
 
-export type AppView = 'explore' | 'anime' | 'detail' | 'player' | 'history' | 'favorites' | 'settings' | 'search';
+// 分区类型定义在 `types/catalog`（service 层也要用），这里只做转出，让既有的
+// `import { ShelfKind } from '../../stores/useAppStore'` 保持有效。
+export type { ShelfKind };
+
+export type AppView = 'explore' | 'anime' | 'detail' | 'player' | 'history' | 'favorites' | 'settings' | 'search' | 'shelf';
+
+/** 进入「更多」页时冻结下来的上下文：哪个分区、从哪个频道点进来的。 */
+export interface ShelfViewState {
+  kind: ShelfKind;
+  channel: ChannelType;
+}
 
 /** 搜索历史：最多保留这么多条，最近搜索排在最前。 */
 const MAX_SEARCH_HISTORY = 12;
@@ -23,18 +34,6 @@ export interface ToastMessage {
   id: string;
   message: string;
   type: 'info' | 'success' | 'warning' | 'error';
-}
-
-export interface CardTransitionData {
-  seriesId: string;
-  cover: string;
-  title: string;
-  rect: {
-    top: number;
-    left: number;
-    width: number;
-    height: number;
-  };
 }
 
 interface AppContextType {
@@ -61,10 +60,16 @@ interface AppContextType {
   isFullscreen: boolean;
   setIsFullscreen: (value: boolean) => void;
   toasts: ToastMessage[];
-  cardTransition: CardTransitionData | null;
+  /**
+   * 「更多」页的进入上下文。为 null 表示当前不在该页（视图仍常驻 DOM，只是 hidden）。
+   *
+   * 频道必须由**发现页点进来的那一刻**决定并冻结：更多页自己挂的是一份独立的
+   * `CatalogProvider`，它不知道发现页的频道状态，事后也读不到（那是另一个
+   * Provider 实例）。传参是唯一可靠的传递方式。
+   */
+  shelfView: ShelfViewState | null;
+  openShelf: (kind: ShelfKind, channel: ChannelType) => void;
   navigateTo: (view: AppView, seriesId?: string) => void;
-  triggerCardTransition: (data: CardTransitionData) => void;
-  clearCardTransition: () => void;
   goBack: () => void;
   setSearchKeyword: (kw: string) => void;
   /** 搜索历史（最近在前），持久化在 localStorage。 */
@@ -88,7 +93,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [isNavCollapsed, setIsNavCollapsed] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
-  const [cardTransition, setCardTransition] = useState<CardTransitionData | null>(null);
+  const [shelfView, setShelfView] = useState<ShelfViewState | null>(null);
 
   /**
    * 所有 action 都用 `useCallback` + ref 读最新 state，而不是直接从闭包里取。
@@ -114,17 +119,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setCurrentView(view);
   }, []);
 
-  const triggerCardTransition = useCallback((data: CardTransitionData) => {
-    setCardTransition(data);
-    if (data.seriesId) {
-      setSelectedSeriesId(data.seriesId);
-    }
-  }, []);
-
-  const clearCardTransition = useCallback(() => {
-    setCardTransition(null);
-  }, []);
-
   const goBack = useCallback(() => {
     const from = previousViewRef.current || 'explore';
     if (currentViewRef.current === 'player') {
@@ -135,6 +129,24 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       navigateTo(from);
     }
   }, [navigateTo]);
+
+  /**
+   * 进入某个分区的「更多」页。
+   *
+   * 与 `navigateTo` 分开是因为它要**同时**带上 kind 与 channel —— 后者是发现页的
+   * 瞬时状态，只能在这一刻由调用方交出来。走 `navigateTo('shelf')` 会把这个上下文
+   * 丢掉，页面只能拿默认值，用户从漫剧专区点进去却看到短剧列表。
+   *
+   * `previousView` 只在**首次**离开非 shelf 视图时写入：在「更多」页里连点另一个
+   * 分区的入口时，不能把 previousView 覆盖成 'shelf'，否则返回会原地打转。
+   */
+  const openShelf = useCallback((kind: ShelfKind, channel: ChannelType) => {
+    if (currentViewRef.current !== 'shelf') {
+      setPreviousView(currentViewRef.current);
+    }
+    setShelfView({ kind, channel });
+    setCurrentView('shelf');
+  }, []);
 
   const persistSearchHistory = useCallback((next: string[]) => {
     setSearchHistory(next);
@@ -196,10 +208,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     isFullscreen,
     setIsFullscreen,
     toasts,
-    cardTransition,
+    shelfView,
+    openShelf,
     navigateTo,
-    triggerCardTransition,
-    clearCardTransition,
     goBack,
     setSearchKeyword,
     searchHistory,
@@ -210,10 +221,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     showToast,
     removeToast,
   }), [
-    cardTransition, clearCardTransition, clearSearchHistory, currentView, goBack, isFullscreen,
-    isNavCollapsed, navigateTo, previousView, removeSearchHistory, removeToast, rememberSearch,
-    searchHistory, searchKeyword, selectedSeriesId, showToast, toasts, toggleNavCollapsed,
-    triggerCardTransition,
+    clearSearchHistory, currentView, goBack, isFullscreen,
+    isNavCollapsed, navigateTo, openShelf, previousView, removeSearchHistory, removeToast,
+    rememberSearch, searchHistory, searchKeyword, selectedSeriesId, shelfView, showToast,
+    toasts, toggleNavCollapsed,
   ]);
 
   return (

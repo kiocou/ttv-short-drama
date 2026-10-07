@@ -1,3 +1,219 @@
+## 0.2.16 - 2026-10-07
+
+### 修复
+
+- **退出全屏不再「先缩小再放大」：把最大化从「向系统请求」改成「手动落位」。** 用户原话：
+  「我点击退出全屏以后，它会先缩小，然后再放大，再回到原先的位置。」
+  - **日志把动作拆成了三跳**（`ttv-playback.log`，同一次操作）：`2560x1537 → 2160x1380 → 2560x1528`。
+    第一跳是 tao 撤掉全屏后的普通铺满态（与全屏几乎同尺寸，肉眼看不见）；第二跳 `2160x1380` 就是
+    **系统最大化动画的中间帧**（那一下「缩小」）；第三跳是最大化后的客户区（「再放大」）。
+  - **决定性证据**：同一次日志里 `[窗口] finish 收尾 前=2582x1550@(-11,-11) 后=2582x1550@(-11,-11)` ——
+    **收尾前后矩形完全相同**，说明窗口不是被我们挪走的，是 `SetWindowPlacement(showCmd = SW_MAXIMIZE)`
+    这一步让 Windows 自己播了一段「从当前尺寸撑到最大」的过渡动画：请求的目标状态与当前「普通窗口」状态不一致。
+  - **修法**：`window_finish_fullscreen` 改为不向系统请求、直接手动落位 —— 先补上 `WS_MAXIMIZE` 样式 →
+    `SetWindowPos` 落到目标矩形 → 写回暂存的原矩形 → 再幂等钉一次位置 → `IsZoomed(hwnd)` 校验。
+    目标矩形取**当前窗口矩形**（本机实测 `2582x1550@(-11,-11)`，无边框窗口四边带阴影扩展，比 `rcMonitor` 准）。
+    **`SetWindowPos` 不走 `WM_SYSCOMMAND`，因此不受系统「窗口最大化/最小化时动画」设置影响，没有中间帧**；
+    写回还原矩形被挪到最后，此刻请求状态与当前一致，是幂等调用，也不会再播动画。
+  - **为什么进全屏仍要先「原地解除最大化」**（0.2.15 已有的行为，本次未动）：不解除，tao 会把仍处于最大化
+    状态的无边框窗口客户区裁到工作区之上。代价是窗口「常规位置」被临时覆盖成整屏矩形 —— 所以退出侧必须把
+    暂存的原矩形写回，否则标题栏「向下还原」永远还原回整屏、放大缩小一个样。两端成对，见 AGENTS.md 不变量 5。
+  - **配套打点**：`[ui] 全屏 进入开始 / 退出开始 / 退出完成 耗时=…ms`、`[窗口] prepare 前 / prepare 后`、
+    `[窗口] finish 收尾 前=… 后=… 还原矩形=…`、`[窗口] finish 状态校验 showCmd=… 已最大化=…`，
+    以及 `trace::log_window_size()` 的**尺寸变化节流打点**（与上一条完全相同则丢弃、同一 500ms 窗口内最多 12 条）
+    —— 正是这条时间线把这个 bug 从「感觉有回弹」变成了三跳矩形。
+
+### 改进
+
+- **红果短剧首开不再干等整集：前缀先行开播，整集在后台补齐后无缝换源。** 上一轮的日志已经证明「首开很长时间」100% 发生在那一个 `resolve` await 里（实测 6.1–11.2 秒下整集），resolve 返回到首帧只有毫秒级。所以优化方向不是调参数，而是**别等整集**。
+  - **两条链路并发**：前端在 `playNativeResolvedFile` 里先同步发出整集请求（`fullPromise`，不 await），再发前缀请求；Rust 侧两条命令的在途去重键不同（整集 `ns:quality:vid`，前缀 `ns:quality:vid:prefix`），因此互不阻塞、可同时跑两个 worker。谁先落盘谁先被用上，**绝不叠加延迟**。
+  - **前缀为什么能直接播**：这条 CDN 是 faststart 布局，moov 在文件头部（实测 offset 28、约 250KB），所以 `Range: bytes=0-(N-1)` 截下来的前 2MB 解密后是一个**自洽可播的小片段**，不是残片。worker 侧新增 `download_prefix()` 与 `resolve-prefix` 子命令，产物 `{vid}.prefix.mp4`（指定档位是 `{vid}-{quality}.prefix.mp4`，`with_extension` 天然分开）。
+  - **本机实测**（`.workbuddy\test-prefix.ps1`，真实 CDN，vid=7691682207982685208）：签名 405ms → 播放模型 1127ms → 直链 1711ms → 前缀落盘 **4254ms**，TOTAL **4307ms** / 12,085,061 字节 / **13.67 秒**可播（h264 High 1920×1080 6939 kb/s + aac 128k）。对照同环境整集 6–11 秒，且整集此刻还在后台继续下。
+  - **前缀规模刻意留在默认 2MB**（`TTV_SD_PREFIX_BYTES`，:1186）。同一集用 4MB 复测：落盘 5401ms、产物 30.13 秒 —— 多等 1.1 秒只换来 16 秒额外覆盖，而整集通常 6–11 秒就会把前缀替换掉，那 16 秒用不上。13.67 秒覆盖足够撑到换源完成。
+  - **换源不黑屏、不弹错**：前缀切到整集走 `adoptPreparedSource`（不调 `load()`，旧帧一直保留到新源 `loadeddata`），切完按 `currentTime` 对齐续播。四条退让全部静默：前缀没来 / 前缀播不起来 / 切源失败 / 集已在盘上（后端直接回整集并置 `cached: true`，此时**不走前缀**）——一律回退到改造前的整集链路，用户看不到任何错误页。
+  - **不破坏既有语义**：全程同一 `sessionId`、同一 `episodeId`，`markSourceCommitted` / `pauseIfStale` 原样复用，连播四重闸门不受影响；前缀路径**永不写进** `resolvedFileByVidRef`（否则下次换集会命中一个只剩开头十几秒的短命文件）；从 `startPosition > PREFIX_COVERAGE_SECONDS` 续播时主动跳过前缀（前缀几乎立刻播到头，反而会先触发一次 `ended`）。
+  - **门禁**：`npx tsc --noEmit` = 0；`npm run build` = 0；`cargo fmt --check` = 0；`cargo clippy --all-targets -- -D warnings` = 0；`cargo test --bins` = **104 passed / 0 failed / 8 ignored**。
+
+- **修「关掉 VSR 后进度条变成 `00:00 / 00:00` 且拖不动」——和 VSR 本身无关，是播放器宿主被连带重挂。** 这个 bug 一直在，只是路径不对没撞上。
+  - **数据流**：进度条唯一数据源是 store 的 `position` / `duration`，两者只由 `handleTimeUpdate` 更新，而它绑在一段**依赖为空数组、只执行一次**的 effect 里（`usePlaybackStore.tsx`，注释明写「监听器只绑定一次」）。`ProgressBar` 侧则是 `duration <= 0` 时直接 `return`（拖拽入口）——所以 `duration` 一旦不再被写入，读数恒 `00:00`、拖拽恒无效，而画面照常播（播放走 `videoRef.current`，永远是当前元素）。
+  - **根因**：`App.tsx` 的 `workspaceKey` 旧写法是 `currentView === 'detail' ? (selectedSeriesId ?? '') : ''`，而它挂在**最外层主工作区**上 —— 那一层内部就住着播放器宿主 `<VideoSurface/>`。于是「详情页（key=剧 id）→ 播放器（key=''）」这次跳转必然换 key，React 卸载重建整个工作区，产生一块**全新的 `<video>`**，而 store 里那份只绑一次的监听器仍挂在被丢弃的旧元素上。同一原因还会**静默带走**连播（`ended` 收不到）与「下载中」遮罩的收尾（`playing` 收不到）。
+  - **修法**：key 只跟**剧**走，不跟视图走 —— `const workspaceKey = selectedSeriesId ?? ''`，并且把它从最外层主工作区**收进详情页那一层**（保留旧实现里唯一有价值的能力：换剧时详情页重挂拿干净状态）。导航栏所在的那层也不给 key。
+  - **为什么用户是「关掉 VSR」之后才遇到**：这是**每次**从详情页点集数进播放器都会发生的路径问题；此前他多半从首页/历史直接进播放器（不经过 detail），key 一直是 `''`，不触发。关掉开关只是让他换了条进入路线。
+  - **顺带补的两条打点**（否则下次同类问题又要靠猜）：`usePlaybackStore` 的监听器绑定处记「首帧-宿主 监听器已绑定 video」与「首帧-宿主 首次 timeupdate 距装载=…ms 时长=…s」（脱钩时第一行有、第二行永远不出现）；`useSettingsStore` 在 VSR 开关**值真正变化**那一刻记一行「VSR 开关切换为：开/关」——此前只有启动时那一行，用户中途拨开关在日志里完全看不见，无法区分「开关没生效」还是「生效了但链路不对」。
+- **「开关 VSR 都没用」的真正根因：`-tls_verify 0` 写在 `-i` 之后，从来没生效过。** 这条与「首开很慢」是同一个根因的两副面孔 ——
+  它的一个直接后果就是每次起播都先白等一轮必然失败的拉流。
+  - **机制**：ffmpeg 的输入选项必须排在 `-i` **之前**，写在后面会被解析成**输出**侧的选项；而输出是 HLS 分片 / 本地文件，根本没有网络输出流，于是该选项被静默忽略，输入仍走默认证书校验。随包 ffmpeg 没有 CA 证书链，所以「打开输入」这一步必然失败。
+  - **实测对照**（`.workbuddy/probe-tls.ps1`，同一条真实 CDN 地址）：`-i <url> -tls_verify 0 …` → **RC=-5 / 115ms 失败**，stderr `[tls @ …] error:0A000086:lib(20)::reason(134)` + `Error opening input: I/O error`；改成 `-tls_verify 0 … -i <url>` → **RC=0 / 704ms / 产出 5,915,296 字节**。
+  - **两处一起中招**：① 红果 worker 的 `_ffmpeg_direct_decrypt` 快速路径（ffmpeg 直连拉流 + 解密 + 转存一步到位）**从未真正生效**，每一集都退化成「python 完整下载整集写盘 → ffmpeg 读盘解密」的慢路径；② `media_enhance` 的增强转码从来没成功打开过源 —— 这才是「开关 VSR 都没用」在 guo / 公开直链场景下的真身。
+  - **修法**：两处都把 `-tls_verify 0 -rw_timeout 60000000` 移到 `-i` 之前，注释里记下 115ms / 704ms 的对照。
+  - **实测**（3 集 × VSR 开/关共 6 次，全部成功、不再出现「改用本地下载模式」）：4982ms / 35.9MB、4785ms / 38.6MB、6952ms / 64.6MB（对照修之前同样的一集要 7.5–8.5 秒，且日志里每次都先闪两次失败文案）。
+
+- **VSR 开关贯通到红果 worker —— 这是「开关 VSR 都没用」在红果短剧下的完整解释。** 红果链路走 `short_drama_app_resolve` → worker 整集转存本地 mp4 → `asset://` 播放，**完全不经过 `media_enhance`**；而开关此前只作用于 `media_enhance`（guo / 公开直链），所以用户点红果短剧时怎么拨都没用。
+  - `run_resolve_worker` 新增 `.env("TTV_SD_VSR", …)`；worker 侧新增 `vsr_enabled()`（缺省按开，与 Rust 侧 `AtomicBool` 初值一致）与 `should_copy_video(codec)`。
+  - **两档语义**（回应用户要求的「开=保留 VSR、关=回到没有 RTX VSR 之前的播放链路」）：**关** = 回到引入 VSR 之前的链路，红果整集走 `-c copy` 重封装（历史实测 0.87s / 10.8MB；本机 WebView2 已开 `PlatformHEVCDecoderSupport`，H.265 源也照播），不再为一样用不上的 VSR 把整集重编成十几倍大的文件；**开** = 这条链路必须产出 H.264（不变量 25），源本来就是 H.264 就 copy，源不是 H.264 才重编码。两档共用同一条判定「输出必须是 H.264，且能 copy 就 copy」，区别只在源不是 H.264 时。`bytevc2` 永远重编码。
+  - **配套**：`is_h264_codec` 改宽容判定。真实 codec 值并不干净 —— `variant_codec` 在 `video_meta.codec_type` 缺失时会把整串 `gear_des_key` 交上来（实测 `0:mp4|1:encrypt|2:h265_hvc1|4:1080p|…`），全等匹配一律判 False，会让源本来就是 H.264 的集白花一次整集重编码。现在先排除 `h265/hvc1/hevc/h266/bytevc2` 标记，再看是否含 `h264`/`avc`。
+  - **NVENC 自适应**：新增 `video_encoder_args(ffmpeg)`，可用 `TTV_SD_ENCODER=nvenc|x264` 强制，否则真跑一次探测（`-f lavfi -i color=black:s=640x360 -frames:v 2 -an … -f null -`，timeout 25s），失败则记一行日志回落 CPU。**探测尺寸必须 640x360** —— 用 64x64 时 nvenc/amf/qsv 全部报错（`Frame Dimension less than the minimum supported value`），是纯粹的假阴性。
+  - **实测**：NVENC 在整集路径上**没有净收益**（7132ms vs libx264 6302ms），但产物更小（35.9MB vs 91.4MB）。保留自适应是为源非 H.264 时的重编段。
+
+- **播放链路前端插桩落地**（诊断日志此前只有后端在写，前端一次都没调用过）：
+  - 新增 `src/services/playbackTrace.ts`：`tracePlayback()` 是零依赖、fire-and-forget 的打点（`hlsAttach.ts` 刻意不依赖 ipc 层，不能为了打点把 ipc 的依赖图拖进去）；`redactUrl()` 在**前端**做脱敏 —— 红果分集直链的 query 是预签名凭据，日志会被用户导出发出来，不能把可用凭证抄进去；`urlShape()` 是「这一集走哪条路」的唯一判据（本地文件 / VSR转码HLS / HLS / 网络直链）。
+  - 打点位置：`hlsAttach.attachSource`（形态 + 脱敏地址 + 耗时）、hls.js 的 `ERROR`（带 `type`/`details`/`fatal`，用于区分「清单还没落地时的分片 404」与真正的解码失败）、`resolveNative`（这唯一出口覆盖了播放器 / 画中画 / 预取三条调用点，耗时 + 字节 + 是否缓存命中）、`VideoSurface` 的 `loadstart`/`loadeddata`/`canplay`/`playing`/`waiting`/`stalled`。
+  - **开发环境实测日志**（`ttv-playback.log`，本轮第一次看到完整链路）：`[ui] resolve 请求开始 vid=… 档位=auto` → `[红果] worker 阶段 … stage=download … 编码=0:mp4|1:encrypt|2:h265_hvc1|…，整集重编码为 H.264（VSR 需要）` → `[红果] resolve 完成 耗时=7156ms 字节=26453365` → `[ui] resolve 返回 耗时=7165ms 字节=25.2MB 缓存=false` → `[ui] 媒体 loadstart 开始加载` → `[ui] 媒体 loadeddata 首帧就绪 readyState=4` → `[ui] 媒体 canplay` → `[ui] 媒体 playing`。
+  - **顺带证实两点**：① 红果整集确实每次都走「整集重编码为 H.264（VSR 需要）」，源是 HEVC；② `resolve` 返回后到首帧就绪只用了**毫秒级**（本地文件），也就是说红果的「首开很长时间」**全部**发生在 `resolve` 那一个 await 里 —— 6.1–11.2 秒。优化目标因此非常明确。
+- **新增播放链路诊断日志（用户可见）**：用户反馈「开关 VSR 都没用」「视频首次加载都很长时间」，但双击启动时（`#![windows_subsystem = "windows"]`）Rust 侧 18 处 `eprintln!` 与 ffmpeg 的输出全是黑洞，只能靠猜。新增 `src-tauri/src/trace.rs`：
+  - **进程内环形缓冲 + 落盘双写**：`MAX_LINES = 2000` 的 `VecDeque`（供设置页面板增量读取，游标按单调递增的 `SEQ` 过滤，`clear` 后不重置，否则前端持有的游标会永远大于最大值而收不到新行）＋ `<data>/ttv-playback.log` 每行 flush（便于强杀后仍能拿到最后几行）。行格式 `[+   1.234s #12]`，时间是相对进程启动的偏移。
+  - **stderr 捕获**：`CreatePipe`（1MB 缓冲，防 ffmpeg 写端堵塞）＋ `SetStdHandle(STD_ERROR_HANDLE, …)`，起线程逐行收进同一条时间线（`[stderr]` 前缀）。必须在 ffmpeg/worker 被拉起**之前**调用。
+  - **URL 脱敏**：`redact_url()` 只保留 `scheme://host[:port]/path`，砍掉 query（源流地址的 query 是预签名凭据，整条进日志等于把凭据抄进磁盘与设置页）。
+  - **启动横幅**记录版本、可执行文件路径与 **mtime**（直接回答"用户跑的是哪一版"，这次正是靠它确认用户启动的是 10/5 的安装版）、VSR 开关当前值、缓存目录、WebView2 启动参数。
+  - 三个 Tauri 命令 `trace_ui_log` / `trace_tail` / `trace_clear`；设置页「客户端信息与诊断」卡片（与已有的导出按钮同一处）下新增可折叠的播放器诊断日志面板：1500ms 游标增量轮询、DOM 最多保留 800 行、`[vsr]`/`[ui]`/失败行分色、手动上滚即暂停自动滚底、复制全部 / 导出 txt / 清空。折叠状态下不产生任何 IPC 流量。
+  - 插桩点覆盖全链路：`media_enhance`（start / 就绪判定 / 令牌无效 / 下发清单 / 分片未就绪 / 转码进程退出）、`main.rs` 的 VSR 开关分支、红果 `resolve` 与 `run_resolve_worker`（启动 / 阶段变化 / stderr 首行 / 超时 / 失败 / 完成，含耗时与字节数）。
+  - **踩过的坑**：`cargo test` 会真的跑通 logger，把 2000 行「填充 N」写进用户真实目录下的 `ttv-playback.log`，把排障现场冲掉 —— 已用 `if cfg!(test) { return None; }` 拦住。
+
+- **修掉「首次打开视频一直加载等待」的真实根因：fMP4 的 `init.mp4` 从来没有落在会话目录里。** 这条不是参数调优问题，是产物压根不在该在的地方：
+  - **机制**：ffmpeg 写 fMP4 的 init 段用的是**相对文件名**，而 `-hls_segment_filename` 我们传的是**绝对路径**。于是只有分片落对了地方，`init.mp4` 悄悄掉进**父进程的当前工作目录**（会直接掉在工程根目录/桌面）。四组对照实测（`.workbuddy/exp-init.txt`）：不传 init 名 + cwd=工程根 → 会话目录内无 init；传相对名 `init.mp4` + cwd=根 → 会话目录内**仍然没有**；**cwd=会话目录 → 会话目录内有 init.mp4 ✅**；传绝对路径 → ffmpeg 直接失败 `Failed to open segment '<abs>/init.mp4'`。
+  - **两处后果正好对应用户的两条反馈**：① `ready()` 要求 `index.m3u8` 与 `init.mp4` 同时存在 → **恒为 false** → `start()` 每次都会死等满 `READY_WAIT` 才把地址交出去，这正是"首次打开一直在加载"里后端按住的那一段；② 就算把地址交出去，播放列表里 `#EXT-X-MAP:URI="init.mp4"` 的请求必然 404（本地服务去会话目录找它），hls.js 只能反复重试首片，用户看到的就是"一直转圈"。
+  - **修法**：`Command::current_dir(&directory)`，即「相对文件名 + cwd 钉在会话目录」——四组实验里唯一稳的组合。注释里写明了为什么不能传绝对路径，以及为什么不再需要 `-hls_fmp4_init_filename`。
+  - **顺带**：转码进程退出时的 stderr 原来只 `eprintln!`（双击启动时是黑洞），改走日志通道并带上会话号、退出状态与前 300 字符。
+
+- **RTX VSR 增强链路「首次打开要等很久」：把串行的等待改成并行，并让提示跟着画面走**。用户反馈「初次打开视频时都会加载很长时间，一直在加载等待」。拆开看是三件独立的事：
+  - **① 转码进程先空等下载 5MB 才肯出第一帧。** media_enhance::start() 拉起 ffmpeg 时用的是默认输入探测参数（probesize=5,000,000 / analyzeduration=5,000,000），它会尽量读满 5MB / 5 秒的源数据才判定「这是什么流、第一帧从哪开始」。对网络输入这就是纯白等。**修法**：显式传 -probesize 1000000 -analyzeduration 2000000（必须是 -i **之前**的输入选项）。本链路处理的只是「一条 H.264/HEVC 视频 + 一条 AAC 音频」这类最普通的 mp4/HLS，1MB / 2 秒足够；探测不足时 ffmpeg 只会退化成边播边补，不会失败。
+  - **② 后端死等首段与前端重试是两段串行等待，用户按两者之和买单。** 原来 start() 要按住最多 **4 秒**等 index.m3u8 + init.mp4 双落地才返回地址。但前端 hlsAttach.ts 早就补了 manifestLoadingMaxRetry: 4 / levelLoadingMaxRetry: 4 / fragLoadingMaxRetry: 8 / fragLoadingRetryDelay: 500 —— 这套重试本来就是为边转边播准备的。**修法**：新增常量 READY_WAIT = Duration::from_millis(1500)，把等待上限压到 1.5 秒（覆盖本地片实测 0.55s、真实源常见的 2–4s 首段就绪里的大部分）。没等到也照旧交地址，剩下的交给播放器自己重试，总耗时从「后端 + 前端」变成两者的较大值。
+  - **③ 画面都开始播了，进度提示还挂在屏幕上等一个后台任务。** 解析进度来自 worker 的 shortdrama://app-resolve 事件，而 worker 是在**下载整集**的过程中上报的。现在链路是「worker 一边下载、播放器一边播」（增强转码流尤其如此：第一段分片落地就能出画，此后 worker 还在为后续分片继续拉源），于是那条「云端解析中」会一直挂到整集下完 —— 用户看到的正是「视频都开始播了，还在转圈等我」，而它等的其实是一件**已经不影响当前播放**的后台任务。**修法**：在 usePlaybackStore.tsx 的 video 监听里加一条 playing 处理 clearResolveOverlay，用 currentTime > 0 判定（不能只看 playing：缓冲挖坑后恢复播放也会触发，那时提示还有意义），首帧真出来才收掉提示。
+- **设置页新增「RTX VSR 视频增强」开关（播放体验）**。默认**开**（与现状一致，老用户行为不变）。两档语义完全对称：
+  - **开** = 保留引入 media_enhance 之后的增强链路：guo 与公开 http(s) 直链先转成本地 H.264 HLS 再播（本机 WebView2 上 VSR 只认 H.264，见不变量 25），红果缓存迁移同理。
+  - **关** = 完全回到**未引入 RTX VSR 之前**的旧播放链路：原始源 URL 直接播，不启动任何转码进程，也不再把旧缓存整集重编成 H.264。判定位置（Rust src-tauri/src/main.rs）：enhance_short_drama_session() 里 `if !vsr_enabled() { return session; }` 必须排在 media_enhance::needs_enhancement() **之前** —— 后者只按 URL 形态决定「能不能转」，与用户开不开增强无关。
+  - **开关落在配置里而不是内存里**：models.rs 的 UserSettings.vsr_enabled（#[serde(default = "default_true")]，旧记录缺失时补 true）；settings_save 写库的同时调 set_vsr_enabled()，因此**改完立刻生效、无需重启**；setup 按落库值初始化。运行期用进程级 `AtomicBool`（OnceLock）而不是 AppState 字段：enhance_short_drama_session 是自由函数，改成收 &AppState 会把状态锁拖进起播热路径；AtomicBool 单字读、无锁、不跨 await。
+  - **顺带修掉一处「关掉开关也没用」的漏网**：旧缓存的 H.264 迁移（ensure_h264_cache）原本无条件跑，而它是在**起播路径上同步执行的整集重编码**（1920×1080 实测几秒到十几秒）。关掉开关后这笔成本换不到任何东西（产物就是 HEVC，VSR 也认不了），现在直接写标记跳过，产物保持 HEVC 直连播放。
+  - **门禁**：cargo fmt --check = 0；cargo clippy --all-targets -- -D warnings = 0；cargo test --bins = 101 passed / 0 failed / 8 ignored（含 models::vsr_settings_tests 三例：旧记录补 true、显式关掉后必须真关、默认 true）。真机 VSR 触发**未实测**（需要真实 HDR/CDN 源 + NVIDIA 驱动侧日志）。
+  - **门禁**：npx tsc --noEmit = 0；npm run build = 0（5.19s）；cargo fmt --check = 0；cargo clippy --all-targets -- -D warnings = 0；cargo test --bins = **101 passed / 0 failed / 8 ignored**。转码侧的①②两项**尚未真机实测**（需要真实 CDN 源），数值取自本机历史实测与 ffmpeg 参数语义。
+
+- **切页面与进出播放器不再卡顿：三条实测根因一起修掉**。用户反馈「切换页面、进入退出播放器容易卡顿」。逐个量下来不是同一件事，而是三条叠在一起：
+  - **① context 按引用广播，播放进度每秒把整棵树刷 4 遍。** `PlaybackContext` 的 value 是内联对象，而 store 里的 `position` 每次 `timeupdate` 都变（约 4 次/秒）、`buffered` 每次 `progress` 都变。只要组件订阅了整表，它的重渲染频率就等于播放进度更新频率 —— 而 `AppContent` 是**所有视图的父节点**、`ExploreView` 下面有上百张 `SeriesCard`，连历史、详情、选集抽屉都跟着刷。**修法**：新增一条低频动作专线 `PlaybackActionsContext`（`usePlaybackActions()`），只装换剧/换集/开关抽屉/音量档位这类**用户操作**才会变的东西；`usePlaybackStore()` 保留给真正需要实时读数的播放器自身（`VideoSurface` / `PlayerControls`）。方法一律经 `actionsRef` 转发到最新实现，所以既不用把每次渲染新建的函数列进依赖，也没有过期闭包。顺带把 `playbackValue` 从「假装有 memo」改成普通对象 —— 它里面 12 个动作函数本来每次渲染都是新引用，列依赖等于没 memo，写清楚比留下误导好。`usePlaybackSelector` 保留，但注释里写明它**只省解构、不省重渲染**（`useContext` 照样订阅整表）。
+  - **② 每切一次页面，整棵视图树被销毁重建一次。** `App.tsx` 里 8 个视图层写的是 `key={currentView === 'x' ? 'view-x' : undefined}`：只有当前激活的那层拿到字符串 key，其余都是 `undefined`。切页时新旧两层的 key **同时**变化（字符串 ↔ undefined），React 的判定是「key 变了就重挂」——于是卡片列表、封面用的 `IntersectionObserver`、分页游标全部重来，主线程被占满。这与「视图常驻 DOM」的初衷正好相反。**修法**：视图层不再挂 key；重挂只保留唯一真正需要的那一处 —— **换剧**（`workspaceKey = currentView === 'detail' ? selectedSeriesId : ''`，挂在工作区容器上），也就是旧 `view-detail-${selectedSeriesId}` 里唯一有价值的部分。「更多」页原本也靠 currentView 强制重挂，同样去掉（它自己已有 `shelfView` 复位逻辑；`channel === 'adult'` 那层的 `CatalogProvider key` 是有意保留的）。
+  - **③ 页面入场动画把恒等值永久钉在 8 个常驻层上。** `animate-fluent-page-in` 的关键帧含 `opacity: 0→1` 且带 `forwards` —— 跑完后 `opacity: 1` 会永久留在那 8 个视图层的内联样式里，等于常驻合成层（本项目已因同类残留让 NVIDIA VSR 失效过一次，见不变量 26）。更糟的是隐藏层：元素在 `display: none` 的祖先里创建时 Chromium 会把动画卡在 0% 帧，而 0% 的 `opacity: 0` 会被当真。**修法**：`fluentPageIn` 只保留 `translateY(8px) → 0`，与 `fluent-card-in` 当年得出的结论（入场动画不碰 opacity）对齐，观感几乎不变。
+  - **实测/门禁**：`npx tsc --noEmit` = 0；`npm run build` = 0（13.85s，`dist/assets/index-*.js` 500.39 kB / gzip 146.73 kB）；`cargo fmt --check` = 0；`cargo clippy --all-targets -- -D warnings` = 0；`cargo test --bins` = **101 passed / 0 failed / 8 ignored**。
+
+- **首页的「正在热播 / 新剧」改用各自「更多」页同一份数据源**（红果榜单 / 最新上架），不再从发现页目录里切一段。原来货架是 `items[0..6]` / `items[6..12]`，而「更多」页走的是红果 App 接口 —— 点进去看到的是**完全另一批剧**，两处对不上。
+  - **共享一份取数**：新增 `src/stores/useShelfFeed.ts`，把游标翻页与**首页首屏缓存**（TTL 3 分钟）收口在这里。首页货架与「更多」页读同一个 hook：货架拉到的第一页就是「更多」页的首屏，所以**从货架点进「更多」是秒开的**（不会再等一次 Python 冷启动），「更多」页还能接着那页的游标继续翻。
+  - **新增 `HomeShelfSection`**：货架位自己的取数 + 渲染。调用方必须传 `key={`${kind}-${channel}`}` —— `useShelfFeed` 的状态只在挂载时初始化，换频道不重挂会有一帧显示上一频道的内容。
+  - **`HomeShelf` 新增 `loading`**：数据没到就先画 6 张骨架卡把高度占住，否则货架会"先消失再出现"，整页跟着跳一下。`onUnavailable` 同时改成可选 —— 货架卡来自 App 接口、不在发现页目录里，`hiddenSeriesIds` 那套除名机制管不到它们。
+  - **18+（神秘小窝）保持原样**：红果 App 接口没有 18+ 口径（那是本机侧"只启用成人源"的聚合概念），该频道继续用本机启用源聚合出来的目录切片。`ExploreView` 因此分成两条分支，`shelfFeedSupports(channel)` 是唯一判据。
+  - **顺带修掉一个"吞剧"的老逻辑**：发现页的「发现更多」网格原来会**让出前 12 条**（`catalogStart = 12`），只因为那 12 条"已经出现在货架上"。货架换成独立数据源后两者再无关系，继续让位等于凭白吞掉 12 部剧 —— 现在目录网格从第 1 条开始。
+  - **代价（已知）**：进发现页会多发两个分区请求，`worker.py` 每次冷启动约 1.8s，两个并发跑、期间货架显示骨架；3 分钟 TTL 内不会重复。
+
+- **「更多」页接上真正的分区数据源**：走红果 App-API 的**榜单**与**最新上架**，而不是上一版那套「本机启用源聚合 + sort」（后端基本不实现 sort，两页会拿到同一份列表）。接口与参数完全照 `红果短剧客户端逆向分析报告.md` §四。
+  - **官方本来就是两条接口**：热播 = 榜单 `GET /reading/bookapi/bookmall/cell/change/v`（`sub_selected_items=comic_series_hot_play`，游标 `session_uuid + next_offset`）；新剧 = 上架 `POST /reading/distribution/category/landpage/v`（`select_items.sort=["online_time"]`，游标 `offset += 本页条数`）。**短剧没有 cell 榜**，所以短剧的"热播"用上架接口的 `sort=hot_score` 近似 —— 这与官方自己一致。
+  - **worker 新增 `feed` 子命令**（`worker.py`）：`feed <json>`，`mode=rank|list` 两种模式，输出沿用既有的逐行 JSON 协议。两条接口的分页模型不同，统一收敛成**不透明游标** `{"o":<offset>,"s":"<session_uuid>"}` 交给调用方原样回传。脏数据（HTML 标签、`今日上新`/`x万热度`/`N集`/季数这些噪声副标题）在 worker 侧清掉，Rust 只做字段搬运。
+  - **worker 不需要"免签"分支**：官方客户端对这两条接口默认不发签名（注释称实测红果不校验 X-Argus），TTV 仍走既有的六代签名 —— 签名是更严的一侧，不会因此被拒，也就不必再分一条代码路径。
+  - **Rust 新增 `short_drama_app_shelf_feed(kind, channel, cursor)`**，并在 `short_drama_app.rs` 里落了一张「分区 × 频道 → 接口参数」表（`shelf_feed_spec`）。评分源给的是字符串（`"9.4"`），解析不了就当"源没给"，**绝不填 0**（不变量 8）。
+  - **前端**：新增 `ipcService.shelf.feed()`（游标式，`cursor` 原样回传）；「更多」页改成自持状态 + 游标翻页 + 按 id 去重（游标翻页可能回吐重复条目，一页全是重复即视为到底）。
+  - **神秘小窝是唯一例外**：红果 App 的榜单/上架**没有 18+ 口径**，拿它填神秘小窝等于把普通短剧塞进 18+ 专区，直接违反门闩不变量。该频道继续走本机启用源的多源聚合，页面版式与另一条完全一致，只有取数链路不同。
+  - **实测（直接跑 worker，2026-10-07）**：用**自造的、格式正确的设备身份**（19 位 deviceId/installId + uuid cdid + 16 位 openudid，不含任何账号凭据）打真接口，四条路径全部通：漫剧热播榜 10 条/页、短剧热播 18 条/页、短剧最新上架 18 条/页、漫剧最新上架 18 条/页，都拿到真实条目（id/标题/封面/集数/评分/题材）。**游标翻页也对**：榜单第二页 10 条与第一页零重叠，`session_uuid` 原样贯穿、`next_offset` 10 → 20。这同时坐实了逆向报告里那条关键结论 —— **列表类接口确实不校验账号**（官方注释称的"免签"），游客态就能拿到数据。
+  - **顺带修掉一个吞错误的真 bug**：Tauri 的 `invoke` 被后端 `Err(String)` 拒绝时抛的是**原字符串**、不是 `Error`，所以 `(err as Error).message` 恒为 `undefined` —— 后端拼出来的错误详情会被静默换成一句通用兜底。新增 `errorText()`（`services/ipc.ts`）统一收口，并换掉 `ShelfMoreView` 与 `useCatalogStore` 里的两处旧写法。这个 bug 正是「更多」页明明报错却只显示"列表加载失败"、看不到真原因的原因。
+  - **注意**：Rust 侧新增了 Tauri 命令，**必须重启 `npm run tauri dev`**（前端 HMR 不会带来新命令，旧进程里 `invoke` 只会得到 command not found）。
+
+- **首页两颗货架的「刷新」换成「更多」，卡片上的 1/2/3 序号一并移除**，新增一个独立的「更多」页。
+  - **移除**：`HomeShelf` 的刷新按钮（`onRefresh` / `refreshing` 两个 prop 与 `RefreshCw`）、`ExploreView` 里整套 `refreshingShelf` / `refreshTokenRef` / 失败 toast、`SeriesCard` 的 `rank` prop 与其金/银/铜三档配色。**序号被移除的连带后果**：上一轮做的"手动强制刷新"（`refreshCatalog(kw, { force: true })` → `catalog_list` 的 `force` → `guo_provider::catalog_refresh` 穿透 15min 缓存）**不再有调用方**，guo 源目录从此只能等 TTL 自然过期。force 链路本身保留在 store / IPC / Rust 三层，随时可以挂到别处。
+  - **新增「更多」页**（`src/components/views/ShelfMoreView.tsx`）：版式与「我的追剧 / 观看历史」完全同构 —— 同一个页面壳（`p-8 / max-w-5xl / mx-auto / gap-6`）、同一个页头（图标 + 标题 + 副标题 + 底边框）、同一套 `MicaCard` 行卡（64×88 封面 + 标题 + 题材/来源 + 集数/评分 + 右侧动作）。带无限流、骨架屏、空态与失败重试。
+  - **跳转**：`useAppStore` 新增 `AppView = 'shelf'`、`ShelfViewState { kind, channel }` 与 `openShelf(kind, channel)`；`App.tsx` 按既有约定挂一个常驻 DOM 视图。频道必须在点击那一刻由发现页交出 —— 「更多」页内部挂的是**另一份** `CatalogProvider`，读不到发现页的频道状态。
+  - **数据源**：`CatalogProvider` 新增可选 `initialChannel` / `initialSort`，「更多」页用一份**独立实例**把排序钉死（正在热播→`heat`，新剧→`latest`），两边的分页 / 缓存 / 预取 / 题材词表互不干扰，也不会串改发现页的排序。**注意**：后端目前基本不实现 `sort`（见 `红果短剧客户端逆向分析报告.md` §七），所以两页今天拿到的很可能是同一份列表；真正的分区数据源要接红果 App 的榜单 / 最新上架接口（同上 §八）。
+  - **顺手修掉两个 Tailwind 死类**（都是"写了但从来没被生成过"）：
+    - `h-22`（「我的追剧」「观看历史」的封面缩略图）不在 spacing 刻度里，父级高度塌成 auto，而占位层是 `absolute inset-0` —— 封面加载失败时整块缩略图会消失。改用 `h-[88px]`（3:4 = 64×88）。
+    - `group-hover:scale-108` 不在 scale 刻度里（0/50/75/90/95/100/105/110/125/150），**封面悬停其实一直不放大**。改用任意值 `group-hover:scale-[1.08]`。这条影响全部 `SeriesCard`（目录 / 动漫 / 搜索 / 货架）。
+  - 两个类名的存在性都拿 dev server 的编译产物核对过（`/src/index.css`），不是靠读代码推断。
+
+- **新增启动进入动画「轨道汇聚」**：六张迷你海报绕品牌图标公转 1.1 圈（角速度按 `1-(1-u)^1.75` 由快到慢，公转期间每张卡各自"呼吸"与轻微摇头），随后按 58ms 错峰依次被吸进中心，品牌承接撞击并做**衰减余振**，再淡出让位给主界面。总长 2300ms，点任意处（或 Esc / 空格 / 回车）可跳过。设计稿与另外 9 套备选方案在 `design-proposals/launch-animation/`，动效落在 `src/components/layout/LaunchAnimation.tsx` + `src/styles/launch.css`。
+  - **为什么动画写在 JS 里而不是 CSS**：椭圆轨道要 72 段采样（关键帧之间是直线插值，"弦"相对椭圆内凹——采样太疏时卡片会肉眼可见地切进导轨线里；半径上还叠了一层"呼吸"，一圈两个周期，采样疏了会被采成折线），六张卡各 70 多帧、每帧带 transform / opacity / filter / z-index 四个属性，写成 CSS keyframes 是几百条规则，改一个参数要动四处。
+  - **⚠️ 同一个元素只允许有一条 `animate()`，多个阶段必须合并成一条关键帧轨。** 这条是实测踩出来的：最初把"公转"和"螺旋吸入"写成两条动画，结果**公转完全没在跑**——后创建的那条带 `fill: 'both'`，它在自己的**延迟期间**就会应用 0% 帧，把公转段整个盖住，六张卡从第一帧就钉死在轨道终点、只有透明度在变。肉眼看上去"绕了一圈"其实一张没动。合并后错峰不能再靠 `delay`（那会把公转相位一起推后、60° 间隔就散了），改成把错峰做进 **offset 空间**：每张卡总时长不同、但同一起跑，于是公转同时收工、再各自等自己的窗口起飞。
+  - **景深是三层一起做的**：只做 `scale`（0.66→1.09）的话卡片永远从品牌"上面"压过去，前后关系是假的；连同 `blur`（0→1.05px）与 `z-index`（后 1 / 品牌 2 / 前 3）一起做，翻面点选在 `y = 0`——那正好是卡片离品牌最远（x = ±300）的瞬间，所以这次离散跳变看不出来。
+  - **品牌的"回弹"必须是挤压拉伸 + 过冲 + 衰减余振，不是"均匀放大"。** 先前的 `scale(1)→scale(1.114)→scale(.972)→scale(1)` 只产生"变大"，没有任何受力感。现在是 X 与 Y **反向**的一条弹簧轨（体积守恒的错觉）：主撞 `1.135×.895`，之后按 0.082 / 0.054 / 0.038 / 0.019 衰减 4 次，同时 ±2° 旋转摆动。实测 1181ms `1.040×0.973` → 1286ms `1.124×0.903` → 1339ms `0.943×1.059` → 1660ms 精确回到 `1.000×1.000`，与设计关键帧逐点吻合。
+  - 配套：公转期间导轨自己脉动两次、收束前先向外"蓄力"一下再猛收；三圈冲击波分别打在第一次 / 第三次 / 末次撞击上（只打末次的话前五次撞击全是"哑"的）；光晕改成脉冲式涨落而不是"慢慢变亮"。
+  - **时间线拆成两段，中间那一段是"等首页"**：`buildPhaseA`（公转 / 汇聚 / 弹簧，1700ms）跑完时所有东西都静止在"品牌 + 光晕"上，正好是一个可以挂起等待的姿态；`buildPhaseB`（让位给主界面，600ms）单独建、单独起。首页目录本来就在 `CatalogProvider` 挂载那一刻开始拉、和甲段同时起跑，但真实网络下不保证 1700ms 内回来 —— 所以甲段跑完时看 `isLoading`：就绪就立刻揭幕，没就绪就挂起（光晕开始呼吸、提示换成「正在准备首页内容…」，**必须有东西在动，否则挂起和卡死长得一模一样**），最多再等 1500ms。**超时也照常揭幕**：骨架屏是诚实的，卡在启动画面上不是。实测：内容就绪时 +1957ms 动画层还未撤、主内容区已有 `img=9` / 350 字（用户看到的是已填好的首页）；目录永不返回时 +1956ms 进入挂起、+4066ms 兜底揭幕，无残留循环动画。就绪信号用 ref 承接、**不进 effect 依赖**，否则整条时间线会重启。
+  - **启动音效与入场底噪，零音频文件**：全部在 `src/services/launchAudio.ts` 里用 Web Audio 现场合成 —— 六张卡的弹入是极轻的"哒"（音高随机微偏 ±5%，避免六下听成机器），汇聚段是一条 560ms 的带通噪声吸气 + 一条 110→220Hz 的爬升正弦，**六次撞击走 A 小调五声音阶上行**（A3 C4 D4 E4 G4 A4，带八度泛音，前两下和最后一下叠一层低频"落地感"），末次落在 A4 并叠成 A4/C5/E5 的挂留和弦，揭幕时补一声收束"咻"；底下铺一条 A3/C4/E4/F#4 的轻微失谐 pad（起音 600ms 缓坡、声音同调所以不打架）。**cue 的时刻表和动画共用同一组常量**，改动画必须两边一起改。离屏量化验证：整体峰值 0.207（未削顶）、六次撞击 RMS 逐次上行 0.034→0.073（明确盖过 0.018 的底噪）、3.2 秒后完全静音。
+  - **自动播放策略**：Chromium 在无手势时会把 `AudioContext` 置为 `suspended`，桌面端靠 `tauri.conf.json` 的 `additionalBrowserArgs` 里加 `--autoplay-policy=no-user-gesture-required` 放行（⚠️ 该字段会覆盖 wry 的默认参数，所以默认那串 `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection` 已原样带上）。万一仍被拦（如开发期浏览器）**静默降级成无声**——丢启动音是小事，让启动动画报错或卡住是大事。设置项 `launchSound` 走 `UserSettings`（Rust 侧 `#[serde(default = "default_true")]`），设置页"播放体验"里可关；它异步读回来，所以前端按 `!== false` 判定并在落地为关时立刻掐掉（有意的约 100ms 窗口）。收尾 `dispose()` 释放 `AudioContext`，否则 Windows"音量合成器"里会挂常驻条目。
+  - **一律 `element.animate` + `fill: 'both'` + 跑完 `cancel()`，不用 `fill: 'forwards'`**：forwards 会把 `transform: matrix(1,0,0,1,0,0)` / `filter: brightness(1)` 这类恒等值永久钉在 `TitleBar` / `NavigationRail` / `<main>` 上，等于常驻合成层（本项目已因同类问题让 NVIDIA VSR 失效过一次）。实测收尾后三个壳层元素 `getAnimations() = 0`、内联 transform/opacity 均无残留。
+  - **壳层动画的目标只有 `data-launch-part="titlebar" | "rail" | "content"` 三个**，它们都不是 `<video>` 的祖先；再往外一层就已经是播放器宿主 div 的祖先了。
+  - **跳过路径的收尾定时器与时间线定时器必须分开存**（`exitTimerRef` / `timelineTimersRef`）。踩过一次：共用一个数组时 React StrictMode 的「effect → cleanup → effect」会把跳过时刚挂上的收尾闹钟一起清掉，表现是"点了跳过、面板已透明，但它还挂在那儿挡点击"；`skip()` 另需先打 `skippedRef` 标记，效果再跑一次时直接收工（首帧就点击跳过的场景）。收尾用 `animation.finished` + 定时器双保险，因为后台标签页里 rAF 会停。
+  - **三处底衬是同一条渐变**（`.ttv-launch` / `html,body` / `.mica-backdrop`），分别负责动画期间、React 挂载前的那几百毫秒、撤层之后；`html,body` 原来是平色 `#f3f5f8`，冷启动会先给一块平色再跳到渐变，现在统一。窗口缩放：`--launch-k` 在 1080×720 / 1440×920 / 1920×1080 下分别为 0.850 / 1.070 / 1.180，卡片最远卡心距窗口中心 231 / 291 / 321px，均在窗口内。`prefers-reduced-motion: reduce` 时整个动画层不出现。
+- **首页按主流桌面播放器重排为内容货架**：首屏依次呈现「正在热播 / 新剧 / 猜你喜欢 / 发现更多」，两个内容货架各自带刷新按钮并防止重复点击；目录数据不足时仍展示已加载的小货架，底部无限流、逐源分页与预取机制保持不变。
+- **“随机看”改为与普通货架同构的紧凑推荐行**：第一版的大面积详情面板在真实目录下会把页面割成两截，且候选不足时还留下半排缩略图；现在只保留随机切换、封面、标题、简介、热度、评分、真实集数与“立即观看”，不再引入额外卡片容器。
+- **题材栏不再把全部分类铺满页面**：短剧/漫剧与动漫专区默认各展示 8 个不换行分类，其余进入「更多」展开；窄窗口改为横向滚动，切频道/题材/排序后自动回到页首，避免新结果出现但筛选栏还停在旧滚动位置。
+- **切换专区与筛选时给出明确加载反馈**：目录请求期间显示顶部细进度条并轻微压暗旧结果、禁止点进已经不属于当前筛选的卡片；内存缓存命中时仍立即显示旧内容，再由后台请求一次性替换，兼顾“不闪白”和“不误以为点击无效”。
+- **卡片悬停/聚焦时预取详情**：`ipcService.series.getDetail` 增加在途去重与会话内缓存，点击卡片优先命中已缓存详情；只预取详情，不预取视频媒体，封面懒加载与 `SeriesCard` 的稳定回调保持不变。
+- **剧集缓存改为用户上限自动清理**：默认仍为全局 1GB，但设置页新增 512MB / 1GB / 2GB / 4GB 上限；旧设置里的 `playbackCacheMb=0` 是 0.2.x 的“不做字节统计”哨兵，迁移时解释成 1GB 而不是永久清空。Rust 侧用运行期 Atomic 预算立即生效，仍保留 7 天过期、LRU、正在写入半成品与当前集豁免。
+- **首页两颗货架刷新按钮的转圈改为只跟着被点的那一颗**（用户报告：“点击刷新按钮后另一个刷新的跟着转了”）。两栏（正在热播 / 新剧）的数据本来就是**同一份首页目录的前后两段切片**，刷新动作只有一次 `refreshCatalog('')`——一次刷新两栏都会换掉；但把 `isLoading` 直接当两栏的转圈开关时，“点的是这一颗”这件事在界面上就丢了。现在 `refreshingShelf` 只描述反馈来自哪一栏（不代表数据范围），转圈由这次刷新自己的 Promise 结束来收，带 token 防串台——连着点两栏时，先回来的那次请求不会把后一次刚点亮的转圈抹掉。
+  - 实测（Chromium + mock 目录，10ms 采样按钮的 `title` / `svg.animate-spin` / `disabled`）：点击瞬间 `正在刷新|spin=true|disabled=true`，128ms（mock 请求耗时）后自行恢复 `刷新正在热播|spin=false|disabled=false`。两栏同时出现的画面在 mock 数据下渲染不出来（新剧栏要求可见条目 ≥10），这部分由代码结构保证：两栏分别读 `refreshingShelf === 'hot'` / `'new'`，不再引用共享的 `isLoading`。
+
+
+- **首页「正在热播 / 新剧」的卡片重做为榜单样式**（用户反馈："排名没有榜单感 / 封面角标互相挤 / 和目录卡没区别，缺精选感"）。三条都只作用在**货架卡**上，目录网格、搜索页、动漫专区三处的卡片形态与位置完全不变。
+  - **榜单序号分档**：原来是一个 28×28 的黑色方块，第 1 名和第 6 名长得一模一样——榜单没有层级就等于没做榜单。现在前三名金 / 银 / 铜（`amber-100→300` / `slate-50→300` / `orange-100→300`），第四名起回到中性半透明黑；色相刻意压淡，免得在这套白色玻璃为主的界面里发廉价。序号本身收紧成 24px 的小 pill，不再跟题材 chip 抢宽度。
+  - **左上角标重排成一行**：原实现把题材 chip 单独压到 `top-10`，而目录卡的 chip 在 `top-2`——同一屏里两种高度，怎么摆都像没对齐。现在 `[序号][题材]` 共用 `inset-x-2 top-2` 的一行 flex，题材加上 `max-w` + `truncate`，窄卡上不再与右上角的评分 / 追剧竖列压边。
+  - **精选辨识度**：货架卡顶部压一条 3px 色条，颜色与栏目标题左侧那道色条同源（正在热播=玫红，新剧=蓝）。这是"这是编辑精选"和下面完整目录之间唯一需要的一笔——不新增任何文案，也不动卡片尺寸。
+  - **顺手修掉一个必然踩到的排布 bug**：货架固定装 6 条（`slice(0, 6)`），而原来的 `lg:grid-cols-5` 在 1024–1280 窗口下会把 6 条排成 5 + 1，第二行孤零零挂一张卡。列数改为只用 2 / 3 / 4 / 6，刻意跳过 5，6 列刚好一行装完。
+
+### 性能
+
+- **打开「神秘小窝」要等一两分钟才出内容**（用户报告："打开神秘小窝的栏目加载非常久"）。用 DLL 台架逐源实测（2026-10-06，直连）：6 个 18+ 源里 3 个已死——野果 25.0s、帝果 16.2s（dial 直接连不上）、黄果 AI 60.0s（6 个镜像逐个跑满超时），存活的黄豆 0.47s / 剧果 1.08s / 黄果视频 0.98s。两个因素把这 ~104s 全压在用户的打开动作上：
+  - **guo-core 的目录缓存 TTL 只有 15 分钟**（`nativeCatalogTTL`），过期即视为不可用 → 每次打开都对全部 6 个源走 `force` 全量网络；失败不写缓存，10 分钟冷却一过期又要再陪死源跑满一遍。
+  - **Rust 侧 guo bridge 是一把全局锁**：6 个并发目录请求在锁里串行排队，总耗时 = 各源耗时之和；期间其它 tab 的封面、详情、画质探测、播放 resolve 全被一起冻住。
+  - **修法一（SWR）**：`guo_provider.catalog` 改为三级——缓存新鲜（guo-core 自己的 `fresh`）直接返回；过期但 `items` 非空 → **0ms 返回旧数据**，同时后台 `spawn_blocking` 起一次 `force` 刷新为下次预热（同一"源|分类"在途去重，冷却中的死源连后台刷新都不起）；完全没缓存才在前台走网络（首次访问该源的代价，躲不掉）。打开神秘小窝从 ~104s 变为 ~0ms（6 个源全部有历史缓存：31/40/120/72/96/40 条），死源的内容不再整块消失——原来冷却期它们以失败计、卡片整列蒸发。缓存过期不置 `degraded`：该字段在搜索链路语义是"来源真的挂了"，"TTL 自然过期"不等于源死了；旧内容可见、点进详情该报错就报错，是当下最诚实的表达。
+  - **修法二（锁分片）**：`GuoBridge` 的调用锁按站源分片（`catalog`/`cached`/`categories`/`sourceJob` 取顶层 `source`，`detail`/`resolve`/`cover` 取 `drama.source`，兜底从 `drama.id` 剥前缀；initialize/resourceSettings/release/cancelRead 等全局语义 action 落全局片）。分片对 guo-core 安全：c-shared 每次调用本来就跑在独立 goroutine，共享状态全在 `engine.mu`/每源锁下，上游 LAN 模式的 HTTPS 服务也是多 goroutine 并发进同一批 handler。现在的效果：黄果 AI 在自己的片里等 60s 超时，不再拖住任何别的源——后台刷新、封面下载、其它 tab 的操作互不相干。锁内不跨 await 的老规矩不变（外层表锁只护 HashMap 几微秒）。
+  - **配套（阻塞池）**：`catalog_list` / `catalog_fast_search` / `catalog_categories` / `guo_cover` / `series_detail` / `anime_qualities` 的 guo 分支全部挪进 `tauri::async_runtime::spawn_blocking`——这些是可能跑满 60s 内部超时的阻塞 FFI，裸调在 async 命令里会占死 tokio worker（封面一页几十张，worker 全被占住时连不相干的 IPC 都排队）。`GuoProvider` 因此 Arc 化（`catalog` 以 `self: Arc<Self>` 为 receiver，把 Arc 递进 SWR 后台任务）。
+
+### 清理
+
+- **整套卡片展开转场是死代码**：`CardExpansionOverlay.tsx`（107 行）实现了「点击剧集卡片 → 卡片铺满展开成详情页 Hero」的转场动画，但它**从未被任何视图挂载**——全仓检索只有它自己的定义处提到 `CardExpansionOverlay`。它配套的三个 store 字段（`cardTransition` / `triggerCardTransition` / `clearCardTransition`）与 `CardTransitionData` 类型也因此悬空：`ExploreView` 从 `useAppStore` 解构了 `triggerCardTransition` 却一次都没调用，`cardTransition` 永远是 `null`，`isNavCollapsed` 只剩侧边栏自己在用。整条链路连同文件一并删除（共 -140 行）。删除前已逐符号全仓检索（含 CSS 与测试目录）确认无引用。
+
+- **`formatTime` 写了两份且格式已经分叉**：`MiniPlayer.tsx`（画中画小窗）产出 `5:03`，`ProgressBar.tsx`（主进度条）产出 `05:03`——同一应用的两个播放面时间码宽度不一致。现在由 `ProgressBar` 导出一份，两个播放面共用。小窗时间码会从 `5:03` 变为 `05:03`（与主进度条一致，这是有意统一）。
+
+- **`Cargo.toml` 顶部注释指向两个不存在的文件**：注释说 `Win32_System_Registry` 的用途「详见 rtx_vsr.rs」、`Win32_System_LibraryLoader` 的用途「详见 lossless_scaling.rs 的 engine()」，但这两个文件在 0.2.5 移除补帧/VSR 时就一并删掉了，照着注释找必然扑空。三个 windows-sys feature 本身都还在用（`main.rs` 的 `window_prepare_fullscreen` 与 `apply_windows_gpu_preference`、`guo_provider.rs` 的 `LoadLibraryA` 加载 `duanju_core.dll`），故只改注释指向，依赖不动。
+
+### 修复
+
+- **「更多」页的视频海报全部出不来**（用户报告："视频海报出不来，然后加载的速度慢"）。根因不在渲染，在**图片格式**：红果图片服务给的是 **HEIC**（实测响应头 `content-type: image/heic`、文件头 `ftypheic`），而 **WebView2 / Chromium 解不了 HEIC** —— 把地址直接交给 `<img>`，浏览器只会解码失败留一块空白。官方 PC 客户端做的是同一件事，它的 `/img?url=` 注释写着"红果封面常返回 HEIC，浏览器不支持时转成 JPEG"，只是它用 Pillow。
+  - **修法**：新增后端命令 `short_drama_app_cover_proxy(url)` —— 下载封面 → 用**随包的 ffmpeg** 转 JPEG（实测单张 **0.39s**，它的 `mov` 解复用器直接吃 HEIF 容器，不需要任何新依赖）→ 落盘缓存到 `<数据目录>/hongguo-covers-v1/` → 以 `data:` URL 回前端。只代理字节系图片域名（`*.fqnovelpic.com` / `*.byteimg.com` / `*.snssdk.com`）；放开成任意 URL 会让它变成一个人人可用的代理（SSRF）。
+  - **为什么返回 `data:` URL 而不是本地文件路径**：`asset:` 协议的作用域在开发态（数据目录是项目内 `.app-data`）与打包后（`app_data_dir()`）并不一致，写文件要么动 scope、要么挑一个两边都在的目录；直接回 JPEG 更干净，而 CSP 的 `img-src` 本来就有 `data:`。`CoverImage` 的 `resolveSrc` 因此扩成**两种返回值都接受**：本地路径（guo 封面，仍走 `convertFileSrc`）与可直接使用的地址（`data:` / `blob:` / `http(s):`，直接当 `src` 用）。
+  - **只接进「更多」页是不够的**：代理第一版只铺到了「更多」页的行卡（`ShelfRow`），而首页那两栏走的是 `SeriesCard` —— 同一批剧在「更多」页有图、在首页仍是空白。现在把三条通道收口成一个 `coverResolver(seriesId, cover)`（`services/ipc.ts`）：`guo:` 前缀走 guo-core 取本地缓存文件，`.heic` 后缀走后端转码，其余直连。`SeriesCard` 与 `ShelfRow` 都用它，口径不会再分叉。
+  - **新增一条联网冒烟测试**（`#[ignore]`，`cargo test --bins -- --ignored cover_proxy --nocapture`）：真去拉一张红果封面，走完"下载 → 识别 HEIC → ffmpeg 转码 → data URL"，并断言解出来的字节以 JPEG 的 `FF D8 FF` 开头。存在的理由很实际 —— `cover_to_data_url` 里任何一步坏掉（域名白名单、HEIC 识别、ffmpeg 参数、base64），前端都只表现为"海报又变成空白占位"，看不出原因；这条测试把失败点直接打出来。实测通过：data URL 51,931 字符、转码后 JPEG 38,930 字节、耗时约 1s。
+  - **顺带解释了"慢"**：海报解码失败会触发 `CoverImage` 的 3 次重试（每次重新下载 18KB 的 HEIC）加上挂起兜底计时，一屏 8 张 eager 封面就是 20 多次无用请求，和列表请求抢带宽。格式修好后这部分开销直接消失。
+  - **仍然存在的下限**：`worker.py` 一页端到端实测 **1.75–2.2s**（大头是每次都要冷启动一个 Python 进程 + 六代签名），首屏 10–18 条 + 自动补一页 ≈ 4s。要更快只能加"空闲预取下一页"（发现页已有这套机制），本轮没做。
+
+- **首页「正在热播 / 新剧」的刷新按钮是个假动作**（用户报告："刷新按钮存在错误"）。两颗按钮点下去只有图标在转，内容一动不动。根因不在前端反馈层，而在数据链路的**缓存穿透**：19 个 guo 站源的目录走「缓存优先 + SWR」（TTL 15min 内直接回盘上缓存，过期则立即回旧值、后台再刷新），而刷新按钮发的是普通 `catalog_list`，于是拿回来的分页与屏幕上已有的完全一致；红果与动漫两条链路本来就每次走网络，所以只在 guo 源上表现为"点了没反应"。`guo_provider::catalog_refresh`（`force: true` 无视磁盘缓存）其实早就写好了，但一直没有暴露到命令层——代码注释里也写着 `main.rs 未单独暴露`。
+  - **打通 force 链路**：`catalog_list` 新增 `force: Option<bool>`，guo 分支里 `force` 走 `catalog_refresh`、否则仍走缓存优先的 `catalog`；前端 `ipcService.catalog.list(filter, force)` → store 的 `refreshCatalog(kw, { force })` → `ExploreView.refreshHomeShelves` 恒传 `{ force: true }`。红果/动漫不做分支（本来就每次走网络）。
+  - **force 请求不共用 in-flight 槽**：`requestCatalog` 给 force 请求另起 `${key}|force`——原来同键复用是「同一页只发一次」的幂等保障，若不隔离，一次刷新会被同键的普通请求（或反过来的预取）复用而重新落回缓存。漫剧空壳重试的 `dropPage1Inflight` 同步改成连 force 变体一起清。
+  - **失败不再静默**：目录在源侧排序不变时「刷新成功」与「刷新失败」在界面上长得一模一样。`loadData` 现在返回本轮是否成功（全部源均无响应为失败），刷新失败时给一条 warning toast，用户才能区分"刷了但没变化"和"根本没刷上"。转圈仍只跟着被点的那一栏（沿用 `refreshingShelf`）。
+  - 顺手删掉 `ExploreView` 里一段死代码：一个 `deps: []` 的 effect 声称"响应全局搜索关键词"，实际只在挂载时跑一次就早退，永远不会再次触发。
+
+- **最后一集播完会重新播放最后一集**：部分 WebView2 版本会对同一末集重复派发一次 `ended`，第二次事件绕过现有自动跳集闩锁后又走收尾/重载路径。新增 `finishedAllEpisodeRef` 对末集结局做幂等处理，用户重新开播、拖进度或切换集时再显式复位，不破坏原有四重连播闸门。
+- **连续点击最大化/还原会互相踩状态**：`toggleMaximize()` 是异步落到窗口线程的，两次点击会排队但第二次仍读旧状态。标题栏窗口操作改为单飞，完成后按真实窗口状态刷新图标；真实 Tauri 窗口实测 1443×923 ↔ 1707×1019 切换正常，播放器原生全屏 1707×1067 进出也无尺寸回弹。
+
+- **漫剧/短剧没有 RTX VSR，动漫有**：用户截图证明上一轮只调用/只看 Chromium trace 不够，必须以 NVIDIA 驱动标识验收。真实 1920×1080 漫剧片段在同一 WebView2/同一窗口中对照：HEVC 文件直连、HEVC 本地 HLS + MSE 都没有 VSR；只把同一画面转成 H.264 后，直连连续 5 秒 151 次、H.264 MSE 连续 5 秒 150 次 `ToggleNvidiaVpSuperResolution(on=true)`，并进入 `VideoProcessorBlt`（2560×1440 合成目标）。之前 1280×720 合成片得出的“HEVC 也能触发”是测试夹具误报，不能代表真实源。
+  - **修复**：红果 worker 下载解密后直接以 `libx264 ultrafast/crf20/zerolatency` 产 H.264 MP4；旧缓存首次命中时做一次 H.264 迁移并用 sidecar 标记防重复转码。guo/公开 http(s) 直链走新 `media_enhance`：本地 127.0.0.1 服务 + ffmpeg 2 秒 fMP4 HLS，首段落地即播，播放列表会把 init/分片补回会话令牌；转码失败保留原始 `backupUrl`，换集/退出/清缓存会终止任务并清理临时目录。短剧宿主仍保留去模糊/无 `forwards` 动画修正，但真正的硬条件是 H.264。
+  - **验收**：真实片段 hls.js 在 WebView2 读到 1920×1080 后，CDP `Tracing` 连续 5 秒记录 150 次 VSR on；`video` 直连与 MSE 两条 H.264 路径均通过。UI 不显示虚假的“VSR 已开启”档位，仍以 NVIDIA App/驱动角标为最终验收。
+
+- **标题栏"向下还原"失效：放大缩小一个样，原始窗口尺寸找不回来**（用户报告："放大缩小都一样大，没有确定缩小的范围"）。复现路径：窗口最大化 → 播放器里进一次全屏 → 退出 → 点右上角还原按钮——窗口从整屏"还原"回整屏，之后这颗按钮永远在两个同样大的状态之间打转，只有拖边或重启才能找回原始尺寸。
+  - **根因**：进全屏前 `window_prepare_fullscreen` 必须"原地解除最大化"（不解除，tao 会把无边框窗口的客户区裁到任务栏之上；直接 `unmaximize()` 又带回弹动画），做法是把窗口的"常规位置"（Windows 的还原目标矩形）覆盖成最大化时的**整屏矩形**。这一覆盖从未被还原——退出全屏时前端只是 `win.maximize()`，Windows 把当时的常规位置（整屏矩形）当作还原目标记下来，于是"向下还原"恒等于"再放大一次"。
+  - **修法（暂存/写回两端成对）**：prepare 覆盖前把真实还原矩形暂存到 Rust 侧（`PRE_FULLSCREEN_NORMAL_RECT`）；新增 `window_finish_fullscreen` 在退出全屏时写回暂存值并**一次调用直接以最大化状态显示**（`SetWindowPlacement` 带 `SW_MAXIMIZE`，没有"先缩回原尺寸再撑开"的中间帧）。前端 `leaveFullscreen` 改调该命令，命令不可用或无暂存（进全屏前本就没最大化、或走了 unmaximize 回退——那条路不覆盖还原矩形）时退回普通 `maximize()`。进全屏前没最大化的路径不受影响（prepare 早退、无暂存）。
+
+- **全部剧集播完后停在黑屏，不会回到详情页**：连播链路的最后一集 `ended` 后，`playNextEpisode` 按"没有下一集"直接返回，什么都不发生——常驻 `<video>` 没有"剧集播完"的呈现，画面从此停在已 ended 的黑屏上，用户只能自己手点返回。短剧（`usePlaybackStore`）与动漫（`useAnimePlayerStore`）两条链路同病。
+  - **判定放 store、导航归组件**：`handleEnded` 在既有闸门（`autoNext` 开启、`tryClaimAutoAdvance` 闩锁、迟到旧源事件过滤）全部通过后，若 ended 的就是最后一集，置位新信号 `finishedAll`（短路剧链路）而非照旧调用 `playNextEpisodeRef`。不能让组件自己看 `uiState === 'ended'` 判断——交接期旧源的 ended 也会把 uiState 置成 ended，组件层分不清；闸门只有 store 拿得到。`VideoSurface` 读到信号后**留 2 秒**（让最后一集的收尾和提示被看到，而不是播完瞬间把画面抽走）再 `navigateTo('detail', seriesId)`；动漫侧同待遇，走与手动返回相同的 `close() + navigateTo('detail')`，以会话号判过期。全屏不需要处理——App 在离开播放视图时会自动退全屏（既有 effect）。
+  - **任何用户接管都撤销返回安排**：`finishedAll` 在重新开播（`handlePlaying`）、手动拖进度（`seek`）、发起换集（`openEpisode`）、离开播放器（`stopPlayback`）四处复位；定时器触发前还会复查 `video.ended`，拖回去重看的人不会被突然拉走。设置里关掉"自动连播"的行为不变——那是用户自己选的"播完停下"。
+
+- **点了小锁之后其他操作照样生效**：锁定（收起控制器）只隐藏了 HUD，交互层到处漏风——单击/双击画面仍会暂停/全屏、长按仍有 3 倍速、空格/方向键/F/`[`/`]` 快捷键照常工作、收起态迷你进度条还能拖动跳转；短剧侧"Esc 退全屏"与"Esc 解锁"两个监听还会同时触发。锁的语义应当是**除解锁外一切输入失效**（与手机播放器的锁定一致），否则它防不了任何误触。
+  - **逐入口封堵，两个播放器同一语义**：画面单击/双击（`handleVideoSurfaceClick` / `handleSurfaceClick`）、长按临时倍速（`handleSurfacePointerDown`）在锁定态直接返回；全局快捷键监听开头按 `isLocked` 早退（动漫侧原来只在 Escape 分支特判，现统一拦在入口，Esc 全权交给 HUD 的解锁监听）。迷你进度条改为**纯显示件**（原"支持收起态拖动找位置"是刻意做的特性，与锁定语义冲突，按本次规范收回），CSS 同步去掉 `cursor: pointer` 与拖拽用的 `touch-action`。
+  - **解锁出口保持三条**：点小锁、按 Esc、键盘焦点在小锁上回车/空格——锁死后永远出得来。
+  - 动漫播放器的 Esc 已有 `isLocked` 特判（锁住时不退全屏、不离开播放器），本次把短剧侧对齐到同一行为：锁住时 Esc 只解锁。
+
+- **从小窗回到播放器后，主窗口压在别的软件最底下**：小窗是常驻置顶窗口，它的典型用法正是「小窗挂在那儿、人切到别的软件干活」。此时主窗口既不激活也不置顶，只在 z 序底部排着；而用户点小窗上的「回到播放器」时，`pip_close` 只做了「回报进度 + 销毁小窗」两件事，从没把主窗口带回前台——于是片子确实接着在主窗口里放起来了，界面却压在那个软件底下，得回任务栏里翻。若期间主窗口被最小化（同样常见），单独 `set_focus` 也只能激活一个最小化窗口，画面照样出不来。
+  - **修法**：`pip_close` 在 `mode == "return"` 时、销毁小窗之前，把主窗口 `show() + unminimize() + set_focus()` 提回前台（`pip.rs` 的 `raise_main_window`）。时机刻意选在**小窗还活着、本进程仍持有前台权**的这一刻——用户刚点了小窗里的按钮，最后一个输入事件属于本进程，Windows 对 `SetForegroundWindow` 的前台限制能够满足；拖到小窗 `Destroyed` 之后再设就晚了，那时前台权可能已让给别的窗口，设置会被拒绝、只剩任务栏闪一下。
+  - **只改「回到播放器」这一条出口**：点小窗上的叉（`close`）与系统路径关闭小窗都不抢焦点——那两种情况下用户可能正在别的窗口里忙，抢焦点反而是打扰。回流后的起播链路（`PipReturnBridge` 重新 `openEpisode`）本身没有改动。
+
+- **标题栏关闭键的悬停底色从来不是红的**（用户报告：“右上角的那个关闭按钮的底色是灰色的，不是红色的”）。三颗窗口按钮共用 `WIN_BUTTON_BASE`（内含 `hover:bg-slate-500/10`），关闭键在其后追加 `hover:bg-red-500` 想盖成 Win11 惯例的红色——两边都是普通类，谁也不带 `!important`。
+  - **根因（实测，不是推断）**：同一个元素上并存两个 `hover:bg-*` 时，生效的是 **Tailwind 的输出顺序**，与 className 里的书写顺序无关（两者特异性相同，都是 0-2-0）。编译 tailwindcss 3.4.17 的产物：`.hover\:bg-red-500:hover` 在产物第 2460 行，`.hover\:bg-slate-500\/10:hover` 在 2497 行——默认调色板把 slate/gray/zinc 一族排在 red 一族之后，红色恒被灰色盖死；`active` 态（`bg-red-600` vs `bg-slate-500/20`）同病。
+  - **修法**：把中性底色与危险底色拆成两个互不重叠的成品类（`WIN_BUTTON_NEUTRAL` / `WIN_BUTTON_CLOSE`），`WIN_BUTTON_BASE` 只留尺寸、字形与焦点环，每个按钮只声明一组 `hover:bg-*`，不再依赖产物顺序。
+  - **Chromium 实测（DPR 2，悬停后取按钮左上角像素）**：修复前 `rgb(237,239,242)`（slate-500/10 叠在白色标题栏上），修复后 `rgb(239,68,68)` = `red-500`。
+
+
 ## 0.2.15 - 2026-10-04
 
 ### 新增

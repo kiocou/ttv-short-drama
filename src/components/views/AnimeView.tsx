@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
 import { ipcService } from '../../services/ipc';
 import type { SeriesItem } from '../../types/catalog';
-import { Clapperboard, RefreshCw, Tv } from 'lucide-react';
+import { Clapperboard, RefreshCw, Tv, ChevronDown, ChevronUp } from 'lucide-react';
 import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
+import { BackToTop } from '../common/BackToTop';
 
 const PAGE_SIZE = 30;
 
@@ -40,6 +41,7 @@ export const AnimeView: React.FC = () => {
     '海外动漫',
     '动画片',
   ]);
+  const [showAllCategories, setShowAllCategories] = useState(false);
   const [items, setItems] = useState<SeriesItem[]>([]);
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
@@ -126,7 +128,14 @@ export const AnimeView: React.FC = () => {
 
 
   return (
-    <div ref={scrollContainerRef} className="flex-1 h-full overflow-y-auto p-5 flex flex-col gap-5 select-none">
+    <div ref={scrollContainerRef} className="relative flex-1 h-full overflow-y-auto p-5 flex flex-col gap-5 select-none" aria-busy={isLoading}>
+      {isLoading && (
+        <div className="pointer-events-none sticky top-0 z-30 -mb-5 h-0">
+          <div className="relative h-0.5 w-full overflow-hidden rounded-full bg-violet-100/70">
+            <div className="absolute inset-y-0 left-0 w-1/3 animate-[loading-progress_1.2s_ease-in-out_infinite] rounded-full bg-violet-500" />
+          </div>
+        </div>
+      )}
       {/* 顶部：标题 + 分类筛选 */}
       <div className="flex flex-col gap-3.5">
         <div className="flex items-center justify-between flex-wrap gap-2.5">
@@ -141,8 +150,9 @@ export const AnimeView: React.FC = () => {
           </div>
 
           {/* 分类筛选（嵌入式凹槽托盘） */}
-          <div className="p-1 bg-slate-100/90 rounded-xl border border-slate-200/70 shadow-inner flex items-center gap-1 flex-wrap">
-            {categories.map(cat => (
+          <div className="flex min-w-0 max-w-full items-center gap-1 overflow-hidden rounded-xl border border-slate-200/70 bg-slate-100/90 p-1 shadow-inner">
+            <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+            {(showAllCategories ? categories : categories.slice(0, 8)).map(cat => (
               <button
                 key={cat}
                 type="button"
@@ -156,6 +166,18 @@ export const AnimeView: React.FC = () => {
                 {cat}
               </button>
             ))}
+            </div>
+            {categories.length > 8 && (
+              <button
+                type="button"
+                onClick={() => setShowAllCategories(value => !value)}
+                className="inline-flex h-7 shrink-0 items-center gap-1 rounded-lg border-l border-slate-200/70 bg-white/75 px-2 text-[11px] font-semibold text-slate-500 hover:text-violet-600"
+                title={showAllCategories ? '收起分类' : '查看全部分类'}
+              >
+                {showAllCategories ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                {showAllCategories ? '收起' : `更多 ${categories.length - 8}`}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -224,6 +246,9 @@ export const AnimeView: React.FC = () => {
           )}
         </div>
       </div>
+
+      {/* 回到顶部：滚过阈值才出现。作为滚动容器的最后一个粘性子元素，不占独立行高。 */}
+      <BackToTop targetRef={scrollContainerRef} />
     </div>
   );
 };

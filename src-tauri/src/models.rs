@@ -140,7 +140,7 @@ pub struct PlaybackSession {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_url: Option<String>,
-    /// 源流形态（**只有动漫链路填**）：
+    /// 源流形态（动漫链路与短剧/漫剧 H.264 增强流填）：
     /// - `hls`：m3u8 播放列表，必须由 hls.js 挂到 MSE 上播放；
     /// - `file`：整段可直连的媒体文件，直接交给 `<video src>`。
     ///
@@ -264,6 +264,30 @@ pub struct UserSettings {
     /// 升级后用户会看到"一个源都没有"的空目录。
     #[serde(default)]
     pub enabled_sources: Vec<String>,
+    /// 启动进入动画是否发声（合成音效 + 入场底噪）。
+    ///
+    /// 旧设置记录里没有这个字段：`#[serde(default)]` 对 bool 只会给 `false`，
+    /// 而这里要的默认是**开**，所以走 `default_true`。
+    /// 音频本身由前端用 Web Audio 现场合成（`src/services/launchAudio.ts`），
+    /// 后端只存这一个开关，不碰媒体链路。
+    #[serde(default = "default_true")]
+    pub launch_sound: bool,
+    /// 是否启用 RTX VSR 播放增强链路（非动漫的短剧/漫剧）。
+    ///
+    /// 开 = 源流经 `media_enhance` 转成 H.264 分片再播（让 NVIDIA 驱动触发
+    /// VSR；H.264 是本机 WebView2 触发 VSR 的硬条件，不变量 25），首次起播
+    /// 多一次转码；关 = 直接播原始源 URL，起播更快、没有增强。
+    ///
+    /// 旧设置记录里没有这个字段，而默认必须是**开**：现状（引入 media_enhance
+    /// 之后）默认就走 VSR 链路，默认关会让老用户升级后行为突变。
+    /// `#[serde(default)]` 对 bool 只会给 `false`，所以走 `default_true`。
+    #[serde(default = "default_true")]
+    pub vsr_enabled: bool,
+}
+
+/// `#[serde(default)]` 对 bool 只会给 `false`；需要默认为真的字段走这个。
+fn default_true() -> bool {
+    true
 }
 
 impl Default for UserSettings {
@@ -275,9 +299,11 @@ impl Default for UserSettings {
             target_fps: 60,
             hardware_acceleration: true,
             catalog_cache_mb: 0.0,
-            playback_cache_mb: 0.0,
+            playback_cache_mb: 1024.0,
             show_adult_sources: false,
             enabled_sources: vec!["hongguo".to_string()],
+            launch_sound: true,
+            vsr_enabled: true,
         }
     }
 }
@@ -370,5 +396,58 @@ mod history_payload_tests {
             "百分比必须夹在 0-100，否则 u8 会溢出"
         );
         assert!(item.channel.is_none());
+    }
+}
+
+/// `vsrEnabled` 的旧记录兼容：字段缺失必须落到「开」。
+///
+/// 这是「默认开」策略的回归测试：现存用户的设置库里没有这个字段，若 serde 走
+/// `bool` 的零值 `false`，升级后所有人的播放链路会**静默降级**——转码消失、VSR
+/// 消失，而界面上开关却显示为开（前端按 `!== false` 判定）。两侧必须一致。
+#[cfg(test)]
+mod vsr_settings_tests {
+    use super::UserSettings;
+
+    /// 只带必填字段的旧记录（没有任何新字段）→ vsr_enabled 必须为 true。
+    #[test]
+    fn legacy_record_without_vsr_field_defaults_to_enabled() {
+        let json = r#"{
+            "defaultQuality": "auto",
+            "autoNext": true,
+            "preferredEngine": "off",
+            "targetFps": 60,
+            "hardwareAcceleration": true,
+            "catalogCacheMb": 0.0,
+            "playbackCacheMb": 1024.0
+        }"#;
+        let settings: UserSettings =
+            serde_json::from_str(json).expect("旧设置记录必须仍能反序列化");
+        assert!(
+            settings.vsr_enabled,
+            "缺字段时必须默认开：默认关会让老用户的播放链路静默降级"
+        );
+    }
+
+    /// 显式关闭必须被如实接受（开关要真的能关）。
+    #[test]
+    fn explicit_false_is_honored() {
+        let json = r#"{
+            "defaultQuality": "auto",
+            "autoNext": true,
+            "preferredEngine": "off",
+            "targetFps": 60,
+            "hardwareAcceleration": true,
+            "catalogCacheMb": 0.0,
+            "playbackCacheMb": 1024.0,
+            "vsrEnabled": false
+        }"#;
+        let settings: UserSettings = serde_json::from_str(json).expect("显式 false 必须可解析");
+        assert!(!settings.vsr_enabled, "用户关掉开关后必须真的关掉");
+    }
+
+    /// `Default::default()` 是新建库的初值，必须与 serde default 一致。
+    #[test]
+    fn default_impl_matches_serde_default() {
+        assert!(UserSettings::default().vsr_enabled);
     }
 }

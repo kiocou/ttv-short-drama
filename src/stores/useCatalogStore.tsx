@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef, useMemo, ReactNode } from 'react';
 import { ChannelType, SeriesItem, CatalogFilter } from '../types/catalog';
-import { ipcService } from '../services/ipc';
+import { ipcService, errorText } from '../services/ipc';
 import { WatchHistoryItem } from '../types/history';
 import { enabledSourcesForTab, adultTabSources } from '../services/guoSources';
 import { useSettingsStore } from './useSettingsStore';
@@ -23,7 +23,15 @@ interface CatalogContextType {
   setCategory: (cat: string) => void;
   setAudience: (aud: string) => void;
   setSort: (s: 'recommend' | 'latest' | 'heat') => void;
-  refreshCatalog: (keyword?: string) => Promise<void>;
+  /**
+   * 重新拉取目录。
+   *
+   * `options.force = true` 表示这是**用户手动刷新**：整轮请求会穿透站源缓存
+   * （见 `ipcService.catalog.list` 与 Rust 侧 `catalog_list` 的 `force` 形参）。
+   * 不传 force 就是普通重载——guo 源仍走「缓存优先 + SWR」，用于切频道/切题材
+   * 这类「不该为了新鲜度付出一次全网请求」的场景。
+   */
+  refreshCatalog: (keyword?: string, options?: { force?: boolean }) => Promise<boolean>;
   loadMore: (keyword?: string) => Promise<void>;
   /**
    * 预取下一页（不碰界面）。滚动到距底部一定距离时调用，把请求提前到滚动路径之外。
@@ -81,9 +89,35 @@ interface FetchedPage {
 
 const CatalogContext = createContext<CatalogContextType | null>(null);
 
-export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+/**
+ * 目录 Provider 的预设项。
+ *
+ * 全部不传 = 发现页那一份（频道漫剧起手、排序综合推荐、题材全部），行为与加这组
+ * props 之前完全一致。
+ *
+ * 「更多」页为什么要再挂一个实例：它必须固定排序（正在热播 / 新剧各一个），而
+ * `sort` 是本 Provider 的内部 state —— 去改全局那一份会把发现页的排序一起改掉
+ * （视图是常驻 DOM，发现页就挂在旁边）。所以在「更多」视图内部再挂一个 Provider，
+ * 用 props 把频道与排序钉死，两边的分页 / 缓存 / 预取 / 题材词表互不干扰。
+ *
+ * 只在**首次挂载**生效（`useState` 初值）：换分区时由调用方加 `key` 强制重挂，
+ * 而不是指望这里跟着 props 变。
+ */
+interface CatalogProviderProps {
+  children: ReactNode;
+  initialChannel?: ChannelType;
+  initialSort?: 'recommend' | 'latest' | 'heat';
+  initialCategory?: string;
+}
+
+export const CatalogProvider: React.FC<CatalogProviderProps> = ({
+  children,
+  initialChannel,
+  initialSort,
+  initialCategory,
+}) => {
   const { settings } = useSettingsStore();
-  const [channel, setChannelState] = useState<ChannelType>('comic');
+  const [channel, setChannelState] = useState<ChannelType>(initialChannel ?? 'comic');
 
   /**
    * 本次目录要聚合的源：按当前 tab（短剧/漫剧）从用户的启用集合里筛出来。
@@ -109,9 +143,9 @@ export const CatalogProvider: React.FC<{ children: ReactNode }> = ({ children })
     ).map(item => item.id);
     return picked.length > 0 ? picked : ['hongguo'];
   }, [settings.enabledSources, settings.showAdultSources, channel]);
-  const [category, setCategoryState] = useState<string>('全部');
+  const [category, setCategoryState] = useState<string>(initialCategory ?? '全部');
   const [audience, setAudienceState] = useState<string>('全部');
-  const [sort, setSortState] = useState<'recommend' | 'latest' | 'heat'>('recommend');
+  const [sort, setSortState] = useState<'recommend' | 'latest' | 'heat'>(initialSort ?? 'recommend');
   const [categories, setCategories] = useState<string[]>(['全部']);
   const [items, setItems] = useState<SeriesItem[]>([]);
   const [continueWatching, setContinueWatching] = useState<WatchHistoryItem | null>(null);
@@ -184,15 +218,18 @@ const loadMoreFailuresRef = useRef(0);
     claimed: boolean;
   } | null>(null);
 
-  const requestCatalog = useCallback((cacheKey: string, filter: CatalogFilter) => {
-    const existing = inflightRef.current[cacheKey];
+  const requestCatalog = useCallback((cacheKey: string, filter: CatalogFilter, force = false) => {
+    // 强制刷新另起一个 in-flight 键：同键复用本来是「同一页只发一次」的幂等保障，
+    // 但一次 force 请求若被同键的普通请求复用（或反之），这次刷新就又被缓存吃掉了。
+    const key = force ? `${cacheKey}|force` : cacheKey;
+    const existing = inflightRef.current[key];
     if (existing) return existing;
-    const request = ipcService.catalog.list(filter);
-    inflightRef.current[cacheKey] = request;
+    const request = ipcService.catalog.list(filter, force);
+    inflightRef.current[key] = request;
     void request.then(() => {
-      if (inflightRef.current[cacheKey] === request) delete inflightRef.current[cacheKey];
+      if (inflightRef.current[key] === request) delete inflightRef.current[key];
     }, () => {
-      if (inflightRef.current[cacheKey] === request) delete inflightRef.current[cacheKey];
+      if (inflightRef.current[key] === request) delete inflightRef.current[key];
     });
     return request;
   }, []);
@@ -211,12 +248,14 @@ const loadMoreFailuresRef = useRef(0);
     sources: string[],
     base: Omit<CatalogFilter, 'source' | 'page' | 'cursor'>,
     pageFor: (source: string) => number,
+    force = false,
   ) => {
     const settled = await Promise.allSettled(sources.map(source => {
       const page = pageFor(source);
       return requestCatalog(
         `${source}_${base.channel}_${base.category}_${base.audience}_${base.sort}_${base.keyword || ''}_p${page}`,
         { ...base, source: source === 'hongguo' ? undefined : source, page },
+        force,
       );
     }));
 
@@ -225,6 +264,15 @@ const loadMoreFailuresRef = useRef(0);
     const categories: string[] = [];
     let hasMore = false;
     const failures: string[] = [];
+    /**
+     * 每个失败源**各自的**错误原文。
+     *
+     * 只报"（N 个源均无响应）"是没法排查的：到底是连不上、HTTP 403、还是响应解析
+     * 不出来，全都长一个样。更糟的是漫剧频道现在只剩红果一个源（其余启用的源都是
+     * 18+，被 `showAdultSources: false` 滤掉了），"1 个源均无响应"背后必然是那个
+     * 唯一源的某一句话——不把它带出来，界面上就只剩一个无法行动的结论。
+     */
+    const failureReasons: string[] = [];
     // 逐源的"还有没有下一页"。聚合的 `hasMore` 是"或"，拿它判断**单个**源到没到
     // 底必然出错：一个只有 30 条的源会被反复请求，而它回来的东西在 id 去重后
     // 永远是 0 条。收尾时必须逐源看这张表，见 loadMore。
@@ -234,6 +282,7 @@ const loadMoreFailuresRef = useRef(0);
       const source = sources[index];
       if (outcome.status === 'rejected') {
         failures.push(source);
+        failureReasons.push(`${source}: ${errorText(outcome.reason, '未知错误')}`);
         // 本轮失败的源**不算**到底：不置 0，下一轮 loadMore 还会再试它一次。
         hasMoreBySource[source] = true;
         return;
@@ -255,7 +304,9 @@ const loadMoreFailuresRef = useRef(0);
       return { items: [], categories: [], hasMore: false, hasMoreBySource: {}, failedSources: [] };
     }
     if (failures.length === sources.length) {
-      throw new Error(`目录数据加载失败（${failures.length} 个源均无响应）`);
+      throw new Error(
+        `目录数据加载失败（${failures.length} 个源均无响应）—— ${failureReasons.join('；')}`,
+      );
     }
     return { items, categories, hasMore, hasMoreBySource, failedSources: failures };
   }, [requestCatalog]);
@@ -327,8 +378,12 @@ const loadMoreFailuresRef = useRef(0);
     if (requestId === requestIdRef.current) setCategories(merged);
   }, []);
 
-const loadData = useCallback(async (kw?: string) => {
+const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) => {
     const requestId = ++requestIdRef.current;
+    // 只有用户手动刷新（首页货架的刷新按钮）才会传 force：它让整轮请求穿透
+    // 站源缓存。切频道/题材/排序这些路径不能 force——那会把每次筛选都变成
+    // 一次全网请求，guo 源在死源冷却上前根本不划算。
+    const force = options?.force === true;
     // 复位"加载更多"的忙态。新的一轮首屏请求会作废任何在途 loadMore（它靠
     // requestId 判定过期），而 loadMore 的 finally 也因为同一判定不会复位
     // isLoadingMore —— 不在这里清掉，它就会永久停在 true：底部一直挂着"正在加载
@@ -353,7 +408,10 @@ const loadData = useCallback(async (kw?: string) => {
       setCategories(mergeCategories(knownCategories, cached.categories));
       setHasMore(cached.hasMore);
       pagingRef.current = {};
-      setIsLoading(false);
+      // 缓存只负责让旧内容立即可见，网络请求仍在后台校验。保留 loading 状态，
+      // 让页面用细进度条和轻微压暗明确告知用户"这是旧内容，正在换新结果"，
+      // 避免点击题材后看起来像没有反应。
+      setIsLoading(true);
     } else {
       setIsLoading(true);
       // 只有切频道才需要换词表；同一频道内切题材/受众/排序必须保留题材栏，
@@ -373,11 +431,25 @@ const loadData = useCallback(async (kw?: string) => {
     // 历史记录是辅助信息，不能阻塞目录首屏。
     const historiesPromise = ipcService.history.list().catch(() => [] as WatchHistoryItem[]);
 
+    // 本轮是否成功。返回值给手动刷新的调用方一个明确的成败信号——目录数据
+    // 在源侧排序不变时「刷新成功」与「刷新失败」在界面上长得一模一样，
+    // 调用方需要它来决定给不给用户一条反馈。
+    let ok = true;
     try {
       // 翻页页码复位：首屏装第 1 页，loadMore 的缺省页码 1 也对应这一点
       //（复位后的第一次 loadMore 请求的是第 2 页）。
       pagingRef.current = {};
-      let res = await requestAllSources(sources, base, () => 1);
+      // 重试前必须连 force 变体一起清：`requestCatalog` 给 force 请求另起了一个
+      // in-flight 键（见那里），只清普通键的话重试会复用同一个在途 Promise，
+      // 三次重试实际只等同一个请求。
+      const dropPage1Inflight = () => {
+        for (const source of sources) {
+          const key = `${source}_${channel}_${category}_${audience}_${sort}_${kw || ''}_p1`;
+          delete inflightRef.current[key];
+          delete inflightRef.current[`${key}|force`];
+        }
+      };
+      let res = await requestAllSources(sources, base, () => 1, force);
       // The public comic page occasionally returns its shell before the rank
       // articles are present. Retry up to twice instead of caching a false
       // empty page——一次重试实测仍可能拿到空壳，两次覆盖 90%+ 的抖动。
@@ -385,16 +457,16 @@ const loadData = useCallback(async (kw?: string) => {
       // Promise 若还在途中（Rust 端 20s 超时），复用它会让三次重试实际只等
       // 同一个请求，用户看到的就是"骨架屏转了很久也不出卡片"。
       if (channel === 'comic' && res.items.length === 0 && requestId === requestIdRef.current) {
-        for (const source of sources) delete inflightRef.current[`${source}_${channel}_${category}_${audience}_${sort}_${kw || ''}_p1`];
+        dropPage1Inflight();
         for (let attempt = 0; attempt < 2; attempt += 1) {
           await new Promise(resolve => window.setTimeout(resolve, 400));
           if (requestId !== requestIdRef.current) break;
-          for (const source of sources) delete inflightRef.current[`${source}_${channel}_${category}_${audience}_${sort}_${kw || ''}_p1`];
-          res = await requestAllSources(sources, base, () => 1);
+          dropPage1Inflight();
+          res = await requestAllSources(sources, base, () => 1, force);
           if (res.items.length > 0) break;
         }
       }
-      if (requestId !== requestIdRef.current) return;
+      if (requestId !== requestIdRef.current) return ok;
       const mergedCategories = mergeCategories(
         categoryVocabularyRef.current[vocabularyKey(sourceKey, channel)] ?? [],
         res.categories,
@@ -417,14 +489,16 @@ const loadData = useCallback(async (kw?: string) => {
       // 首屏已渲染，后台再汇总全站题材词表（不 await，见 refreshCategoryVocabulary）。
       void refreshCategoryVocabulary(sources, channel, requestId);
     } catch (err) {
-      setError((err as Error).message || '目录数据加载失败');
+      ok = false;
+      setError(errorText(err, '目录数据加载失败'));
     } finally {
       if (requestId === requestIdRef.current) setIsLoading(false);
     }
 
     const histories = await historiesPromise;
-    if (requestId !== requestIdRef.current) return;
+    if (requestId !== requestIdRef.current) return ok;
     setContinueWatching(histories[0] || null);
+    return ok;
   }, [audience, category, channel, refreshCategoryVocabulary, requestAllSources, sort, sources]);
 
   useEffect(() => {
@@ -599,7 +673,7 @@ const loadData = useCallback(async (kw?: string) => {
       if (pendingFetchRef.current === record) pendingFetchRef.current = null;
     } catch (err) {
       if (requestId === requestIdRef.current) {
-        setError((err as Error).message || '加载更多目录数据失败');
+        setError(errorText(err, '加载更多目录数据失败'));
         // 连续失败就停掉自动重试。observer 在 isLoadingMore 复位后会重建，而哨兵
         // 仍在视口内 → 立刻又触发一次 loadMore，失败请求会变成一秒几次的无限风暴
         // （实测表现为底部一直转、且各路请求都在超时）。两次失败是网络/站方问题的
