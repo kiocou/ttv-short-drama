@@ -208,11 +208,18 @@ export const AnimeVideoSurface: React.FC = () => {
   }, [isFullscreen]);
 
   const exitToDetail = useCallback(() => {
-    if (isFullscreen) {
-      void leaveFullscreen().then(() => setIsFullscreen(false));
-    }
-    close();
-    if (series?.id) navigateTo('detail', series.id);
+    // 退全屏与"关播放器 + 回详情页"必须串行：先 await 完原生窗口状态回退，
+    // 再关播放器换视图。旧实现是 `void leaveFullscreen()` 立刻往下走 —— 中间那段
+    // 窗口还在往普通尺寸收、而界面已经切到详情页，两块宿主同时做布局，
+    // 用户看到的就是退出动漫时"界面先跳一下再定住"。
+    void (async () => {
+      if (isFullscreen) {
+        await leaveFullscreen();
+        setIsFullscreen(false);
+      }
+      close();
+      if (series?.id) navigateTo('detail', series.id);
+    })();
   }, [close, isFullscreen, navigateTo, series, setIsFullscreen]);
 
   useEffect(() => () => {

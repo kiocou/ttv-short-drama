@@ -1033,6 +1033,16 @@ fn normalize_requested_quality(raw: &str) -> String {
     }
 }
 
+/// sidecar 标记里的内容是否代表"这已经是转码后的 H.264"。
+///
+/// 只有 `h264` 算数：`skip`（用户关着 VSR 时跳过的 HEVC）与空/损坏内容都不算。
+/// 旧版标记文件也是 `h264\n`，所以历史记录继续有效。
+fn marker_content_is_h264(marker: &std::path::Path) -> bool {
+    std::fs::read_to_string(marker)
+        .map(|value| value.trim() == "h264")
+        .unwrap_or(false)
+}
+
 /// 把历史缓存补齐成 H.264。旧版本会把 bytevc1/HEVC 原样留下；没有这个迁移，
 /// 升级后重播旧缓存仍然走不到 RTX VSR。新 worker 产物本身已是 H.264，但用同
 /// 一个 sidecar 标记避免每次命中都重转一遍。
@@ -1042,7 +1052,14 @@ async fn ensure_h264_cache(
     enabled: bool,
 ) -> Result<(), String> {
     let marker = path.with_extension("h264");
-    if marker.is_file() {
+    // 标记**必须连同内容一起判**，不能只看文件存在。
+    //
+    // 历史坑：VSR 关闭分支曾经也写下 `h264\n`，与"转码成功"的标记一字不差。
+    // 于是关掉 VSR 看一集 HEVC 旧缓存之后，那集就被永久打上"已是 H.264"的假标记；
+    // 用户重新打开 VSR 时这一集被这里直接短路，HEVC 文件照原样播出去，
+    // 视觉增强静默失效（不变量 25：VSR 的硬条件是 H.264）。
+    // 现在关闭分支写的是 `skip\n`，只认 `h264` 才算真转码过。
+    if marker_content_is_h264(&marker) {
         return Ok(());
     }
     // 用户关掉了 RTX VSR：不再把整集重编一遍。
@@ -1050,9 +1067,14 @@ async fn ensure_h264_cache(
     // 这不是"省一点 CPU"——旧缓存迁移是在**起播路径上同步跑**的：一集 1920×1080
     // 实测要重编几秒到十几秒，而缓存里可能积累了几十集旧缓存（HEVC/bytevc1）。
     // 开着开关时这笔成本换的是 VSR；关掉之后它换不到任何东西，只剩"点一集转一次"。
-    // 直接写标记跳过：产物保持 HEVC，直连播放（VSR 本来也不认 HEVC，见不变量 25）。
+    // 产物保持 HEVC，直连播放（VSR 本来也不认 HEVC，见不变量 25）。
+    //
+    // ⚠️ 这里写的必须是**与转码成功不同的内容**（`skip` 而不是 `h264`）。
+    // 写 `h264` 会造成"假标记"：用户之后重新打开 VSR 时，上面那道
+    // `marker_content_is_h264` 判定会把这一集的 HEVC 当成已迁移，直接放行 ——
+    // 视觉增强永久静默失效，而且现象是"有些集有 VSR、有些集没有"，极难排查。
     if !enabled {
-        let _ = std::fs::write(&marker, b"h264\n");
+        let _ = std::fs::write(&marker, b"skip\n");
         return Ok(());
     }
     let partial = path.with_file_name(format!(
@@ -3025,10 +3047,41 @@ pub async fn short_drama_app_album<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::{
-        cover_to_data_url, normalize_cache_budget_mb, normalize_requested_quality,
-        HongguoAppProfile,
+        cover_to_data_url, marker_content_is_h264, normalize_cache_budget_mb,
+        normalize_requested_quality, HongguoAppProfile,
     };
     use base64::Engine;
+
+    // 只有内容为 h264 的 sidecar 才算「已迁移」。
+    //
+    // 回归用例：旧实现让「关掉 VSR」这条分支也写 h264，于是在关着开关时看过一集
+    // HEVC 旧缓存之后，重新打开 VSR 会被只判「文件存在」的旧逻辑放行 —— HEVC 文件
+    // 照原样播出去，视觉增强静默失效（不变量 25：VSR 的硬条件是 H.264）。
+    // 现在关闭分支写的是 skip，必须被这里判成「未迁移」，从而触发真正的转码。
+    #[test]
+    fn h264_marker_content_decides_migration_state() {
+        let dir = std::env::temp_dir().join(format!("ttv-marker-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let marker = dir.join("probe.mp4.h264");
+
+        // 真正的转码产物标记。
+        std::fs::write(&marker, b"h264\n").unwrap();
+        assert!(marker_content_is_h264(&marker));
+
+        // 用户关着 VSR 时跳过的标记：不能被当成已迁移。
+        std::fs::write(&marker, b"skip\n").unwrap();
+        assert!(!marker_content_is_h264(&marker));
+
+        // 空文件 / 损坏内容同样不算。
+        std::fs::write(&marker, b"").unwrap();
+        assert!(!marker_content_is_h264(&marker));
+
+        // 标记不存在（从未迁移）也必须为 false，而不是让调用方 panic。
+        let _ = std::fs::remove_file(&marker);
+        assert!(!marker_content_is_h264(&marker));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cache_budget_defaults_and_clamps_user_values() {

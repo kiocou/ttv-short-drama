@@ -655,8 +655,14 @@ fn lock(bridge: &'static Mutex<DmghgBridge>) -> MutexGuard<'static, DmghgBridge>
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// 动漫链路的日志出口。
+///
+/// 之前这里是 `println!` —— 在 `#![windows_subsystem = "windows"]` 的进程里
+/// stdout 根本没有控制台，输出直接进黑洞。于是「动漫为什么退回暴风源」这类问题
+/// 在用户机器上永远查不到（只有开发时用 cargo run 才看得见）。
+/// 改走 crate::trace::log：与控制台无关，落进应用自己的 ttv-playback.log。
 fn log_line(message: &str) {
-    println!("[anime] {message}");
+    crate::trace::log(format!("[anime] {message}"));
 }
 
 // ---------------------------------------------------------------------------

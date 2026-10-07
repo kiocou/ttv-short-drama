@@ -18,6 +18,9 @@ import {
 } from '../services/animePlayback';
 import { dismissPip, openPip } from '../services/pip';
 import type { EpisodeItem, SeriesDetail } from '../types/series';
+// 只借用有界起播这个纯 DOM 工具（不变量 21）：动漫 store 仍然是独立的一份状态，
+// 不引用 usePlaybackStore 的任何 state / context。
+import { playBounded } from './usePlaybackStore';
 import { useAppStore } from './useAppStore';
 import { useSettingsStore } from './useSettingsStore';
 
@@ -145,7 +148,10 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
   const seriesRef = useRef<SeriesDetail | null>(null);
   const episodeRef = useRef<EpisodeItem | null>(null);
   const qualityRef = useRef('auto');
-  const volumeRef = useRef(1);
+  // 必须与上面 `useState(0.85)` 的初值一致。旧实现这里是 1，于是「首次进动漫」与
+  // 「画中画交接」这两条读 ref 的路径会把音量设成 100%，而控制条显示的是 0.85 ——
+  // 用户看到的是"音量键没用"。
+  const volumeRef = useRef(0.85);
   const mutedRef = useRef(false);
   const rateRef = useRef(1);
 
@@ -390,7 +396,10 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
       });
 
       try {
-        await video.play();
+        // 与短剧链路同款的有界保底（不变量 21）：`play()` 在"源无数据也无错误"时
+        // 可以永不 settle，画面停死却没有任何报错。短剧侧走 `playBounded`，动漫侧
+        // 旧实现是裸 await —— 同一台机器上表现为"点进去一直转圈、进度条不走"。
+        await playBounded(video);
         if (sessionRef.current !== sessionId) return;
         setIsPlaying(true);
         setUiState({ kind: 'playing' });
@@ -498,6 +507,10 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
     const onWaiting = () => setUiState(prev => (prev.kind === 'playing' ? { kind: 'buffering' } : prev));
     const onPlaying = () => setUiState(prev => (prev.kind === 'error' ? prev : { kind: 'playing' }));
     const onError = () => {
+      // 必须复查会话：换集时旧源的 error 可能**迟到**到新源已经接管之后才派发，
+      // 不复查就会把新一集直接刷成错误页（本文件其它每个异步续体都有这道复查，
+      // 唯独这个 DOM 回调漏了）。以元素上记录的会话号为准，与接管处同源。
+      if (video.dataset.sessionId !== String(sessionRef.current)) return;
       setIsPlaying(false);
       setUiState({
         kind: 'error',

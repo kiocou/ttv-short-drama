@@ -40,6 +40,25 @@ import { tracePlayback } from './playbackTrace';
 let wasMaximizedBeforeFullscreen = false;
 
 /**
+ * 全屏状态的所有权令牌。
+ *
+ * 上面那两个模块级变量只应该属于**最后进入全屏的那一次**调用。
+ * 历史坑：快速连按 F（或 enter 与 leave 交叠）时两次调用会共用一个变量：
+ * A 记下"进全屏前是最大化"、还没走到 setFullscreen；B 也记一次（可能是 false）
+ * 并覆盖掉 A 的值 —— 之后谁也说不清该不该 maximize()，后果是还原矩形被钉死。
+ *
+ * 用自增令牌做所有权判定：`enterFullscreen` 开头领取令牌，只有仍持有它的那次
+ * 才允许写 wasMaximized；`leaveFullscreen` 开头把令牌作废（置 0），使任何还在
+ * 半路上的 enter 都不会再改状态。
+ */
+let fullscreenToken = 0;
+
+/** 让还在途的 enter 失去对全屏状态的写入权（退出全屏时调用）。 */
+function revokeFullscreenOwnership(): void {
+  fullscreenToken += 1;
+}
+
+/**
  * `set_fullscreen` / `maximize` 都是异步落到窗口线程的，调用返回时状态未必已生效。
  * 这里轮询真实状态，最多等 `tries × 90ms`，拿到"已生效"就立刻返回。
  * 查询本身失败时返回 `expected`，不谎报也不卡死。
@@ -119,13 +138,22 @@ export async function enterFullscreen(): Promise<boolean> {
   const startedAt = performance.now();
   tracePlayback('全屏 进入开始 ' + (await describeWindow(win)));
 
+  // 领取本次进入的所有权令牌：之后每一步写状态前都要复核自己还持有它。
+  fullscreenToken += 1;
+  const token = fullscreenToken;
+  const stillOwner = () => fullscreenToken === token;
+
   // 关键步骤：先静默解除最大化，否则客户区会被裁到工作区（任务栏之上）。
+  let wasMaximized = false;
   try {
-    wasMaximizedBeforeFullscreen = await win.isMaximized();
+    wasMaximized = await win.isMaximized();
   } catch {
-    wasMaximizedBeforeFullscreen = false;
+    wasMaximized = false;
   }
-  if (wasMaximizedBeforeFullscreen) {
+  // 只在仍持有令牌时落账；中途被 leaveFullscreen 作废就整段放弃，
+  // 免得把"上一次进入"的状态写进这一次的记录里。
+  if (stillOwner()) wasMaximizedBeforeFullscreen = wasMaximized;
+  if (wasMaximized) {
     const cleared = await clearMaximizedSilently();
     tracePlayback(
       '全屏 静默解除最大化 返回=' + cleared + ' ' + (await describeWindow(win)),
@@ -136,14 +164,20 @@ export async function enterFullscreen(): Promise<boolean> {
     await win.setFullscreen(true);
   } catch {
     // 权限或环境不支持：如实返回当前真实状态。
+    // 这里**必须**把状态复位：旧实现在这条退出路径上留着 wasMaximized=true，
+    // 下一次 leaveFullscreen 会消费这个脏值去走 window_finish_fullscreen，
+    // 而窗口其实从没进过全屏 —— 按 Rust 侧注释，后果是把"还原矩形"钉死。
     tracePlayback('全屏 setFullscreen(true) 抛错，改用真实查询');
+    if (stillOwner()) wasMaximizedBeforeFullscreen = false;
     try {
       return await win.isFullscreen();
     } catch {
       return false;
     }
   }
+  // 进全屏失败（轮询没等到 true）：同样不留脏状态，否则它会在退出时被消费。
   const actual = await waitForState(win, true);
+  if (!actual && stillOwner()) wasMaximizedBeforeFullscreen = false;
   tracePlayback(
     '全屏 进入完成 结果=' +
       actual +
@@ -160,6 +194,8 @@ export async function leaveFullscreen(): Promise<boolean> {
   const { getCurrentWindow } = await import('@tauri-apps/api/window');
   const win = getCurrentWindow();
 
+  // 作废任何还在半路上的 enter 的所有权，然后才读状态。
+  revokeFullscreenOwnership();
   const startedAt = performance.now();
   tracePlayback(
     '全屏 退出开始 ' +

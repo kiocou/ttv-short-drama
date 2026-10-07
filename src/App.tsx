@@ -83,9 +83,17 @@ const AppContent: React.FC = () => {
 
   // 播放器宿主常驻 DOM，离开时仅被 display:none 隐藏，video 不会自动停。
   // 不显式停止就会出现"回到主界面但声音还在播"（含后台连播倒计时自动开播）。
+  //
+  // ⚠️ `isAnimePlayerOpen` 必须列进来，且判定是「或」而不是只看视图。
+  // 从短剧播放器直接进动漫播放时（详情页/发现页/历史页三条入口都是这个走法），
+  // `currentView` 全程停在 `'player'`，`isPlayer` 自始至终是 true —— 旧写法的
+  // `if (!isPlayer)` 因此**一次都不会触发**，短剧那条链路（卡死看门狗、连播倒计时、
+  // 预解池、在途 resolveNative）全部跨这次「离开」继续存活：倒计时到点会把一部
+  // 用户根本看不见的短剧强行开播并出声。动漫侧的 haltCurrent 停的是它自己那块
+  // video，不会碰短剧这块。这是不变量 1「同一时刻只有一路在播」的实质缺口。
   useEffect(() => {
-    if (!isPlayer) stopPlayback();
-  }, [isPlayer, stopPlayback]);
+    if (!isPlayer || isAnimePlayerOpen) stopPlayback();
+  }, [isPlayer, isAnimePlayerOpen, stopPlayback]);
 
   // 非播放视图下必须退出全屏。
   // 否则用户在全屏播放时返回详情页/发现页，窗口仍停在全屏，整个程序看起来

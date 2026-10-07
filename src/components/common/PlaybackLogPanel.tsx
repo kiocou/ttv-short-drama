@@ -45,15 +45,28 @@ export const PlaybackLogPanel: React.FC = () => {
   const cursorRef = useRef(0);
   const boxRef = useRef<HTMLDivElement | null>(null);
 
+  // 在途守卫：轮询间隔是 1.5 秒，而一次 IPC 在机器忙（大量转码日志）时可能更慢。
+  // 没有这道守卫就会有两次 pull 并发，各自带着**同一个起始游标**发出，回来时后者
+  // 覆盖前者的 nextCursor —— 表现为日志面板里整段行凭空消失、或同一段重复出现。
+  const inFlightRef = useRef(false);
+
   const pull = useCallback(async () => {
-    const r = await ipcService.diagnostics.tail(cursorRef.current);
-    if (r.nextCursor !== cursorRef.current) cursorRef.current = r.nextCursor;
-    if (r.dropped) setDropped(true);
-    if (r.lines.length > 0) {
-      setLines(prev => {
-        const next = prev.concat(r.lines);
-        return next.length > MAX_RENDER_LINES ? next.slice(next.length - MAX_RENDER_LINES) : next;
-      });
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
+      const r = await ipcService.diagnostics.tail(cursorRef.current);
+      if (r.nextCursor !== cursorRef.current) cursorRef.current = r.nextCursor;
+      if (r.dropped) setDropped(true);
+      if (r.lines.length > 0) {
+        setLines(prev => {
+          const next = prev.concat(r.lines);
+          return next.length > MAX_RENDER_LINES ? next.slice(next.length - MAX_RENDER_LINES) : next;
+        });
+      }
+    } catch {
+      // IPC 失败（窗口正在关闭 / 后端忙）不该让面板卡在"正在拉取"状态。
+    } finally {
+      inFlightRef.current = false;
     }
   }, []);
 

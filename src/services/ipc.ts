@@ -156,6 +156,9 @@ export const DEFAULT_SETTINGS: UserSettings = {
   autoNext: true,
   preferredEngine: 'off',
   targetFps: 60,
+  // 后端契约字段（无界面开关）：必须与 models.rs 的 UserSettings 同形，
+  // 否则 settings_save 反序列化整体失败 → 所有设置都不落库。详见 types/settings.ts。
+  hardwareAcceleration: true,
   catalogCacheMb: 0,
   playbackCacheMb: 1024,
   showAdultSources: false,

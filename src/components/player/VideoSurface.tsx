@@ -80,6 +80,20 @@ export const VideoSurface: React.FC = () => {
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
 
+  // 单击/双击判定用的 220ms 定时器必须在卸载时清掉。
+  //
+  // 历史坑：旧实现只在"第二次点击"那条同步路径里 clearTimeout，卸载时不管。
+  // 于是单击画面后 220ms 内退出播放器（返回详情页 / 切到发现页）时，App.tsx 已经
+  // stopPlayback()、video 也已经 pause，但这个定时器照样到点执行 togglePlay() ——
+  // 常驻的 <video> 会在用户已经离开播放器之后重新出声。
+  // 对照：AnimeVideoSurface 的同款定时器早已做了卸载清理。
+  useEffect(() => () => {
+    if (clickTimerRef.current) {
+      clearTimeout(clickTimerRef.current);
+      clickTimerRef.current = null;
+    }
+  }, []);
+
   // 控制条自动隐藏定时器 (2.5s)。锁定时保持可见（HUD 隐藏但锁与迷你条接管），
   // 这里不需要特判——锁定态 HUD 是否显示由 PlayerControls 内部决定。
   const handleUserActivity = useCallback(() => {

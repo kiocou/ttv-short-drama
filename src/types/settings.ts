@@ -5,6 +5,19 @@ export interface UserSettings {
   preferredEngine: string;
   /** 已废弃：补帧链路已移除，仅兼容旧设置记录。 */
   targetFps: number;
+  /**
+   * 是否启用硬件加速（WebView2 的 GPU 合成）。**后端契约字段，前端不提供开关。**
+   *
+   * 历史坑：`src-tauri/src/models.rs` 的这个字段早于前端存在，而前端 `UserSettings`
+   * 一直漏了它。`settings_save` 的入参是**反序列化出来的** `UserSettings`——缺字段
+   * 会在反序列化阶段整体失败、命令体一行都不执行（错误只被 `useSettingsStore`
+   * 吞成一行 console.warn）。表现为：设置页任何改动都"看起来生效了"（前端内存里
+   * 确实变了），但从不落库、重启回到默认，而且 `set_vsr_enabled` 也一并没执行 ——
+   * 这就是「开关 VSR 都没用」的另一半根因。
+   *
+   * 因此这里**必须**与后端保持字段同形，哪怕界面上没有对应开关。
+   */
+  hardwareAcceleration: boolean;
   catalogCacheMb: number;
   playbackCacheMb: number;
   /** 是否展示 18+ 外部内容源（默认关闭；关闭时首页与搜索都不会出现这些源）。 */
