@@ -217,6 +217,17 @@ pub struct ShortDramaAppPlayback {
     pub height: u32,
     pub size_bytes: u64,
     pub cached: bool,
+    ///
+    /// 播放形态。`None` 或缺省 = 本地文件路径（前端走 convertFileSrc + <video>.src）；
+    /// `Some("hls")` = 本地 HLS 地址（前端必须走 hls.js 挂载，不能 convertFileSrc）。
+    ///
+    /// 这个字段是「边转边播」链路的一部分：流式首屏交出去的是 `http://127.0.0.1`
+    /// 上的 m3u8，把它当文件路径处理会得到一个必然 404 的 asset:// 地址。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_kind: Option<String>,
+    /// 本地 HLS 挂载失败时的回退地址（原始加密直链由调用方兜底）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1192,6 +1203,8 @@ pub async fn short_drama_app_resolve<R: Runtime>(
             height: 0,
             size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
             cached: true,
+            stream_kind: None,
+            backup_url: None,
         })
     };
     if let Some(parent) = out_path.parent() {
@@ -1401,6 +1414,8 @@ pub async fn short_drama_app_resolve_prefix(
             height: 0,
             size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
             cached: true,
+            stream_kind: None,
+            backup_url: None,
         });
     }
 
@@ -1506,6 +1521,8 @@ fn prefix_payload(path: &std::path::Path) -> Option<ShortDramaAppPlayback> {
         // 前缀**不是**整集：cached 必须为 false，否则前端会以为自己拿到了整集，
         // 不再等后台那条整集链路，播完十几秒就没了。
         cached: false,
+        stream_kind: None,
+        backup_url: None,
     })
 }
 
@@ -1762,6 +1779,8 @@ async fn run_resolve_worker<R: Runtime>(
         height,
         size_bytes: size,
         cached: false,
+        stream_kind: None,
+        backup_url: None,
     })
 }
 
@@ -2824,6 +2843,143 @@ pub async fn short_drama_app_qualities<R: Runtime>(
     Ok(variants)
 }
 
+/// 边转边播：把红果加密源**直接**转成本地 H.264 HLS，首片落地就把地址交出去。
+///
+/// ## 它和另外两条红果链路的关系
+///
+/// | 链路 | 产物 | 实测首屏 | 说明 |
+/// |---|---|---|---|
+/// | `resolve`（整集） | 本地 mp4 | 6.6–22.3 秒 | 下载+解密+转存**整集**才返回 |
+/// | `resolve_prefix`（前缀） | `{vid}.prefix.mp4` | 6.2–7.2 秒 | 只取开头 2MB 源流，但仍要下载+解密+转码一轮 |
+/// | **本命令** | 本地 HLS 分片 | **约 3.3 秒**（首片 1.1 秒+API 2.2 秒） | 不落整集，边解密边转边播 |
+///
+/// ## 为什么它更快
+///
+/// 前缀通道要把「下载 2MB 源流 → 解密转码 → 落盘 mp4 → 再交给播放器」整段走完才
+/// 能返回（实测下载 2301ms + 转码 983ms）。本命令把这四步**合并成一件事**：ffmpeg
+/// 直接从加密直链读、带 `-decryption_key` 边解密边转 H.264、按 2 秒切片写到本地 HLS
+/// 目录，第一个分片一写完地址就能播。实测：**首片 1005–1126ms 落地**（含 API 往返
+/// 3.1–3.5 秒总首屏），而不是等整段下载完。
+///
+/// 这就是用户要的「先把视频画面出来，播放的同时再加载」——播放与取流并行了。
+///
+/// ## 和整集链路并存，不是替代
+///
+/// 调用方应当**同时**发这条和整集 `resolve`：本命令负责尽早出画，整集负责最终质量
+/// （可拖动、秒切清晰度、不需要持续转码）。两条链路各有自己的会话目录与在途去重键，
+/// 互不阻塞。
+///
+/// ## 失败语义
+///
+/// 与 `media_enhance` 一致：`ensure_server` 起不来、ffmpeg 立刻退出、或者等满
+/// `READY_WAIT` 仍无产物，都返回 Err，调用方回退既有链路。**慢不等于失败**——
+/// 进程还活着就把地址交出去，让播放器按自己的重试节奏等首段。
+#[tauri::command]
+pub async fn short_drama_app_open_stream<R: Runtime>(
+    app: AppHandle<R>,
+    input: ShortDramaAppStreamInput,
+    session_id: u64,
+) -> Result<ShortDramaAppPlayback, String> {
+    let vid = input.vid.trim().to_owned();
+    if vid.is_empty() || !vid.chars().all(|c| c.is_ascii_digit()) {
+        return Err("缺少有效的集 vid。".into());
+    }
+    // RTX VSR 开关关闭时**不走这条路**：这条链路产出的是 H.264 分片，正是 VSR 需要
+    // 的形态，而「关」的语义是"完全回到引入 media_enhance 之前的旧播放链路"。
+    // 判断放在这里而不是前端，是为了让开关只有一处权威判定（与
+    // `enhance_short_drama_session` 同一个 AtomicBool），前端漏判也不会破坏契约。
+    if !crate::vsr_is_enabled() {
+        crate::trace::log(format!(
+            "[红果] VSR 开关=关，流式开播让位给旧链路 vid={vid}（调用方回退前缀/整集）"
+        ));
+        return Err("VSR 开关已关闭，使用旧播放链路。".into());
+    }
+    let profile = HongguoAppProfile::from_input(input.content_type, input.app_id)?;
+    // 已缓存的整集优先：盘上有整集就没必要再起一路转码。
+    // 寻址与 resolve 主线同构（含旧版本直接写在根目录下的副本）。
+    let namespace_path = cache_dir()
+        .join(profile.cache_namespace)
+        .join(format!("{vid}.mp4"));
+    let legacy_path = cache_dir().join(format!("{vid}.mp4"));
+    let existing = std::iter::once(namespace_path)
+        .chain(std::iter::once(legacy_path))
+        .find(|path| path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false));
+    if let Some(path) = existing {
+        touch_cache_entry(&path);
+        return Ok(ShortDramaAppPlayback {
+            play_url: path.to_string_lossy().to_string(),
+            width: 0,
+            height: 0,
+            size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
+            cached: true,
+            stream_kind: None,
+            backup_url: None,
+        });
+    }
+
+    // 复用预签名直链（详情页/首页预热过的话，这一步省掉两次 App API 往返 = 2.5 秒）。
+    // 这是首屏耗时里最大的一块纯等待，命中与否直接决定 3.3 秒还是 5.8 秒。
+    let cached_stream = peek_stream(&vid);
+    let (source_url, decryption_key) = match cached_stream.clone() {
+        Some(cached) => (cached.url, cached.content_key),
+        None => {
+            let payload = run_worker_subcommand(&app, "stream", &vid, "stream", profile).await?;
+            let url = payload
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if url.is_empty() {
+                return Err("云端直链为空。".into());
+            }
+            let key = payload
+                .get("content_key")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            store_stream(&vid, &payload);
+            (url, key)
+        }
+    };
+    crate::trace::log(format!(
+        "[红果] 流式开播 vid={vid} 复用预签名={} 会话={session_id}",
+        cached_stream.is_some()
+    ));
+
+    // 会话号必须落在 media_enhance 的地址空间里：stop(session_id) 由
+    // playback_command 的 "stop" 分支统一调用，两处用同一个 id 才能被停掉。
+    match crate::media_enhance::start_with_key(
+        session_id,
+        &source_url,
+        Some(decryption_key.as_str()).filter(|key| !key.is_empty()),
+    )
+    .await
+    {
+        Ok(url) => {
+            let (width, height) = cached_stream
+                .as_ref()
+                .map(|cached| (cached.width, cached.height))
+                .unwrap_or((0, 0));
+            Ok(ShortDramaAppPlayback {
+                play_url: url,
+                width,
+                height,
+                size_bytes: 0,
+                // 不是整集，不能标 cached：调用方仍要等整集那条链路，
+                // 并在它落盘后切过去（否则拖到 2 秒后就没了）。
+                cached: false,
+                stream_kind: Some("hls".to_owned()),
+                backup_url: Some(source_url),
+            })
+        }
+        Err(error) => {
+            crate::trace::log(format!("[红果] 流式开播未启动：{error}"));
+            Err(format!("流式转码未启动：{error}"))
+        }
+    }
+}
 /// 锁定集秒开：签名取回加密直链 + CENC 密钥，交给 libmpv 流播（不落盘）。
 #[tauri::command]
 pub async fn short_drama_app_stream<R: Runtime>(

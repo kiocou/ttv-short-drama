@@ -1063,6 +1063,83 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   /**
+   * 播放**本地 HLS**（流式转码产物）——「先出画面」链路的落点。
+   *
+   * 与 `playLocalFile` 的区别只有一个但很关键：源是 `http://127.0.0.1` 上的 m3u8，
+   * 必须走 hls.js（`attachSource` 内部判断），不能 convertFileSrc——把 m3u8 当文件
+   * 路径处理会得到一个必然 404 的 asset:// 地址，表现是「地址没问题、播放器全黑」。
+   *
+   * 首帧等待给了 15 秒而不是常规的 8–10 秒：这条链路的分片是**边转边生成**的，
+   * 播放器很可能先拿到清单、再等首个分片写完（实测 ffmpeg 侧首片 1.1 秒，但加上
+   * 网络往返与 hls.js 自身的重试节奏会更宽）。`hlsAttach` 已配好
+   * `manifestLoadingMaxRetry=4` / `fragLoadingMaxRetry=8` / `fragLoadingRetryDelay=500`，
+   * 这里给足预算，别在播放器还在正常重试时判死。
+   */
+  const playStreamingHls = async (
+    hlsUrl: string,
+    video: HTMLVideoElement,
+    sessionId: number,
+    startPosition: number,
+    episodeId: string,
+  ): Promise<PlayOutcome> => {
+    adoptingRef.current = true;
+    try {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = '';
+      }
+      video.dataset.sessionId = String(sessionId);
+      video.playbackRate = playbackRateRef.current;
+      video.volume = isMutedRef.current ? 0 : volumeRef.current;
+      video.muted = isMutedRef.current;
+
+      const firstFrameReady = new Promise<void>(resolve => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          video.removeEventListener('loadeddata', done);
+          video.removeEventListener('error', done);
+          resolve();
+        };
+        const timer = setTimeout(done, 15000);
+        video.addEventListener('loadeddata', done, { once: true });
+        video.addEventListener('error', done, { once: true });
+      });
+      // attachSource 内部会先 detachSource，并把 hls.js 实例挂在 video 上，
+      // 换集/退出时由 detachSource 统一拆掉——不需要在这里手动管生命周期。
+      await attachSource(video, hlsUrl);
+      markSourceCommitted(sessionId, episodeId);
+      await firstFrameReady;
+      if (activeSessionRef.current !== sessionId) return 'stale';
+      if (video.error) {
+        noteFailure('流式 HLS 解码失败', video.error);
+        return 'error';
+      }
+      video.playbackRate = playbackRateRef.current;
+      if (startPosition > 0) {
+        try {
+          video.currentTime = startPosition;
+        } catch {
+          // metadata 未就绪则从 0 播。
+        }
+      }
+      const started = await startPlayback(video);
+      if (started !== 'ok') return started;
+      if (pauseIfStale(sessionId, video)) return 'stale';
+      setIsPlaying(true);
+      setUiState({ kind: 'playing', sessionId, position: video.currentTime });
+      return 'ok';
+    } catch (error) {
+      noteFailure('流式 HLS 挂载异常', error);
+      return 'error';
+    } finally {
+      adoptingRef.current = false;
+    }
+  };
+
+  /**
    * 红果起播：**前缀先行，整集后到替身**。
    *
    * 用户点上"播放"之后，等待全部发生在"整集下载+解密+转存"这一个 await 里
@@ -1149,6 +1226,71 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     if (startPosition > PREFIX_COVERAGE_SECONDS) {
       tracePlayback(`前缀起播 跳过（续播位置 ${startPosition.toFixed(1)}s 超出前缀覆盖范围）`);
       return startFull();
+    }
+
+    // ===== 「先出画面」主路径：流式 HLS =====
+
+    //
+    // 这是用户明确要的"先把视频画面出来、播放的同时再加载"。实测对比：
+    //   流式 HLS   首片 1005–1126ms 落地（含 API 往返总首屏 3.1–3.5 秒）
+    //   前缀 mp4   整段 6219–7174ms（要先下载 2MB + 解密转码 + 落盘）
+    //   整集 mp4   6600–22320ms
+    //
+    // 它失败不是错误——整集链路早就在跑了，回退到前缀/整集即可。
+    // 注意它必须排在**前缀之前**：前缀要等下载完一段才能出画，而流式是边转边出。
+    const streamingStarted = performance.now();
+    const streaming = await ipcService.playback
+      .openStreamNative(seriesId, episodeId, sessionId, contentType)
+      .catch((error: unknown) => {
+        tracePlayback(`流式开播 未命中（回退前缀/整集） ${describeError(error)}`);
+        return null;
+      });
+    if (activeSessionRef.current !== sessionId) return `stale`;
+    if (streaming && streaming.cached !== true && streaming.streamKind === 'hls') {
+      const streamingOutcome = await playStreamingHls(
+        streaming.playUrl, video, sessionId, startPosition, episodeId,
+      );
+      if (streamingOutcome === `stale`) return `stale`;
+      if (streamingOutcome === `ok`) {
+        tracePlayback(`流式开播 出画 耗时=${Math.round(performance.now() - streamingStarted)}ms（整集仍在后台下载）`);
+        // 与前缀同款标记：画面还挂在「非整集」源上，这一集播到头时不能算看完。
+        prefixSourceRef.current = { episodeId, sessionId };
+        // 后台等整集落盘切源（与下面前缀分支完全同一段逻辑，抽不抽都行——
+        // 但这里刻意**不抽**：抽成函数会让这段的会话复查与 ref 清理多一层间接，
+        // 而它恰恰是最需要一眼看清的地方）。
+        void (async () => {
+          try {
+            const resolved = await fullPromise;
+            if (activeSessionRef.current !== sessionId) return;
+            if (!resolved.playUrl || resolved.playUrl === streaming.playUrl) return;
+            const { convertFileSrc } = await import(`@tauri-apps/api/core`);
+            const assetUrl = convertFileSrc(resolved.playUrl);
+            const probe = await preloadSource(assetUrl, 0, 8000);
+            if (!probe) return;
+            if (activeSessionRef.current !== sessionId) {
+              disposePrepared({ url: assetUrl, element: probe });
+              return;
+            }
+            const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+            const switchedAt = performance.now();
+            const outcome = await adoptPreparedSource(
+              { url: assetUrl, element: probe }, video, sessionId, resumeAt, episodeId,
+            );
+            disposePrepared({ url: assetUrl, element: probe });
+            if (outcome !== `ok`) {
+              tracePlayback(`整集切换未完成（outcome=${outcome}，继续播流式源）`);
+              return;
+            }
+            prefixSourceRef.current = null;
+            tracePlayback(`整集切换完成 耗时=${Math.round(performance.now() - switchedAt)}ms 位置=${resumeAt.toFixed(1)}s 字节=${(resolved.sizeBytes / 1048576).toFixed(1)}MB`);
+          } catch (error) {
+            tracePlayback(`整集切换异常（继续播流式源） ${describeError(error)}`);
+          }
+        })();
+        return `ok`;
+      }
+      // 流式播不起来：不弹错误页，继续走前缀/整集。
+      tracePlayback(`流式开播 失败（outcome=${streamingOutcome}，回退前缀）`);
     }
 
     // 前缀失败不是错误，只是没享受到加速：整集链路早就在跑，继续等它就行。

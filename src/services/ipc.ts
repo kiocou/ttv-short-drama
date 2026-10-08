@@ -14,6 +14,26 @@ export interface TraceTail {
   dropped: boolean;
 }
 
+/**
+ * 一次本地播放解析的结果。
+ *
+ * `streamKind` 缺省表示 `playUrl` 是**本地文件路径**（走 convertFileSrc + <video>.src）；
+ * `'hls'` 表示它是本地 HLS 地址（必须走 hls.js 挂载）。两者装载方式完全不同，
+ * 判错的表现是「地址看起来没问题、播放器却一直黑屏」——因为 asset:// 指向一个
+ * 根本不存在的文件。
+ */
+export interface NativeResolved {
+  playUrl: string;
+  width: number;
+  height: number;
+  sizeBytes: number;
+  cached: boolean;
+  /** 'hls' = 本地 HLS 地址；缺省 = 本地文件路径。 */
+  streamKind?: string;
+  /** 本地 HLS 失败时的回退地址（原始加密直链）。 */
+  backupUrl?: string;
+}
+
 export function isTauriEnvironment(): boolean {
   return typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
 }
@@ -612,16 +632,53 @@ async guoCover(seriesId: string): Promise<string | null> {
       }
     },
 
+    /**
+     * 「先出画面」入口：红果加密源**边解密边转**本地 H.264 HLS，首片落地即返回。
+     *
+     * 返回结构的 `streamKind === 'hls'` 是硬信号：`playUrl` 是 `http://127.0.0.1`
+     * 上的 m3u8，**必须走 hls.js 挂载**，当作文件路径 convertFileSrc 会得到一个
+     * 必然 404 的 asset:// 地址。
+     *
+     * `sessionId` 必须与本次播放会话号一致——转码任务用它在 `playback_command` 的
+     * stop 分支里被停掉（换集/退出播放器时），传别的值会让 ffmpeg 一直空转。
+     */
+    async openStreamNative(
+      seriesId: string,
+      vid: string,
+      sessionId: number,
+      contentType?: number,
+    ): Promise<NativeResolved> {
+      if (!isTauriEnvironment()) throw new Error('原生短剧播放仅在桌面应用中可用。');
+      const started = performance.now();
+      void ipcService.diagnostics.uiLog(`流式开播 请求开始 vid=${vid} 会话=${sessionId}`);
+      try {
+        const result = await invokeBackend<NativeResolved>('short_drama_app_open_stream', {
+          input: { seriesId, vid, contentType, quality: 'auto' },
+          sessionId,
+        });
+        const ms = Math.round(performance.now() - started);
+        void ipcService.diagnostics.uiLog(
+          `流式开播 返回 耗时=${ms}ms 形态=${result?.streamKind ?? 'file'} 缓存=${result?.cached === true}`,
+        );
+        return result;
+      } catch (error) {
+        void ipcService.diagnostics.uiLog(
+          `流式开播 失败（回退既有链路） 耗时=${Math.round(performance.now() - started)}ms ${errorText(error, '未知错误')}`,
+        );
+        throw error;
+      }
+    },
+
     // 前缀先行开播：与 resolveNative 参数、返回结构完全一致，但产物是
     // `{vid}.prefix.mp4`——只含开头一小段，几秒内就能出画。整集是另一条并发请求，
     // 调用方拿到前缀先播、等整集落盘再切过去，用户不必盯着加载卡等满 6-11 秒。
     // 后端在整集已在盘上时直接返回整集（cached=true），调用方按"这就是最终文件"处理。
-    async resolveNativePrefix(seriesId: string, vid: string, contentType?: number, quality = 'auto'): Promise<{ playUrl: string; width: number; height: number; sizeBytes: number; cached: boolean }> {
+    async resolveNativePrefix(seriesId: string, vid: string, contentType?: number, quality = 'auto'): Promise<NativeResolved> {
       if (!isTauriEnvironment()) throw new Error('原生短剧播放仅在桌面应用中可用。');
       const started = performance.now();
       void ipcService.diagnostics.uiLog(`前缀 resolve 请求开始 vid=${vid} 档位=${quality}`);
       try {
-        const result = await invokeBackend<{ playUrl: string; width: number; height: number; sizeBytes: number; cached: boolean }>('short_drama_app_resolve_prefix', {
+        const result = await invokeBackend<NativeResolved>('short_drama_app_resolve_prefix', {
           input: { seriesId, vid, contentType, quality },
         });
         const ms = Math.round(performance.now() - started);

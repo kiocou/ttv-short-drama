@@ -22,10 +22,10 @@ use crate::pip::{pip_close, pip_dismiss, pip_handoff, pip_is_open, pip_open, pip
 use crate::provider::DramaProvider;
 use crate::short_drama_app::{
     short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
-    short_drama_app_cover_proxy, short_drama_app_episode_counts, short_drama_app_prefetch_stream,
-    short_drama_app_qualities, short_drama_app_resolve, short_drama_app_resolve_prefix,
-    short_drama_app_set_device, short_drama_app_shelf_feed, short_drama_app_status,
-    short_drama_app_stream,
+    short_drama_app_cover_proxy, short_drama_app_episode_counts, short_drama_app_open_stream,
+    short_drama_app_prefetch_stream, short_drama_app_qualities, short_drama_app_resolve,
+    short_drama_app_resolve_prefix, short_drama_app_set_device, short_drama_app_shelf_feed,
+    short_drama_app_status, short_drama_app_stream,
 };
 use crate::storage::Database;
 use crate::trace::{trace_clear, trace_tail, trace_ui_log};
@@ -44,7 +44,14 @@ struct AppState {
     /// Arc 是给 [`GuoProvider::catalog`] 的 SWR 后台刷新递 `Arc<Self>` 用的；
     /// 其余方法照常经 Deref 调用，调用点无感。
     guo_provider: Arc<crate::guo_provider::GuoProvider>,
-    database: Database,
+    /// Arc 是为了让**读命令**能把 `Database` 移进 `spawn_blocking`。
+    ///
+    /// 为什么必须这么做：`history_list` / `favorites_list` 这类命令此前是**同步**的
+    /// `#[tauri::command] fn`，Tauri 会在**窗口主线程**上直接执行它——SQLite 查询
+    /// 于是和渲染抢同一根线程。「打开应用」「回到发现页」时这几条命令恰好都在
+    /// 发车窗口里（设置/收藏/历史/目录四条并发），主观感受就是"页面卡住不动"。
+    /// 改成 async + spawn_blocking 之后，查询在阻塞池里跑，主线程只等 JoinHandle。
+    database: std::sync::Arc<Database>,
     sessions: Mutex<HashMap<u64, PlaybackSession>>,
     cache_dir: PathBuf,
 }
@@ -817,9 +824,14 @@ fn playback_snapshot(
     })
 }
 
+/// 读历史。**必须是 async**：同步命令会被 Tauri 放到窗口主线程上执行，
+/// SQLite 查询于是和渲染抢同一根线程（详见 `AppState::database` 的注释）。
 #[tauri::command]
-fn history_list(state: State<'_, AppState>) -> Result<Vec<WatchHistoryItem>, String> {
-    state.database.list_history()
+async fn history_list(state: State<'_, AppState>) -> Result<Vec<WatchHistoryItem>, String> {
+    let database = std::sync::Arc::clone(&state.database);
+    tauri::async_runtime::spawn_blocking(move || database.list_history())
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// 进全屏前窗口的"常规位置"（即标题栏"向下还原"的目标矩形）。
@@ -1094,12 +1106,16 @@ fn history_clear(state: State<'_, AppState>) -> Result<(), String> {
     state.database.clear_history()
 }
 
+/// 读收藏。与 `history_list` 同理：搬出主线程。
 #[tauri::command]
-fn favorites_list(
+async fn favorites_list(
     mark: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<FavoriteItem>, String> {
-    state.database.list_favorites(mark.as_deref())
+    let database = std::sync::Arc::clone(&state.database);
+    tauri::async_runtime::spawn_blocking(move || database.list_favorites(mark.as_deref()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1474,7 +1490,7 @@ fn main() {
                 provider,
                 anime_provider,
                 guo_provider,
-                database,
+                database: std::sync::Arc::new(database),
                 sessions: Mutex::new(HashMap::new()),
                 cache_dir,
             });
@@ -1553,6 +1569,9 @@ fn main() {
             short_drama_app_resolve,
             // 前缀先行开播：与整集同参数的另一条快链路，前端先拿它出画。
             short_drama_app_resolve_prefix,
+            // 边转边播：红果加密源直接转本地 H.264 HLS，首片约 1.1 秒落地。
+            // 与整集 resolve 并发跑，前者负责尽早出画、后者负责最终质量。
+            short_drama_app_open_stream,
             short_drama_app_cache_clear,
             short_drama_app_cache_usage,
             short_drama_app_stream,

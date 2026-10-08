@@ -59,6 +59,25 @@ pub fn needs_enhancement(url: &str) -> bool {
 
 /// 启动一条 H.264 HLS 增强流。源流失败时返回 Err，调用方继续用原 URL。
 pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> {
+    start_with_key(session_id, source_url, None).await
+}
+
+/// 与 `start` 相同，但可带**解密密钥**。
+///
+/// 红果的源是 CENC 加密的（`1:encrypt`），ffmpeg 需要 `-decryption_key` 才能读出
+/// 画面。加上这个参数之后，这条链路对红果也成立了 —— 而它带来的收益比 guo/直链
+/// 那条大得多：
+///
+/// 红果原先必须把整集下载+解密+转存成本地 mp4 才能播（实测 6.6–22.3 秒），
+/// 而改成「解密密钥 + 边解密边转 H.264 HLS」之后，**首片实测 1126ms 就落地**
+/// （含 API 往返的总首屏 3.3 秒）。这就是「先把画面出来、播放的同时再加载」。
+///
+/// `key_hex` 是 16 字节 AES-128 密钥的十六进制串；`None` 表示源未加密。
+pub async fn start_with_key(
+    session_id: u64,
+    source_url: &str,
+    key_hex: Option<&str>,
+) -> Result<String, String> {
     if source_url.trim().is_empty() || !needs_enhancement(source_url) {
         return Err("源流地址不支持增强转码。".to_owned());
     }
@@ -101,6 +120,12 @@ pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> 
         ffmpeg.display()
     ));
     let mut command = Command::new(ffmpeg);
+    // 解密密钥是**输入**选项，必须排在 `-i` 之前（与 -tls_verify 同一条规则：
+    // 写到 -i 之后会被解析到输出侧，而输出是 HLS 分片、没有解密封装器，等于被忽略，
+    // 结果是 ffmpeg 拿到密文解不出画面）。
+    if let Some(key) = key_hex.map(str::trim).filter(|value| !value.is_empty()) {
+        command.arg("-decryption_key").arg(key);
+    }
     // 关键：把 ffmpeg 的工作目录钉死在本次会话目录上。
     //
     // fMP4 的 init 段（`init.mp4`）在 ffmpeg 里是按**相对文件名**写出的，而
