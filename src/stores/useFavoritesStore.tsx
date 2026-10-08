@@ -93,7 +93,23 @@ export const FavoritesProvider: React.FC<{ children: ReactNode }> = ({ children 
   }, []);
 
   useEffect(() => {
-    void loadFavorites();
+    // 冷启动窗口里让路：设置/目录才是首屏必需的两条 IPC，而收藏列表要等用户
+    // 真的进收藏页才有用。挂到空闲回调上，既不与首屏抢窗口，也不改变语义——
+    // 用户点进收藏页时它几乎总是已经加载好了（空闲回调通常在几百毫秒内就跑到）。
+    //
+    // 兜底用 setTimeout：`requestIdleCallback` 在部分 WebView 版本里不存在，
+    // 而这里绝不能因为缺一个 API 就不加载（收藏页会永远空着）。
+    const schedule: (cb: () => void) => void =
+      typeof window.requestIdleCallback === 'function'
+        ? cb => window.requestIdleCallback(() => cb())
+        : cb => window.setTimeout(cb, 400);
+    let cancelled = false;
+    schedule(() => {
+      if (!cancelled) void loadFavorites();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadFavorites]);
 
   const setMark = useCallback(async (

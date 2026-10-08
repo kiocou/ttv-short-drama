@@ -130,10 +130,48 @@ export const DetailView: React.FC = () => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
   }, []);
 
+  /*
+    详情还没到手时的占位。
+
+    历史：这里原本是一个居中的转圈。它是「点进详情页卡一下」的直接来源 ——
+    详情是单次网络往返（实测 0.3–1.2 秒，慢源更久），而整屏只有一个 spinner，
+    用户既看不到剧名、也点不了返回，主观上就是"页面卡住了"。
+
+    改成**骨架屏**：版面结构与真实内容一致，用户立刻知道"要看到什么了"，
+    而且这是一次布局、不是一次跳变（真内容进来时位置对得上）。
+    返回按钮刻意做成可点 —— 转圈最气人的一点是"连退都退不出去"。
+  */
   if (!detail) {
     return (
-      <div className="flex-1 h-full flex items-center justify-center select-none">
-        <div className="w-7 h-7 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+      <div className="flex-1 h-full overflow-hidden select-none pb-12" aria-busy="true">
+        <div className="max-w-6xl mx-auto px-6 sm:px-8 pt-5 flex flex-col gap-6 animate-pulse">
+          <div className="flex items-center justify-between">
+            <button
+              onClick={goBack}
+              className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-white/85 hover:bg-white text-slate-700 hover:text-blue-600 shadow-xs border border-slate-200/70 text-xs font-semibold cursor-pointer active:scale-95 transition-all"
+              title="返回发现精选"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span>返回发现</span>
+            </button>
+            <div className="h-3 w-40 rounded-full bg-slate-200/80" />
+          </div>
+          <div className="flex flex-col md:flex-row gap-7 items-start">
+            <div className="w-44 sm:w-52 aspect-[3/4] rounded-2xl bg-slate-200/80 flex-shrink-0" />
+            <div className="flex-1 flex flex-col gap-3 pt-0.5">
+              <div className="h-3 w-24 rounded-full bg-slate-200/80" />
+              <div className="h-7 w-64 rounded-xl bg-slate-200/80" />
+              <div className="h-3 w-full max-w-lg rounded-full bg-slate-200/60" />
+              <div className="h-3 w-4/5 max-w-md rounded-full bg-slate-200/60" />
+              <div className="h-11 w-40 rounded-xl bg-slate-200/80 mt-2" />
+            </div>
+          </div>
+          <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2.5">
+            {Array.from({ length: 12 }).map((_, index) => (
+              <div key={index} className="h-9 rounded-lg bg-slate-200/70" />
+            ))}
+          </div>
+        </div>
       </div>
     );
   }
