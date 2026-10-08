@@ -268,6 +268,34 @@ export const ExploreView: React.FC = () => {
     };
   })();
 
+  /**
+   * 首页「继续观看」那张卡的**预签名**。
+   *
+   * 为什么值得为它单独写一段：点击「继续观看」时前端会直接 openEpisode，
+   * 而该集的整集下载要等 `resolve` 走完「两次 App API 往返 + 下载 + 解密」——
+   * 实测 API 往返这一段固定 2.5 秒，占前缀通道总耗时的一半以上。
+   *
+   * 详情页那条路径有详情接口的往返时间可以打掩护（用户在看简介），首页这张卡
+   * 是**从打开应用就一直在屏幕上的**，预热窗口有几分钟，比详情页更充分。
+   *
+   * `prefetchStream` 只做两次 API 往返、不下载任何媒体（几 KB），不会与首页的
+   * 目录请求抢带宽；命中后点击时这一步直接跳过。动漫与 guo 源不走这条链路
+   * （动漫有自己的解析、guo 是直链），所以先按 channel / id 前缀挡掉。
+   */
+  const warmResumeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (currentView !== 'explore' || !continueWatching) return;
+    const item = continueWatching;
+    // 动漫（dmghg / bfzy 前缀或 anime 频道）走 anime 分支的解析链路，预签名对它无意义。
+    if (item.channel === 'anime') return;
+    if (item.seriesId.startsWith('dmghg:') || item.seriesId.startsWith('bfzy:')) return;
+    // 同一集只预热一次：continueWatching 会随进度更新而频繁变化，不设闸门会反复重发。
+    const key = `${item.seriesId}:${item.episodeId}`;
+    if (warmResumeRef.current === key) return;
+    warmResumeRef.current = key;
+    void ipcService.playback.prefetchStream([item.episodeId], 1);
+  }, [currentView, continueWatching]);
+
   const handleRandomWatch = useCallback((series: SeriesItem, detail: SeriesDetail) => {
     const episode = detail.episodes.find(item => (item.watchedSeconds || 0) > 0 && !item.isFinished)
       || detail.episodes[0];
