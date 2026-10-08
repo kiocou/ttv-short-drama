@@ -1,5 +1,27 @@
 # 短剧播放器后端与架构设计
 
+> ⚠️ **状态：目标架构设计稿（不是现状说明）。**
+> 本文描述的是目标形态：模块化目录（`domain/` `application/` `infrastructure/` `adapters/`）、libmpv actor +
+> `mpv_render_context`/D3D11 合成、小黄鸭/RIFE 补帧、`commands/mod.rs` 拆分迁移。
+> **现状**：单层 `src-tauri/src/*.rs`（13 个模块，见 `AGENTS.md` §4）、播放内核是 WebView2 `<video>`、
+> 补帧引擎 0.2.5 整体移除、mpv 与外部播放器兜底 0.2.15 删除。本文与下面「现状对照」冲突时以现状为准。
+
+## 0. 现状对照（2026-10 校核）
+
+| 本文的说法 | 现状 |
+| --- | --- |
+| `src-tauri/src/{domain,application,infrastructure,adapters}/` | **不存在**。就是 `src-tauri/src/` 下一层的 13 个 `.rs` |
+| `short_drama.rs`、`playback/`、`commands/mod.rs` | 都不存在（残留描述）。真实入口是 `main.rs` 的 `generate_handler!` 命令注册表 |
+| libmpv actor / `mpv_render_context` + D3D11 compositor | 不存在。播放内核是 WebView2 `<video>`；HLS 走本地 `hls_proxy`（127.0.0.1 + 访问令牌） |
+| `PlaybackPlan { primary, fallbacks, expires_at }` | 没有这个结构。会话是 `PlaybackSession`（`models.rs`），存在 `AppState.sessions: Mutex<HashMap<u64, PlaybackSession>>` |
+| EnhancementManager / `FrameGenerationProvider` | 不存在。唯一增强是 `media_enhance.rs`（H.264 本地分片 HLS → 驱动侧 RTX VSR），开关 `vsr_enabled` |
+| SQLite 七张表（series / episodes / catalog_snapshots / playback_manifests / provider_health / kv_settings） | 实际只有三张：`watch_history`、`favorites`、`settings`（KV），开 WAL；目录与详情缓存都在内存里（`storage.rs`） |
+| 命令 `playback_set_quality` / `enhancement_capabilities` / `enhancement_set_preference` / `diagnostics_snapshot` | 都不存在。真实命令面见 `docs/backend-integration.md` 与 `main.rs` 的 `generate_handler!` |
+| 事件通道（`playback.state` / `stats` / `source-changed` …，有界队列） | 不存在。前端直接订阅 `<video>` 的 DOM 事件，会话判定靠自增 `sessionId`（不变量 2） |
+| 「视频媒体不由应用完整缓存」 | 已变更：红果短剧/漫剧是**整集下载解密后本地播放**，并带 7 天 / 1GB 的 LRU 预算（`short_drama_app.rs`） |
+| 「缓存目录必须用 `com.ttv.shortdrama`」 | 成立（`app_storage_root()`，见 `AGENTS.md` 不变量 7） |
+| 「禁止把用户输入直接当命令行参数传给 ffmpeg / mpv / 外部增强进程」 | 成立且范围已收窄：mpv 与外部播放器路径已于 0.2.15 删除 |
+
 ## 1. 目标与约束
 
 本文定义 TTV Short Drama 独立桌面程序的后端模块、播放稳定性策略、缓存策略和补帧集成方案。
@@ -178,32 +200,33 @@ SQLite 开启 WAL。核心表：
 
 | 表 | 作用 |
 | --- | --- |
-| `series` | 剧集基本信息、封面和来源 |
-| `episodes` | 集数、标题、来源标识和可用状态 |
-| `catalog_snapshots` | 目录分页快照和过期时间 |
-| `playback_manifests` | 解析结果元数据，不保存长期有效的敏感签名 |
-| `watch_history` | 位置、时长、完成状态和观看时间 |
-| `provider_health` | 来源错误计数、熔断时间和最近成功时间 |
-| `kv_settings` | 用户设置和增强偏好 |
+| `watch_history` | 每部剧一行（`series_id` 主键）：当前集、位置、时长、进度、完成标记、channel |
+| `favorites` | 收藏（`series_id` 主键）+ 分组标记、更新时间 |
+| `settings` | KV 表，整份 `UserSettings` 按 key 存 |
 
-缓存分层：内存 LRU 用于当前会话，磁盘缓存用于目录、详情和小型 manifest。视频媒体不由应用完整缓存，除非未来明确增加下载功能。缓存目录必须使用独立的 `com.ttv.shortdrama` 应用数据路径，不能继续与 TTV Box 共用 `com.ttv.player`。
+本文原来列的 `series` / `episodes` / `catalog_snapshots` / `playback_manifests` / `provider_health` / `kv_settings`
+**都不存在**（`src-tauri/src/storage.rs`）。剧集详情与目录分页缓存放在内存（`provider.rs` 的抓取缓存 +
+`main.rs` 的 `SearchCache`）；guo 目录缓存由 guo-core 自己维护在 `<app_dir>/guo-core`，**TTV 侧不存第二份**。
+
+缓存分层（现状）：内存 LRU 用于当前会话与目录/详情热点；磁盘用于**红果整集解密后的本地 mp4**（7 天 / 1GB 全局预算，LRU，见 `short_drama_app.rs`）与 guo-core 的封面缓存。缓存目录用独立的 `com.ttv.shortdrama` 应用数据路径（开发态落在 `src-tauri/.app-data/`），不与任何其它应用共用（不变量 7）。
 
 ## 7. IPC 与事件契约
 
 命令按领域划分：
 
 ```text
-catalog_list
-series_detail
-playback_open
-playback_command
-playback_snapshot
-playback_set_quality
-history_list
-history_save
-enhancement_capabilities
-enhancement_set_preference
-diagnostics_snapshot
+catalog_list / catalog_fast_search / catalog_suggest / catalog_categories
+series_detail / anime_qualities / guo_cover
+playback_open / playback_command
+short_drama_app_resolve / short_drama_app_resolve_prefix / short_drama_app_stream / short_drama_app_prefetch_stream
+history_list / history_save / history_remove / history_clear
+favorites_list / favorites_save / favorites_remove
+settings_get / settings_save / cache_clear / short_drama_app_cache_usage
+window_prepare_fullscreen / window_finish_fullscreen
+pip_open / pip_handoff / pip_report / pip_close / pip_dismiss / pip_is_open
+update_check / update_download / update_reveal / update_install / app_version
+trace_ui_log / trace_tail / trace_clear
+guo_source_status / guo_source_check / guo_proxy_get / guo_proxy_set
 ```
 
 事件至少包括：
@@ -217,7 +240,7 @@ diagnostics_snapshot
 }
 ```
 
-事件类型应覆盖 `state`、`stats`、`source-changed`、`enhancement-state`、`error` 和 `ended`。事件发布采用有界队列；UI 不可用时丢弃高频统计事件，但不得丢弃状态迁移和错误事件。
+**现状没有事件通道**：这套 `playback.*` 事件从未实现；`playback_snapshot` 命令也只剩一个恒返回占位值的壳（前端零调用方）。真实播放状态全部由前端 `<video>` 的 DOM 事件驱动，异步续体靠自增 `sessionId` 判 stale（不变量 2）。
 
 ## 8. 可观测性与安全
 
@@ -258,4 +281,11 @@ Tauri CSP、资源 scope 和外部请求白名单按最小权限配置。解析�
 
 ## 11. 当前实现对照
 
-独立项目已具备短剧目录、详情、播放、清晰度、自动连播和观看历史的兼容实现，且前端构建和桌面打包已通过。现有增强代码支持 `rife`、`lsfg` 和显示重采样，但真实小黄鸭接口尚未提供，因此当前只能记录为后备/兼容引擎。后续重构应以本文契约为边界，避免把现有大文件继续扩展成新的耦合点。
+现状（2026-10）：短剧/漫剧（红果官网 + App API + 19 个 guo 外部站源）、动漫专区（dmghg 正式源 + 暴风兜底）、
+画中画小窗、本地 HLS 代理与更新链路都已可用，前端构建与桌面打包在 CI 通过。
+
+原文说「现有增强代码支持 `rife`、`lsfg` 和显示重采样」——**已不成立**：补帧代码 0.2.5 整体删除，
+现在只有 `media_enhance.rs` 的 H.264 本地 HLS 转码（目的是让驱动侧 RTX VSR 生效，不变量 25）。
+
+后续演进**不要**照本文的目录结构做重构（那是一次从未发生的迁移）；要改就按 `AGENTS.md` §7 的外科手术式改法，
+别顺手重构仓库里的大文件。

@@ -1,5 +1,13 @@
 # 给同时在这个仓库工作的其他会话 —— 交接说明
 
+> **状态标注（2026-10-08 复核）**：这是一份**已完成的历史交接说明**（2026-09-18），**不是待办** —— 动漫正式源早已接入并长期运行。细节以 `docs/dmghg-reverse/REVERSE-NOTES.md` 与代码为准。
+>
+> - **「`main.rs` 只加了 1 行」已不成立**：现在 `main.rs` 里 dmghg 相关有 `mod dmghg_bridge;`（`src-tauri/src/main.rs:4`）、`anime_qualities` 命令（实现 `:502`，注册 `:1543`），以及动漫按来源分发的分支（搜索并流 `:284` / `:299`，详情按 id 前缀分流 `:632-635`，测试 `:1753`）。
+> - **行数已变**：`dmghg_bridge.rs` 现为 **1190 行**（`wc -l`；本文当时写「约 820 行」）。
+> - **测试数量以本地 `cargo test` 为准**：本文写的「35 passed」只是当时的读数，不再抄具体数字。
+> - **动漫链路现在还有暴风兜底源**：剧集 id 用 `bfzy:` 前缀（`src-tauri/src/anime_provider.rs:33` 的 `BFZY_ID_PREFIX`），与 `dmghg:` 前缀并列；**来源判定一律看 id 前缀**（`AGENTS.md` 不变量 9），不看 `use_dmghg()`、也不看前端 `channelBySeriesId`（它是内存 Map，重载/从收藏历史进入时为空）。
+> - 本文两个「务必知道的坑」（`DMGHG_LEGACY_DIRECT_HOST` 必须设成 `http://bkbfdm.hzhcbkj.cn`、集数与线路必须传字符串）**仍有效**。
+
 **时间：** 2026-09-18 12:35（00:05 版：只做逆向；后经用户同意已接入代码）
 **来自：** PI-Desktop 会话 `8667e9ac`（动漫源逆向 + 接入）
 

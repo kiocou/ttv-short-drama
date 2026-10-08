@@ -1,5 +1,16 @@
 # dmghg 逆向资料（动漫共和国概念版）
 
+> ✅ **状态：接口结论仍有效（2026-10 复核）。** 本文是 dmghg 正式源的逆向与接入记录（2026-09-18）：
+> 「直接驱动厂商 `electron_bridge.dll`」的结论、DLL 的 7 个 C ABI 导出、`part`/`play` 的字符串语义，
+> 以及下面「四个务必知道的坑」**都仍然成立**。细节以 `REVERSE-NOTES.md` 与代码为准。
+>
+> - 本文只讲 dmghg 这一条源。动漫链路现在**还有暴风兜底源**，剧集 id 前缀是 `bfzy:`
+>   （`src-tauri/src/anime_provider.rs` 的 `BFZY_ID_PREFIX`）。**来源判定一律看 id 前缀**
+>   （`AGENTS.md` 不变量 9），不看内存里的 `channelBySeriesId`。
+> - 「已接入 TTV」一节里的行数与清单是当时的快照，**已过时**（`dmghg_bridge.rs` 现为 1190 行、
+>   `main.rs` 的改动不止 `mod dmghg_bridge;`、测试数量以本地 `cargo test` 为准）。
+> - 第 4 个坑（三级兜底开关跨源污染）**已修复**，约束见 `AGENTS.md` 不变量 4。
+
 这个目录是**只读逆向**的产物：把动漫共和国概念版（dmghg）的接口摸清楚，
 给「动漫专区」接正式源用。**没有修改目标程序任何文件。**
 
@@ -69,7 +80,7 @@ os.environ["DMGHG_LEGACY_DIRECT_HOST"] = "http://bkbfdm.hzhcbkj.cn"
 `part` 和 `play` 的合法值从 `get_detail()["parts"]` 里取。
 第 3 条的完整分析见 `REVERSE-NOTES.md` 第 6.6 节。
 
-**4) 跨源/跨会话污染 —— 播完动漫后，漫剧和短剧就播不了**
+**4) 跨源/跨会话污染 —— 播完动漫后，漫剧和短剧就播不了（✅ 已修复；以下保留为历史记录）**
 
 这是**播放器自身的既有 bug**，不是动漫源引入的：
 
@@ -85,8 +96,9 @@ hasTriedNativeResolveRef.current = true; // 本地解析：本会话已试过
 于是播完一次，下一部剧的三级兜底腿全被残留顶掉：公开直链本来就注定被
 防盗链拦，兜底又全断，表现就是"播不了"。
 
-**修法**：进入非动漫路径前统一复位（`usePlaybackStore.tsx` 里那段
-「复位三级兜底开关」）。快路径若命中会在下面自己置 true，不受影响。
+**修法（已落地）**：进入非动漫路径前统一复位——`src/stores/usePlaybackStore.tsx` 里
+「复位三级兜底开关」那段（约 `:1869` 起）。快路径若命中会在下面自己置 true，不受影响。
+该约束现在记为 `AGENTS.md` 不变量 4：**改播放链路时不要删这次复位**。
 
 同场加映：`channelBySeriesId` 是**内存 Map**，页面重载 / HMR 后为空，
 从收藏、历史进入时也不会填。所以 `series_detail` / `playback_open`
@@ -99,7 +111,7 @@ hasTriedNativeResolveRef.current = true; // 本地解析：本会话已试过
 
 | 文件 | 改动 |
 |---|---|
-| `src-tauri/src/dmghg_bridge.rs` | **新增**。DLL 加载 + JSON RPC + 目录/详情/播放解析 + 清晰度档位 |
+| `src-tauri/src/dmghg_bridge.rs` | **新增**（现为 1190 行）。DLL 加载 + JSON RPC + 目录/详情/播放解析 + 清晰度档位 |
 | `src-tauri/src/anime_provider.rs` | 四条链路（列表/详情/档位/取播放地址）加正式源分支 |
 | `src-tauri/src/main.rs` | `mod dmghg_bridge;`、`anime_qualities` 命令、动漫分发按 id 前缀兜底 |
 | `src/services/ipc.ts` | `playback.animeQualities()` |
@@ -133,7 +145,7 @@ hasTriedNativeResolveRef.current = true; // 本地解析：本会话已试过
 
 ```bash
 cd src-tauri
-cargo test                      # 35 passed / 0 failed（含 dmghg_bridge 7 个单测）
+cargo test                      # 数量以本机读数为准（含 dmghg_bridge 的单测）
 cargo test dmghg_smoke -- --ignored --nocapture   # 真机冒烟：列表→详情→播放地址
 ```
 

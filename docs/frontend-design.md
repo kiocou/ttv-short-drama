@@ -1,5 +1,26 @@
 # 短剧播放器前端设计
 
+> ⚠️ **状态：目标架构设计稿（不是现状说明）。**
+> 本文描述的是**目标形态**：libmpv 播放内核、补帧引擎（小黄鸭 / RIFE）状态机、`app-runtime.js` 迁移。
+> 这些**都没有落地、也不会再落地**——播放内核是 WebView2 里的 `<video>` + MSE(hls.js)，补帧引擎已于 0.2.5
+> 整体移除，mpv 与外部播放器兜底已于 0.2.15 删除。本文与下面「现状对照」冲突时，**一律以现状为准**；
+> 写代码以 `AGENTS.md` + 代码为准。
+
+## 0. 现状对照（2026-10 校核）
+
+| 本文的说法 | 现状 |
+| --- | --- |
+| 主导航只有 发现 / 观看历史 / 设置 | 现在是 **发现 / 动漫 / 搜索 / 收藏 / 观看历史 / 设置**（`src/components/layout/NavigationRail.tsx`） |
+| 播放内核是 libmpv actor | WebView2 `<video>`。三块播放面：短剧/漫剧 `VideoSurface`（常驻 DOM）、动漫 `AnimeVideoSurface`（按需挂载）、画中画小窗 `MiniPlayer`（独立窗口） |
+| 播放增强（小黄鸭 / RIFE / 兼容模式）与 `EnhancementUiState` | 已整体移除（0.2.5）。现在唯一的增强是 `UserSettings.vsr_enabled` → `media_enhance.rs` 把源流转成 **H.264** 本地分片 HLS，让 NVIDIA 驱动触发 RTX VSR（H.264 是硬条件，见 `AGENTS.md` 不变量 25） |
+| `enhancement.getCapabilities()` / `enhancement.setPreference()` | 不存在。设置项只有 `default_quality` / `auto_next` / `catalog_cache_mb` / `playback_cache_mb` / `show_adult_sources` / `enabled_sources` / `vsr_enabled` / `launch_sound` / `hardware_acceleration`（`src-tauri/src/models.rs`） |
+| `playback.snapshot()` 读运行状态 | 命令还在，但恒返回 `kind: "opening"`、`duration: 0`、`volume: 1` 的占位值，前端**零调用方**；真实播放状态在 store 里由 `<video>` 的 DOM 事件驱动 |
+| 事件通道（`playback.state` / `stats` / `enhancement-state`，有界队列） | **不存在事件通道**。前端直接订阅 `<video>` 事件，会话判定靠自增 `sessionId`（不变量 2） |
+| 「前端不拼接解析 URL」 | 成立：所有后端交互都过 `src/services/ipc.ts`（另有 `pip.ts` / `windowFx.ts` / `updater.ts` 各自 invoke） |
+| §8「从 TTV Box 复制而来的 `app-runtime.js`」 | 仓库里**没有**这个文件，也没有任何 TTV Box 代码；拆分（`stores/` + `services/`）已经完成 |
+| 「不在首版范围内：成人内容」 | 已变更：19 个 guo 站源里有 6 个 18+，由「设置 → 内容源分级」显式开关控制（默认关闭，见不变量 19） |
+| 键盘：播放/暂停、左右 seek、上下集、全屏 | 成立；另有**长按 ← / → 固定 2 倍速**（`src/services/boostController.ts`，见 `CHANGELOG.md` 0.2.19） |
+
 ## 1. 文档目的
 
 本文定义 TTV Short Drama 独立桌面程序的前端页面、功能、交互和状态约定。本文暂不规定颜色、字体、圆角、阴影、动效等视觉样式，视觉设计应在本信息架构稳定后由设计稿和组件规范另行确定。
@@ -17,7 +38,7 @@
 | 播放 | 播放、暂停、进度、音量、全屏、清晰度、上一集/下一集 | 必须 |
 | 连播 | 播放结束倒计时、取消自动播放、下一集预解析 | 必须 |
 | 历史 | 最近观看、断点续播、移除单条、清空 | 必须 |
-| 播放增强 | 小黄鸭、RIFE、兼容模式、运行状态和降级提示 | 分阶段 |
+| ~~播放增强~~ | **已移除**（0.2.5 整体删除补帧；现有 `vsr_enabled` 只是触发驱动侧 RTX VSR） | 不适用 |
 | 诊断 | 网络、解析、缓冲、丢帧和增强状态 | 首版提供基础状态 |
 | 设置 | 默认清晰度、自动连播、增强偏好、缓存清理 | 必须 |
 
@@ -27,11 +48,14 @@
 
 ### 3.1 应用壳
 
-应用壳提供全局导航、搜索入口、网络/运行时状态、窗口操作和错误通知。主导航只保留：
+应用壳提供全局导航、搜索入口、网络/运行时状态、窗口操作和错误通知。主导航（**现状**；本文原本只列了三项）：
 
 1. 发现
-2. 观看历史
-3. 设置
+2. 动漫
+3. 搜索
+4. 收藏
+5. 观看历史
+6. 设置
 
 播放器是独立工作区，可从发现、历史或详情进入，也可以通过返回操作回到来源页面。应用壳不应在播放器工作区叠加详情弹窗或其他媒体模块。
 
@@ -85,7 +109,7 @@
 - 清晰度入口：展示后端返回的可选档位和当前档位；换清晰度必须保留播放位置。
 - 集数栏：显示当前剧集的完整或分组列表；当前集、已看集、不可用集有明确状态。
 - 连播提示：接近结尾时显示下一集标题、剩余秒数和取消按钮。
-- 增强状态：展示“关闭、预热中、运行中、已降级、不可用”等真实运行状态，并显示引擎和目标帧率（若有）。
+- ~~增强状态~~：**已移除**（0.2.5）。现状只有「设置 → 播放增强（RTX VSR）」一个开关，且不把不存在的档位显示成可用（不变量 8）。
 - 诊断入口：可查看缓冲时长、当前播放源、解码帧率、丢帧数和最近恢复原因。
 
 播放控制规则：
@@ -111,16 +135,20 @@
 
 ### 3.6 设置页
 
-设置页只呈现短剧播放器相关选项：
+设置页（**现状**；本文原本列的是目标形态）：
 
-- 默认清晰度：自动、最高可用、固定档位。
-- 自动连播：开启/关闭，连播倒计时秒数可配置。
-- 补帧引擎：自动、关闭、小黄鸭、RIFE、兼容模式。
-- 补帧倍率/性能档：由运行时能力返回可用选项。
-- 缓存：查看占用、清理目录缓存、清理解析缓存。
-- 诊断：导出匿名运行日志，不包含播放令牌和完整 URL。
+| 设置项 | 现状 |
+| --- | --- |
+| 默认清晰度 | `default_quality`；后端 `settings_save` 会把它**强制为 `auto`**（不变量 8） |
+| 自动连播 | `auto_next`，另有连播倒计时 |
+| 补帧引擎 / 补帧倍率 | **不存在**（0.2.5 移除；`preferred_engine` 字段保留但恒为 `off`） |
+| 播放增强 | `vsr_enabled`：把源流转成 H.264 本地 HLS，触发驱动侧 RTX VSR |
+| 内容源分级 | `show_adult_sources`（默认关）+ `enabled_sources`（勾选启用的站源 id） |
+| 缓存 | `catalog_cache_mb` / `playback_cache_mb` + 真实占用与清理 |
+| 启动音 | `launch_sound`（默认开，见不变量 26） |
+| 版本与更新 | 走 Rust 侧 `update_*`（见不变量 13 的补充三/五） |
 
-设置修改后显示“已保存”或明确错误。增强相关设置在能力探测完成前不可选择，不应让用户误以为功能已可用。
+设置修改后显示「已保存」或明确错误。**不要把不存在的档位显示成可用**（不变量 8）。
 
 ## 4. 前端状态模型
 
@@ -149,23 +177,40 @@ type EnhancementUiState =
 
 ## 5. 前端与后端契约
 
-前端不拼接解析 URL，不读取本地缓存路径，不直接操作 mpv。建议使用统一的 IPC 客户端：
+前端不拼接解析 URL，不读取本地缓存路径，不直接操作 mpv。现状就是统一的 IPC 客户端（`src/services/ipc.ts`），命令面如下：
 
 ```ts
-catalog.list(input): Promise<CatalogPage>
-series.getDetail(input): Promise<SeriesDetail>
-playback.open(input): Promise<PlaybackSession>
-playback.command(input): Promise<void>
-playback.snapshot(input): Promise<PlaybackSnapshot>
-history.list(input): Promise<WatchHistory[]>
-history.save(input): Promise<void>
-enhancement.getCapabilities(): Promise<EnhancementCapabilities>
-enhancement.setPreference(input): Promise<void>
+// 目录 / 搜索
+catalog.list(filter)            // catalog_list
+catalog.fastSearch(filter, kw)  // catalog_fast_search（门闩守卫必须早于缓存查表）
+catalog.suggest(kw, channel)    // catalog_suggest
+catalog.categories(filter)      // catalog_categories
+// 详情 / 封面 / 档位
+series.getDetail(seriesId)      // series_detail
+series.guoCover(seriesId)       // guo_cover（直达类：18+ 源被关时返回 Err）
+series.animeQualities(id)       // anime_qualities
+// 播放
+playback.open(input)            // playback_open（sessionId 从 100 起自增）
+playback.command(cmd)           // playback_command
+playback.resolveNative(...)     // short_drama_app_resolve / _resolve_prefix / _stream / _prefetch_stream
+// 本地数据
+history.list() / history.save() / history.remove() / history.clear()
+favorites.list() / favorites.save() / favorites.remove()
+settings.get() / settings.save()
+cache.clear() / cache.usage()   // cache_clear / short_drama_app_cache_usage
+// 窗口 / 小窗 / 更新 / 诊断
+window.prepareFullscreen() / window.finishFullscreen()
+pip.open(handoff) / pip.handoff() / pip.report() / pip.close() / pip.dismiss() / pip.isOpen()
+update.check() / update.download() / update.install() / update.reveal() / app.version()
+trace.tail(cursor) / trace.uiLog(line) / trace.clear()
 ```
 
 事件统一包含 `sessionId` 和时间戳。未知事件类型必须被忽略并记录诊断日志，不能导致界面崩溃。
 
 ## 6. 播放全链路
+
+> 下面的时序图是**目标形态**（libmpv + 独立增强管理器）。现状：解析在 Rust（红果 worker / guo FFI / 动漫桥），
+> 播放由前端的 `<video>` / hls.js 承担，**没有增强管理器**，也没有事件通道。
 
 ```mermaid
 sequenceDiagram
@@ -204,4 +249,7 @@ sequenceDiagram
 
 ## 8. 迁移说明
 
-当前独立项目仍包含从 TTV Box 复制而来的大型 `app-runtime.js`。它可以作为兼容期实现，但新设计应逐步拆为 `catalog`、`series`、`playback`、`history`、`settings` 和 `diagnostics` 前端模块，并通过单一 IPC 客户端访问 Rust。迁移完成前不得继续向旧全局状态追加新的短剧功能。
+原文说「项目仍包含从 TTV Box 复制而来的大型 `app-runtime.js`，应逐步拆分」——**这个文件在仓库里从来不存在**，拆分也早已完成：
+`src/stores/`（app / catalog / playback / animePlayer / history / favorites / settings 七个独立 store）+ `src/services/`
+（`ipc.ts` 是唯一后端入口，另有 pip / windowFx / updater / hlsAttach / animePlayback 等专职模块）。
+新增功能按 §3 的约定进对应 store，**不要**再引入跨领域的全局状态。

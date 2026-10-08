@@ -1,5 +1,20 @@
 # TDD：Magpie 实时画质增强与视频补帧集成
 
+> ❌ **方案状态：未采纳（Draft 冻结；2026-10 复核）。**
+> 本文提议的「外部 Magpie 协调 + 整窗口 Graphics Capture + 光流补帧」**从未落地**，且方向已被推翻：
+> `Magpie` 在 `src/` 与 `src-tauri/src/` 里**零命中**；本文第 5 / 9 / 10 / 11 章列出的
+> `src-tauri/src/enhancement/*`、`enhancement_*` 命令、`src/stores/useEnhancementStore.tsx`、
+> `src/types/enhancement.ts`、`src/services/enhancement.ts`、`enhancement://` 事件、
+> `ttv-magpie-v1` 命名管道与 `videoEnhancement` 配置项，**在仓库里都不存在**。
+>
+> **被采纳的只有目标，不是手段**：播放增强改由 `src-tauri/src/media_enhance.rs` 实现 —— 把源流转成
+> **H.264** 本地分片 HLS，让 NVIDIA 驱动自行触发 RTX VSR（H.264 是硬条件，见 `AGENTS.md` 不变量 25）；
+> 开关是 `UserSettings.vsr_enabled`（`src-tauri/src/models.rs`）。补帧引擎已于 0.2.5 整体移除。
+>
+> **以什么为准**：以代码 + `CHANGELOG.md` 为准（`AGENTS.md` §6）。若将来重启这个方向，第 5 / 9 / 10 / 11 章
+> 的文件路径与 IPC 契约需要全部重写；本文里仍准确的部分只有「`preferredEngine` / `targetFps` 恒为 off」
+> 这类与现状一致的结论。
+
 | 字段 | 内容 |
 |---|---|
 | 项目 | TTV Short Drama |

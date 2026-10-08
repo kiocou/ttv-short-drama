@@ -1,5 +1,18 @@
 # 动漫共和国概念版（dmghg）接口逆向笔记
 
+> ✅ **状态：逆向证据链仍有效（2026-10 复核）—— 本文正文保持原样，不改写。**
+> 性质：对用户本机已安装客户端的**只读逆向**（2026-09-18，目标程序零改动）。
+>
+> - **仍然有效**：`electron_bridge.dll` 的 7 个 C ABI 导出与 JSON 信封协议、`part` / `play` 的语义、
+>   legacy 直连主机、服务端防重放，以及「`Authentication` 头离线造不出来」这个结论。
+> - **已过时**：第 7 节「接入方案」里的行数、文件清单与「`main.rs` 只加 1 行」之类的施工细节 ——
+>   现状见 `src-tauri/src/dmghg_bridge.rs`（1190 行）、`src-tauri/src/anime_provider.rs`、
+>   `src-tauri/src/main.rs` 的 `anime_qualities` 命令。
+> - **补充现状**：动漫链路现已并存**暴风兜底源**（剧集 id 前缀 `bfzy:`，见 `anime_provider.rs`）；
+>   播放地址若为 m3u8 或非 https 一律经 `hls_proxy` 转本地流播放（`anime_provider.rs` 里的
+>   `hls_proxy::proxied_url` 调用点，以及本文第 6.6 节的分析）。
+> - 冲突时以代码 + `CHANGELOG.md` 为准（`AGENTS.md` §6）。
+
 日期：2026-09-18
 目标：`C:\Users\kioco\AppData\Local\Programs\动漫共和国概念版`
 方法：**全程只读**（静态字符串/PE 解析 + Frida 抓包 + 直接驱动厂商 DLL）。未修改目标程序任何文件。

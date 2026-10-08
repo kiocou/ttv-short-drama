@@ -28,9 +28,10 @@ TTV Short Drama —— **Windows 专属**的短剧 / 漫剧 / 动漫桌面播放
 ```bash
 # 前端
 npm ci                      # 严格按锁文件安装（CI 用这个）
-npm run dev                 # Vite dev server → http://127.0.0.1:5175（strictPort）
+npm run dev                 # Vite dev server → http://127.0.0.1:5175（tauri dev 时带 --strictPort）
 npx tsc --noEmit            # 类型检查（CI 第一步）
 npm run build               # tsc + vite build → dist/
+npm run verify:boost        # 长按加速状态机的 36 条确定性用例（唯一的自动化前端用例，不在 CI 里）
 npm run preview             # 预览构建产物 → 127.0.0.1:4173
 
 # Rust
@@ -56,7 +57,7 @@ Windows 批处理脚本（本机环境专用，含硬编码路径）：
 | `start-dev-safe.bat` | C 盘满盘兜底：临时目录与 WebView2 user-data 全落项目盘，再拉起 exe |
 | `release.ps1` / `release.bat` | 一键发布：检查 → 构建 → 抽 CHANGELOG → 发 GitHub Release（见 §2.1） |
 
-**改完必须跑的验证**：`npx tsc --noEmit` + `cargo clippy ... -D warnings` + `cargo test --bins`。CI 就这三项加 `npm run build`（见 `.github/workflows/ci.yml`）。改了 `src-tauri/guo-core/**/*.go` 还要 `go test ./...` 与 `pwsh -File src-tauri/guo-core/build.ps1` —— **CI 不跑 Go**，Go 侧回归全靠本地。
+**改完必须跑的验证**：`npx tsc --noEmit` + `cargo fmt --check` + `cargo clippy ... -D warnings` + `cargo test --bins`。CI 就这四项加 `npm run build` 与一次随包资源存在性校验（见 `.github/workflows/ci.yml`）。改了 `src-tauri/guo-core/**/*.go` 还要 `go test ./...` 与 `pwsh -File src-tauri/guo-core/build.ps1` —— **CI 不跑 Go**，Go 侧回归全靠本地。同理 **`npm run verify:boost` 也不在 CI 里**（动了长按加速就必须手动跑）。CI 的资源校验只查 `python/python.exe`、`shortdrama-worker/worker.py`、`mpv/ffmpeg.exe` 三项，**没查 `guo-core/duanju_core.dll`**。
 
 ### 2.1 发布流程
 
@@ -85,12 +86,15 @@ src/
 │   ├── guoSources.ts 19 个 guo 站源的静态清单（kind / adult）+ tab 与启用集过滤
 │   ├── animePlayback.ts 动漫专区独立播放内核（源形态判定 / hls.js 挂载 / 出帧看门狗）
 │   ├── hlsAttach.ts  m3u8 挂载与 hls.js 生命周期
+│   ├── boostController.ts 长按临时加速状态机（速率/阈值唯一来源，配 scripts/verify-boost.mjs）
+│   ├── launchAudio.ts 启动音（振荡器现场合成，零音频资源；cue 常量与动画共用）
+│   ├── playbackTrace.ts 播放链路诊断埋点
 │   ├── windowFx.ts   原生全屏唯一入口
 │   ├── pip.ts        画中画小窗交接协议（窗口标签判定 / 交接包 / 进度回传）
 │   └── updater.ts     检查更新（GitHub Releases，走 Rust 不走 CSP）
 ├── stores/       Context 状态机：app / catalog / playback / animePlayer / history / favorites / settings
 ├── components/   layout · common · player · views
-└── styles/       mica.css · crystal.css（玻璃材质与动效）
+└── styles/       mica.css（底衬）· crystal.css（玻璃材质）· launch.css（启动动画）
 ```
 
 约定：
@@ -98,29 +102,34 @@ src/
 - **前端不拼接解析 URL、不读缓存路径、不直接操作播放器进程**。所有后端交互都过 `ipcService`，靠 `isTauriEnvironment()` 分流到 Tauri 命令或 mock。
 - **视图切换是常驻 DOM + `hidden`**，不卸载（`App.tsx` 里每个 view 一行 `block`/`hidden`）。这既是动效需要，也是多个历史 bug 的来源（见 §5）。
 - 新领域状态建独立 store，不要往 `useAppStore` 或单个大 store 里堆。
-- **`usePlaybackStore.tsx`（2.7k 行）是短剧/漫剧主链路**，`useAnimePlayerStore.tsx`（740 行）是动漫专区，两者**完全独立**；画中画小窗是第三块播放面（`MiniPlayer.tsx`）。改动漫不会碰短剧，反之亦然。
+- **启动动画（`components/layout/LaunchAnimation.tsx` + `styles/launch.css` + `services/launchAudio.ts`）只在冷启动跑一次**，动画与音效共用一组时间常量；它跑完就 unmount，不要改成常驻 + `display:none`（边界见 §5-26）。
+- **`usePlaybackStore.tsx`（约 3.1k 行）是短剧/漫剧主链路**，`useAnimePlayerStore.tsx`（约 810 行）是动漫专区，两者**完全独立**；画中画小窗是第三块播放面（`MiniPlayer.tsx`）。改动漫不会碰短剧，反之亦然。
 
 ## 4. Rust 后端结构
 
 | 模块 | 行数 | 职责 |
 | --- | --- | --- |
-| `main.rs` | 1422 | 窗口/状态装配、全部 Tauri 命令、全屏前置处理、WebView2 启动参数、数据根目录、搜索缓存、18+ 门闩 |
-| `provider.rs` | 2602 | 红果官网抓取：目录分页、题材路由、搜索（含中文数字归一 + App 联想合并） |
-| `short_drama_app.rs` | 2225 | 红果 App-API 桥：设备凭据、worker 调度、预签名、整集解密下载、缓存预算与淘汰 |
-| `guo_provider.rs` | 1472 | guo 站源桥：FFI 加载、19 源目录/详情/分集/取流、封面缓存、画质探测、死源冷却、代理模式、错误脱敏 |
-| `dmghg_bridge.rs` | 1074 | 驱动厂商 `electron_bridge.dll`（JSON RPC），目录/详情/播放地址/清晰度档位 |
-| `anime_provider.rs` | 526 | 动漫源分发：dmghg 正式源 / 暴风兜底源，按 id 前缀与源可用性选择 |
-| `hls_proxy.rs` | 488 | 本地 HLS 代理（127.0.0.1，带访问令牌，分块流式转发） |
-| `pip.rs` | 412 | 画中画小窗（label: `mini`）：置顶无边框窗口创建/复用、交接包与进度回传、关闭回报 |
-| `update.rs` | 559 | 客户端更新：查 GitHub Releases、下载安装包到下载目录、静默安装并退出 |
-| `storage.rs` | 310 | SQLite：历史、收藏、设置 |
-| `models.rs` | 353 | 跨 IPC 的 serde 契约 |
+| `main.rs` | 1832 | 窗口/状态装配、全部 Tauri 命令、全屏前置处理、WebView2 启动参数、数据根目录、搜索缓存、18+ 门闩 |
+| `provider.rs` | 2834 | 红果官网抓取：目录分页、题材路由、搜索（含中文数字归一 + App 联想合并） |
+| `short_drama_app.rs` | 3420 | 红果 App-API 桥：设备凭据、worker 调度、预签名、整集解密下载、缓存预算与淘汰 |
+| `guo_provider.rs` | 1742 | guo 站源桥：FFI 加载、19 源目录/详情/分集/取流、封面缓存、画质探测、死源冷却、代理模式、错误脱敏 |
+| `dmghg_bridge.rs` | 1190 | 驱动厂商 `electron_bridge.dll`（JSON RPC），目录/详情/播放地址/清晰度档位 |
+| `anime_provider.rs` | 562 | 动漫源分发：dmghg 正式源 / 暴风兜底源，按 id 前缀与源可用性选择 |
+| `hls_proxy.rs` | 520 | 本地 HLS 代理（127.0.0.1，带访问令牌，分块流式转发） |
+| `media_enhance.rs` | 688 | 播放增强：把源流转成 **H.264** 本地分片 HLS，让驱动侧 RTX VSR 生效（会话上限 8，见 §5-25） |
+| `pip.rs` | 472 | 画中画小窗（label: `mini`）：置顶无边框窗口创建/复用、交接包与进度回传、关闭回报 |
+| `update.rs` | 774 | 客户端更新：查 GitHub Releases、下载安装包到下载目录、四道校验后静默安装并退出 |
+| `storage.rs` | 321 | SQLite：历史、收藏、设置（WAL，单连接） |
+| `models.rs` | 490 | 跨 IPC 的 serde 契约 |
+| `trace.rs` | 391 | 播放链路诊断日志：内存环形缓冲 + 落盘 `ttv-playback.log` + 接管原生 stderr |
+
+（行数是 2026-10 的量级，只用来判断文件大小，**不要当契约**。`guo-core/` 未计入。）
 
 **`src-tauri/guo-core/` 是第三方 Go 源码**（Go module `duanjuapp/native`，已整棵入库）：`bridge/main.go` 是 c-shared 导出层（`DuanjuRequest` / `DuanjuFree`），`core/` 是各站源 provider，`diag/probe_sources.py` 是逐源体检脚本。Rust 侧只经 `guo_provider.rs` 的 FFI 调它，**不要在 Rust 里重写站源解析，也不要在 Go 里塞 UI 概念**。
 
 单元测试写在各自 `.rs` 底部的 `#[cfg(test)] mod tests`；需要真机/联网的冒烟测试标 `#[ignore]`（如 `dmghg_smoke`），默认不跑。`guo_provider.rs` 里有几条不加载 DLL 也能跑的纯函数测试（`next_sequence` / `retain_recent_sessions` / `catalog_cooldown_active` / 分类归一化），另有 `bridge_loads_and_initializes` 会真去 LoadLibrary。
 
-Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状态进程**，`stdout` 逐行输出 JSON（`{"event":"progress"}` / `{"ok":true}` / `{"ok":false,"error"}`），由 Rust 注入 `TTV_SD_*` 环境变量。子命令：`resolve` / `stream` / `album`。
+Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状态进程**，`stdout` 逐行输出 JSON（`{"event":"progress"}` / `{"ok":true}` / `{"ok":false,"error"}`），由 Rust 注入 `TTV_SD_*` 环境变量。子命令白名单：`resolve` / `resolve-prefix` / `stream` / `album` / `search` / `counts` / `feed`（见 `worker.py` 的 `main()`），另有 `selftest`。
 
 ## 5. 必须遵守的不变量（都是踩过的坑）
 
@@ -135,7 +144,7 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 9. **动漫 id 判定一律看前缀**：剧集 id 带 `dmghg:`，集 id 编码为 `线路|集名`。`channelBySeriesId` 是内存 Map，页面重载 / HMR 后为空，从收藏或历史进入也不会填，不能作为来源判定依据。
 10. **HEVC 依赖 WebView2 `PlatformHEVCDecoderSupport`**。不要加回 `--disable-gpu-compositing`：它会让全部渲染退回软件光栅（界面有 30 处 `backdrop-blur`）并让平台 HEVC 硬解失效，直接导致"该媒体无法由 WebView 解码"。
 11. **整集解析是单飞（leader/follower）**。预取与前台换集可能同时打同一集，只有 leader 跑 worker，follower 等产物。按 mtime 清理缓存时**不能删除很新的 `.part.mp4` / `.source.tmp`**，那是并发 worker 正在写的半成品。
-12. 前端错误文案**不泄露**内部 URL、令牌、文件路径；`external_player_open` 只接受 `https://` 且不得把用户输入直接当命令行参数。guo 侧的错误统一过 `sanitize_guo_error`（剥 URL/域名/IP，把 `HTTP 404/403/429`、`context deadline exceeded`、`no such host` 翻译成人话），原始错误只进 stderr。
+12. 前端错误文案**不泄露**内部 URL、令牌、文件路径；任何把用户输入当命令行参数传给外部进程的路径都必须白名单化（`external_player_open` 这条外部播放兜底已于 0.2.15 删除，现在不存在任何外部播放器路径）。guo 侧的错误统一过 `sanitize_guo_error`（剥 URL/域名/IP，把 `HTTP 404/403/429`、`context deadline exceeded`、`no such host` 翻译成人话），原始错误只进 stderr。
 13. **画中画小窗是第三块 `<video>`，但播放权同一时刻只属于一个窗口**（小窗 = 独立置顶窗口 `mini`，见 `src-tauri/src/pip.rs` + `src/services/pip.ts`）。交接时主窗口先 `pause()` 再离开播放器视图（`stopPlayback` 作废会话 + 落盘）；主窗口要自己起播时先 `dismissPip()` 收掉小窗。交接包里传的是**身份 + 播放参数**（seriesId / episodeId / 秒数 / 音量 / 静音 / 倍速 / 连播设置 / 集列表），**不传播放地址**——动漫链路主窗口挂的是 hls.js 的 MSE `blob:`（跨窗口不可用），所以小窗自己按同一条 IPC 命令重新解析。另：两个窗口各自持有一份前端会话号计数（都从 100 起），靠"播放权唯一"避开撞号；若将来允许两路同时播，必须把会话号收口到后端。
     （补充：创建小窗的 `pip_open` **必须是 `async` 命令** —— 同步命令跑在主线程上，而 `WebviewWindowBuilder::build()` 在主线程里要内联建窗口、又需要事件循环继续泵消息，两边互等会让这次 IPC 永不返回、小窗停在 `about:blank`。小窗起播还必须容忍 WebView2 的省电暂停：小窗刚创建时还没有前台激活权限，首次 `play()` 几乎必定抛 `AbortError`，而小窗的常态就是"别的窗口在前台"，所以要靠"播放意图 + 周期重试"自己接上，不能只挂 `focus`/`visibilitychange`。）
     （补充二：**停播必须自己动手，不能指望"窗口没了声音就停"**。窗口 `hide()` 之后音频照旧在播（Chromium 标准行为），而页面的 `document.visibilityState` 仍是 `visible` —— 前端根本发现不了自己被藏起来，"声音停掉"曾完全依赖销毁 webview，而 `destroy()` 是异步投递且可能失败。因此 `pip.rs` 里停播、隐藏、销毁是**三步分开的**：先注入停播脚本（`pause()` + 清 `src` + `load()`）→ 再 `hide()` → 留 150ms 排空 → 最后销毁；销毁失败退化为 `close()` 并写 stderr，不得静默吞错。系统关闭路径（Alt+F4）同样要在 **`CloseRequested`** 里补停播，`Destroyed` 是事后的、什么都来不及。另：那 150ms 内窗口可能被 `pip_open` 重新 `show()` 复用，销毁前必须先看可见性，否则会出现"点了画中画、小窗闪一下就没"。）
@@ -174,21 +183,32 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
       - 开关是设置项 `launchSound`，Rust 侧用 `#[serde(default = "default_true")]` —— `#[serde(default)]` 对 bool 只会给 `false`，而这里要的默认是**开**。它**异步读回来**，而启动动画在设置之前就起跑了（子组件的 effect 先于祖先组件执行），所以前端判定用 `!== false`（`undefined` 当开），并在设置落地为关时立刻 `dispose(120)` —— 此刻底噪还没涨起来，120ms 淡出等于没出声。这是个**有意的、约 100ms 的窗口**，代价远小于让所有人都慢半拍。
       - 收尾必须 `dispose()` 释放 `AudioContext`，否则 Windows 的"音量合成器"里会挂一个常驻条目；`dispose` 与动画的 `cancelAll` **分开走**（动画要立刻回终态，声音要淡出，硬停会"啪"一下）。
 
-## 6. 文档与现实存在偏差（重要）
+## 6. 文档地图与偏差（重要）
 
-本仓库的文档描述的是**目标架构**，代码是**兼容期实现**。不要照文档写代码：
+**权威顺序：代码 > `CHANGELOG.md` > `AGENTS.md` > 其它文档。** 除前三者外，仓库里的文档都带**状态标签**，读之前先看标签：
 
-- `docs/frontend-design.md` / `docs/backend-architecture.md` 讲的是 libmpv actor、`mpv_render_context` + D3D11 合成、小黄鸭/RIFE 补帧、`commands/mod.rs` 拆分迁移。**现状**：WebView2 `<video>` + MSE(hls.js)，补帧引擎已整体移除；mpv 与 `external_player_open` 外部播放兜底也已于 0.2.15 一并删除（零调用方），现在不存在任何外部播放器路径。
-- `README.md` 提到的 `src/stores/useEnhancementStore.tsx`、`src-tauri/src/rtx_vsr.rs`、`lossless_scaling.rs` 都**不存在**。`Cargo.toml` 里关于它们的注释同样是残留 —— 那段注释提到的 `Win32_System_LibraryLoader` 现在有真实用途：`guo_provider.rs` 用它 `LoadLibraryA` 加载 `duanju_core.dll`。
-- 前端设计文档里"主导航只保留发现/历史/设置"也已过时：现在还有动漫、收藏、搜索。
-- 根目录的分析报告（`红果短剧抓包分析报告*.md`、`画质档位分辨率实测验证.md`、`短剧画质链路集成实施方案.md`）是**阶段性调研记录**，不随代码更新，读它们时以代码为准。
+| 文档 | 状态 | 说明 |
+| --- | --- | --- |
+| `README.md` | ✅ 现状 | 项目定位、功能、随包资源、目录结构 |
+| `docs/backend-integration.md` | ✅ 现状 | 后端命令面与数据归属 |
+| `docs/dmghg-reverse/` | ✅ 接口有效 | 动漫共和国逆向记录与 `electron_bridge.dll` 调用契约；施工细节（行数、文件清单）已过时 |
+| `docs/frontend-design.md`、`docs/backend-architecture.md` | ⚠️ 目标架构设计稿 | 讲的是 libmpv actor、`mpv_render_context` + D3D11 合成、小黄鸭/RIFE 补帧、`commands/mod.rs` 拆分迁移。**现状**：WebView2 `<video>` + MSE(hls.js)；补帧引擎 0.2.5 整体移除；mpv 与外部播放兜底 0.2.15 删除（零调用方） |
+| `docs/design-proposals/magpie-video-enhancement-integration.md` | ❌ 未采纳 | 外部 Magpie 协调 + 整窗口捕获方案，从未落地；真正的增强是 `media_enhance.rs` 的 H.264 本地 HLS（见 §5-25） |
+| 根目录 `红果短剧*.md`、`画质档位分辨率实测验证.md`、`短剧画质链路集成实施方案.md` | ⚠️ 阶段性存档 | 抓包原始记录 / 实测数据 / 未实施的设计稿，不随代码更新。其中 `画质档位分辨率实测验证.md` 的档位矩阵仍是权威证据 |
+| `design-proposals/` | ⚠️ 设计稿存档 | 原型预览，不参与构建（`launch-animation/` 的方案 05 已落地，边界见 §5-26） |
 
-**冲突时以代码 + `CHANGELOG.md` 为准。** 改动行为后同步更新 `CHANGELOG.md`（它的写法是记录根因与实测数据，不是罗列改动）。
+其它容易踩的残留：
+
+- `src/stores/useEnhancementStore.tsx`、`src-tauri/src/rtx_vsr.rs`、`lossless_scaling.rs` 都**不存在**；`Cargo.toml` 里关于它们的注释是残留。那段注释提到的 `Win32_System_LibraryLoader` 现在有真实用途：`guo_provider.rs` 用它 `LoadLibraryA` 加载 `duanju_core.dll`。
+- `docs/` 与根目录报告里出现的 worker 子命令 `rank` / `latest`、`short_drama_app_preload`、`preloadNative`、`variant_cache`、`bitrateKbps`、`TTV_SD_SOURCE_TMP`，以及 `enhancement_*` 命令与 `enhancement://` 事件，**在代码里都不存在**，别照它们找实现。
+- 文档里的「主导航只保留发现/历史/设置」也已过时：现在还有动漫、收藏、搜索。
+
+**冲突时以代码 + `CHANGELOG.md` 为准。** 改动行为后同步更新 `CHANGELOG.md`（它的写法是记录根因与实测数据，不是罗列改动）；改了模块/命令/资源清单后，同步更新本文件的 §3/§4/§6 与 `README.md`。
 
 ## 7. 代码风格
 
 - 注释用中文，解释**为什么**，并带上实测根因、反例或历史事故。"这段代码在做什么"式的复述注释不要写。负面结论要如实保留（"这条链路实测固定 2.16s"、"该模式会漏掉 108 个 .pyd"、"guo 弹幕不可达"），它们防止后来者重走弯路。
-- 修改保持外科手术式：只动任务涉及的部分。仓库里有很多大文件（`provider.rs` 2.6k 行、`usePlaybackStore.tsx` 2.7k 行、`guo-core/core/` 整棵 Go 树），**不要顺手重构**。`guo-core/` 是上游代码，改动前先确认它是不是应该在本仓库改。
+- 修改保持外科手术式：只动任务涉及的部分。仓库里有很多大文件（`provider.rs` 2.8k 行、`usePlaybackStore.tsx` 3.1k 行、`short_drama_app.rs` 3.4k 行、`guo-core/core/` 整棵 Go 树），**不要顺手重构**。`guo-core/` 是上游代码，改动前先确认它是不是应该在本仓库改。
 - 保留既有注释，尤其是带历史结论的那些。
 - 写不变量时把"为什么不能那样写"一起写进去：本仓库的注释密度高是刻意的，它们是下一个人唯一能拿到的实测数据。
 
@@ -213,4 +233,6 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 - [ ] 触及 guo 链路时：sequence 高水位、bridge 单锁不跨 await、分类 id 映射、18+ 门闩两侧名单是否同步
 - [ ] 触及网络/CSP/新域名时：`tauri.conf.json` 的 `csp` 与 `assetProtocol.scope` 已同步
 - [ ] 触及交互的改动在 **Tauri 窗口里**（不是浏览器）验证过 —— 全屏、HEVC、CSP、WebView2 省电暂停这些只在窗口里才暴露
+- [ ] 改了 `src/services/boostController.ts` / 长按加速：`npm run verify:boost` 通过（36 项，**不在 CI 里**）
+- [ ] 文档口径变了（模块、命令、资源清单、方案状态）：`README.md` 与 `AGENTS.md` §3/§4/§6、相关文档的状态标签已同步
 - [ ] `CHANGELOG.md` 已按"根因 + 实测"风格更新
