@@ -346,7 +346,7 @@ def should_copy_video(codec: str) -> bool:
     这就是设置页「RTX VSR 视频增强」开关在红果链路里的落地语义：
 
       * 开关**关** → 完全回到引入 RTX VSR 之前的播放链路。那条链路对红果
-        整集用的就是 `-c copy` 重封装（见 .workbuddy/memory/2026-10-07.md
+        整集用的就是 `-c copy` 重封装（本机实测记录
         的实测：同一条链路 copy 是 0.87s / 10.8MB）。播放器只要求"WebView2
         能解出画面"，本机已开 PlatformHEVCDecoderSupport，H.265 源也照播，
         因此这里不再为了一样用不上的 VSR 去做整集重编码。
@@ -955,7 +955,7 @@ def _ffmpeg_direct_decrypt(ffmpeg: str, url: str, key_hex: str | None,
     # copy_video：源档本身就是 H.264 时**不重编码**，只把解密后的裸流重新封装。
     # 这一条只改 CPU 占用，不改下载时间——但正是它把"整集重编"这笔成本变成零：
     # 历史实测同一条链路 -c copy 是 0.87s / 10.8MB，而 libx264/ultrafast 整集
-    # 重编是 9.99s / 157.5MB（膨胀 15 倍，见 .workbuddy/memory/2026-10-07.md）。
+    # 重编是 9.99s / 157.5MB（膨胀 15 倍，本机实测）。
     # 输出仍是 H.264，RTX VSR 的硬条件（AGENTS.md 不变量 25）不受影响。
     #
     # 音轨仍然转 AAC：音频重编的代价可以忽略，而源音频是什么编码我们并不
@@ -967,7 +967,7 @@ def _ffmpeg_direct_decrypt(ffmpeg: str, url: str, key_hex: str | None,
     )
     # `-tls_verify 0` 与 `-rw_timeout` 必须写在 **`-i` 之前**。
     #
-    # 这是整条链路最隐蔽的一处坑，实测（.workbuddy/probe-tls.ps1）：
+    # 这是整条链路最隐蔽的一处坑，本机实测：
     #   * 写成 `-i <url> -tls_verify 0 ...` → ffmpeg 在**打开输入**时用的是
     #     默认的证书校验，直接 `error:0A000086:lib(20)::reason(134)` +
     #     `Error opening input: I/O error`，115ms 就失败。它被解析成了输出侧

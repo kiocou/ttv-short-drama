@@ -9,7 +9,13 @@ import sys
 import tempfile
 import time
 
-DLL = r"D:\Users/<user>\Desktop\TTV Short Drama\src-tauri\resources\guo-core\duanju_core.dll"
+# DLL 路径：优先环境变量 TTV_GUO_CORE_DLL，否则按仓库相对位置推断
+# （脚本在 src-tauri/guo-core/diag/，DLL 在 src-tauri/resources/guo-core/）。
+DLL = os.environ.get("TTV_GUO_CORE_DLL") or os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "resources", "guo-core", "duanju_core.dll"
+))
+if not os.path.exists(DLL):
+    raise SystemExit(f"找不到 duanju_core.dll: {DLL}\n可设环境变量 TTV_GUO_CORE_DLL 指定路径。")
 
 SOURCES = [
     "hongguo", "huangdou", "huangju", "yeguo", "dsd", "huangguoai", "huangguo-video",

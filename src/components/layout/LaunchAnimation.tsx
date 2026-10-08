@@ -9,7 +9,7 @@ import { startLaunchAudio, type LaunchAudioController } from '../../services/lau
  * 六张迷你海报绕品牌公转 1.1 圈（角速度由快到慢），然后依次被吸进中心；
  * 品牌承接六次撞击、回弹一次，再淡出让位给主界面。总长 2150ms。
  *
- * 设计稿与全部备选方案在 design-proposals/launch-animation/。
+ * 设计稿与全部备选方案属于维护者本地材料，不在公开仓库内。
  *
  * ── 为什么动画写在 JS 里而不是 CSS ──
  *
