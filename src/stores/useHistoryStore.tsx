@@ -29,7 +29,20 @@ export const HistoryProvider: React.FC<{ children: ReactNode }> = ({ children })
   }, []);
 
   useEffect(() => {
-    loadHistory();
+    // 与收藏同理：历史列表不急在冷启动这一刻。挂到空闲回调，让设置与目录先走。
+    // 进观看历史页时 HistoryView 自己还会按 `currentView === 'history'` 再拉一次，
+    // 所以即使这里被推迟得很晚，用户看到的也不会有陈旧数据。
+    const schedule: (cb: () => void) => void =
+      typeof window.requestIdleCallback === 'function'
+        ? cb => window.requestIdleCallback(() => cb())
+        : cb => window.setTimeout(cb, 400);
+    let cancelled = false;
+    schedule(() => {
+      if (!cancelled) void loadHistory();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadHistory]);
 
   const removeRecord = useCallback(async (seriesId: string) => {

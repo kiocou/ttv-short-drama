@@ -15,7 +15,7 @@ const PAGE_SIZE = 30;
  * 分类联动与红果频道切换深度耦合）；这里自带轻量分页与缓存，逻辑独立。
  */
 export const AnimeView: React.FC = () => {
-  const { navigateTo } = useAppStore();
+  const { navigateTo, currentView } = useAppStore();
 
   /**
    * 全部卡片共用这一个点击回调（卡片自己带上 seriesId）。
@@ -102,10 +102,22 @@ export const AnimeView: React.FC = () => {
     }
   }, []);
 
-  // 首次进入与切换分类
+  /*
+    首次**进入本页**与切换分类时才取数。
+
+    历史：这个 effect 只依赖 `[category, loadPage]`，而本视图是**常驻 DOM**
+    （切换视图只切 hidden，不卸载），于是它在**应用启动那一刻**就会发一次动漫
+    目录请求——即使用户根本没打算看动漫。冷启动本来就有设置/收藏/历史/红果目录
+    四条 IPC 在抢窗口，再叠一条跨进程 FFI 的动漫目录，首屏可用时间被白白推后。
+
+    加上 currentView 守卫之后：只在真的停在动漫页时才拉；从别的页面切回来时
+    currentView 变化会重新触发一次（`loadPage` 自带 `anime_${cat}_${page}` 缓存，
+    命中即同步返回，所以来回切页面不会产生重复请求）。
+  */
   useEffect(() => {
+    if (currentView !== 'anime') return;
     void loadPage(1, category, false);
-  }, [category, loadPage]);
+  }, [currentView, category, loadPage]);
 
   // 无限滚动
   useEffect(() => {
