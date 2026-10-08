@@ -4,6 +4,7 @@ import { ipcService, errorText } from '../services/ipc';
 import { WatchHistoryItem } from '../types/history';
 import { enabledSourcesForTab, adultTabSources } from '../services/guoSources';
 import { useSettingsStore } from './useSettingsStore';
+import { tracePlayback as traceCatalog } from '../services/playbackTrace';
 
 interface CatalogContextType {
   channel: ChannelType;
@@ -250,14 +251,44 @@ const loadMoreFailuresRef = useRef(0);
     pageFor: (source: string) => number,
     force = false,
   ) => {
+    /**
+     * 单源等待上限。**这是首屏的关键闸门**。
+     *
+     * 为什么必须有：`Promise.allSettled` 是"等最慢的那个"，而 guo 源走的是
+     * `spawn_blocking` + guo-core **内部 60 秒**超时（`main.rs` 的注释原文）。
+     * 默认配置只启用红果时问题被掩盖；用户一旦在设置里勾上第 2、第 N 个源，
+     * 首屏耗时立刻变成"最慢那个源"——一个死源就能把发现页钉住几十秒，
+     * 而界面上只有一个转圈，看起来就是"卡死/加载不出来"。
+     *
+     * 6 秒的依据：正常源实测 0.4–1.5 秒返回，慢源 3–5 秒也够；再长用户已经在
+     * 盯着空页面等了。到点的那一路按"本轮失败"处理（不置 hasMore=0，
+     * 下一轮 loadMore 还会再试它），所以**不会**把慢源永久踢出。
+     */
+    const SOURCE_TIMEOUT_MS = 6000;
+    let timedOut = false;
     const settled = await Promise.allSettled(sources.map(source => {
       const page = pageFor(source);
-      return requestCatalog(
+      const request = requestCatalog(
         `${source}_${base.channel}_${base.category}_${base.audience}_${base.sort}_${base.keyword || ''}_p${page}`,
         { ...base, source: source === 'hongguo' ? undefined : source, page },
         force,
       );
+      return Promise.race([
+        request,
+        new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`等待超过 ${SOURCE_TIMEOUT_MS / 1000} 秒`));
+          }, SOURCE_TIMEOUT_MS);
+        }),
+      ]);
     }));
+    if (timedOut) {
+      // 到点没回来的源不会因为这次超时被放弃：`allSettled` 已经把它们的
+      // rejected 结果记为"本轮失败"，下一轮 loadMore 仍会重试。这里只记一行
+      // 日志，便于排查"某次首屏为什么少了一个源的内容"。
+      traceCatalog(`目录聚合：有源超过 ${SOURCE_TIMEOUT_MS}ms 未返回，先用已有结果渲染`);
+    }
 
     const seen = new Set<string>();
     const items: SeriesItem[] = [];

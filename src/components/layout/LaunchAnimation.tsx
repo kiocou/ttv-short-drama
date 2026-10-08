@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useCatalogStore } from '../../stores/useCatalogStore';
+// launch 不再依赖目录状态（见下方揭幕 effect 的长注释）。
 import { useSettingsStore } from '../../stores/useSettingsStore';
 import { startLaunchAudio, type LaunchAudioController } from '../../services/launchAudio';
 
@@ -486,7 +486,9 @@ export const LaunchAnimation: React.FC = () => {
    * 和启动动画同时起跑 —— 这里不做"催它去加载"，只做"等它回来"。
    * 用 ref 承接而不是放进 effect 依赖：那会让整条时间线重启。
    */
-  const { isLoading: catalogLoading } = useCatalogStore();
+  // 刻意**不订阅目录的 isLoading**：揭幕已经与目录加载解耦（见下面那个 effect
+  // 的长注释）。订阅它会让这份 785 行的动画在目录每次更新时白白重渲染一轮，
+  // 而启动这一刻它本来就是白幕期，重渲染纯属浪费。
 
   /**
    * 启动音开关。设置还没读回来时 `settings` 就是 `DEFAULT_SETTINGS`（开），
@@ -659,12 +661,22 @@ export const LaunchAnimation: React.FC = () => {
     return cancelAll;
   }, [phase, finish, reveal, cancelAll]);
 
-  // 首页目录就绪 → 只要甲段已经跑完就立刻揭幕
+  /*
+    揭幕**不再等首页目录**。
+
+    历史（这是一处真正的「打开就卡」来源）：揭幕条件原本是 `!catalogLoading`，
+    也就是把「用户能看到界面」这件事绑死在**目录网络请求完成**上。
+    实测时间线是 PHASE_A_END(1700ms) + 目录耗时：单源常见 2.3 秒揭幕、
+    最坏 3.2 秒（冷启动四条 IPC 抢窗口 + 任一源慢）；而目录里的
+    `requestAllSources` 甚至没有总超时，最慢的源可以把它拖到 60 秒。
+
+    现在改成：甲段跑完就揭幕（目录由首页自己画骨架/骨架卡片），
+    目录回来再填内容。用户要的是"点了就有反应"，而不是"等网络"。
+    这条同时让 `catalogLoading` 彻底退出揭幕条件——它连 `readyRef` 都不再写。
+  */
   useEffect(() => {
-    if (catalogLoading) return;
     readyRef.current = true;
-    reveal();
-  }, [catalogLoading, reveal]);
+  }, []);
 
   /*
     设置是异步读回来的，而启动动画在设置之前就起跑了（子组件的 effect 先于祖先组件执行）
