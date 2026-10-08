@@ -173,6 +173,9 @@ type EnhancementUiState =
   | { kind: 'faulted'; reason: string };
 ```
 
+> `EnhancementUiState` 与整套增强状态**已随 0.2.5 的补帧移除一起作废**（见 §0）；`PlaybackUiState` 也从未作为
+> 类型实现过——真实状态是 `usePlaybackStore` 里的字段 + `<video>` 事件。
+
 目录、详情、历史和设置也应各自拥有 `idle/loading/ready/error` 状态，并通过请求编号或取消信号防止竞态覆盖。
 
 ## 5. 前端与后端契约
@@ -192,7 +195,7 @@ series.animeQualities(id)       // anime_qualities
 // 播放
 playback.open(input)            // playback_open（sessionId 从 100 起自增）
 playback.command(cmd)           // playback_command
-playback.resolveNative(...)     // short_drama_app_resolve / _resolve_prefix / _stream / _prefetch_stream
+playback.resolveNative(...)     // short_drama_app_resolve / short_drama_app_resolve_prefix / _stream / _prefetch_stream
 // 本地数据
 history.list() / history.save() / history.remove() / history.clear()
 favorites.list() / favorites.save() / favorites.remove()
