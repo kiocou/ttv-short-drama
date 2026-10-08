@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | 短剧 / 漫剧 | 红果官网 + App API | 网页抓取目录，App API 取播放地址；整集下载解密后本地播放 |
 | 短剧 / 漫剧 | guoapp 外部站源（19 个，其中 6 个 18+） | 通过 `duanju_core.dll` FFI 承接目录 / 搜索 / 详情 / 分集 / 真实清晰度 / 取流；剧集 ID 统一为 `guo:<source>:<id>`。**红果被显式排除在这条链路外**（红果 id 是裸 `series_id`） |
-| 动漫 | 动漫共和国（正式源）/ 暴风资源（兜底） | 动漫共和国驱动厂商桥接取直链；不可用时自动回退公开兜底源 |
+| 动漫 | 动漫共和国 / 暴风资源（兜底） | 经**私有渠道**取直链；不可用时自动回退公开兜底源 |
 
 外部站源的可用性由**站方**决定，且**死源无法在代码里修活**——因此应用带一套五步链路体检（入口与目录 → 分集目录 → 播放地址与播放列表 → 播放密钥 → 媒体连接），在「设置 → 站源状态」可逐源现场跑一次并看到每一步的 host / HTTP 状态 / 耗时。没体检过的一律显示「未检测」，**不显示成「可用」**。
 
@@ -103,41 +103,14 @@ CI 会启用 LFS 并校验这些资源存在，避免生成缺少运行时文件
 ```text
 TTV Short Drama/
 ├── AGENTS.md                     # 给 AI 代理的入口：不变量、命令、环境陷阱（改代码前先读它）
-├── docs/                         # 设计与逆向资料（多为目标架构 / 阶段性存档，见「文档地图」）
+├── docs/                         # 设计与调研资料（多为目标架构 / 阶段性存档，见「文档地图」）
 ├── design-proposals/             # 原型与设计稿存档（不参与构建）
 ├── src/
 │   ├── types/                    # 领域契约（catalog / series / playback / history / favorite / settings）
-│   ├── services/
-│   │   ├── ipc.ts                # 唯一后端入口 + sessionId 分配 + 详情缓存 + mock 降级
-│   │   ├── guoSources.ts         # 19 个 guo 站源静态清单（kind / adult）+ tab 与启用集过滤
-│   │   ├── pip.ts                # 画中画小窗交接协议
-│   │   ├── updater.ts            # 检查更新（走 Rust，不走被 CSP 收紧的页面 fetch）
-│   │   ├── hlsAttach.ts          # m3u8 挂载与 hls.js 生命周期
-│   │   ├── animePlayback.ts      # 动漫链路挂载与出帧看门狗
-│   │   ├── boostController.ts    # 长按临时加速状态机（速率 / 阈值唯一来源）
-│   │   ├── launchAudio.ts        # 启动音（振荡器现场合成，零音频资源）
-│   │   ├── playbackTrace.ts      # 播放链路诊断埋点
-│   │   ├── windowFx.ts           # 原生全屏唯一入口
-│   │   └── mockData.ts           # Web / 演示模式数据源
-├── docs/                         # 设计与逆向资料
-├── design-proposals/             # 方案预览（播放器设计稿、随机推荐页 10 套方案，不参与构建）
-├── src/
-│   ├── types/                    # 领域契约（catalog / series / playback / history / favorite / settings）
-│   ├── services/
-│   │   ├── ipc.ts                # 唯一后端入口 + sessionId 分配 + 详情缓存
-│   │   ├── guoSources.ts         # guo 外部站源静态表（结构性属性 + 分级）
-│   │   ├── pip.ts                # 画中画小窗交接协议
-│   │   ├── updater.ts            # 检查更新（GitHub Releases）
-│   │   ├── hlsAttach.ts          # m3u8 挂载与 hls.js 生命周期
-│   │   ├── animePlayback.ts      # 动漫链路挂载
-│   │   ├── windowFx.ts           # 原生全屏唯一入口
-│   │   └── mockData.ts           # Web / 演示模式数据源
+│   ├── services/                 # 后端入口与专职模块：ipc / pip / updater / hlsAttach / animePlayback
+│   │                             #   / boostController / launchAudio / playbackTrace / windowFx / guoSources
 │   ├── stores/                   # Context 状态机：app / catalog / playback / animePlayer / history / favorites / settings
-│   ├── components/
-│   │   ├── layout/               # TitleBar, NavigationRail, ToastContainer, LaunchAnimation
-│   │   ├── common/               # MicaCard, FluentButton, CoverImage, SeriesCard, UpdatePrompt, …
-│   │   ├── player/               # VideoSurface, AnimeVideoSurface, MiniPlayer, PlayerHud, …
-│   │   └── views/                # Explore / Anime / Detail / Search / History / Favorites / Settings / ShelfMore
+│   ├── components/               # layout · common · player · views
 │   └── styles/                   # mica.css（底衬）· crystal.css（玻璃材质）· launch.css（启动动画）
 ├── src-tauri/
 │   ├── src/
@@ -176,9 +149,8 @@ TTV Short Drama/
 | 本 README | ✅ 现状 | 项目定位、功能、随包资源、目录结构 |
 | [`docs/frontend-design.md`](./docs/frontend-design.md)、[`docs/backend-architecture.md`](./docs/backend-architecture.md) | ⚠️ 目标架构设计稿 | 描述的是**目标形态**（libmpv actor、补帧、模块化目录），与现状不符；现状以代码为准 |
 | [`docs/backend-integration.md`](./docs/backend-integration.md) | ✅ 现状 | 后端命令面与数据归属 |
-| [`docs/dmghg-reverse/`](./docs/dmghg-reverse/) | ✅ 仍有效 | 动漫共和国逆向记录与 DLL 调用契约（接口部分有效，施工细节已过时） |
 | [`docs/design-proposals/magpie-video-enhancement-integration.md`](./docs/design-proposals/magpie-video-enhancement-integration.md) | ❌ 未采纳 | 外部 Magpie 增强方案，从未落地 |
-| 根目录 `红果短剧*.md` / `画质档位分辨率实测验证.md` / `短剧画质链路集成实施方案.md` | ⚠️ 阶段性存档 | 抓包原始记录、实测数据与未实施的设计稿，不随代码更新 |
+| 根目录 `画质档位分辨率实测验证.md`、`短剧画质链路集成实施方案.md` | ⚠️ 阶段性存档 | 实测数据与未实施的设计稿，不随代码更新 |
 | [`design-proposals/`](./design-proposals/) | ⚠️ 设计稿存档 | 原型预览，不参与构建 |
 
 **任何冲突都以代码 + `CHANGELOG.md` 为准。**
@@ -186,7 +158,7 @@ TTV Short Drama/
 ## 免责声明
 
 - 本项目**不存储、不托管、不传播**任何视频内容，仅为播放器前端；所有剧集数据与媒体流均来自第三方公开接口，请求由用户本机直接发出。
-- 项目中的第三方站点适配部分（含 `docs/dmghg-reverse/` 的调研记录）仅用于**接口互通性研究**，不包含也未分发任何第三方客户端二进制。
+- 项目中的第三方站点适配部分来自**私有渠道**调研，仅用于**接口互通性研究**；仓库不包含也未分发任何第三方客户端二进制。
 - 请自行确认在所在地区的合法性，**禁止用于商业用途**。因使用本项目产生的任何后果由使用者自行承担。
 - 若权利人认为本项目侵犯其权益，请提 Issue 联系删除相关适配代码。
 
