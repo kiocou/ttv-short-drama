@@ -1,11 +1,20 @@
 ## Unreleased
 
+### 整理（面向公开仓库）
+
+- **把维护者本地材料移出公开仓库（`git rm --cached` + `.gitignore`，文件仍留在本机）。** 收口三类：**智能体提示词**（`AGENTS.md`、`.zcodeignore`）、**设计与调研稿**（`docs/`、`design-proposals/`、根目录两份实测/设计记录）、**品牌素材库**（`VidCom图标库/`；App 图标另有 `public/app-icon.png` 与 `src-tauri/icons/`，不受影响）。移出后公开仓库只剩源码 + `README` / `CHANGELOG` / `LICENSE` 三份 Markdown。
+  - **为什么是「移出」而不是删除**：它们对本机维护仍有用（`AGENTS.md` 是改代码前的必读清单），删掉等于丢东西。要恢复任意一项：`git add -f <路径>`。
+  - **顺带脱敏**：`build.bat` / `start-dev-safe.bat` / `release.ps1` 里写死的本机 Rust、Node 安装路径，改为**环境变量（`TTV_CARGO` / `TTV_NODE` / `TTV_CARGO_BIN`）→ PATH** 的顺序查找；`guo-core/diag/probe_sources.py` 的 DLL 路径改为 `TTV_GUO_CORE_DLL` → 仓库相对位置；`CHANGELOG` / `media_enhance.rs` / `worker.py` 里指向本机工作区（`.workbuddy/*`）的实验记录引用改为中性描述。
+  - **本机要沿用原来的绝对路径，请先设上述环境变量**——否则这几个脚本会直接报「找不到 cargo / node」。
+  - **`.gitignore` 同步重写**：本地材料与各类 AI 工具工作区（含会话记录、真实源地址、样本与截图）统一登记，并补 `.cline-home/`，避免以后误提交。
+  - ⚠️ **只改工作分支**：`main` 与 git 历史里这些文件仍在；历史清理需要重写 + 强推，**未执行**。
+
 ### 文档
 
 - **全仓库文档与代码对齐（纯文档改动，不改任何行为）。** 起因是一次逐文件核对，发现三处「文档说的和代码做的不是一回事」：README 里「检查更新**不会自动安装**」早在 0.2.15 就被推翻（`update_install` + `app.exit(0)`），却一直留在用户可见的位置；`AGENTS.md` §4 的模块表漏了 `media_enhance.rs` 与 `trace.rs`、且 11 个模块的行数全部过期；`docs/backend-integration.md` 的命令面还停在 `enhancement_*` 时代。
   - **做法**：给每份非权威文档加**状态标签**（✅ 现状 / ⚠️ 目标架构 / ⚠️ 阶段性存档 / ❌ 未采纳），并在 `README.md` 与 `AGENTS.md` §6 建了一份「文档地图」，一次说清「哪些能照抄、哪些只能当证据」。权威顺序统一为 **代码 > `CHANGELOG.md` > `AGENTS.md` > 其它文档**。
   - **同步的硬事实**：Rust 模块表（13 个模块 + 现行行数）、worker 子命令白名单（`resolve / resolve-prefix / stream / album / search / counts / feed`）、真实 Tauri 命令面与三条零调用的历史命令、SQLite 实际只有三张表（`watch_history` / `favorites` / `settings`，WAL）、随包资源清单（`duanju_core.dll` 缺了应用起不来，但 CI 未校验它）、`npm run verify:boost` 不在 CI 里、启动动画实现总长 2150ms（设计稿标称 2300ms）。
-  - **明确写进文档的「不要照做」**：`docs/frontend-design.md` / `docs/backend-architecture.md` 的 libmpv + 补帧 + `domain/application/infrastructure/adapters` 目录结构从未落地；`docs/design-proposals/magpie-video-enhancement-integration.md` 的 Magpie 方案未采纳；根目录几份报告里的 `rank` / `latest`、`short_drama_app_preload`、`preloadNative`、`variant_cache`、`bitrateKbps`、`TTV_SD_SOURCE_TMP` 等标识符在代码里零命中。
+  - **明确写进文档的「不要照做」**：那两份目标架构稿里的 libmpv + 补帧 + `domain/application/infrastructure/adapters` 目录结构从未落地；Magpie 增强方案未采纳；调研记录里的 `rank` / `latest`、`short_drama_app_preload`、`preloadNative`、`variant_cache`、`bitrateKbps`、`TTV_SD_SOURCE_TMP` 等标识符在代码里零命中。
   - 本次**只动 Markdown**（`git diff --stat` 全是 `.md`）：既没有改代码，也没有改 CI。CI 的两个缺口（不跑 Go、资源校验漏 `duanju_core.dll`）只做了记录，修不修由后续单独决定。
 
 ### 移除
@@ -13,7 +22,7 @@
 - **仓库内不再保留「私有渠道」调研记录，相关表述统一为「私有渠道」。** 删除 `docs/` 下的私有渠道调研记录（8 个文件：调研笔记、参考实现、从第三方响应转储的脚本原件与样本数据）与三份红果侧调研报告（客户端分析、两批样本分析）；`README.md`、`AGENTS.md`、本文件、代码注释、`.gitignore` 与**打包进包的 worker**（`resources/shortdrama-worker/worker.py`、`liushen/device_register.py`）里的相关措辞一并改为「私有渠道」。
   - **为什么删**：这些材料不是项目内容——其中一份是从第三方响应里转储的脚本原件，其余是笔记与样本数据，留着没有维护价值，却让公开仓库替它们承担授权风险。该保留的**接口结论**都在代码注释与 `docs/backend-integration.md` 里，没有丢。
   - **代码只动了注释与一条用户可见文案**（`worker.py` 的设备身份报错措辞），无行为变更；`npx tsc --noEmit` 与 Python 语法校验通过。
-  - **保留了两份仍有价值的文档**：`画质档位分辨率实测验证.md`（档位矩阵是权威证据）与`短剧画质链路集成实施方案.md`（未实施设计稿），只去掉其中的样本获取方式表述。`LICENSE` 的授权范围**没有放宽**：三条说明仍然是「不在 MIT 范围内、权利属各自权利人、再分发前先移除」。
+  - **两份仍有价值的实测/设计记录当时保留在仓库**（档位矩阵与未实施设计稿），随后随下面的「仓库整理」一并移出公开仓库。`LICENSE` 的授权范围**没有放宽**：三条说明仍然是「不在 MIT 范围内、权利属各自权利人、再分发前先移除」。
   - ⚠️ **本次只删在工作分支上**：`main`、修包/分支与 git 历史（含已 clone 的副本与 fork）里依然能找到这些文件。要彻底清除需重写历史 + 强推，**尚未执行**。
 
 ## 0.2.19 - 2026-10-07
@@ -76,7 +85,7 @@
 
 ### 改进
 
-- **发布前完成两路并行只读代码审查**（Rust 后端 + 前端），各产出一份带行号、触发条件、后果与最小修法的报告（`.workbuddy/review-rust.md`、`.workbuddy/review-frontend.md`）。两份报告的一致结论：**架构纪律执行得干净**——常驻 DOM 无多余 key、三块 video 作用域、hls.js 生命周期、全屏唯一入口、类型安全零 `any`/`@ts-ignore`、全仓 138 处锁无跨 `await` 持锁、无 IPC 可达 panic、增强服务令牌 + 白名单三重收口且路径不可穿越、`kill_on_drop` 覆盖全部子进程。上面这批修复全部来自这两份报告。
+- **发布前完成两路并行只读代码审查**（Rust 后端 + 前端），各产出一份带行号、触发条件、后果与最小修法的报告（本机工作区，未入库）。两份报告的一致结论：**架构纪律执行得干净**——常驻 DOM 无多余 key、三块 video 作用域、hls.js 生命周期、全屏唯一入口、类型安全零 `any`/`@ts-ignore`、全仓 138 处锁无跨 `await` 持锁、无 IPC 可达 panic、增强服务令牌 + 白名单三重收口且路径不可穿越、`kill_on_drop` 覆盖全部子进程。上面这批修复全部来自这两份报告。
 - `short_drama_app` 的封面代理与 `hls_proxy` 的主机白名单标准此前不一致（前者校验初始 URL、后者只看 scheme），记入待办。
 ## 0.2.16 - 2026-10-07
 
@@ -108,7 +117,7 @@
 - **红果短剧首开不再干等整集：前缀先行开播，整集在后台补齐后无缝换源。** 上一轮的日志已经证明「首开很长时间」100% 发生在那一个 `resolve` await 里（实测 6.1–11.2 秒下整集），resolve 返回到首帧只有毫秒级。所以优化方向不是调参数，而是**别等整集**。
   - **两条链路并发**：前端在 `playNativeResolvedFile` 里先同步发出整集请求（`fullPromise`，不 await），再发前缀请求；Rust 侧两条命令的在途去重键不同（整集 `ns:quality:vid`，前缀 `ns:quality:vid:prefix`），因此互不阻塞、可同时跑两个 worker。谁先落盘谁先被用上，**绝不叠加延迟**。
   - **前缀为什么能直接播**：这条 CDN 是 faststart 布局，moov 在文件头部（实测 offset 28、约 250KB），所以 `Range: bytes=0-(N-1)` 截下来的前 2MB 解密后是一个**自洽可播的小片段**，不是残片。worker 侧新增 `download_prefix()` 与 `resolve-prefix` 子命令，产物 `{vid}.prefix.mp4`（指定档位是 `{vid}-{quality}.prefix.mp4`，`with_extension` 天然分开）。
-  - **本机实测**（`.workbuddy\test-prefix.ps1`，真实 CDN，vid=7691682207982685208）：签名 405ms → 播放模型 1127ms → 直链 1711ms → 前缀落盘 **4254ms**，TOTAL **4307ms** / 12,085,061 字节 / **13.67 秒**可播（h264 High 1920×1080 6939 kb/s + aac 128k）。对照同环境整集 6–11 秒，且整集此刻还在后台继续下。
+  - **本机实测**（本机探针脚本，真实 CDN，vid=7691682207982685208）：签名 405ms → 播放模型 1127ms → 直链 1711ms → 前缀落盘 **4254ms**，TOTAL **4307ms** / 12,085,061 字节 / **13.67 秒**可播（h264 High 1920×1080 6939 kb/s + aac 128k）。对照同环境整集 6–11 秒，且整集此刻还在后台继续下。
   - **前缀规模刻意留在默认 2MB**（`TTV_SD_PREFIX_BYTES`，:1186）。同一集用 4MB 复测：落盘 5401ms、产物 30.13 秒 —— 多等 1.1 秒只换来 16 秒额外覆盖，而整集通常 6–11 秒就会把前缀替换掉，那 16 秒用不上。13.67 秒覆盖足够撑到换源完成。
   - **换源不黑屏、不弹错**：前缀切到整集走 `adoptPreparedSource`（不调 `load()`，旧帧一直保留到新源 `loadeddata`），切完按 `currentTime` 对齐续播。四条退让全部静默：前缀没来 / 前缀播不起来 / 切源失败 / 集已在盘上（后端直接回整集并置 `cached: true`，此时**不走前缀**）——一律回退到改造前的整集链路，用户看不到任何错误页。
   - **不破坏既有语义**：全程同一 `sessionId`、同一 `episodeId`，`markSourceCommitted` / `pauseIfStale` 原样复用，连播四重闸门不受影响；前缀路径**永不写进** `resolvedFileByVidRef`（否则下次换集会命中一个只剩开头十几秒的短命文件）；从 `startPosition > PREFIX_COVERAGE_SECONDS` 续播时主动跳过前缀（前缀几乎立刻播到头，反而会先触发一次 `ended`）。
@@ -123,7 +132,7 @@
 - **「开关 VSR 都没用」的真正根因：`-tls_verify 0` 写在 `-i` 之后，从来没生效过。** 这条与「首开很慢」是同一个根因的两副面孔 ——
   它的一个直接后果就是每次起播都先白等一轮必然失败的拉流。
   - **机制**：ffmpeg 的输入选项必须排在 `-i` **之前**，写在后面会被解析成**输出**侧的选项；而输出是 HLS 分片 / 本地文件，根本没有网络输出流，于是该选项被静默忽略，输入仍走默认证书校验。随包 ffmpeg 没有 CA 证书链，所以「打开输入」这一步必然失败。
-  - **实测对照**（`.workbuddy/probe-tls.ps1`，同一条真实 CDN 地址）：`-i <url> -tls_verify 0 …` → **RC=-5 / 115ms 失败**，stderr `[tls @ …] error:0A000086:lib(20)::reason(134)` + `Error opening input: I/O error`；改成 `-tls_verify 0 … -i <url>` → **RC=0 / 704ms / 产出 5,915,296 字节**。
+  - **实测对照**（本机探针脚本，同一条真实 CDN 地址）：`-i <url> -tls_verify 0 …` → **RC=-5 / 115ms 失败**，stderr `[tls @ …] error:0A000086:lib(20)::reason(134)` + `Error opening input: I/O error`；改成 `-tls_verify 0 … -i <url>` → **RC=0 / 704ms / 产出 5,915,296 字节**。
   - **两处一起中招**：① 红果 worker 的 `_ffmpeg_direct_decrypt` 快速路径（ffmpeg 直连拉流 + 解密 + 转存一步到位）**从未真正生效**，每一集都退化成「python 完整下载整集写盘 → ffmpeg 读盘解密」的慢路径；② `media_enhance` 的增强转码从来没成功打开过源 —— 这才是「开关 VSR 都没用」在 guo / 公开直链场景下的真身。
   - **修法**：两处都把 `-tls_verify 0 -rw_timeout 60000000` 移到 `-i` 之前，注释里记下 115ms / 704ms 的对照。
   - **实测**（3 集 × VSR 开/关共 6 次，全部成功、不再出现「改用本地下载模式」）：4982ms / 35.9MB、4785ms / 38.6MB、6952ms / 64.6MB（对照修之前同样的一集要 7.5–8.5 秒，且日志里每次都先闪两次失败文案）。
@@ -150,7 +159,7 @@
   - **踩过的坑**：`cargo test` 会真的跑通 logger，把 2000 行「填充 N」写进用户真实目录下的 `ttv-playback.log`，把排障现场冲掉 —— 已用 `if cfg!(test) { return None; }` 拦住。
 
 - **修掉「首次打开视频一直加载等待」的真实根因：fMP4 的 `init.mp4` 从来没有落在会话目录里。** 这条不是参数调优问题，是产物压根不在该在的地方：
-  - **机制**：ffmpeg 写 fMP4 的 init 段用的是**相对文件名**，而 `-hls_segment_filename` 我们传的是**绝对路径**。于是只有分片落对了地方，`init.mp4` 悄悄掉进**父进程的当前工作目录**（会直接掉在工程根目录/桌面）。四组对照实测（`.workbuddy/exp-init.txt`）：不传 init 名 + cwd=工程根 → 会话目录内无 init；传相对名 `init.mp4` + cwd=根 → 会话目录内**仍然没有**；**cwd=会话目录 → 会话目录内有 init.mp4 ✅**；传绝对路径 → ffmpeg 直接失败 `Failed to open segment '<abs>/init.mp4'`。
+  - **机制**：ffmpeg 写 fMP4 的 init 段用的是**相对文件名**，而 `-hls_segment_filename` 我们传的是**绝对路径**。于是只有分片落对了地方，`init.mp4` 悄悄掉进**父进程的当前工作目录**（会直接掉在工程根目录/桌面）。四组对照实测：不传 init 名 + cwd=工程根 → 会话目录内无 init；传相对名 `init.mp4` + cwd=根 → 会话目录内**仍然没有**；**cwd=会话目录 → 会话目录内有 init.mp4 ✅**；传绝对路径 → ffmpeg 直接失败 `Failed to open segment '<abs>/init.mp4'`。
   - **两处后果正好对应用户的两条反馈**：① `ready()` 要求 `index.m3u8` 与 `init.mp4` 同时存在 → **恒为 false** → `start()` 每次都会死等满 `READY_WAIT` 才把地址交出去，这正是"首次打开一直在加载"里后端按住的那一段；② 就算把地址交出去，播放列表里 `#EXT-X-MAP:URI="init.mp4"` 的请求必然 404（本地服务去会话目录找它），hls.js 只能反复重试首片，用户看到的就是"一直转圈"。
   - **修法**：`Command::current_dir(&directory)`，即「相对文件名 + cwd 钉在会话目录」——四组实验里唯一稳的组合。注释里写明了为什么不能传绝对路径，以及为什么不再需要 `-hls_fmp4_init_filename`。
   - **顺带**：转码进程退出时的 stderr 原来只 `eprintln!`（双击启动时是黑洞），改走日志通道并带上会话号、退出状态与前 300 字符。
@@ -202,7 +211,7 @@
     - `group-hover:scale-108` 不在 scale 刻度里（0/50/75/90/95/100/105/110/125/150），**封面悬停其实一直不放大**。改用任意值 `group-hover:scale-[1.08]`。这条影响全部 `SeriesCard`（目录 / 动漫 / 搜索 / 货架）。
   - 两个类名的存在性都拿 dev server 的编译产物核对过（`/src/index.css`），不是靠读代码推断。
 
-- **新增启动进入动画「轨道汇聚」**：六张迷你海报绕品牌图标公转 1.1 圈（角速度按 `1-(1-u)^1.75` 由快到慢，公转期间每张卡各自"呼吸"与轻微摇头），随后按 58ms 错峰依次被吸进中心，品牌承接撞击并做**衰减余振**，再淡出让位给主界面。总长 2300ms，点任意处（或 Esc / 空格 / 回车）可跳过。设计稿与另外 9 套备选方案在 `design-proposals/launch-animation/`，动效落在 `src/components/layout/LaunchAnimation.tsx` + `src/styles/launch.css`。
+- **新增启动进入动画「轨道汇聚」**：六张迷你海报绕品牌图标公转 1.1 圈（角速度按 `1-(1-u)^1.75` 由快到慢，公转期间每张卡各自"呼吸"与轻微摇头），随后按 58ms 错峰依次被吸进中心，品牌承接撞击并做**衰减余振**，再淡出让位给主界面。总长 2300ms，点任意处（或 Esc / 空格 / 回车）可跳过。设计稿与另外 9 套备选方案属于维护者本地材料，动效落在 `src/components/layout/LaunchAnimation.tsx` + `src/styles/launch.css`。
   - **为什么动画写在 JS 里而不是 CSS**：椭圆轨道要 72 段采样（关键帧之间是直线插值，"弦"相对椭圆内凹——采样太疏时卡片会肉眼可见地切进导轨线里；半径上还叠了一层"呼吸"，一圈两个周期，采样疏了会被采成折线），六张卡各 70 多帧、每帧带 transform / opacity / filter / z-index 四个属性，写成 CSS keyframes 是几百条规则，改一个参数要动四处。
   - **⚠️ 同一个元素只允许有一条 `animate()`，多个阶段必须合并成一条关键帧轨。** 这条是实测踩出来的：最初把"公转"和"螺旋吸入"写成两条动画，结果**公转完全没在跑**——后创建的那条带 `fill: 'both'`，它在自己的**延迟期间**就会应用 0% 帧，把公转段整个盖住，六张卡从第一帧就钉死在轨道终点、只有透明度在变。肉眼看上去"绕了一圈"其实一张没动。合并后错峰不能再靠 `delay`（那会把公转相位一起推后、60° 间隔就散了），改成把错峰做进 **offset 空间**：每张卡总时长不同、但同一起跑，于是公转同时收工、再各自等自己的窗口起飞。
   - **景深是三层一起做的**：只做 `scale`（0.66→1.09）的话卡片永远从品牌"上面"压过去，前后关系是假的；连同 `blur`（0→1.05px）与 `z-index`（后 1 / 品牌 2 / 前 3）一起做，翻面点选在 `y = 0`——那正好是卡片离品牌最远（x = ±300）的瞬间，所以这次离散跳变看不出来。

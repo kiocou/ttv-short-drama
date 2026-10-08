@@ -5,8 +5,9 @@
 .DESCRIPTION
   为什么需要这个脚本：这套流程里有四个坑，手工发布每次都要重踩一遍——
 
-    1. **cargo 不在 PATH**（实际装在 C:\Program Files\Rust stable MSVC 1.96\bin），
+    1. **cargo 可能不在 PATH**（Rust 安装时可以选"不加入 PATH"），
        而且 TEMP/TMP 必须指到项目盘，否则链接阶段会报 "os error 5 / 拒绝访问"。
+       脚本按 TTV_CARGO_BIN → PATH 的顺序定位，未在脚本里写死安装路径。
     2. **必须是 npm run tauri build**：它自动带上 tauri/custom-protocol 特性；
        手写 cargo build --release 产出的包启动后仍会去连 127.0.0.1:5175，
        表现为"无法访问此页面"。
@@ -44,8 +45,16 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 Set-Location $root
 
-# --- 项目已知环境事实（见 build.bat 的说明，不要改成"更通用"的写法）---
-$CargoBin = 'C:\Program Files\Rust stable MSVC 1.96\bin'
+# --- 定位 cargo 的 bin 目录（TTV_CARGO_BIN → PATH）：不要把某台机器的
+#     安装路径写进脚本，换机器就会失败。---
+$CargoBin = $env:TTV_CARGO_BIN
+if (-not $CargoBin) {
+    $cargoCmd = Get-Command cargo -ErrorAction SilentlyContinue
+    if ($cargoCmd) { $CargoBin = Split-Path -Parent $cargoCmd.Source }
+}
+if (-not $CargoBin) {
+    throw ' 找不到 cargo：请把 Rust 的 bin 目录加入 PATH，或设环境变量 TTV_CARGO_BIN 指向它。'
+}
 $TmpDir = Join-Path $root '.tmp'
 $nl = [Environment]::NewLine
 

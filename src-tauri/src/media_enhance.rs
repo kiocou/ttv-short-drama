@@ -116,7 +116,7 @@ pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> 
     //      （本地服务去会话目录里找它，找不到），hls.js 只能反复重试首片 →
     //      用户看到的就是"一直转圈、加载很长时间"。
     //
-    // 实测四种组合（见 .workbuddy/exp-init.txt）：
+    // 实测四种组合：
     //   不传 init 名 + cwd=工程根   → 目录内 init=False（掉到 cwd）
     //   传相对名 init.mp4 + cwd=根  → 目录内 init=False（照样掉到 cwd）
     //   **cwd=会话目录**            → 目录内 init=True ✅
@@ -151,7 +151,7 @@ pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> 
         // 随包 ffmpeg 没有 CA 证书链，后果是打开 https 源必然失败：
         //   error:0A000086:lib(20)::reason(134)
         //   Error opening input: I/O error
-        // 实测对照（.workbuddy/probe-tls.ps1，同一条真实 CDN 地址）：
+        // 实测对照（同一条真实 CDN 地址）：
         //   写在 `-i` 之后 → 115ms 失败；写在 `-i` 之前 → 704ms 成功出片。
         //
         // 这条链路上它意味着**增强转码从来没有成功打开过源**：每次播放都在

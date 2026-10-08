@@ -21,27 +21,31 @@ src-tauri/.app-data/
 *.sqlite3-wal
 short-drama-device.json
 
-# ---- 工作目录与 AI / 编辑器工具产物（不属于项目内容）----
-# `build.bat` / `start-dev-safe.bat` 把临时目录指向 .tmp；后三个是 AI 工具自己写的
-# 工作区——`.zcode/plans/` 曾经因为漏了规则而被误提交（里面有一份含**私有渠道**调研计划的会话文档），
-# 公开仓库里不应该出现它们。
+# ---- 维护者本地材料（本机保留，不入公开仓库）----
+# 这些是本机的工作材料与智能体提示词：公开仓库里不发布，文件仍留在本机。
+# 需要把其中某一项恢复到仓库时用 `git add -f <路径>`。
+/AGENTS.md
+/.zcodeignore
+/docs/
+/design-proposals/
+/VidCom图标库/
+/画质档位分辨率实测验证.md
+/短剧画质链路集成实施方案.md
+
+# ---- 临时目录与智能体/编辑器工作区（不属于项目内容）----
+# `build.bat` / `start-dev-safe.bat` 把临时目录指向 .tmp；其余是各类 AI 工具
+# 自己写的工作区与调试产物（含会话记录、真实源地址、样本与截图），一律不入库
+# ——实测其中一个抓包/样本目录单独就有 43MB。
 .tmp/
 .zcode/
 .agents/
-.workbuddy-ai/
-.serena/
-# **私有渠道**调研/站点分析的中间产物：实测 `.har-analysis/` 单独就 43MB（HAR 响应体 +
-# 下载样本 + 解析脚本），是排查某个源能不能播的临时材料，不是项目内容。
-.har-analysis/
-# 调试会话的临时工作区（空壳目录，实际内容在 @wingsky-* 子目录里）。
-.dsh/
-# AI 协作工区：本项目的调试脚本、实测产物（含真实源地址、临时 mp4 与截图）与
-# 会话记录，属于排查材料而不是项目内容；公开仓库里不应该出现它们（同类教训见
-# 上面 .zcode/ 那条：漏一条规则就会把含**私有渠道**调研计划的会话文档提交上去）。
 .workbuddy/
+.workbuddy-ai/
 .learnings/
-# 设计提案的交互预览稿：单文件 HTML，不参与构建，体积大且随时可重新生成。
-design-proposals/random-pick/
+.serena/
+.dsh/
+.cline-home/
+.har-analysis/
 
 # ---- 随包分发的第三方运行期资源 ----
 # 现已纳入版本控制，使仓库开箱即用。

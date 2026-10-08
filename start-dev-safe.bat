@@ -3,7 +3,7 @@ REM ============================================================================
 REM  TTV Short Drama - C: 盘满盘环境下的启动脚本
 REM ============================================================================
 REM  背景
-REM    本机系统盘 C:（卷标「日常系统」）剩余空间为 0 字节。这会导致两类故障：
+REM    当系统盘（C:）剩余空间不足（极端情况为 0 字节）时会导致两类故障：
 REM
 REM    1) 窗口整片纯黑
 REM       WebView2 默认把 GPU / 着色器 / user-data 缓存写在 C:。
@@ -16,11 +16,10 @@ REM       SQLite 建库会以 "disk I/O error" 让 setup 钩子 panic；
 REM       cargo 链接阶段也会报 "os error 5 / 拒绝访问"。
 REM
 REM  对策
-REM    把所有临时目录与运行期数据目录全部落到 D:（有 190GB+ 富余），
-REM    并关闭 WebView2 的 GPU 合成走软件光栅。
+REM    把所有临时目录与运行期数据目录全部落到项目所在盘，避开系统盘。
 REM
 REM  用法
-REM    先确保 C: 至少有几百 MB（清一下临时目录），然后双击本脚本。
+REM    先确保系统盘至少有几百 MB（清一下临时目录），然后双击本脚本。
 REM    应用代码已在 main.rs 里内置了同样的兜底逻辑。
 REM ============================================================================
 
@@ -42,7 +41,16 @@ REM 程序内部会自行追加 --enable-features=PlatformHEVCDecoderSupport。
 set "WEBVIEW2_USER_DATA_FOLDER=%PROJ%.webview-data"
 set "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--enable-features=PlatformHEVCDecoderSupport"
 
-set "NODE=D:\Program Files\nodejs\node.exe"
+REM node 可能不在 PATH：按 TTV_NODE → PATH 的顺序查找。
+set "NODE="
+if defined TTV_NODE set "NODE=%TTV_NODE%"
+if not defined NODE for /f "delims=" %%i in ('where node 2^>nul') do if not defined NODE set "NODE=%%i"
+if not defined NODE (
+  echo [TTV] 错误：找不到 node。
+  echo [TTV] 请把 Node.js 加入 PATH，或设 TTV_NODE 指向 node.exe。
+  pause
+  exit /b 1
+)
 set "VITE=%PROJ%node_modules\vite\bin\vite.js"
 set "EXE=%PROJ%src-tauri\target\debug\ttv-short-drama.exe"
 

@@ -102,9 +102,6 @@ CI 会启用 LFS 并校验这些资源存在，避免生成缺少运行时文件
 
 ```text
 TTV Short Drama/
-├── AGENTS.md                     # 给 AI 代理的入口：不变量、命令、环境陷阱（改代码前先读它）
-├── docs/                         # 设计与调研资料（多为目标架构 / 阶段性存档，见「文档地图」）
-├── design-proposals/             # 原型与设计稿存档（不参与构建）
 ├── src/
 │   ├── types/                    # 领域契约（catalog / series / playback / history / favorite / settings）
 │   ├── services/                 # 后端入口与专职模块：ipc / pip / updater / hlsAttach / animePlayback
@@ -136,24 +133,20 @@ TTV Short Drama/
 
 ## 开发约定
 
-见 [`AGENTS.md`](./AGENTS.md)——它记录了必须遵守的不变量与踩过的坑（会话号判定、连播闸门、CSP 只在生产注入、画中画播放权唯一等）。**改动行为后请同步更新 `CHANGELOG.md`。**
+改代码前请先读 `src/` / `src-tauri/` 里的文件头注释——**必须遵守的不变量与踩过的坑都写在代码旁边**（会话号判定、连播闸门、兜底开关复位、CSP 只在生产注入、画中画播放权唯一等）。**改动行为后请同步更新 `CHANGELOG.md`。**
 
-## 文档地图
+## 文档
 
-本仓库的文档分三类，**读之前先看它顶部的状态标签**：
+本仓库公开的内容只有三份 Markdown：
 
-| 文档 | 状态 | 用途 |
-| --- | --- | --- |
-| [`AGENTS.md`](./AGENTS.md) | ✅ 权威 | 不变量、常用命令、环境陷阱。**改代码前必读** |
-| [`CHANGELOG.md`](./CHANGELOG.md) | ✅ 权威 | 每个版本的根因与实测数据（不是改动清单） |
-| 本 README | ✅ 现状 | 项目定位、功能、随包资源、目录结构 |
-| [`docs/frontend-design.md`](./docs/frontend-design.md)、[`docs/backend-architecture.md`](./docs/backend-architecture.md) | ⚠️ 目标架构设计稿 | 描述的是**目标形态**（libmpv actor、补帧、模块化目录），与现状不符；现状以代码为准 |
-| [`docs/backend-integration.md`](./docs/backend-integration.md) | ✅ 现状 | 后端命令面与数据归属 |
-| [`docs/design-proposals/magpie-video-enhancement-integration.md`](./docs/design-proposals/magpie-video-enhancement-integration.md) | ❌ 未采纳 | 外部 Magpie 增强方案，从未落地 |
-| 根目录 `画质档位分辨率实测验证.md`、`短剧画质链路集成实施方案.md` | ⚠️ 阶段性存档 | 实测数据与未实施的设计稿，不随代码更新 |
-| [`design-proposals/`](./design-proposals/) | ⚠️ 设计稿存档 | 原型预览，不参与构建 |
+| 文档 | 用途 |
+| --- | --- |
+| 本 `README.md` | 项目定位、功能、随包资源、目录结构 |
+| [`CHANGELOG.md`](./CHANGELOG.md) | 每个版本的根因与实测数据（不是改动清单）；发布说明直接取自它 |
+| [`LICENSE`](./LICENSE) | 授权范围与第三方内容说明 |
 
-**任何冲突都以代码 + `CHANGELOG.md` 为准。**
+设计与架构稿、阶段性调研记录属于维护者本地材料，**不在公开仓库内**。
+实现层面的约定（不变量、踩过的坑、为什么不能那样写）都在源码注释里，以**代码 + `CHANGELOG.md`** 为准。
 
 ## 免责声明
 
