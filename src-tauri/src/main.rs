@@ -1204,6 +1204,9 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
 fn cache_clear(state: State<'_, AppState>) -> Result<CacheClearResult, String> {
     // 增强 HLS 是临时转码产物，清缓存时正在播的流也一并释放；下次打开会重新起。
     media_enhance::cleanup_all();
+    // 动漫目录内存缓存也一并丢弃：用户点"清空缓存"的意图是"让程序重新取一遍数据"，
+    // 留着这层会让他在 TTL 内看不到任何变化。
+    crate::dmghg_bridge::clear_catalog_cache();
     // 应用自有缓存目录（SQLite 快照等）一并清理。
     let own = clear_directory(&state.cache_dir).unwrap_or(0);
     let report = short_drama_app_cache_clear()?;

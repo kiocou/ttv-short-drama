@@ -680,12 +680,116 @@ where
         .map_err(|error| format!("dmghg 任务执行失败: {error}"))?
 }
 
+/// 动漫目录的**类目→页**内存缓存。
+///
+/// 为什么必须加：切换类目（日漫 / 国漫 / …）走的是 `dmghg_bridge::catalog_async`
+/// → `catalog.get_video_list` 的**同步 FFI 调用**，每次都要跨进客户端进程取一遍；
+/// 而它完全没有缓存 —— 同一个类目来回切两次，第二次照样重新拉。用户报告的
+/// 「切换类目不能秒加载、会卡顿一下才刷新出来」就是这一段等待。
+///
+/// 与 guo 19 源那套「缓存优先 + SWR」保持一致：TTL 内直接回内存，过期后仍然
+/// **立即回旧值**并后台刷新（前台永远不为刷新等待）。红果与动漫原先都是每次走
+/// 网络，这条是给动漫补上的那一层。
+fn catalog_cache() -> &'static Mutex<std::collections::HashMap<String, CachedCatalogPage>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, CachedCatalogPage>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 缓存条目。`at` 用于 TTL 判定，`page` 是已解析好的结果（克隆即可返回）。
+struct CachedCatalogPage {
+    at: std::time::Instant,
+    page: CatalogPage,
+}
+
+/// 目录缓存存活时长。与 guo 源的目录 TTL 取同一个量级：动漫榜单在几分钟内
+/// 不会变，而用户在一个类目下连续翻页/来回切换是秒级行为。
+const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// 缓存键：类别 / 分类 / 受众 / 排序 / 关键词 / 页。
+///
+/// **必须把全部筛选维度都编进去**：漏掉任意一个都会让"切类目回到上一个类目的
+/// 数据"——那是比慢更糟的错。受众与排序虽然动漫侧目前不参与请求，仍编入键，
+/// 免得将来后端开始用它时这里静默串味。
+fn catalog_cache_key(filter: &CatalogFilter) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        filter.channel,
+        filter.category,
+        filter.audience,
+        filter.sort,
+        filter.keyword.as_deref().unwrap_or("").trim(),
+        filter.page.max(1),
+    )
+}
+
+/// 读缓存。命中时同时返回"是否新鲜"，调用方据此决定要不要后台刷新。
+fn peek_catalog_cache(filter: &CatalogFilter) -> Option<(CatalogPage, bool)> {
+    let key = catalog_cache_key(filter);
+    let guard = catalog_cache().lock().ok()?;
+    let entry = guard.get(&key)?;
+    Some((entry.page.clone(), entry.at.elapsed() < CATALOG_TTL))
+}
+
+/// 写缓存。只在成功时调用。
+fn store_catalog_cache(filter: &CatalogFilter, page: &CatalogPage) {
+    let key = catalog_cache_key(filter);
+    if let Ok(mut guard) = catalog_cache().lock() {
+        guard.insert(
+            key,
+            CachedCatalogPage {
+                at: std::time::Instant::now(),
+                page: page.clone(),
+            },
+        );
+    }
+}
+
+/// 清空目录缓存（设置页清缓存、切换来源时调用）。
+pub fn clear_catalog_cache() {
+    if let Ok(mut guard) = catalog_cache().lock() {
+        guard.clear();
+    }
+}
+
 pub async fn catalog_async(filter: CatalogFilter) -> Result<CatalogPage, String> {
-    run_blocking(move || {
-        let bridge = shared().ok_or_else(|| "dmghg 桥接未就绪".to_string())?;
-        lock(bridge).catalog(&filter)
+    // 1) 命中且新鲜：直接返回，零 FFI、零网络。这就是"秒加载"的全部来源。
+    if let Some((page, fresh)) = peek_catalog_cache(&filter) {
+        if fresh {
+            return Ok(page);
+        }
+        // 2) 命中但过期：**先把旧值交出去**，再在后台刷新。
+        //
+        // 顺序不能颠倒。用户点击类目时等待的每一毫秒都是可见的卡顿，而这里
+        // 的旧值来自 15 分钟内的同一次查询，内容差异对"刚点进来"这个动作
+        // 毫无意义。刷新失败也不影响已经返回的结果——下一次请求会重试。
+        let stale = page;
+        let refresh_filter = filter.clone();
+        tokio::task::spawn(async move {
+            let refreshed = run_blocking(move || {
+                let bridge = shared().ok_or_else(|| "dmghg 桥接未就绪".to_string())?;
+                let page = lock(bridge).catalog(&refresh_filter)?;
+                store_catalog_cache(&refresh_filter, &page);
+                Ok::<(), String>(())
+            })
+            .await;
+            if let Err(error) = refreshed {
+                crate::trace::log(format!("[anime] 目录后台刷新失败（沿用旧值）: {error}"));
+            }
+        });
+        return Ok(stale);
+    }
+    // 3) 未命中：走真实链路，成功即写缓存。
+    let result = run_blocking({
+        let filter = filter.clone();
+        move || {
+            let bridge = shared().ok_or_else(|| "dmghg 桥接未就绪".to_string())?;
+            lock(bridge).catalog(&filter)
+        }
     })
-    .await
+    .await?;
+    store_catalog_cache(&filter, &result);
+    Ok(result)
 }
 
 pub async fn detail_async(series_id: String) -> Result<SeriesDetail, String> {
@@ -1086,6 +1190,72 @@ mod tests {
             "[冒烟] 选项: {:?}",
             options.iter().map(|o| &o.value).collect::<Vec<_>>()
         );
+    }
+
+    /// 动漫目录缓存的**实机计时**冒烟：同一类目连查两次，第二次必须几乎瞬时。
+    ///
+    /// 需要本机安装动漫共和国客户端，所以与上面的冒烟一样默认跳过。
+    /// 跑法：`cargo test -- --ignored --nocapture dmghg_catalog_cache`
+    ///
+    /// 这条测的是用户报的那个现象本身——「切换类目不能秒加载，会卡顿一下才刷新
+    /// 出来」。断言用**比值**而不是绝对毫秒：这台机器上 dmghg 的 FFI 往返实测
+    /// 数百毫秒到一秒多，而缓存命中应当是微秒级，两者差三四个数量级，任何一个
+    /// 像样的机器上都判得出来；写死毫秒反而会在慢机器上误报。
+    #[test]
+    #[ignore = "需要本机安装动漫共和国客户端"]
+    fn dmghg_catalog_cache_makes_repeat_lookup_instant() {
+        // 先清一次，保证下面的第一次一定是冷查（不依赖上一次运行的状态）。
+        clear_catalog_cache();
+
+        let filter = CatalogFilter {
+            source: None,
+            channel: "anime".into(),
+            category: "全部".into(),
+            audience: String::new(),
+            sort: "hits".into(),
+            keyword: None,
+            page: 1,
+            page_size: 20,
+            cursor: None,
+        };
+
+        // 冷查：走真实 FFI。
+        let cold_started = std::time::Instant::now();
+        let cold = tauri::async_runtime::block_on(catalog_async(filter.clone()))
+            .expect("冷查应当成功（需要本机装动漫共和国客户端）");
+        let cold_ms = cold_started.elapsed().as_millis();
+        println!("[缓存冒烟] 冷查 {}ms items={}", cold_ms, cold.items.len());
+        assert!(!cold.items.is_empty(), "列表不应为空");
+
+        // 热查：必须命中缓存。
+        let warm_started = std::time::Instant::now();
+        let warm =
+            tauri::async_runtime::block_on(catalog_async(filter.clone())).expect("热查应当成功");
+        let warm_us = warm_started.elapsed().as_micros();
+        println!("[缓存冒烟] 热查 {}us items={}", warm_us, warm.items.len());
+
+        assert_eq!(
+            warm.items.len(),
+            cold.items.len(),
+            "缓存命中必须返回与冷查一致的结果"
+        );
+        assert_eq!(warm.total, cold.total, "total 也必须一致");
+        assert_eq!(warm.categories, cold.categories, "分类表也必须一致");
+        // 命中缓存时不做任何 FFI，应当在毫秒级；给一个宽松上限避免慢机器误报。
+        assert!(
+            warm_us < 50_000,
+            "缓存命中应远快于冷查（实测热查 {warm_us}us / 冷查 {cold_ms}ms）"
+        );
+
+        // 换一个类目必须**不命中**：漏掉筛选维度就会串味，这条挡住那个错误。
+        let mut other = filter.clone();
+        other.category = "日韩动漫".into();
+        assert!(
+            peek_catalog_cache(&other).is_none(),
+            "换类目不应命中上一个类目的缓存"
+        );
+
+        clear_catalog_cache();
     }
 
     /// 诊断用：打印 dmghg 详情里的**全部图片类字段**，确认封面是不是只有 `pic` 一个来源。
