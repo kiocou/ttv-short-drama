@@ -560,7 +560,7 @@ impl DramaProvider {
     /// 全站搜索：走站点自己的 `/search/{keyword}` 路由。
     ///
     /// 站点把搜索结果放在 SSR 的 router data 里（loaderData 下键名形如
-    /// "search_(keyword)/page"，内含 searchList），因此无需逆向内部 XHR 接口，
+    /// "search_(keyword)/page"，内含 searchList），因此无需对接内部 XHR 接口，
     /// 也不需要翻 34 页目录自己做索引。
     async fn search_catalog(
         &self,

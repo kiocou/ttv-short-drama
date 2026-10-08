@@ -16,8 +16,7 @@ import { ArrowLeft, ChevronRight, Flame, Play, Sparkles } from 'lucide-react';
  * ## 数据源是两条不同接口，不是同一份列表切两段
  *
  * 官方红果客户端里「热播」与「新剧」本来就是两条接口（榜单 `cell/change` 与
- * 最新上架 `landpage`），逆向结论见仓库根目录
- * 「红果短剧客户端逆向分析报告.md」§四、§八。这里照那条结论走：
+ * 最新上架 `landpage`），结论来自**私有渠道**调研。这里照那条结论走：
  *
  * | 分区 | 频道 | 数据源 |
  * | --- | --- | --- |

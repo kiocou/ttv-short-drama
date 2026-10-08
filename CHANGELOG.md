@@ -8,6 +8,14 @@
   - **明确写进文档的「不要照做」**：`docs/frontend-design.md` / `docs/backend-architecture.md` 的 libmpv + 补帧 + `domain/application/infrastructure/adapters` 目录结构从未落地；`docs/design-proposals/magpie-video-enhancement-integration.md` 的 Magpie 方案未采纳；根目录几份报告里的 `rank` / `latest`、`short_drama_app_preload`、`preloadNative`、`variant_cache`、`bitrateKbps`、`TTV_SD_SOURCE_TMP` 等标识符在代码里零命中。
   - 本次**只动 Markdown**（`git diff --stat` 全是 `.md`）：既没有改代码，也没有改 CI。CI 的两个缺口（不跑 Go、资源校验漏 `duanju_core.dll`）只做了记录，修不修由后续单独决定。
 
+### 移除
+
+- **仓库内不再保留「私有渠道」调研记录，相关表述统一为「私有渠道」。** 删除 `docs/` 下的私有渠道调研记录（8 个文件：调研笔记、参考实现、从第三方响应转储的脚本原件与样本数据）与三份红果侧调研报告（客户端分析、两批样本分析）；`README.md`、`AGENTS.md`、本文件、代码注释、`.gitignore` 与**打包进包的 worker**（`resources/shortdrama-worker/worker.py`、`liushen/device_register.py`）里的相关措辞一并改为「私有渠道」。
+  - **为什么删**：这些材料不是项目内容——其中一份是从第三方响应里转储的脚本原件，其余是笔记与样本数据，留着没有维护价值，却让公开仓库替它们承担授权风险。该保留的**接口结论**都在代码注释与 `docs/backend-integration.md` 里，没有丢。
+  - **代码只动了注释与一条用户可见文案**（`worker.py` 的设备身份报错措辞），无行为变更；`npx tsc --noEmit` 与 Python 语法校验通过。
+  - **保留了两份仍有价值的文档**：`画质档位分辨率实测验证.md`（档位矩阵是权威证据）与`短剧画质链路集成实施方案.md`（未实施设计稿），只去掉其中的样本获取方式表述。`LICENSE` 的授权范围**没有放宽**：三条说明仍然是「不在 MIT 范围内、权利属各自权利人、再分发前先移除」。
+  - ⚠️ **本次只删在工作分支上**：`main`、修包/分支与 git 历史（含已 clone 的副本与 fork）里依然能找到这些文件。要彻底清除需重写历史 + 强推，**尚未执行**。
+
 ## 0.2.19 - 2026-10-07
 
 ### 修复 / 调整
@@ -173,14 +181,14 @@
   - **顺带修掉一个"吞剧"的老逻辑**：发现页的「发现更多」网格原来会**让出前 12 条**（`catalogStart = 12`），只因为那 12 条"已经出现在货架上"。货架换成独立数据源后两者再无关系，继续让位等于凭白吞掉 12 部剧 —— 现在目录网格从第 1 条开始。
   - **代价（已知）**：进发现页会多发两个分区请求，`worker.py` 每次冷启动约 1.8s，两个并发跑、期间货架显示骨架；3 分钟 TTL 内不会重复。
 
-- **「更多」页接上真正的分区数据源**：走红果 App-API 的**榜单**与**最新上架**，而不是上一版那套「本机启用源聚合 + sort」（后端基本不实现 sort，两页会拿到同一份列表）。接口与参数完全照 `红果短剧客户端逆向分析报告.md` §四。
+- **「更多」页接上真正的分区数据源**：走红果 App-API 的**榜单**与**最新上架**，而不是上一版那套「本机启用源聚合 + sort」（后端基本不实现 sort，两页会拿到同一份列表）。接口与参数完全照**私有渠道**调研结论。
   - **官方本来就是两条接口**：热播 = 榜单 `GET /reading/bookapi/bookmall/cell/change/v`（`sub_selected_items=comic_series_hot_play`，游标 `session_uuid + next_offset`）；新剧 = 上架 `POST /reading/distribution/category/landpage/v`（`select_items.sort=["online_time"]`，游标 `offset += 本页条数`）。**短剧没有 cell 榜**，所以短剧的"热播"用上架接口的 `sort=hot_score` 近似 —— 这与官方自己一致。
   - **worker 新增 `feed` 子命令**（`worker.py`）：`feed <json>`，`mode=rank|list` 两种模式，输出沿用既有的逐行 JSON 协议。两条接口的分页模型不同，统一收敛成**不透明游标** `{"o":<offset>,"s":"<session_uuid>"}` 交给调用方原样回传。脏数据（HTML 标签、`今日上新`/`x万热度`/`N集`/季数这些噪声副标题）在 worker 侧清掉，Rust 只做字段搬运。
   - **worker 不需要"免签"分支**：官方客户端对这两条接口默认不发签名（注释称实测红果不校验 X-Argus），TTV 仍走既有的六代签名 —— 签名是更严的一侧，不会因此被拒，也就不必再分一条代码路径。
   - **Rust 新增 `short_drama_app_shelf_feed(kind, channel, cursor)`**，并在 `short_drama_app.rs` 里落了一张「分区 × 频道 → 接口参数」表（`shelf_feed_spec`）。评分源给的是字符串（`"9.4"`），解析不了就当"源没给"，**绝不填 0**（不变量 8）。
   - **前端**：新增 `ipcService.shelf.feed()`（游标式，`cursor` 原样回传）；「更多」页改成自持状态 + 游标翻页 + 按 id 去重（游标翻页可能回吐重复条目，一页全是重复即视为到底）。
   - **神秘小窝是唯一例外**：红果 App 的榜单/上架**没有 18+ 口径**，拿它填神秘小窝等于把普通短剧塞进 18+ 专区，直接违反门闩不变量。该频道继续走本机启用源的多源聚合，页面版式与另一条完全一致，只有取数链路不同。
-  - **实测（直接跑 worker，2026-10-07）**：用**自造的、格式正确的设备身份**（19 位 deviceId/installId + uuid cdid + 16 位 openudid，不含任何账号凭据）打真接口，四条路径全部通：漫剧热播榜 10 条/页、短剧热播 18 条/页、短剧最新上架 18 条/页、漫剧最新上架 18 条/页，都拿到真实条目（id/标题/封面/集数/评分/题材）。**游标翻页也对**：榜单第二页 10 条与第一页零重叠，`session_uuid` 原样贯穿、`next_offset` 10 → 20。这同时坐实了逆向报告里那条关键结论 —— **列表类接口确实不校验账号**（官方注释称的"免签"），游客态就能拿到数据。
+  - **实测（直接跑 worker，2026-10-07）**：用**自造的、格式正确的设备身份**（19 位 deviceId/installId + uuid cdid + 16 位 openudid，不含任何账号凭据）打真接口，四条路径全部通：漫剧热播榜 10 条/页、短剧热播 18 条/页、短剧最新上架 18 条/页、漫剧最新上架 18 条/页，都拿到真实条目（id/标题/封面/集数/评分/题材）。**游标翻页也对**：榜单第二页 10 条与第一页零重叠，`session_uuid` 原样贯穿、`next_offset` 10 → 20。这同时坐实了**私有渠道**调研里那条关键结论 —— **列表类接口确实不校验账号**（官方注释称的"免签"），游客态就能拿到数据。
   - **顺带修掉一个吞错误的真 bug**：Tauri 的 `invoke` 被后端 `Err(String)` 拒绝时抛的是**原字符串**、不是 `Error`，所以 `(err as Error).message` 恒为 `undefined` —— 后端拼出来的错误详情会被静默换成一句通用兜底。新增 `errorText()`（`services/ipc.ts`）统一收口，并换掉 `ShelfMoreView` 与 `useCatalogStore` 里的两处旧写法。这个 bug 正是「更多」页明明报错却只显示"列表加载失败"、看不到真原因的原因。
   - **注意**：Rust 侧新增了 Tauri 命令，**必须重启 `npm run tauri dev`**（前端 HMR 不会带来新命令，旧进程里 `invoke` 只会得到 command not found）。
 
@@ -188,7 +196,7 @@
   - **移除**：`HomeShelf` 的刷新按钮（`onRefresh` / `refreshing` 两个 prop 与 `RefreshCw`）、`ExploreView` 里整套 `refreshingShelf` / `refreshTokenRef` / 失败 toast、`SeriesCard` 的 `rank` prop 与其金/银/铜三档配色。**序号被移除的连带后果**：上一轮做的"手动强制刷新"（`refreshCatalog(kw, { force: true })` → `catalog_list` 的 `force` → `guo_provider::catalog_refresh` 穿透 15min 缓存）**不再有调用方**，guo 源目录从此只能等 TTL 自然过期。force 链路本身保留在 store / IPC / Rust 三层，随时可以挂到别处。
   - **新增「更多」页**（`src/components/views/ShelfMoreView.tsx`）：版式与「我的追剧 / 观看历史」完全同构 —— 同一个页面壳（`p-8 / max-w-5xl / mx-auto / gap-6`）、同一个页头（图标 + 标题 + 副标题 + 底边框）、同一套 `MicaCard` 行卡（64×88 封面 + 标题 + 题材/来源 + 集数/评分 + 右侧动作）。带无限流、骨架屏、空态与失败重试。
   - **跳转**：`useAppStore` 新增 `AppView = 'shelf'`、`ShelfViewState { kind, channel }` 与 `openShelf(kind, channel)`；`App.tsx` 按既有约定挂一个常驻 DOM 视图。频道必须在点击那一刻由发现页交出 —— 「更多」页内部挂的是**另一份** `CatalogProvider`，读不到发现页的频道状态。
-  - **数据源**：`CatalogProvider` 新增可选 `initialChannel` / `initialSort`，「更多」页用一份**独立实例**把排序钉死（正在热播→`heat`，新剧→`latest`），两边的分页 / 缓存 / 预取 / 题材词表互不干扰，也不会串改发现页的排序。**注意**：后端目前基本不实现 `sort`（见 `红果短剧客户端逆向分析报告.md` §七），所以两页今天拿到的很可能是同一份列表；真正的分区数据源要接红果 App 的榜单 / 最新上架接口（同上 §八）。
+  - **数据源**：`CatalogProvider` 新增可选 `initialChannel` / `initialSort`，「更多」页用一份**独立实例**把排序钉死（正在热播→`heat`，新剧→`latest`），两边的分页 / 缓存 / 预取 / 题材词表互不干扰，也不会串改发现页的排序。**注意**：后端目前基本不实现 `sort`（见**私有渠道**调研结论），所以两页今天拿到的很可能是同一份列表；真正的分区数据源要接红果 App 的榜单 / 最新上架接口。
   - **顺手修掉两个 Tailwind 死类**（都是"写了但从来没被生成过"）：
     - `h-22`（「我的追剧」「观看历史」的封面缩略图）不在 spacing 刻度里，父级高度塌成 auto，而占位层是 `absolute inset-0` —— 封面加载失败时整块缩略图会消失。改用 `h-[88px]`（3:4 = 64×88）。
     - `group-hover:scale-108` 不在 scale 刻度里（0/50/75/90/95/100/105/110/125/150），**封面悬停其实一直不放大**。改用任意值 `group-hover:scale-[1.08]`。这条影响全部 `SeriesCard`（目录 / 动漫 / 搜索 / 货架）。
@@ -616,7 +624,7 @@
 3. **同一集的解析结果不稳定**：同一 `(剧, 集, 档)` 不同次调用可能回不同 CDN——实测凡人修仙传 年番 第01集一次给 `sns-video-hs.xhscdn.com` 的 701MB MP4（头尾 512KB 都取不到 moov），另一次给 `img.nxjunyu.asia` 的 m3u8（应用里 1920x1080、780 帧正常播放）。所以「事前探一次」不能当作「这一集能不能播」的依据，判定只能放在播放通路上做。
 4. 源还会把非剧集内容当档位返回：实测见到 `v2-ad.video.yximgs.com/bs2/adVideoLp/...`（路径字面就是广告落地页，base64 解出 `ad_alliance_ssp:MERCHANT`）与 `sns-music.xhscdn.com`。这类地址即使能解码也不是剧集内容。
 
-附带结论：批量采样分片时不能用 ffmpeg 直接吃 HLS 地址——该源把 TS 分片伪装成 `.png`/`.pdf`/`.wav` 扩展名，ffmpeg 的 HLS 解复用器按扩展名白名单直接拒绝（`URL ... is not in allowed_segment_extensions`），会把好源误判成坏源。采样脚本改为自己按内容嗅探容器后再交给 ffmpeg（见 `docs/dmghg-reverse/sample_codecs.py`）。
+附带结论：批量采样分片时不能用 ffmpeg 直接吃 HLS 地址——该源把 TS 分片伪装成 `.png`/`.pdf`/`.wav` 扩展名，ffmpeg 的 HLS 解复用器按扩展名白名单直接拒绝（`URL ... is not in allowed_segment_extensions`），会把好源误判成坏源。采样脚本改为自己按内容嗅探容器后再交给 ffmpeg（该采样脚本已随私有渠道调研记录一并移除）。
 
 ## 0.2.5 - 2026-09-16
 

@@ -4,7 +4,7 @@
 - 注册域只有 log.snssdk.com 接受 /service/2/device_register/
 - x-tt-dt 是响应里的 device_token，不是本地签名
 - 该接口还要求 libmetasec_ml.so 生成的 x-argus / x-ladon
-  TTV Box worker 不会自动调用本模块；缺设备身份时请从真机抓包填入
+  TTV Box worker 不会自动调用本模块；缺设备身份时请从真实设备获取后填入
   short-drama-device.json。
 """
 import base64

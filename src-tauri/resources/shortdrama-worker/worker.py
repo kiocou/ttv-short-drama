@@ -18,7 +18,7 @@
 最终行为 {"ok":true,...}（各子命令字段不同），
 失败时 {"ok":false,"error":"..."} 并以非零码退出。
 
-接口形态与 2026-09 红果/番茄 APK 逆向结论一致（PlayerApiService 全部
+接口形态与 2026-09 的**私有渠道**调研结论一致（PlayerApiService 全部
 `$POST /novel/player/*/v1/`、JSON 序列化）:
   - multi_video_model: 取 video_model.fallback_api → GET 解析 video_info.data
   - album_detail: album_data + video_detail_data，EpisodeInfo{vid,vid_index,
@@ -113,7 +113,7 @@ def download_source(session: requests.Session, real_url: str, source: Path) -> N
                         emit({"event": "progress", "stage": "download", "percent": pct})
 
 # 红果短剧和红果漫剧共用 seriessdk 播放端点，但在 APK 中注册为不同模型/aids。
-# 只保留逆向报告确认的值，避免让 UI 传入任意请求模型。
+# 只保留**私有渠道**调研确认的值，避免让 UI 传入任意请求模型。
 #
 # 2026-09-18 实测：服务端策略已变——漫剧 vid 用 aid=8662（短剧 aid）在
 # v1/v2 端点都能取到播放模型；旧的 1004/1007 → aid=8704 现在被网关
@@ -146,7 +146,7 @@ VIDEO_MODEL_PATH = "/novel/player/multi_video_model/v1/"
 VIDEO_MODEL_V2_PATH = "/novel/player/multi_video_model/default/v1/"
 ALBUM_PATH = "/novel/player/album_detail/v1/"
 
-# 与 APK 逆向出的 GetVideoBizParam 对齐的字段子集（worker 实证可用）。
+# 与**私有渠道**得到的 GetVideoBizParam 对齐的字段子集（worker 实证可用）。
 BIZ_PARAM = {
     "detail_page_version": 0,
     "device_level": 3,
@@ -658,7 +658,7 @@ def hongguo_business_error(payload: dict) -> str | None:
         numeric = None
     if numeric == 111104:
         return (
-            "设备身份无效（111104）。请用真机抓包更新 deviceId / installId，"
+            "设备身份无效（111104）。请用真实设备的身份更新 deviceId / installId，"
             "并写入服务端下发的 deviceToken（x-tt-dt），不要本地编造。"
         )
     if numeric == 110001:
@@ -1569,8 +1569,7 @@ def counts_cmd(series_ids: list[str], device_id: str, install_id: str, aid: int)
 # ---------------------------------------------------------------------------
 # 「更多」页的分区数据源：红果榜单 / 最新上架
 # ---------------------------------------------------------------------------
-# 逆向自官方 PC 客户端 `backend/hongguo.py`（见仓库根目录
-# 「红果短剧客户端逆向分析报告.md」§四）：
+# 来自**私有渠道**调研（官方 PC 客户端）：
 #   榜单  GET  /reading/bookapi/bookmall/cell/change/v   → sub_selected_items 换榜
 #   上架  POST /reading/distribution/category/landpage/v → select_items.sort 换排序
 #

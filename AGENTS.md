@@ -191,10 +191,9 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 | --- | --- | --- |
 | `README.md` | ✅ 现状 | 项目定位、功能、随包资源、目录结构 |
 | `docs/backend-integration.md` | ✅ 现状 | 后端命令面与数据归属 |
-| `docs/dmghg-reverse/` | ✅ 接口有效 | 动漫共和国逆向记录与 `electron_bridge.dll` 调用契约；施工细节（行数、文件清单）已过时 |
 | `docs/frontend-design.md`、`docs/backend-architecture.md` | ⚠️ 目标架构设计稿 | 讲的是 libmpv actor、`mpv_render_context` + D3D11 合成、小黄鸭/RIFE 补帧、`commands/mod.rs` 拆分迁移。**现状**：WebView2 `<video>` + MSE(hls.js)；补帧引擎 0.2.5 整体移除；mpv 与外部播放兜底 0.2.15 删除（零调用方） |
 | `docs/design-proposals/magpie-video-enhancement-integration.md` | ❌ 未采纳 | 外部 Magpie 协调 + 整窗口捕获方案，从未落地；真正的增强是 `media_enhance.rs` 的 H.264 本地 HLS（见 §5-25） |
-| 根目录 `红果短剧*.md`、`画质档位分辨率实测验证.md`、`短剧画质链路集成实施方案.md` | ⚠️ 阶段性存档 | 抓包原始记录 / 实测数据 / 未实施的设计稿，不随代码更新。其中 `画质档位分辨率实测验证.md` 的档位矩阵仍是权威证据 |
+| 根目录 `画质档位分辨率实测验证.md`、`短剧画质链路集成实施方案.md` | ⚠️ 阶段性存档 | 实测数据 / 未实施的设计稿，不随代码更新。其中 `画质档位分辨率实测验证.md` 的档位矩阵仍是权威证据 |
 | `design-proposals/` | ⚠️ 设计稿存档 | 原型预览，不参与构建（`launch-animation/` 的方案 05 已落地，边界见 §5-26） |
 
 其它容易踩的残留：
@@ -202,6 +201,7 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 - `src/stores/useEnhancementStore.tsx`、`src-tauri/src/rtx_vsr.rs`、`lossless_scaling.rs` 都**不存在**；`Cargo.toml` 里关于它们的注释是残留。那段注释提到的 `Win32_System_LibraryLoader` 现在有真实用途：`guo_provider.rs` 用它 `LoadLibraryA` 加载 `duanju_core.dll`。
 - `docs/` 与根目录报告里出现的 worker 子命令 `rank` / `latest`、`short_drama_app_preload`、`preloadNative`、`variant_cache`、`bitrateKbps`、`TTV_SD_SOURCE_TMP`，以及 `enhancement_*` 命令与 `enhancement://` 事件，**在代码里都不存在**，别照它们找实现。
 - 文档里的「主导航只保留发现/历史/设置」也已过时：现在还有动漫、收藏、搜索。
+- 红果 / 动漫的接口细节来自**私有渠道**调研，按约定**仓库内不留调研记录**（2026-10 已移除）。要改实现只能读代码：`src-tauri/src/{short_drama_app,dmghg_bridge,anime_provider}.rs` 与 `docs/backend-integration.md`。
 
 **冲突时以代码 + `CHANGELOG.md` 为准。** 改动行为后同步更新 `CHANGELOG.md`（它的写法是记录根因与实测数据，不是罗列改动）；改了模块/命令/资源清单后，同步更新本文件的 §3/§4/§6 与 `README.md`。
 
@@ -222,7 +222,7 @@ Python 侧：`resources/shortdrama-worker/worker.py` 是**单次调用的无状�
 - 开发态数据落在 `src-tauri/.app-data/`（含 WebView2 的 `.app-data/webview-data`），运行期数据在 `%LOCALAPPDATA%\com.ttv.shortdrama`（设备凭据 + 剧集缓存 + `guo-core/`）。这些目录**绝不入库**。
 - `VidCom图标库/`、`design-proposals/` 是素材与预览，不参与构建。
 - `TTV_GUO_CORE_DLL` 环境变量可覆盖 DLL 查找路径（调试用）。
-- 抓包/站点分析产物在 `.har-analysis/`（实测单个就有 43MB），是临时材料，别入库也别当参考资料。
+- **私有渠道**调研/站点分析产物（`.har-analysis/` 那类，实测单个就有 43MB）一律不入库，也不当参考资料。
 
 ## 9. 提交前检查清单
 
