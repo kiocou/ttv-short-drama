@@ -15,7 +15,7 @@
 | 频道 | 来源 | 说明 |
 | --- | --- | --- |
 | 短剧 / 漫剧 | 红果官网 + App API | 网页抓取目录，App API 取播放地址；整集下载解密后本地播放 |
-| 短剧 / 漫剧 | guoapp 外部站源（18+ 源） | 通过 `duanju_core.dll` FFI 承接目录 / 搜索 / 详情 / 分集 / 真实清晰度 / 取流；剧集 ID 统一为 `guo:<source>:<id>` |
+| 短剧 / 漫剧 | guoapp 外部站源（19 个，其中 6 个 18+） | 通过 `duanju_core.dll` FFI 承接目录 / 搜索 / 详情 / 分集 / 真实清晰度 / 取流；剧集 ID 统一为 `guo:<source>:<id>`。**红果被显式排除在这条链路外**（红果 id 是裸 `series_id`） |
 | 动漫 | 动漫共和国（正式源）/ 暴风资源（兜底） | 动漫共和国驱动厂商桥接取直链；不可用时自动回退公开兜底源 |
 
 外部站源的可用性由**站方**决定，且**死源无法在代码里修活**——因此应用带一套五步链路体检（入口与目录 → 分集目录 → 播放地址与播放列表 → 播放密钥 → 媒体连接），在「设置 → 站源状态」可逐源现场跑一次并看到每一步的 host / HTTP 状态 / 耗时。没体检过的一律显示「未检测」，**不显示成「可用」**。
@@ -33,24 +33,28 @@
 - **画中画小窗**：把正在看的一集交给一个**独立置顶无边框窗口**继续播，可拖动、八向拉伸改大小；主窗口照常浏览，播放权同一时刻只属于一个窗口
 - **断点续播**：整集本地缓存，回看与换集秒开；缓存自动清理（7 天 / 1GB 全局预算，LRU）
 - **观看历史 / 追剧收藏**：SQLite 持久化，支持分组与筛选；卡片上按「想看 / 在看 / 已看」三态显示
-- **检查更新**：从 GitHub Releases 拉取最新安装包（只下载并定位文件，**不会自动安装**）
+- **长按临时加速**：按住 ← / → 固定 2 倍速（基准档位已 ≥ 2x 时不动、也不弹提示），松开只恢复原速、不跳转；速率与阈值只在 `src/services/boostController.ts` 一处定义
+- **启动进入动画**：方案 05「轨道汇聚」（6 张迷你海报公转 → 依次汇聚 → 品牌弹簧回弹），配一段用振荡器现场合成的启动音（一个音频文件都没有；可在设置里关闭）
+- **检查更新**：从 GitHub Releases 拉取最新安装包，**下载完成后自动静默安装**（安装器启动后应用退出）。动手前要过四道校验——路径 `canonicalize` 后必须仍在下载目录内、扩展名必须是 `.exe`、文件头必须是 `MZ`、体积 ≥ 1 MB；任一条不过就拒绝执行，并回落成「打开安装包所在文件夹」如实提示原因。启动时自动检查（6 小时一次），**是否立即更新由用户选**
 
 ## 技术栈
 
-- **前端**：React 19 + TypeScript + Vite 6 + Tailwind CSS
-- **后端**：Tauri 2 + Rust（`src-tauri/src/`）
-- **随包运行时**：嵌入式 CPython + 解析 worker + ffmpeg
-- **数据**：SQLite（历史 / 收藏 / 设置）
+- **前端**：React 19 + TypeScript + Vite 6 + Tailwind CSS（`src/`）
+- **后端**：Tauri 2 + Rust（`src-tauri/src/`，13 个模块）
+- **随包运行时**：嵌入式 CPython + 解析 worker + ffmpeg + **guo-core**（Go 编译的 `duanju_core.dll`）。ffmpeg 住在 `resources/mpv/` 目录下，但该目录**只装 ffmpeg**——mpv 已于 0.2.15 随外部播放兜底一起移除
+- **外部站源内核**：`src-tauri/guo-core/`（Go module `duanjuapp/native`，整棵入库），Rust 侧只经 FFI 调用，不在 Rust 里重写站源解析
+- **数据**：SQLite（历史 / 收藏 / 设置，WAL）
 
 ## 快速开始
 
 ```bash
-npm ci                  # 严格按锁文件安装
+npm ci                  # 严格按锁文件安装（CI 用这个）
 npm run dev             # Vite dev server → http://127.0.0.1:5175
 npm run tauri dev       # 桌面窗口（Windows 专属）
 
 npx tsc --noEmit        # 类型检查
 npm run build           # tsc + vite build → dist/
+npm run verify:boost    # 长按加速状态机用例（36 项，假时钟 + 假 video，不依赖真实定时器）
 ```
 
 后端检查（与 CI 一致）：
@@ -60,6 +64,10 @@ cargo fmt   --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path src-tauri/Cargo.toml --bins
 ```
+
+改了 `src-tauri/guo-core/**/*.go` 还要在 `src-tauri/guo-core/` 下跑 `go test ./...`（需要 Go 1.24+），
+必要时用 `pwsh -File src-tauri/guo-core/build.ps1` 重新产出 `duanju_core.dll`——**CI 不跑 Go**，Go 侧回归全靠本地；
+前端那条 `npm run verify:boost` 也不在 CI 里，改长按加速时记得手动跑。
 
 ### 发布
 
@@ -84,12 +92,33 @@ pwsh -NoProfile -File release.ps1 -NoPublish   # 只构建，先本地验包
 | `src-tauri/resources/shortdrama-worker/site-packages/` | worker 的 Python 依赖 | 已随仓库提供 |
 | `src-tauri/resources/guo-core/` | 外部站源的 `duanju_core.dll` + 头文件 | 已随仓库提供 |
 
+> ⚠️ `guo-core/duanju_core.dll`（15.2 MB）**缺了应用起不来**（`GuoProvider::new` 直接返回错误），
+> 但它**目前不在 CI 的资源校验清单里**（CI 只校验 python / worker / ffmpeg 三项）——克隆与打包时别漏。
+> `mpv/` 是历史遗留的目录名，里面**只有 `ffmpeg.exe`**。
+
 CI 会启用 LFS 并校验这些资源存在，避免生成缺少运行时文件的安装包。
 
 ## 目录结构
 
 ```text
 TTV Short Drama/
+├── AGENTS.md                     # 给 AI 代理的入口：不变量、命令、环境陷阱（改代码前先读它）
+├── docs/                         # 设计与逆向资料（多为目标架构 / 阶段性存档，见「文档地图」）
+├── design-proposals/             # 原型与设计稿存档（不参与构建）
+├── src/
+│   ├── types/                    # 领域契约（catalog / series / playback / history / favorite / settings）
+│   ├── services/
+│   │   ├── ipc.ts                # 唯一后端入口 + sessionId 分配 + 详情缓存 + mock 降级
+│   │   ├── guoSources.ts         # 19 个 guo 站源静态清单（kind / adult）+ tab 与启用集过滤
+│   │   ├── pip.ts                # 画中画小窗交接协议
+│   │   ├── updater.ts            # 检查更新（走 Rust，不走被 CSP 收紧的页面 fetch）
+│   │   ├── hlsAttach.ts          # m3u8 挂载与 hls.js 生命周期
+│   │   ├── animePlayback.ts      # 动漫链路挂载与出帧看门狗
+│   │   ├── boostController.ts    # 长按临时加速状态机（速率 / 阈值唯一来源）
+│   │   ├── launchAudio.ts        # 启动音（振荡器现场合成，零音频资源）
+│   │   ├── playbackTrace.ts      # 播放链路诊断埋点
+│   │   ├── windowFx.ts           # 原生全屏唯一入口
+│   │   └── mockData.ts           # Web / 演示模式数据源
 ├── docs/                         # 设计与逆向资料
 ├── design-proposals/             # 方案预览（播放器设计稿、随机推荐页 10 套方案，不参与构建）
 ├── src/
@@ -103,33 +132,56 @@ TTV Short Drama/
 │   │   ├── animePlayback.ts      # 动漫链路挂载
 │   │   ├── windowFx.ts           # 原生全屏唯一入口
 │   │   └── mockData.ts           # Web / 演示模式数据源
-│   ├── stores/                   # Context 状态机：app / catalog / playback / anime / history / favorites / settings
+│   ├── stores/                   # Context 状态机：app / catalog / playback / animePlayer / history / favorites / settings
 │   ├── components/
-│   │   ├── layout/               # TitleBar, NavigationRail, ToastContainer
-│   │   ├── common/               # MicaCard, FluentButton, CoverImage, SeriesCard, …
-│   │   ├── player/               # VideoSurface, AnimeVideoSurface, MiniPlayer, PlayerControls, …
-│   │   └── views/                # Explore / Anime / Detail / Search / History / Favorites / Settings
-│   └── styles/                   # mica.css, crystal.css
+│   │   ├── layout/               # TitleBar, NavigationRail, ToastContainer, LaunchAnimation
+│   │   ├── common/               # MicaCard, FluentButton, CoverImage, SeriesCard, UpdatePrompt, …
+│   │   ├── player/               # VideoSurface, AnimeVideoSurface, MiniPlayer, PlayerHud, …
+│   │   └── views/                # Explore / Anime / Detail / Search / History / Favorites / Settings / ShelfMore
+│   └── styles/                   # mica.css（底衬）· crystal.css（玻璃材质）· launch.css（启动动画）
 ├── src-tauri/
 │   ├── src/
-│   │   ├── main.rs               # 窗口装配、Tauri 命令、WebView2 启动参数
-│   │   ├── provider.rs           # 红果官网抓取
-│   │   ├── short_drama_app.rs    # 红果 App-API 桥（签名 / 整集解析 / CENC 解密 / 缓存预算）
+│   │   ├── main.rs               # 窗口装配、全部 Tauri 命令、全屏、WebView2 启动参数、18+ 门闩
+│   │   ├── provider.rs           # 红果官网抓取（目录 / 题材路由 / 搜索）
+│   │   ├── short_drama_app.rs    # 红果 App-API 桥（凭据 / worker 调度 / 整集解密 / 缓存预算）
 │   │   ├── guo_provider.rs       # guo 外部站源桥（duanju_core.dll FFI）
-│   │   ├── anime_provider.rs     # 动漫源分发
-│   │   ├── dmghg_bridge.rs       # 动漫共和国桥接
-│   │   ├── hls_proxy.rs          # 本地 HLS 代理
+│   │   ├── anime_provider.rs     # 动漫源分发（dmghg 正式源 / 暴风兜底）
+│   │   ├── dmghg_bridge.rs       # 动漫共和国桥接（electron_bridge.dll）
+│   │   ├── media_enhance.rs      # H.264 本地 HLS 转码（驱动侧 RTX VSR 的前提）
+│   │   ├── hls_proxy.rs          # 本地 HLS 代理（带访问令牌）
 │   │   ├── pip.rs                # 画中画小窗
-│   │   ├── update.rs             # 检查更新与安装包下载
-│   │   └── storage.rs            # SQLite
+│   │   ├── update.rs             # 检查更新与安装包下载 / 四道校验 / 静默安装
+│   │   ├── storage.rs            # SQLite（历史 / 收藏 / 设置）
+│   │   ├── models.rs             # 跨 IPC 的 serde 契约
+│   │   └── trace.rs              # 诊断日志（环形缓冲 + 落盘 + 接管 stderr）
+│   ├── guo-core/                 # Go 内核源码（module duanjuapp/native → duanju_core.dll）
 │   └── resources/                # 随包运行时（Python / worker / ffmpeg / guo-core）
 ├── release.ps1                   # 一键发布
+├── scripts/verify-boost.mjs      # 长按加速状态机的确定性用例（npm run verify:boost）
 └── CHANGELOG.md                  # 变更记录（含根因与实测数据）
 ```
 
 ## 开发约定
 
 见 [`AGENTS.md`](./AGENTS.md)——它记录了必须遵守的不变量与踩过的坑（会话号判定、连播闸门、CSP 只在生产注入、画中画播放权唯一等）。**改动行为后请同步更新 `CHANGELOG.md`。**
+
+## 文档地图
+
+本仓库的文档分三类，**读之前先看它顶部的状态标签**：
+
+| 文档 | 状态 | 用途 |
+| --- | --- | --- |
+| [`AGENTS.md`](./AGENTS.md) | ✅ 权威 | 不变量、常用命令、环境陷阱。**改代码前必读** |
+| [`CHANGELOG.md`](./CHANGELOG.md) | ✅ 权威 | 每个版本的根因与实测数据（不是改动清单） |
+| 本 README | ✅ 现状 | 项目定位、功能、随包资源、目录结构 |
+| [`docs/frontend-design.md`](./docs/frontend-design.md)、[`docs/backend-architecture.md`](./docs/backend-architecture.md) | ⚠️ 目标架构设计稿 | 描述的是**目标形态**（libmpv actor、补帧、模块化目录），与现状不符；现状以代码为准 |
+| [`docs/backend-integration.md`](./docs/backend-integration.md) | ✅ 现状 | 后端命令面与数据归属 |
+| [`docs/dmghg-reverse/`](./docs/dmghg-reverse/) | ✅ 仍有效 | 动漫共和国逆向记录与 DLL 调用契约（接口部分有效，施工细节已过时） |
+| [`docs/design-proposals/magpie-video-enhancement-integration.md`](./docs/design-proposals/magpie-video-enhancement-integration.md) | ❌ 未采纳 | 外部 Magpie 增强方案，从未落地 |
+| 根目录 `红果短剧*.md` / `画质档位分辨率实测验证.md` / `短剧画质链路集成实施方案.md` | ⚠️ 阶段性存档 | 抓包原始记录、实测数据与未实施的设计稿，不随代码更新 |
+| [`design-proposals/`](./design-proposals/) | ⚠️ 设计稿存档 | 原型预览，不参与构建 |
+
+**任何冲突都以代码 + `CHANGELOG.md` 为准。**
 
 ## 免责声明
 

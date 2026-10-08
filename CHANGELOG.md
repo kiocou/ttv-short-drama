@@ -1,3 +1,13 @@
+## Unreleased
+
+### 文档
+
+- **全仓库文档与代码对齐（纯文档改动，不改任何行为）。** 起因是一次逐文件核对，发现三处「文档说的和代码做的不是一回事」：README 里「检查更新**不会自动安装**」早在 0.2.15 就被推翻（`update_install` + `app.exit(0)`），却一直留在用户可见的位置；`AGENTS.md` §4 的模块表漏了 `media_enhance.rs` 与 `trace.rs`、且 11 个模块的行数全部过期；`docs/backend-integration.md` 的命令面还停在 `enhancement_*` 时代。
+  - **做法**：给每份非权威文档加**状态标签**（✅ 现状 / ⚠️ 目标架构 / ⚠️ 阶段性存档 / ❌ 未采纳），并在 `README.md` 与 `AGENTS.md` §6 建了一份「文档地图」，一次说清「哪些能照抄、哪些只能当证据」。权威顺序统一为 **代码 > `CHANGELOG.md` > `AGENTS.md` > 其它文档**。
+  - **同步的硬事实**：Rust 模块表（13 个模块 + 现行行数）、worker 子命令白名单（`resolve / resolve-prefix / stream / album / search / counts / feed`）、真实 Tauri 命令面与三条零调用的历史命令、SQLite 实际只有三张表（`watch_history` / `favorites` / `settings`，WAL）、随包资源清单（`duanju_core.dll` 缺了应用起不来，但 CI 未校验它）、`npm run verify:boost` 不在 CI 里、启动动画实现总长 2150ms（设计稿标称 2300ms）。
+  - **明确写进文档的「不要照做」**：`docs/frontend-design.md` / `docs/backend-architecture.md` 的 libmpv + 补帧 + `domain/application/infrastructure/adapters` 目录结构从未落地；`docs/design-proposals/magpie-video-enhancement-integration.md` 的 Magpie 方案未采纳；根目录几份报告里的 `rank` / `latest`、`short_drama_app_preload`、`preloadNative`、`variant_cache`、`bitrateKbps`、`TTV_SD_SOURCE_TMP` 等标识符在代码里零命中。
+  - 本次**只动 Markdown**（`git diff --stat` 全是 `.md`）：既没有改代码，也没有改 CI。CI 的两个缺口（不跑 Go、资源校验漏 `duanju_core.dll`）只做了记录，修不修由后续单独决定。
+
 ## 0.2.19 - 2026-10-07
 
 ### 修复 / 调整
