@@ -650,7 +650,10 @@ export const VideoSurface: React.FC = () => {
                 <p className="text-xs text-slate-500 leading-relaxed">
                   {uiState.code === 'MEDIA_AUTOPLAY_FAILED'
                     ? '浏览器限制了自动播放，点击下方按钮即可继续。'
-                    : '该媒体无法由 WebView 解码，已尝试备用源与兼容 Blob 播放。'}
+                    // ⚠️ 不要谎称"已尝试备用源与兼容 Blob 播放"：整集 HLS 收敛为单源之后，
+                    // 那两步在有流式源时是被**主动跳过**的（`resetStreamingSource` 的注释
+                    // 里有原因）。按字面读完再点重试的用户会发现"它说试过，其实没试"。
+                    : '这集的画面没能解出来。可能是源本身的问题，也可能是后台还在转码。'}
                 </p>
                 {/*
                   当设备同时跑着整集下载与转码时，最先失败的往往是"分片还来不及

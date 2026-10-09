@@ -119,7 +119,13 @@ pub(crate) fn rate_limits(source_kbps: Option<u32>) -> (u32, u32) {
         _ => return (3000, 6000),
     };
     let maxrate = ((source as f64) * 2.24).round() as u32;
-    let maxrate = maxrate.clamp(900, 8000);
+    // 下限只用来挡"离谱的小值"（上游码率字段脏数据），**绝不能反过来把低码率源抬高**：
+    // 300kbps 的源按 2.24× 是 672k，若下限取 900k，输出就变成源码率的 3 倍 ——
+    // 体积膨胀而画质零收益，正是"恒定质量模式把输出放到源之上"在小码率源上复现
+    // （审查 R6）。所以再取一次 min(上限, 源码率 × 3)。
+    let maxrate = maxrate
+        .clamp(150, 8000)
+        .min(source.saturating_mul(3).max(150));
     (maxrate, maxrate * 2)
 }
 
@@ -342,6 +348,19 @@ fn tier_cache_path() -> PathBuf {
     crate::short_drama_app::cache_dir().join(TIER_CACHE_FILE)
 }
 
+/// 探测结果的**进程内**槽位（与 `nvenc_slot` 同一套做法）。
+///
+/// 为什么必须有：`detect_encoder_tier` 在热路径上被反复调用（每次开播的
+/// `artifact_is_current` → `encoder_fingerprint` → `hls_packaging_args` 各一次，
+/// 加上 `video_encoder_args` 自己一次）。只有"落盘缓存"的话，每次都要读一次盘；
+/// 而一旦读盘失败或指纹失配，就会退化成**每次开播都真跑一次 ffmpeg 探测**
+/// （实测约 1.1 秒）—— 那等于把探测税重新摊回每一集的首屏（审查 R8）。
+static TIER_SLOT: OnceLock<std::sync::RwLock<Option<EncoderTier>>> = OnceLock::new();
+
+fn tier_slot() -> &'static std::sync::RwLock<Option<EncoderTier>> {
+    TIER_SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
 /// 探测本机适合哪一档。**只探测一次**（进程内 + 落盘）。
 ///
 /// 判据与理由：
@@ -353,6 +372,12 @@ fn tier_cache_path() -> PathBuf {
 /// 3. **不确定时取保守档**：探测失败宁可当低配（720p 也能看），也不要让低配
 ///    用户在"一直转圈"里等。画质差一点是可见的遗憾，卡住不动是体验事故。
 pub fn detect_encoder_tier(ffmpeg: &std::path::Path) -> EncoderTier {
+    // 0) 进程内已有结论：这是热路径上的第一道（也是绝大多数调用会命中的那道）。
+    if let Ok(guard) = tier_slot().read() {
+        if let Some(tier) = *guard {
+            return tier;
+        }
+    }
     // 盘上已有结论且指纹匹配：直接读（省掉每次冷启动的探测开销）。
     if let Some(fingerprint) = tier_fingerprint() {
         if let Ok(raw) = std::fs::read_to_string(tier_cache_path()) {
@@ -366,6 +391,9 @@ pub fn detect_encoder_tier(ffmpeg: &std::path::Path) -> EncoderTier {
                     };
                     if let Some(value) = parsed {
                         crate::trace::log(format!("[vsr] 编码档位：读缓存 = {value:?}"));
+                        if let Ok(mut slot) = tier_slot().write() {
+                            *slot = Some(value);
+                        }
                         return value;
                     }
                 }
@@ -393,6 +421,9 @@ pub fn detect_encoder_tier(ffmpeg: &std::path::Path) -> EncoderTier {
             EncoderTier::SoftwareLow => "software-low",
         };
         let _ = std::fs::write(tier_cache_path(), format!("{fingerprint} {tag}"));
+    }
+    if let Ok(mut slot) = tier_slot().write() {
+        *slot = Some(tier);
     }
     tier
 }
@@ -687,7 +718,26 @@ fn directory_of_inflight_vid(directory: &std::path::Path) -> Option<PathBuf> {
 fn register_reused(session_id: u64, directory: PathBuf) {
     let done = Arc::new(AtomicBool::new(true));
     if let Ok(mut guard) = jobs().lock() {
-        // 同号已有的先收掉（正常情况下不会有）。
+        // ⚠️ 同号已有任务时，先看它是不是"正在给我自己转"。
+        //
+        // 同号重入是**常态**，不是异常：前端首播失败后会带着同一个 sessionId 重试
+        // （700ms 自动重试、CDN 失败后的本地解析兜底都用那个号），而上面的 1b 分支
+        // 会把这份**正在转**的目录挂到同一个号上。若这里无条件 abort，等于杀掉自己
+        // 正在写产物的 ffmpeg —— 产物永远等不到 `#EXT-X-ENDLIST`，播放器播到已生成
+        // 分片的末尾就 stall（用户看到"播一半卡死"），而且没有任何路径会补转（审查 R1）。
+        let same_inflight = guard
+            .get(&session_id)
+            .map(|previous| {
+                previous.directory == directory && !previous.done.load(Ordering::Acquire)
+            })
+            .unwrap_or(false);
+        if same_inflight {
+            crate::trace::log(format!(
+                "[vsr] 会话号重入同一份在途转码，保持原任务 会话={session_id}"
+            ));
+            return;
+        }
+        // 其余情况（同号但换了目录、或旧任务已结束）照旧收掉。
         if let Some(previous) = guard.remove(&session_id) {
             if let Some(task) = previous.task {
                 task.abort();
@@ -1042,6 +1092,24 @@ async fn start_in_directory(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if ready() || job_alive(session_id) {
+        // ⚠️ 进程已经退出、且产物**不完整**（没有 `#EXT-X-ENDLIST`）时不能算成功。
+        //
+        // 那说明 ffmpeg 中途挂了（网络断、密钥错、源返回 403），产物只覆盖开头几秒。
+        // 旧实现看到 ready() 为真就返回 Ok(地址)，于是上层不会走 `cached_full_mp4`
+        // 回退链路 —— 用户看到的是"播一两秒就卡住、既不报错也不自愈"（审查 R5）。
+        // 只有"进程还在跑"或"转完了（ENDLIST 齐）"两种情形才值得把地址交出去。
+        if !job_alive(session_id) {
+            let complete = std::fs::read_to_string(&playlist)
+                .map(|body| body.contains("#EXT-X-ENDLIST"))
+                .unwrap_or(false);
+            if !complete {
+                crate::trace::log(format!(
+                    "[vsr] 转码进程已退出且产物不完整（无 ENDLIST），按失败处理 会话={session_id}"
+                ));
+                stop(session_id);
+                return Err("增强转码提前退出，产物不完整。".to_owned());
+            }
+        }
         // 这一行是判断"到底谁在拖"的关键：ready=true 说明 ffmpeg 已经在 1.5 秒内
         // 吐出首片，后面的等待全在播放器侧；ready=false 说明后端压根没跟上。
         crate::trace::log(format!(
@@ -1049,7 +1117,7 @@ async fn start_in_directory(
             ready(),
             job_alive(session_id),
             wait_start.elapsed().as_millis(),
-            url
+            crate::trace::redact_url(&url)
         ));
         if !ready() {
             crate::trace::log("[vsr] 首段尚未落地，先交地址交由播放器重试");
@@ -1120,6 +1188,11 @@ pub fn clear_encoder_capability_cache() {
     if let Ok(mut guard) = nvenc_slot().write() {
         *guard = None;
     }
+    // 档位结论的进程内槽位同样要清 —— 否则"重新探测"只对 NVENC 那半生效，
+    // 分档（Hardware / SoftwareFast / SoftwareLow）仍是旧结论。
+    if let Ok(mut slot) = tier_slot().write() {
+        *slot = None;
+    }
 }
 
 /// 某一集的整集 HLS 缓存目录（`rtx-vsr/vid-{vid}`）。
@@ -1130,15 +1203,50 @@ pub fn video_cache_dir(vid: &str) -> PathBuf {
     media_root().join(format!("vid-{vid}"))
 }
 
-/// 启动时/清缓存时清掉所有残留；此时没有正在使用的增强任务。
-pub fn cleanup_all() {
+/// 清掉残留的增强产物。
+///
+/// `keep_persistent` 决定 `vid-{vid}` 的整集 HLS 目录留不留：
+///   * **启动路径传 `true`** —— 那些目录是"同一集第二次打开零等待"的全部依据
+///     （按 vid 存、换集不删、带参数指纹）。旧实现无条件 `remove_dir_all(media_root())`，
+///     等于把持久缓存降级成"单进程内有效"：每次重启、每次升级，所有看过的集都要重转，
+///     而且用户完全看不出为什么"昨天秒开的今天又要等"（审查 R2）。
+///   * **设置页「清空缓存」传 `false`** —— 用户主动要求释放空间，那时应当真的清干净。
+///
+/// 另外**不在持锁状态下删目录**：清缓存时 `rtx-vsr` 可能是 GB 级，而本地 HLS 服务的
+/// 每个分片请求都要拿这把锁 —— 持锁删盘会让正在播的画面卡住好几秒（审查 R9）。
+pub fn cleanup_all(keep_persistent: bool) {
+    let mut abandoned: Vec<PathBuf> = Vec::new();
     if let Ok(mut guard) = jobs().lock() {
         for (_, job) in guard.drain() {
             if let Some(task) = job.task {
                 task.abort();
             }
-            let _ = std::fs::remove_dir_all(job.directory);
+            if !job.persist || !keep_persistent {
+                abandoned.push(job.directory);
+            }
         }
+    }
+    for directory in abandoned {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+    if keep_persistent {
+        // 只清根目录下的**临时**残留（`session-<id>-<uuid>`、早期版本的裸数字目录）。
+        let Ok(entries) = std::fs::read_dir(media_root()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("vid-") {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        return;
     }
     let _ = std::fs::remove_dir_all(media_root());
 }
@@ -1460,6 +1568,24 @@ async fn write_head(
     Ok(())
 }
 
+/// 预转的**在途闸门**（同时最多 1 路）。
+///
+/// 为什么必须放在 Rust 侧：预转的产物与"正在播的那一集"共用同一块编码单元，而
+/// 实测 NVENC **完全串行**（两路 9455+9407ms、四路 20060ms × 4，总时长不因并发减少，
+/// 只是把正在播的那一路挤慢 → 分片来不及生成 → hls.js 重试耗尽报错）。
+/// 前端的 `MAX_PREWARM_INFLIGHT = 1` 只管得住它自己那条路，画中画、悬停预取、
+/// 连播预转各有入口 —— 闸门放在这里才能对所有调用方生效（审查 R3）。
+static PREWARM_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 在途计数的配对释放器：无论函数从哪条路径返回（含提前 return）都会减回去。
+struct PrewarmGuard;
+
+impl Drop for PrewarmGuard {
+    fn drop(&mut self) {
+        PREWARM_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// **预转**某一集的整集 HLS，不占用任何播放会话。
 ///
 /// ## 为什么需要它（用户需求：「集与集之间无缝切换」）
@@ -1488,6 +1614,16 @@ pub async fn prewarm_video_cache(
     session_slot: u64,
     source_kbps: Option<u32>,
 ) {
+    // 闸门：已经有预转在跑就不再接新的（见 `PREWARM_INFLIGHT` 的说明）。
+    // 放在最前面——比"查产物"还早，避免多路调用同时走到起 ffmpeg 那一步。
+    if PREWARM_INFLIGHT.fetch_add(1, Ordering::AcqRel) > 0 {
+        PREWARM_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+        crate::trace::log(format!("[vsr] 预转跳过（已有预转在途）vid={vid}"));
+        return;
+    }
+    // 从这里开始，任何 return 都会由 guard 把计数减回去。
+    let _guard = PrewarmGuard;
+
     let directory = video_cache_dir(vid);
     let playlist = directory.join("index.m3u8");
     // 参数变了就把旧产物丢掉：否则预转会把"旧参数的成品"当成就绪而跳过，
@@ -1600,8 +1736,13 @@ mod tests {
         assert_eq!(rate_limits(None), (3000, 6000));
         // 荒谬的小值按"拿不到"处理（上游字段出过 100 这种不可信的值）
         assert_eq!(rate_limits(Some(0)), (3000, 6000));
-        // 边界钳制：极低不跌破 900k，极高不超过 8000k
-        assert_eq!(rate_limits(Some(100)).0, 900);
+        // 低码率源（实测档位表里出现过 300kbps 档）**不能被下限抬高**：
+        // 2.24×300 = 672，旧实现的下限 900 会把它抬到源码率的 3 倍（审查 R6）。
+        assert_eq!(rate_limits(Some(300)), (672, 1344));
+        // 边界：低于 100k 的"码率"一律视为脏数据（不是码率），按拿不到处理；
+        // 极高值钳到 8000k。
+        assert_eq!(rate_limits(Some(10)), (3000, 6000));
+        assert_eq!(rate_limits(Some(100)), (224, 448));
         assert_eq!(rate_limits(Some(99_999)).0, 8000);
     }
 

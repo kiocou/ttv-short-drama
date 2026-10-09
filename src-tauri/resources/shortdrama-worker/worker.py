@@ -872,24 +872,47 @@ def probe_duration_ms(ffmpeg: str, url: str, key_hex: str | None) -> int:
 
     代价很小且不落盘：`-t 0` 让 ffmpeg 打开输入、打印元数据后立刻退出（不解码）。
     失败一律静默返回 0，由调用方决定退回什么。
+
+    ⚠️ 三个必须写清的点（审查指出，任一漏掉都会让修复失效甚至更糟）：
+
+    1. **必须带 App 的 UA/Referer（先带头、失败再裸直连）**。这条 CDN 会拒绝不带头的
+       请求（同文件 `_ffmpeg_direct_decrypt` 的注释里有实测记录：不带头的第一轮
+       6 集无一例外都失败）。只探一次裸直连的话，探测几乎必然返回 0，时长修复
+       在实机上等于没做。
+    2. **`loglevel` 保持 info**（Duration 是 info 级才打印），但**必须显式指定
+       `encoding="utf-8"`**：info 级会把整个 input dump（含源的 Metadata，中文标题
+       在内）打到 stderr，而 Windows 中文系统上 `text=True` 默认按 cp936 解码 ——
+       UTF-8 的中文标题会直接抛 `UnicodeDecodeError`，它**不是** `OSError` 也不是
+       `SubprocessError`，会穿透下面的兜底一路冒到子命令入口，让整条 `stream`
+       失败（用户点播放直接报错）。
+    3. **超时要短**（6 秒）且 `-rw_timeout` 收到 6 秒：这条探测在签名链路上是
+       同步串行的，最坏情况会叠加到用户的"一直在加载"里；探不到就当没有时长，
+       不该拖住播放。
     """
     if not ffmpeg or not url:
         return 0
-    command = [ffmpeg, "-hide_banner", "-nostdin"]
-    if key_hex:
-        command += ["-decryption_key", key_hex]
-    command += ["-tls_verify", "0", "-rw_timeout", "8000000",
-                "-i", url, "-t", "0", "-f", "null", "-"]
-    try:
-        proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                              text=True, timeout=15, **_no_window())
-    except (OSError, subprocess.SubprocessError):
-        return 0
-    match = _DURATION_RE.search(proc.stderr or "")
-    if not match:
-        return 0
-    hours, minutes, seconds, centis = (int(part) for part in match.groups())
-    return (hours * 3600 + minutes * 60 + seconds) * 1000 + centis * 10
+    for with_app_headers in (True, False):
+        command = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "info"]
+        if key_hex:
+            command += ["-decryption_key", key_hex]
+        command += ["-tls_verify", "0", "-rw_timeout", "6000000",
+                    "-probesize", "500000", "-analyzeduration", "1000000"]
+        if with_app_headers:
+            command += ["-user_agent", DOWNLOAD_UA,
+                        "-headers", f"Referer: {DOWNLOAD_REFERER}\r\n"]
+        command += ["-i", url, "-t", "0", "-f", "null", "-"]
+        try:
+            proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                  text=True, encoding="utf-8", errors="replace",
+                                  timeout=6, **_no_window())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        match = _DURATION_RE.search(proc.stderr or "")
+        if not match:
+            continue
+        hours, minutes, seconds, centis = (int(part) for part in match.groups())
+        return (hours * 3600 + minutes * 60 + seconds) * 1000 + centis * 10
+    return 0
 
 
 # 两条编码路径的唯一区别就在这几项上；其余参数（音轨、faststart）两条共用。
@@ -1450,10 +1473,17 @@ def resolve(vid: str, out_path: Path, device_id: str, install_id: str, ffmpeg: s
     #
     # 保留第二轮而不是直接删掉：将来若某种源流反过来拒绝带头请求，这条链路
     # 仍能退到裸直连，最坏情况与旧版持平，不会更糟。
+    # 进度换算的分母也必须**真的探一次**：上游那个字段实测只有 100（不可信），
+    # 拿它当毫秒会让下载进度第一帧就跳到 99%（审查指出 `stream` 那处修了、
+    # 这里漏了）。探不到才退回上游值，并滤掉不可能是"毫秒时长"的小值。
+    progress_duration_ms = probe_duration_ms(ffmpeg, real_url, key_hex)
+    if progress_duration_ms <= 0:
+        upstream_ms = int(stream_info.get("duration_ms") or 0)
+        progress_duration_ms = upstream_ms if upstream_ms >= 1000 else 0
     for with_app_headers in (True, False):
         try:
             if _ffmpeg_direct_decrypt(ffmpeg, real_url, key_hex, out_path,
-                                      int(stream_info.get("duration_ms") or 0),
+                                      progress_duration_ms,
                                       with_app_headers, copy_video):
                 size = out_path.stat().st_size
                 emit({"event": "done", "ok": True, "file": str(out_path), "width": width,

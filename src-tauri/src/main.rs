@@ -1218,8 +1218,9 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
 /// 由它清理真实的剧集缓存并返回释放量。
 #[tauri::command]
 fn cache_clear(state: State<'_, AppState>) -> Result<CacheClearResult, String> {
-    // 增强 HLS 是临时转码产物，清缓存时正在播的流也一并释放；下次打开会重新起。
-    media_enhance::cleanup_all();
+    // 增强 HLS 产物一并释放：这是用户主动要求腾空间，`vid-{vid}` 的持久整集缓存
+    // 也一起清（`false` 的语义见 `cleanup_all` 的文档）。
+    media_enhance::cleanup_all(false);
     // 动漫目录内存缓存也一并丢弃：用户点"清空缓存"的意图是"让程序重新取一遍数据"，
     // 留着这层会让他在 TTL 内看不到任何变化。
     crate::dmghg_bridge::clear_catalog_cache();
@@ -1540,7 +1541,9 @@ fn main() {
             // 的陈旧剧集、并把总占用压回用户设置的缓存上限内。放在独立线程里执行，
             // 避免在缓存很大时拖慢窗口创建（首次启动可能要删掉上 GB 文件）。
             std::thread::spawn(|| {
-                media_enhance::cleanup_all();
+                // `true` = 保留 `vid-{vid}` 持久整集缓存：它们是"看过的集再打开零等待"
+                // 的依据，只有用户主动点「清空缓存」时才该消失（审查 R2）。
+                media_enhance::cleanup_all(true);
                 let report = short_drama_app::auto_clean_cache_on_start();
                 if report.removed_files > 0 {
                     eprintln!(

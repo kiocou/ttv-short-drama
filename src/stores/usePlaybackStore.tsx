@@ -1108,7 +1108,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       video.volume = isMutedRef.current ? 0 : volumeRef.current;
       video.muted = isMutedRef.current;
       // 这里换上的是真实的本地媒体文件：兜底链可以从"流式源"模式退出来了。
-      streamingSourceRef.current = false;
+      // ⚠️ 必须走统一出口 `resetStreamingSource()` 而不是只写 ref：它同时清掉
+      // "时长权威值"。只清 ref 的话，连播命中这条快路径时新集会**沿用上一集的总时长**
+      // —— 进度条拖不过旧时长、`saveProgressThrottled` 的百分比虚高、历史被误判
+      // "已看完"（审查 F1，本次唯一的致命项）。
+      resetStreamingSource();
 
       // 等首批可绘制数据到位再切入：旧帧一直保留到这一刻。
       const firstFrameReady = new Promise<void>(resolve => {
@@ -1406,6 +1410,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // （日志实证 `整集切换完成 位置=8.0s`）与两倍磁盘占用。
     const streamingStarted = performance.now();
     beginStreamingWindow();
+    // 这一次 `beginStreamingWindow()` 有没有被配对释放。
+    //
+    // 为什么需要显式记账：`openStreamNative` 抛错（后端直接 Err —— **VSR 开关关闭时
+    // 是确定性触发**）时不会进入下面任何一条分支的释放点，窗口记账就永久多出一次，
+    // 之后的整集 mp4 预热会在 90 秒内全被拒（VSR 关的用户唯一能播的就是整集 mp4，
+    // 于是每次换集都现场等 7 秒多，审查 F2）。
+    let streamingWindowReleased = false;
     const streaming = await ipcService.playback
       .openStreamNative(seriesId, episodeId, sessionId, contentType)
       .catch((error: unknown) => {
@@ -1414,11 +1425,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       });
     if (activeSessionRef.current !== sessionId) {
       endStreamingWindow();
+      streamingWindowReleased = true;
       return `stale`;
     }
     // 后端在「盘上只有旧链路 mp4」时会回 file 形态：那不是失败，就是走文件。
     if (streaming && streaming.streamKind !== 'hls' && streaming.cached === true) {
       endStreamingWindow();
+      streamingWindowReleased = true;
       tracePlayback('整集 HLS 未启用，后端返回已缓存的整集文件');
       return startFull();
     }
@@ -1428,6 +1441,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       );
       if (streamingOutcome === `stale`) {
         endStreamingWindow();
+        streamingWindowReleased = true;
         return `stale`;
       }
       if (streamingOutcome === `ok`) {
@@ -1463,9 +1477,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         return `ok`;
       }
       endStreamingWindow();
+      streamingWindowReleased = true;
       tracePlayback(`整集 HLS 播放失败（outcome=${streamingOutcome}，回退整集文件）`);
     }
     // 只剩「HLS 起不来」这一种情况：回退旧链路的整集文件。
+    //
+    // ⚠️ 补一次配对释放（`streaming === null` 这条路走不到上面任何释放点，见
+    // `streamingWindowReleased` 的说明）。已释放过的路径都置了 true，不会重复减。
+    if (!streamingWindowReleased) {
+      endStreamingWindow();
+    }
     return startFull();
   };
 
@@ -1541,8 +1562,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const probeQualities = async (episodeId: string, contentType: number) => {
     if (probedVidsRef.current.has(episodeId)) return;
     probedVidsRef.current.add(episodeId);
+    // 探测要拉起一次 worker（秒级），这期间用户完全可能已经换集/换剧。
+    // 结果只对**发起探测时**的那个会话有效 —— 否则新一集的清晰度菜单会被
+    // 上一集的档位覆盖（同类调用点在别处都有这层校验，这里此前漏了，审查 F5）。
+    const sessionAtProbe = activeSessionRef.current;
     try {
       const variants = await ipcService.playback.listNativeQualities(episodeId, contentType);
+      if (activeSessionRef.current !== sessionAtProbe) return;
       if (!variants.length) {
         setAvailableQualities([]);
         return;
@@ -1639,6 +1665,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 因此这里用"顺序推进 + 并发上限"：既覆盖更深的往后集数，又不影响当前播放。
    */
   const prefetchQueueRef = useRef<Array<{ seriesId: string; episodeId: string; contentType: number }>>([]);
+  // 队列的**属主会话**：换集后新会话会重灌队列，而旧泵还活着的那个短窗口里
+  // 不能让它把新队列清掉（审查 F4）。0 表示没有属主。
+  const prefetchQueueOwnerRef = useRef<number>(0);
   const prefetchPumpRunningRef = useRef<boolean>(false);
 
   /**
@@ -1660,6 +1689,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const contentType = series.type === 'comic' ? 1004 : 1;
     // 每次重新排队前先清空旧队列：换了剧或换了集之后，之前的预测已经过时。
     prefetchQueueRef.current = [];
+    // 队列易主：新会话从现在起拥有它（旧泵醒来时据此判断"该不该清"，见审查 F4）。
+    prefetchQueueOwnerRef.current = sessionAtRequest;
+    if (sessionAtRequest <= 0) {
+      // 会话号还没建立（不该发生）：不设属主，交给泵的会话校验兜底。
+      prefetchQueueOwnerRef.current = 0;
+    }
     // 旧队列对应的首帧预解也随之作废——那些集已经不是"接下来要播的"了。
     // 必须连同 dispose 一起清，只清 Map 不释放会让解码器挂在脱离文档流的
     // video 上直到 WebView 回收。
@@ -1703,6 +1738,14 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // 会话已作废（用户切走/退出播放器）就不再预转：那台机器上正在播的
         // 已经不是这一集了，占用转码资源只会拖慢用户真正在看的那一路。
         if (activeSessionRef.current !== sessionAtRequest) return;
+        // ⚠️ 本集还在转码窗口内也不要发车：预转与"正在播的那一集"共用同一块
+        // 编码单元（实测 NVENC 串行），两路重叠会把正在播的那一路挤慢 ——
+        // 这正是 `MAX_PREWARM_INFLIGHT` 下调要治的病，而这条预转此前没有任何
+        // 前端闸门（审查 F7；后端现在也有一道闸门兜底）。
+        if (streamingInFlight()) {
+          tracePlayback('本集仍在流式转码窗口内，跳过下一集预转');
+          return;
+        }
         void ipcService.playback.prewarmStreamNative(series.id, nextEpisode.id, contentType);
       }, STREAMING_TRANSCODE_SETTLE_MS + 1000);
     }
@@ -1747,7 +1790,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     prefetchPumpRunningRef.current = true;
     const step = () => {
       if (activeSessionRef.current !== sessionAtQueueBuild) {
-        prefetchQueueRef.current = [];
+        // ⚠️ 只清**属于我这个旧会话**的队列。
+        //
+        // 新会话（换集后）会灌进自己的队列并起一个新泵，但泵有"同时只跑一个"的守卫
+        // （`prefetchPumpRunningRef`）—— 旧泵还活着时新泵直接被挡掉，而旧泵醒来发现
+        // 会话不符，若在这里无条件清空，清掉的正是**新会话刚灌进去的队列**，
+        // 此后又没有任何泵会重启，该集的 mp4 预热全失效（审查 F4）。
+        if (prefetchQueueOwnerRef.current === sessionAtQueueBuild) {
+          prefetchQueueRef.current = [];
+          prefetchQueueOwnerRef.current = 0;
+        }
         prefetchPumpRunningRef.current = false;
         return;
       }
@@ -1940,7 +1992,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 它自己的释放点，靠递减会让计数慢慢涨上去、把整集预取永久关掉。
     resetStreamingWindow();
     // 兜底链的分支判定也一并复位：新一集还没决定走哪条源。
-    streamingSourceRef.current = false;
+    // ⚠️ 同样必须走统一出口：只写 `streamingSourceRef` 会留下**上一集的时长权威值**，
+    // 于是新集的总时长是上一集的（审查 F1）。
+    resetStreamingSource();
     dismissPip();
     const qualitySwitchRequested = Boolean(
       qualityOverride
