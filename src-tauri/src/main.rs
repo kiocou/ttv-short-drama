@@ -23,9 +23,9 @@ use crate::provider::DramaProvider;
 use crate::short_drama_app::{
     short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
     short_drama_app_cover_proxy, short_drama_app_episode_counts, short_drama_app_open_stream,
-    short_drama_app_prefetch_stream, short_drama_app_qualities, short_drama_app_resolve,
-    short_drama_app_resolve_prefix, short_drama_app_set_device, short_drama_app_shelf_feed,
-    short_drama_app_status, short_drama_app_stream,
+    short_drama_app_prefetch_stream, short_drama_app_prewarm_stream, short_drama_app_qualities,
+    short_drama_app_resolve, short_drama_app_resolve_prefix, short_drama_app_set_device,
+    short_drama_app_shelf_feed, short_drama_app_status, short_drama_app_stream,
 };
 use crate::storage::Database;
 use crate::trace::{trace_clear, trace_tail, trace_ui_log};
@@ -1223,6 +1223,9 @@ fn cache_clear(state: State<'_, AppState>) -> Result<CacheClearResult, String> {
     // 动漫目录内存缓存也一并丢弃：用户点"清空缓存"的意图是"让程序重新取一遍数据"，
     // 留着这层会让他在 TTL 内看不到任何变化。
     crate::dmghg_bridge::clear_catalog_cache();
+    // 硬件编码探测结论也清掉：换显卡/更新驱动后用户需要一个"强制重新探测"的入口，
+    // 而探测结果的指纹只认得随包 ffmpeg 的变化，感知不到硬件与驱动。
+    crate::media_enhance::clear_encoder_capability_cache();
     // 应用自有缓存目录（SQLite 快照等）一并清理。
     let own = clear_directory(&state.cache_dir).unwrap_or(0);
     let report = short_drama_app_cache_clear()?;
@@ -1572,6 +1575,8 @@ fn main() {
             // 边转边播：红果加密源直接转本地 H.264 HLS，首片约 1.1 秒落地。
             // 与整集 resolve 并发跑，前者负责尽早出画、后者负责最终质量。
             short_drama_app_open_stream,
+            // 预转下一集：连播期间把下一集提前转好，切换时零等待。
+            short_drama_app_prewarm_stream,
             short_drama_app_cache_clear,
             short_drama_app_cache_usage,
             short_drama_app_stream,

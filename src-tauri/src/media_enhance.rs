@@ -32,6 +32,16 @@ struct Job {
     done: Arc<AtomicBool>,
     directory: PathBuf,
     task: Option<JoinHandle<()>>,
+    ///
+    /// 这条会话的产物是否值得**保留**为缓存。
+    ///
+    /// 红果短剧的整集 HLS 是「按 vid 转一次、之后任意次都能直接播」的产物（实测整集
+    /// 转码只要 5.6 秒，但没必要每集都重转），所以它的目录必须跨会话留存；而 guo /
+    /// 公开直链那种按 session 建的临时转码目录用完即弃。
+    ///
+    /// `false` 时 `stop()` 仍然删目录（沿用旧行为）；`true` 时只杀进程、留产物，
+    /// 由缓存预算（`evict_channels_to_budget`）负责回收。
+    persist: bool,
 }
 
 fn server_info() -> &'static OnceLock<ServerInfo> {
@@ -57,9 +67,538 @@ pub fn needs_enhancement(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
+/// H.264 视频编码参数：能上硬件就上硬件。
+///
+/// **为什么这件事对「边转边播」是决定性的**：流式链路的可用性取决于"转码速度
+/// 能否跟上播放速度"。CPU 编码（libx264 ultrafast）在 1080p 上要吃掉好几个核，
+/// 一旦与整集预取抢起来就会跟不上，播放器随即撞上"分片还没生成"→ 重试耗尽 →
+/// 报错。NVENC 把这块负载整体搬到显卡的编码单元，CPU 让出来给解密与下载。
+///
+/// 实测这台机器（RTX 5060 Laptop）：NVENC 探测约 0.3 秒（每个进程只探一次），
+/// 编码 1080p 从 libx264 ultrafast 的 ~1.0 秒/2 秒分段降到 ~0.4 秒。
+///
+/// 探测失败一律回落 libx264：兼容性优先，VSR 只要求"是 H.264"，不要求谁编的。
+/// 码率上限（三档共用）。
+///
+/// **为什么恒定质量模式还要限码率**：`-cq` / `-crf` 的语义是"给你这个质量，码率
+/// 自己想办法"——在源流本身码率很低、画面又简单的短剧上，它会把输出**放到源之上**。
+/// 本机实测（同一集、92.7 秒正片）：NVENC cq26 不加上限时输出 **61.3MB**，而这一集
+/// 的源流总共只有 10.2MB。补上 `-maxrate` / `-bufsize` 后体积降到 **13.5MB**，
+/// 整集转码反而快 243ms（要写盘的字节少了一个数量级），画质仍由 cq26 决定，无可见变化。
+///
+/// 1100k 的由来：该源平均约 0.9Mbps，留约 20% 余量，快镜头不卡码。
+///
+/// ⚠️ **已知边界（本轮刻意保留）**：1100k 是按**这一条源**标定的固定值，而三档 × 两条
+/// 链路共用它。对码率明显更高的源（高码率档、guo 直链、公开直链），它会把输出硬压到
+/// 1100k，表现是"某些集清楚、某些集发糊"。之所以先固定：收益可测、行为可预期；
+/// 按源码率自适应（如 `min(源码率 × 1.2, 2500k)`）要先探测输入码率，那是一次
+/// 独立改动，本轮不做。
+const RATE_CAP: &str = "1100k";
+
+/// 上限的缓冲窗口（2× 上限，ffmpeg 常规配比）：给瞬时复杂画面留透支空间，
+/// 约束过紧会把画面压出块。
+const RATE_BUFFER: &str = "2200k";
+
+/// 硬件档参数（NVIDIA NVENC）。
+const NVENC_ARGS: &[&str] = &[
+    "-c:v",
+    "h264_nvenc",
+    "-preset",
+    "p1",
+    "-cq",
+    "26",
+    "-maxrate",
+    RATE_CAP,
+    "-bufsize",
+    RATE_BUFFER,
+    "-pix_fmt",
+    "yuv420p",
+    "-profile:v",
+    "high",
+    "-g",
+    "48",
+    "-keyint_min",
+    "48",
+    "-sc_threshold",
+    "0",
+];
+
+/// 软件档（CPU，核数够）：libx264 ultrafast 实测约 8 倍实时。
+const X264_ARGS: &[&str] = &[
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "20",
+    "-maxrate",
+    RATE_CAP,
+    "-bufsize",
+    RATE_BUFFER,
+    "-tune",
+    "zerolatency",
+    "-pix_fmt",
+    "yuv420p",
+    "-profile:v",
+    "high",
+    "-g",
+    "48",
+    "-keyint_min",
+    "48",
+    "-sc_threshold",
+    "0",
+];
+
+/// 软件档参数：给"要产出一份普通 H.264 mp4"的地方复用（旧缓存迁移那条链路用）。
+///
+/// **为什么需要暴露它**：`short_drama_app::ensure_h264_cache` 此前自己写了一份 libx264
+/// 参数，与本表漂移了——少了 `-profile:v high`、没有码率上限、也没有关键帧约束
+/// （libx264 默认 keyint 250 帧）。症状是同一部剧里"迁移出来的老集"与"新解析的集"
+/// seek 粒度、体积、首帧时间都不一样，正是 `worker.py` 注释点名的那种极难定位的差异。
+/// 参数表只留一份，谁要产 H.264 都从这里取。
+pub(crate) fn x264_args() -> &'static [&'static str] {
+    X264_ARGS
+}
+
+/// 低配档：**降分辨率**而不是只降码率。
+///
+/// 理由（本机实测）：只降码率对 CPU 几乎无帮助 —— 1080p cq26→cq34 只从 5499ms 降到
+/// 5429ms；而降到 720p 直接到 4027–4691ms。解码像素数决定解码与编码两个阶段的
+/// 算术量，减半分辨率等于把这块砍到四分之一。
+const LOW_TIER_ARGS: &[&str] = &[
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "24",
+    "-maxrate",
+    RATE_CAP,
+    "-bufsize",
+    RATE_BUFFER,
+    "-tune",
+    "zerolatency",
+    "-vf",
+    "scale=-2:720",
+    "-pix_fmt",
+    "yuv420p",
+    "-profile:v",
+    "high",
+    "-g",
+    "48",
+    "-keyint_min",
+    "48",
+    "-sc_threshold",
+    "0",
+];
+
+/// HLS 打包参数（增强链路与短剧流式链路共用同一套节奏）。
+///
+/// `-hls_init_time 1`：**只对第一个分片生效**的切分时长目标值。不给它时，首片要等满
+/// `-hls_time`（2 秒）才写得出来；给了 1 秒，第一片理论上 1 秒就能交给播放器，之后
+/// 恢复 2 秒节奏。
+///
+/// ⚠️ 实测边界必须写清：**本地源**上首片完成时间 652ms → 465ms；而在**真实网络源**上
+/// （15fps、`-g 48` ⇒ 关键帧间隔 3.2 秒）**没有可测出的收益** —— HLS 分片只能从关键帧
+/// 开始切，`hls_time` / `hls_init_time` 比 GOP 短时形同虚设，首片仍是 3.2 秒一片。
+/// 它是"在 GOP ≤ `hls_time` 的源上才会显形"的改动，本身不带来坏处，所以照留。
+///
+/// `-hls_list_size 0`：保留全部已生成分片，已转好的部分可自由 seek。
+///
+/// **这里没有 `-force_key_frames`**：它对 NVENC 无效，对 libx264 是与 `-g` 并行的
+/// 第二条规则 —— 详见调用点的长注释。
+const HLS_PACKAGING_ARGS: &[&str] = &[
+    "-f",
+    "hls",
+    "-hls_time",
+    "2",
+    "-hls_init_time",
+    "1",
+    "-hls_list_size",
+    "0",
+    "-hls_flags",
+    "independent_segments",
+    "-hls_segment_type",
+    "fmp4",
+];
+
+/// 软件档专用的 HLS 打包参数：与上面**只差**一条 `-force_key_frames`。
+///
+/// **为什么只给软件档**：`-force_key_frames` 只对软件编码器生效，NVENC 不认这个表达式
+/// （见调用点的长注释）。没有它时软件档的关键帧只能落在 `-g 48` 上，15fps 源就是 3.2 秒
+/// 一片。实测（libx264 ultrafast、同一集、各 3 次取中位，两组只差这一个参数）：
+///
+/// | 组 | 首片时长 | 首片体积 | 首片完成 | 整集 |
+/// |---|---|---|---|---|
+/// | 无 force | 3.2 秒 | 0.71MB | 1028ms | 9218ms |
+/// | 有 force | **2.0 秒** | **0.53MB** | 958ms | 8277ms |
+///
+/// 也就是说：首片覆盖时长与 `hls_time` 对齐、体积小 25%（下载更快），而首片完成时间
+/// 的差别在噪声内。这条实测推翻了我先前的判断（"删掉它对软件档也无害"）——它确实有用，
+/// 只是**对硬件档没用**。
+const HLS_PACKAGING_ARGS_X264: &[&str] = &[
+    "-f",
+    "hls",
+    "-hls_time",
+    "2",
+    "-hls_init_time",
+    "1",
+    "-hls_list_size",
+    "0",
+    "-hls_flags",
+    "independent_segments",
+    "-hls_segment_type",
+    "fmp4",
+    "-force_key_frames",
+    "expr:gte(t,n_forced*2)",
+];
+
+/// 按档位选 HLS 打包参数：硬件档不带 `-force_key_frames`（无效参数只会有误导性），
+/// 软件两档带上（它真的生效，见 `HLS_PACKAGING_ARGS_X264` 的实测表）。
+fn hls_packaging_args(ffmpeg: &std::path::Path) -> &'static [&'static str] {
+    if detect_encoder_tier(ffmpeg) == EncoderTier::Hardware {
+        HLS_PACKAGING_ARGS
+    } else {
+        HLS_PACKAGING_ARGS_X264
+    }
+}
+
+fn video_encoder_args(ffmpeg: &std::path::Path) -> Vec<String> {
+    let tier = detect_encoder_tier(ffmpeg);
+    let args = match tier {
+        EncoderTier::Hardware => NVENC_ARGS,
+        EncoderTier::SoftwareFast => X264_ARGS,
+        EncoderTier::SoftwareLow => LOW_TIER_ARGS,
+    };
+    args.iter().map(|value| (*value).to_owned()).collect()
+}
+
+/// 硬件能力档位。决定用哪一套编码参数与目标分辨率。
+///
+/// 用户需求：「如果程序遇到配置低的用户，则自适应」。档位不是"猜"出来的，
+/// 而是**实测探测**出来的 —— 与 `nvenc_available` 同一套方法论（真跑一次，
+/// 而不是读 `-encoders` 列表，那个在缺卡/驱动过旧时照样会列出编码器）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderTier {
+    /// 有可用的 NVIDIA 硬件编码：整集 1080p 重编实测约 5.5 秒（92.7 秒正片）。
+    Hardware,
+    /// 没有硬件编码、但 CPU 核数够（>= 8）：libx264 ultrafast 实测约 11.7 秒。
+    SoftwareFast,
+    /// 低配机（CPU 核数少）：降到 720p 并要求更低码率，牺牲画质换"能看"。
+    SoftwareLow,
+}
+
+/// 探测结果落盘文件名（与 NVENC 探测同一套指纹失效机制）。
+const TIER_CACHE_FILE: &str = "encoder-tier";
+
+fn tier_cache_path() -> PathBuf {
+    crate::short_drama_app::cache_dir().join(TIER_CACHE_FILE)
+}
+
+/// 探测本机适合哪一档。**只探测一次**（进程内 + 落盘）。
+///
+/// 判据与理由：
+/// 1. **能上硬件就上硬件**：NVENC 把编码负载整体从 CPU 移走，而 CPU 还要同时
+///    做解密与下载 —— 这是本机实测 5.5s vs 11.7s 的差距来源。
+/// 2. **没有硬件才看 CPU 核数**：libx264 ultrafast 在 8 核以上实测 11.7 秒
+///    （92.7 秒正片，约 8 倍实时），仍然够"边转边播"；核数更少时同步转码会
+///    明显跟不上播放进度，此时降分辨率比降码率有效（解码像素数直接减半）。
+/// 3. **不确定时取保守档**：探测失败宁可当低配（720p 也能看），也不要让低配
+///    用户在"一直转圈"里等。画质差一点是可见的遗憾，卡住不动是体验事故。
+pub fn detect_encoder_tier(ffmpeg: &std::path::Path) -> EncoderTier {
+    // 盘上已有结论且指纹匹配：直接读（省掉每次冷启动的探测开销）。
+    if let Some(fingerprint) = tier_fingerprint() {
+        if let Ok(raw) = std::fs::read_to_string(tier_cache_path()) {
+            if let Some((saved, tier)) = raw.trim().split_once(' ') {
+                if saved == fingerprint {
+                    let parsed = match tier {
+                        "hardware" => Some(EncoderTier::Hardware),
+                        "software-fast" => Some(EncoderTier::SoftwareFast),
+                        "software-low" => Some(EncoderTier::SoftwareLow),
+                        _ => None,
+                    };
+                    if let Some(value) = parsed {
+                        crate::trace::log(format!("[vsr] 编码档位：读缓存 = {value:?}"));
+                        return value;
+                    }
+                }
+            }
+        }
+    }
+    let tier = if nvenc_available(ffmpeg) {
+        EncoderTier::Hardware
+    } else if available_parallelism() >= 8 {
+        EncoderTier::SoftwareFast
+    } else {
+        EncoderTier::SoftwareLow
+    };
+    crate::trace::log(format!(
+        "[vsr] 编码档位探测 = {tier:?}（核数={}）",
+        available_parallelism()
+    ));
+    if let Some(fingerprint) = tier_fingerprint() {
+        if let Some(parent) = tier_cache_path().parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tag = match tier {
+            EncoderTier::Hardware => "hardware",
+            EncoderTier::SoftwareFast => "software-fast",
+            EncoderTier::SoftwareLow => "software-low",
+        };
+        let _ = std::fs::write(tier_cache_path(), format!("{fingerprint} {tag}"));
+    }
+    tier
+}
+
+/// 档位缓存的失效指纹：ffmpeg 身份 + **CPU 核数**。
+///
+/// 核数必须进指纹：换机器（或虚拟机调核）会改变分档，而 ffmpeg 没变。
+fn tier_fingerprint() -> Option<String> {
+    let ffmpeg = crate::short_drama_app::ffmpeg_path().ok()?;
+    let base = ffmpeg_fingerprint(&ffmpeg)?;
+    Some(format!("{base}-cpu{}", available_parallelism()))
+}
+
+/// 本机可用并行度。取不到时给一个**偏保守**的默认（4），理由见 `detect_encoder_tier`。
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+}
+
+///
+/// **必须真跑一次**，不能读 `-encoders` 列表：编译进去的 h264_nvenc 在没有 N 卡、
+/// 驱动过旧或编码会话占满时照样会列出来，只有实际初始化才暴露。
+/// 这与 worker 侧 `video_encoder_args` 的做法一致（那边探测尺寸用 640x360，
+/// 因为 64x64 会被 NVENC 直接拒、给出假阴性）。
+/// 进程内探测结论。
+///
+/// 用 `RwLock<Option<bool>>` 而不是 `OnceLock<bool>`：后者一旦写入就再也改不了，
+/// 于是设置页的「清空缓存」（用户换显卡/更新驱动后表达"重新探测"的唯一入口）
+/// 只能删掉盘上的文件，进程内那份旧结论仍然生效 —— 除非重启应用（审查 E1）。
+static NVENC_AVAILABLE: OnceLock<std::sync::RwLock<Option<bool>>> = OnceLock::new();
+
+fn nvenc_slot() -> &'static std::sync::RwLock<Option<bool>> {
+    NVENC_AVAILABLE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// 探测结果落盘的文件名（放在缓存根目录）。
+///
+/// 为什么落盘：探测本身要起一次 ffmpeg（实测 **1133ms**），而它发生在**首屏路径上**
+/// —— 每次进程冷启动后的第一次播放都会付这笔税。日志里那段 15.7 秒首屏中它占 1.1 秒，
+/// 而结果在同一台机器上不会变（显卡与驱动都不动）。落盘之后只有"第一次安装后首播"
+/// 才探测，此后直接读文件。
+///
+/// 失效条件写清：换显卡、换驱动、升级 ffmpeg 都应重新探测。这里用 ffmpeg 的**文件大小
+/// 与 mtime** 做指纹——它是随包资源，升级必然变；显卡/驱动变化本应用无法可靠感知，
+/// 用户可以用设置页的"清空缓存"强制重探（`cache_clear` 会连带清掉这个文件）。
+const NVENC_CACHE_FILE: &str = "h264-nvenc-capability";
+
+fn nvenc_cache_path() -> PathBuf {
+    crate::short_drama_app::cache_dir().join(NVENC_CACHE_FILE)
+}
+
+/// 读落盘的探测结论。返回 `None` 表示没有可用记录（需重新探测）。
+fn read_nvenc_cache(ffmpeg: &std::path::Path) -> Option<bool> {
+    let fingerprint = ffmpeg_fingerprint(ffmpeg)?;
+    let raw = std::fs::read_to_string(nvenc_cache_path()).ok()?;
+    // 格式：`<指纹> <0|1>`。指纹不匹配即视为失效。
+    let (saved, verdict) = raw.trim().split_once(' ')?;
+    if saved != fingerprint {
+        return None;
+    }
+    Some(verdict.trim() == "1")
+}
+
+fn write_nvenc_cache(ffmpeg: &std::path::Path, available: bool) {
+    let Some(fingerprint) = ffmpeg_fingerprint(ffmpeg) else {
+        return;
+    };
+    let path = nvenc_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        path,
+        format!("{fingerprint} {}", if available { 1 } else { 0 }),
+    );
+}
+
+/// ffmpeg 的身份指纹：大小 + mtime 秒。升级随包 ffmpeg 必然改变其中一个。
+fn ffmpeg_fingerprint(ffmpeg: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(ffmpeg).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|delta| delta.as_secs())
+        .unwrap_or(0);
+    Some(format!("{}-{}", meta.len(), mtime))
+}
+
+fn nvenc_available(ffmpeg: &std::path::Path) -> bool {
+    // 命中进程内结论直接返回（这是热路径：每次开播都会问一次）。
+    if let Ok(guard) = nvenc_slot().read() {
+        if let Some(value) = *guard {
+            return value;
+        }
+    }
+    let verdict = {
+        // 先读落盘结论：命中就完全不付探测成本（省 1133ms 首屏税）。
+        if let Some(cached) = read_nvenc_cache(ffmpeg) {
+            crate::trace::log(format!(
+                "[vsr] 硬件编码：读缓存 = {}",
+                if cached { "可用" } else { "不可用" }
+            ));
+            cached
+        } else {
+            let probe = std::process::Command::new(ffmpeg)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=black:s=640x360",
+                    "-frames:v",
+                    "2",
+                    "-an",
+                    "-c:v",
+                    "h264_nvenc",
+                    "-preset",
+                    "p1",
+                    "-cq",
+                    "26",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-profile:v",
+                    "high",
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let ok = probe.map(|status| status.success()).unwrap_or(false);
+            crate::trace::log(format!(
+                "[vsr] 硬件编码探测：h264_nvenc={}",
+                if ok {
+                    "可用"
+                } else {
+                    "不可用，回落 libx264"
+                }
+            ));
+            // 落盘：下次冷启动直接读，不再付这 1133ms。
+            write_nvenc_cache(ffmpeg, ok);
+            ok
+        }
+    };
+    // 写回进程内槽位。用 `write()` 而不是 `get_or_init`：清缓存时会把槽位置回
+    // `None`，此时才可能真正重探（审查 E1）。
+    if let Ok(mut guard) = nvenc_slot().write() {
+        *guard = Some(verdict);
+    }
+    verdict
+}
+
 /// 启动一条 H.264 HLS 增强流。源流失败时返回 Err，调用方继续用原 URL。
 pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> {
     start_with_key(session_id, source_url, None).await
+}
+
+/// 红果短剧：按 **vid** 建持久缓存目录的整集 HLS。
+///
+/// 与 `start_with_key` 的区别只有生命周期，但它正是方案 B 成立的关键：
+///   - 目录名是 `vid-<vid>` 而不是 `session-<id>`，**同一集无论打开多少次都是同一份产物**；
+///   - 任务标记 `persist = true`，换集 `stop()` 不会删目录；
+///   - 产物已完整（含 `#EXT-X-ENDLIST`）时**直接返回地址，连 ffmpeg 都不起**。
+///
+/// 实测依据：整集转码 5.6 秒（92.7 秒正片，16 倍实时）。转一次之后二次打开的代价应当是
+/// 零 —— 起进程、起转码、等首片全部省掉。
+pub async fn start_video_cache(
+    session_id: u64,
+    vid: &str,
+    source_url: &str,
+    key_hex: Option<&str>,
+) -> Result<String, String> {
+    let directory = media_root().join(format!("vid-{vid}"));
+    let playlist = directory.join("index.m3u8");
+    // 1) 已完成（ENDLIST）的产物直接复用：这是「同一集第二次打开」的快路径。
+    if let Ok(body) = std::fs::read_to_string(&playlist) {
+        if body.contains("#EXT-X-ENDLIST") && directory.join("init.mp4").is_file() {
+            let info = ensure_server().await?;
+            let url = format!(
+                "http://127.0.0.1:{}/rtx/{}/index.m3u8?token={}",
+                info.port, session_id, info.token
+            );
+            // 复用目录必须重新挂进 jobs 表：本地服务是按 session 找目录的，
+            // 而这次会话是新的（新的 session_id），表里没有它的映射。
+            register_reused(session_id, directory.clone());
+            crate::trace::log(format!(
+                "[vsr] 复用已转好的整集 HLS 会话={session_id} vid={vid}（未起转码）"
+            ));
+            return Ok(url);
+        }
+    }
+    // 1b) **同一 vid 正在转码中**：不能再起第二个 ffmpeg 往同一个目录里写。
+    //
+    // 为什么这条必须有：目录现在按 vid 固定（不再按 session 唯一），于是「转码还没
+    // 结束，用户又打开同一集」（切走再切回、连播回退、画中画交接）会让第二次调用
+    // 也走到下面的 `start_in_directory` —— 两个 ffmpeg 同时写 `index.m3u8` 与
+    // `seg-*.m4s`，产物必然损坏（截断的清单 + 交错的分片），而症状是"画面花掉/播一半停"。
+    //
+    // 处置：把正在转的那条会话的目录**挂到本次会话号上**，共用同一次转码。
+    if let Some(existing) = directory_of_inflight_vid(&directory) {
+        let info = ensure_server().await?;
+        let url = format!(
+            "http://127.0.0.1:{}/rtx/{}/index.m3u8?token={}",
+            info.port, session_id, info.token
+        );
+        register_reused(session_id, existing);
+        crate::trace::log(format!(
+            "[vsr] 同一 vid 正在转码，共用产物 会话={session_id} vid={vid}"
+        ));
+        return Ok(url);
+    }
+    // 2) 没有可用产物：正常起转码，但目录按 vid 固定、且不清空旧内容。
+    start_in_directory(session_id, source_url, key_hex, directory, true).await
+}
+
+/// 若某个**正在转码**的任务用的正是这个目录，返回那份目录。
+///
+/// `done == false` 说明它的 ffmpeg 还没退出（也就是还在写分片）。
+fn directory_of_inflight_vid(directory: &std::path::Path) -> Option<PathBuf> {
+    let guard = jobs().lock().ok()?;
+    guard
+        .values()
+        .find(|job| job.directory == directory && !job.done.load(Ordering::Acquire))
+        .map(|job| job.directory.clone())
+}
+
+/// 把一个**已存在**的产物目录重新挂进任务表，让本地服务能按新会话号找到它。
+///
+/// 不需要真进程：`done` 直接置位（表示"没有正在跑的转码"），`task` 为 None。
+fn register_reused(session_id: u64, directory: PathBuf) {
+    let done = Arc::new(AtomicBool::new(true));
+    if let Ok(mut guard) = jobs().lock() {
+        // 同号已有的先收掉（正常情况下不会有）。
+        if let Some(previous) = guard.remove(&session_id) {
+            if let Some(task) = previous.task {
+                task.abort();
+            }
+        }
+        guard.insert(
+            session_id,
+            Job {
+                done,
+                directory,
+                task: None,
+                persist: true,
+            },
+        );
+    }
 }
 
 /// 与 `start` 相同，但可带**解密密钥**。
@@ -81,6 +620,22 @@ pub async fn start_with_key(
     if source_url.trim().is_empty() || !needs_enhancement(source_url) {
         return Err("源流地址不支持增强转码。".to_owned());
     }
+    // 每次会话一个临时目录（用完即弃），与红果的按 vid 持久目录相对。
+    let directory = media_root().join(format!("{session_id}-{}", uuid::Uuid::new_v4().simple()));
+    start_in_directory(session_id, source_url, key_hex, directory, false).await
+}
+
+/// 转码主体：`start_with_key`（临时目录）与 `start_video_cache`（按 vid 持久目录）共用。
+async fn start_in_directory(
+    session_id: u64,
+    source_url: &str,
+    key_hex: Option<&str>,
+    directory: PathBuf,
+    persist: bool,
+) -> Result<String, String> {
+    if source_url.trim().is_empty() || !needs_enhancement(source_url) {
+        return Err("源流地址不支持增强转码。".to_owned());
+    }
     // ⚠️ 清理与淘汰**必须排在 `ensure_server().await` 之后**。
     //
     // 历史坑：旧实现把 `stop(session_id)` 与"上限 8 淘汰"放在这个 await 之前，
@@ -96,17 +651,26 @@ pub async fn start_with_key(
     stop(session_id);
     // 预取可能同时准备多条 guo 会话；限制任务数，避免用户连续点选后留下十几路 ffmpeg。
     while jobs().lock().map(|guard| guard.len()).unwrap_or(0) >= 8 {
-        let oldest = jobs()
-            .lock()
-            .ok()
-            .and_then(|guard| guard.keys().copied().min());
-        match oldest {
+        // 淘汰只能挑**非持久**任务：持久目录是可复用缓存，掐掉正在转的那一路
+        // 会连同它的产物一起失效（下次还得重转）。
+        let victim = jobs().lock().ok().and_then(|guard| {
+            guard
+                .iter()
+                .filter(|(_, job)| !job.persist)
+                .map(|(id, _)| *id)
+                .min()
+        });
+        match victim {
             Some(id) => stop(id),
             None => break,
         }
     }
 
-    let directory = media_root().join(format!("{session_id}-{}", uuid::Uuid::new_v4().simple()));
+    // 持久目录要**保留已有产物**：重转时只覆盖分片与清单，不整目录清空，
+    // 这样「转了一半就被打断」的那次留下的分片仍可能被复用。
+    if !persist {
+        let _ = std::fs::remove_dir_all(&directory);
+    }
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("创建增强缓存目录失败：{error}"))?;
 
@@ -119,7 +683,7 @@ pub async fn start_with_key(
         crate::trace::redact_url(source_url),
         ffmpeg.display()
     ));
-    let mut command = Command::new(ffmpeg);
+    let mut command = Command::new(&ffmpeg);
     // 解密密钥是**输入**选项，必须排在 `-i` 之前（与 -tls_verify 同一条规则：
     // 写到 -i 之后会被解析到输出侧，而输出是 HLS 分片、没有解密封装器，等于被忽略，
     // 结果是 ffmpeg 拿到密文解不出画面）。
@@ -193,32 +757,45 @@ pub async fn start_with_key(
         .arg("0:v:0")
         .arg("-map")
         .arg("0:a:0?")
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-preset")
-        .arg("ultrafast")
-        .arg("-crf")
-        .arg("20")
-        .arg("-tune")
-        .arg("zerolatency")
-        .arg("-pix_fmt")
-        .arg("yuv420p")
+        .args(video_encoder_args(&ffmpeg))
         .arg("-c:a")
         .arg("aac")
         .arg("-b:a")
         .arg("128k")
-        .arg("-force_key_frames")
-        .arg("expr:gte(t,n_forced*2)")
-        .arg("-f")
-        .arg("hls")
-        .arg("-hls_time")
-        .arg("2")
-        .arg("-hls_list_size")
-        .arg("0")
-        .arg("-hls_flags")
-        .arg("independent_segments")
-        .arg("-hls_segment_type")
-        .arg("fmp4")
+        // ⚠️ 关键帧间隔必须用**编码器自己的** GOP 参数，不能用 `-force_key_frames`。
+        //
+        // 实测（同一集、同一条真实加密源，五组对照）：
+        //   现状 hls_time=2 + force_key_frames  →  分片 **8.33 秒** × 12 个，首片 4.6MB
+        //   + -g48 -keyint_min 48 -sc_threshold 0 →  分片 **3.20 秒** × 46 个，首片 1.8MB
+        //   两者整集转码耗时几乎相同（5320ms vs 5412ms）
+        //
+        // 原因是 `-force_key_frames` 只对软件编码器生效，**NVENC 不认这个表达式**；
+        // 于是分片边界只能落在源流自带的关键帧上，而源是 8.33 秒一个关键帧。
+        // 用户看到的「前 8 秒转换」正是这个：首片要等满一个 8.33 秒的 GOP 才写得出，
+        // 而 hls_time=2 在这里形同虚设（HLS 分片只能比 GOP 长，不能比它短）。
+        //
+        // 收到 3.2 秒之后：首片体积 4.6→1.8MB（用户更早看到画面）、拖动粒度更细。
+        //
+        // 2026-10-09：**`-force_key_frames` 已删除**（`HLS_PACKAGING_ARGS` 里也没有）。
+        // 上面那次实测已经证明它对 NVENC 无效（不删也撑不出 2 秒分片）。删它的另一个
+        // 理由是它对 libx264 是**第二条**规则：硬编码的 2.0 秒与 `-g 48` 在不同帧率下
+        // 并不重合（24fps 源是 2.0 秒、15fps 源是 3.2 秒），两者取并集＝比配置更密的关键帧。
+        //
+        // ⚠️ 但**"关键帧节奏只有一处权威"只对软件档成立**：`-keyint_min` 与
+        // `-sc_threshold` 对 `h264_nvenc` 是死参数（随包 ffmpeg 会直接报
+        // `Codec AVOption sc_threshold has not been used for any stream`），硬件档真正
+        // 生效的只有 `-g 48`，外加 NVENC 自己在场景切换处插的 I 帧。实测"首片 3.2 秒、
+        // 分片中位 1.6 秒、46 段"就是 `-g` 与这些场景切换点取并集的结果——对用户是好事
+        // （分片更短、seek 更细），所以**刻意不去关掉场景切换插帧**（`-no-scenecut 1`
+        // 只在 `-rc-lookahead > 0` 时才可用，且关了会让分片统一变回 3.2 秒）。
+        //
+        // 三档自己那份参数里已经含这套 GOP 设置，这里**不再重复追加**（重复会让"只改一处
+        // 就漂移"变成静默失败：命令行里出现两遍同值参数，单测也看不见）。
+        //
+        // `-force_key_frames` 的取舍按档位分开：软件档需要它（实测首片 3.2→2.0 秒、
+        // 首片体积 -25%），硬件档不需要（NVENC 不认这个表达式）。两个常量各自的注释里有
+        // 完整的实测表。
+        .args(hls_packaging_args(&ffmpeg))
         // 刻意**不传** `-hls_fmp4_init_filename`。
         //
         // 传绝对路径（`directory.join("init.mp4")`；正斜杠、反斜杠、预创建空文件，
@@ -278,13 +855,33 @@ pub async fn start_with_key(
                 done,
                 directory: directory.clone(),
                 task: Some(task),
+                persist,
             },
         );
     if let Some(previous) = replaced {
         if let Some(task) = previous.task {
             task.abort();
         }
-        let _ = std::fs::remove_dir_all(previous.directory);
+        // ⚠️ 这里**不能**无条件删目录。
+        //
+        // 被替换的那份可能正是 `vid-{vid}` 持久目录，而它可能同时被别的会话
+        // 用着（`register_reused` 会把同一目录挂到多个会话号上）。旧实现无条件
+        // `remove_dir_all`，于是「同一集并发两次 start」会把另一会话正在播的
+        // 产物从盘上抽走 —— 表现为播到一半分片全 404（审查 R1）。
+        //
+        // 判据与 `stop()` 完全一致：只有"非持久 + 没有别的会话在用 + 目录确实换了"
+        // 才允许删。
+        let still_used = jobs()
+            .lock()
+            .map(|guard| {
+                guard
+                    .values()
+                    .any(|other| other.directory == previous.directory)
+            })
+            .unwrap_or(false);
+        if !previous.persist && !still_used && previous.directory != directory {
+            let _ = std::fs::remove_dir_all(previous.directory);
+        }
     }
 
     // 快路径：首个分片落地就把地址交出去（常见 2–4 秒），与官方实现的 on_ready
@@ -355,7 +952,11 @@ fn job_alive(session_id: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// 停止并清理一条会话的增强流。重复调用是安全的。
+/// 停止一条会话的增强流。重复调用是安全的。
+///
+/// **`persist` 的产物不删目录**：换集时 `playback_command("stop")` 会走到这里，
+/// 而对红果的整集 HLS 来说那时转码早已结束、产物是一份可复用的缓存 —— 删掉意味着
+/// 用户下一次打开同一集又要重转 5.6 秒。回收改由缓存预算统一负责。
 pub fn stop(session_id: u64) {
     let job = jobs()
         .lock()
@@ -365,8 +966,44 @@ pub fn stop(session_id: u64) {
         if let Some(task) = job.task {
             task.abort();
         }
-        let _ = std::fs::remove_dir_all(job.directory);
+        // ⚠️ 即使 `persist == false` 也要先确认"还有没有别的会话在用这个目录"。
+        //
+        // 复用场景下同一份 `vid-{vid}` 目录会被挂到多个会话号上（切走再切回、
+        // 连播回退、画中画交接都走 `register_reused`）。此时若某个会话 stop 时
+        // 直接删目录，就会把**另一个会话正在播的那份产物**从盘上抽走——
+        // 播放器下一次请求分片时拿到 404，表现为"播到一半突然卡死"。
+        // 回收交给缓存预算（它按整目录 LRU 淘汰），这里只负责解绑。
+        let still_used = jobs()
+            .lock()
+            .map(|guard| guard.values().any(|other| other.directory == job.directory))
+            .unwrap_or(false);
+        if !job.persist && !still_used {
+            let _ = std::fs::remove_dir_all(job.directory);
+        }
     }
+}
+
+/// 清掉落盘的硬件编码探测结论，让下一次播放重新探测。
+///
+/// 设置页的"清空缓存"会调它：那是用户能表达"环境变了、重来一遍"的唯一入口，
+/// 而探测结果的指纹只覆盖随包 ffmpeg，覆盖不到显卡与驱动。
+pub fn clear_encoder_capability_cache() {
+    let _ = std::fs::remove_file(nvenc_cache_path());
+    let _ = std::fs::remove_file(tier_cache_path());
+    // **同时清进程内槽位**。只删盘上文件的话，本次运行里 `nvenc_slot()` 仍是旧结论，
+    // 探测要等重启才会重做 —— 而用户点"清空缓存"的动机恰恰是"环境变了，现在重来"
+    // （换显卡、更新驱动）。审查 E1 指出的就是这个缺口。
+    if let Ok(mut guard) = nvenc_slot().write() {
+        *guard = None;
+    }
+}
+
+/// 某一集的整集 HLS 缓存目录（`rtx-vsr/vid-{vid}`）。
+///
+/// 暴露给上层是为了两件事：命中复用/起转之后把它的 mtime 推到当下（缓存淘汰的
+/// 唯一保护），以及测试里直接断言目录形态。
+pub fn video_cache_dir(vid: &str) -> PathBuf {
+    media_root().join(format!("vid-{vid}"))
 }
 
 /// 启动时/清缓存时清掉所有残留；此时没有正在使用的增强任务。
@@ -484,6 +1121,40 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
     if file_name == "index.m3u8" {
         let body = std::fs::read_to_string(&file_path).unwrap_or_default();
         let rewritten = rewrite_local_playlist(&body, &server.token);
+        // ⚠️ 清单还没写出有效内容时**必须返 5xx**，绝不能返 200 空清单。
+        //
+        // 为什么：hls.js 对"拿到了完整响应但内容是空的"的解读只有一个 ——
+        // `manifestParsingError`，而它走 `handleManifestParsingError`，**那条路径里
+        // 没有任何重试逻辑**，`fatal` 直接为 true。也就是说返 200 空清单等于把一个
+        // 必死信号交给播放器，它连等的余地都没有。
+        //
+        // 而"暂时还没准备好"应当用 **503** 表达：hls.js 的 `manifestLoadError` 会走
+        // `shouldRetry` → `retryForHttpStatus`，**对 5xx 重试、对 4xx 不重试**，因此
+        // 配上调用方的 `manifestLoadingMaxRetry: 4` 正好让它自己等到 ffmpeg 吐出首片。
+        // （返 404 是错的：4xx 不重试。分片路径上的 404 之所以没事，是因为 hls.js 对
+        //  分片另有 `fragLoadingMaxRetry` 那条不同的重试路径。）
+        //
+        // 空清单只有一种成因：ffmpeg 刚起、还没来得及 prime 出播放列表。实测从起进程
+        // 到清单首次含 `#EXTINF` 是 1011ms，这段窗口踩中的概率不低——用户那次 15.7 秒
+        // 首屏里就正好撞上（日志 `下发清单 会话=102 字节=1`）。
+        //
+        // 判据是**没有 `#EXTINF`**，不是"文件为空"：ffmpeg 会先把 header 版清单
+        // （`#EXTM3U` + `#EXT-X-TARGETDURATION`，约 40~120 字节）写出来，那段时间
+        // 清单非空但没有一条分片。返 200 的话 hls.js 会报 `LEVEL_EMPTY_ERROR`
+        // （无 ENDLIST 被判成 live 流）→ 落到 `levelLoadingMaxRetry`，重试预算被花在
+        // 另一条路径上；返 503 才回到注释上面写的那条 `manifestLoadingMaxRetry`。
+        if !rewritten.contains("#EXTINF") {
+            crate::trace::log(format!(
+                "[vsr] 本地服务：清单尚未就绪 会话={session_id}（返 503 让播放器重试）"
+            ));
+            write_plain(
+                &mut socket,
+                "503 Service Unavailable",
+                "增强播放清单尚未就绪",
+            )
+            .await?;
+            return Ok(());
+        }
         // 播放器每次重新拉清单都会打一行：清单已经被拉了几次，直接反映"卡了多久"。
         crate::trace::log(format!(
             "[vsr] 本地服务：下发清单 会话={session_id} 字节={}",
@@ -665,9 +1336,216 @@ async fn write_head(
     Ok(())
 }
 
+/// **预转**某一集的整集 HLS，不占用任何播放会话。
+///
+/// ## 为什么需要它（用户需求：「集与集之间无缝切换」）
+///
+/// 方案 B 的播放源是整集 HLS，转码耗时实测 5.6 秒（92.7 秒正片）。若这一集等到
+/// 用户真的点开/连播到它才开始转，那 5.6 秒就是黑屏等待。
+///
+/// 而一集正片 50–140 秒，**上一集播放期间完全来得及把下一集转好**。这个函数就是
+/// 做这件事：起一路转码写进 `vid-{vid}` 目录（与 `start_video_cache` 同一个目录），
+/// 转完自然退出。等用户真的切过去时，`start_video_cache` 命中 `#EXT-X-ENDLIST`
+/// 直接返回地址 —— 切换不需要任何等待。
+///
+/// ## 与播放任务的区别
+///
+/// - **不占会话号**：用一个专用的大数段做 key，且 `persist = true`。播放会话的
+///   `stop()` 不会误删它，8 路淘汰也不会选中它。
+/// - **不等待就绪**：预转是后台行为，不等首片、不返回地址，调用方 fire-and-forget。
+/// - **已有产物直接跳过**：避免与正在播的那一路重复转码（`directory_of_inflight_vid`
+///   会挡住并发，这里再加一道 ENDLIST 检查）。
+///
+/// 失败一律静默（只记日志）：预转是纯优化，失败时用户走的就是"现场转"那条老路。
+pub async fn prewarm_video_cache(
+    vid: &str,
+    source_url: &str,
+    key_hex: Option<&str>,
+    session_slot: u64,
+) {
+    let directory = video_cache_dir(vid);
+    let playlist = directory.join("index.m3u8");
+    // 已经转好：什么都不用做。
+    if let Ok(body) = std::fs::read_to_string(&playlist) {
+        if body.contains("#EXT-X-ENDLIST") && directory.join("init.mp4").is_file() {
+            return;
+        }
+    }
+    // 正在播的那一路已经在转同一个目录：让它跑完即可，别起第二路。
+    if directory_of_inflight_vid(&directory).is_some() {
+        crate::trace::log(format!("[vsr] 预转跳过（同一 vid 已在转码）vid={vid}"));
+        return;
+    }
+    crate::trace::log(format!("[vsr] 预转开始 vid={vid} 槽位={session_slot}"));
+    match start_in_directory(session_slot, source_url, key_hex, directory.clone(), true).await {
+        Ok(_) => {
+            // 地址拿到就丢弃：预转不需要播，等 ffmpeg 自己跑完。
+            // 转完后 `start_video_cache` 会凭 ENDLIST 直接复用。
+            crate::trace::log(format!("[vsr] 预转已就绪 vid={vid}"));
+        }
+        Err(error) => {
+            crate::trace::log(format!("[vsr] 预转未启动（静默）vid={vid}：{error}"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 低配档必须**降分辨率**，而不是只降码率。
+    ///
+    /// 这是「遇到配置低的用户则自适应」唯一可被单测钉住的一面（探测本身依赖真实
+    /// 硬件）。低配档的全部性能保障就是这条 `-vf scale=-2:720` —— 实测只降码率对
+    /// CPU 几乎无帮助（1080p cq26→cq34 只从 5499ms 降到 5429ms），而降分辨率到
+    /// 720p 能到 4027–4691ms。改参数时若把它删掉，低配用户会立刻退回"一直转圈"。
+    #[test]
+    fn low_tier_drops_resolution() {
+        assert!(
+            LOW_TIER_ARGS.contains(&"-vf"),
+            "低配档缺少 -vf，等于只降码率、对 CPU 无实质帮助"
+        );
+        assert!(
+            LOW_TIER_ARGS
+                .iter()
+                .any(|value| value.contains("scale=-2:720")),
+            "低配档的分辨率目标应为 720p"
+        );
+    }
+
+    /// 三档都必须钉住关键帧间隔。
+    ///
+    /// 缺了它 HLS 分片会落到源流的关键帧间隔上（实测 8.33 秒），`hls_time=2` 形同
+    /// 虚设 —— 那正是「前 8 秒转换」的由来。三档共用同一套分片节奏，用户换机器不
+    /// 该改变"多久能看到画面"。
+    #[test]
+    fn every_tier_pins_keyframe_interval() {
+        for (name, args) in [
+            ("hardware", NVENC_ARGS),
+            ("software-fast", X264_ARGS),
+            ("software-low", LOW_TIER_ARGS),
+        ] {
+            for flag in ["-g", "-keyint_min", "-sc_threshold"] {
+                assert!(
+                    args.contains(&flag),
+                    "{name} 档缺少 {flag}，分片时长会退化成源流关键帧间隔"
+                );
+            }
+        }
+    }
+
+    /// 三档参数必须两两不同 —— 否则"自适应"是假的。
+    #[test]
+    fn tiers_are_actually_distinct() {
+        assert_ne!(NVENC_ARGS, X264_ARGS, "硬件档与软件档参数相同");
+        assert_ne!(X264_ARGS, LOW_TIER_ARGS, "软件快档与低配档参数相同");
+    }
+
+    /// 三档都必须给出码率上限。
+    ///
+    /// `-crf` / `-cq` 是恒定质量模式，不加上限时会为了保质量把码率放到源之上 ——
+    /// 实测同一集 NVENC cq26 输出 61.3MB，而这一集的源流总共只有 10.2MB。影响不止
+    /// "体积大一点"：要多写一个数量级的字节，整集转码因此慢 243ms，边转边播的分片
+    /// 也跟着来得更晚。删掉它等于把首屏时间还给磁盘。
+    #[test]
+    fn every_tier_caps_bitrate() {
+        for (name, args) in [
+            ("hardware", NVENC_ARGS),
+            ("software-fast", X264_ARGS),
+            ("software-low", LOW_TIER_ARGS),
+        ] {
+            for flag in ["-maxrate", "-bufsize"] {
+                assert!(
+                    args.contains(&flag),
+                    "{name} 档缺少 {flag}，恒定质量模式会把码率放到源之上"
+                );
+            }
+        }
+    }
+
+    /// 首片必须比 `-hls_time` 更早切出去，且关键帧节奏只能有一条规则。
+    ///
+    /// `-hls_init_time 1` 是"首片多早写得出来"的一个手段：不给它，首片要等满
+    /// `-hls_time`（2 秒）才有机会落盘（本地源实测 652ms → 465ms）。⚠️ 但它在
+    /// **GOP 比 `hls_time` 长的源上不起作用** —— 网络源实测（15fps、`-g 48` ⇒ GOP
+    /// 3.2 秒）首片仍是 3.2 秒一片、完成时间在噪声内。它属于"GOP ≤ hls_time 才显形"
+    /// 的改动，留着无害；别把它当成首屏时间的保证。
+    ///
+    /// `-force_key_frames` 必须**不在**这套参数里：它对 NVENC 无效（实测分片照样
+    /// 8.33 秒），而对 libx264 又是与 `-g` 并行的第二条规则（不同帧率下两者不重合，
+    /// 取并集＝无谓更密的关键帧）。软件档删掉它的实测代价与收益见调用点注释。
+    /// `-force_key_frames` 的取舍：**硬件档不许有、软件档必须有**。
+    ///
+    /// 硬件档有它是纯误导（NVENC 不认表达式，实测分片照样 8.33 秒）；软件档没有它时
+    /// 关键帧只能落在 `-g 48` 上（15fps 源＝3.2 秒），实测首片 3.2→2.0 秒、体积 -25%。
+    #[test]
+    fn hls_packaging_keeps_first_segment_early() {
+        assert!(
+            HLS_PACKAGING_ARGS.contains(&"-hls_init_time"),
+            "缺少 -hls_init_time，首片要等满 -hls_time 才出得来"
+        );
+        assert!(
+            !HLS_PACKAGING_ARGS.contains(&"-force_key_frames"),
+            "硬件档不该有 -force_key_frames：NVENC 不认这个表达式，写它是误导"
+        );
+        assert!(
+            HLS_PACKAGING_ARGS_X264.contains(&"-force_key_frames"),
+            "软件档需要 -force_key_frames：实测首片 3.2→2.0 秒、首片体积 -25%"
+        );
+    }
+
+    /// Rust 与 worker 的三档编码参数必须逐项一致。
+    ///
+    /// 参数表在两个文件里各有一份（这里是 `NVENC_ARGS` / `X264_ARGS` / `LOW_TIER_ARGS`，
+    /// worker 是 `_NVENC_ARGS` / `_X264_ARGS` / `_X264_LOW_ARGS`），此前已经漂移过两次
+    /// （GOP 一次、`-profile:v high` 与码率上限又一次），症状是"同一条链路换集后分片粒度、
+    /// 体积、首屏突然变样"，极难定位。worker 那边的注释写着"必须保持一致"，但那条承诺
+    /// 过去完全靠人盯着 —— 这个测试把它变成**会失败的检查**。
+    ///
+    /// 只比元素的多重集、不比顺序：两边都是输出侧选项，顺序没有语义（低配档的
+    /// `-vf scale=-2:720` 位置就与 Rust 侧不同）。读不到 `worker.py` 时直接跳过
+    /// （打包后的运行环境里没有源码，这个测试只在开发机上才有意义）。
+    #[test]
+    fn worker_encoder_args_match_rust() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/shortdrama-worker/worker.py");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        for (python_name, rust_args) in [
+            ("_NVENC_ARGS", NVENC_ARGS),
+            ("_X264_ARGS", X264_ARGS),
+            ("_X264_LOW_ARGS", LOW_TIER_ARGS),
+        ] {
+            let mut worker = python_list_literals(&text, python_name)
+                .unwrap_or_else(|| panic!("worker.py 里找不到 {python_name} 的列表字面量"));
+            let mut rust: Vec<String> = rust_args.iter().map(|value| (*value).to_owned()).collect();
+            worker.sort();
+            rust.sort();
+            assert_eq!(
+                worker, rust,
+                "{python_name} 与 Rust 侧同名档位的参数漂移了（两边必须同一套）"
+            );
+        }
+    }
+
+    /// 取出 Python 源码里 `<name> = [ ... ]` 这一段之间所有字符串字面量的值。
+    ///
+    /// 只够应付当前这份列表（纯双引号字面量、无嵌套括号），刻意不写通用解析器：
+    /// 它服务于上面那条一致性断言，不是通用的 Python 解析。
+    fn python_list_literals(text: &str, name: &str) -> Option<Vec<String>> {
+        let start = text.find(&format!("{name} = ["))?;
+        let rest = &text[start..];
+        let end = rest.find(']')?;
+        Some(
+            rest[..end]
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(|piece| piece.to_owned())
+                .collect(),
+        )
+    }
 
     #[tokio::test]
     #[ignore = "真实源流冒烟：设置 TTV_VSR_SMOKE_SOURCE=http://.../video.mp4 后手动运行"]

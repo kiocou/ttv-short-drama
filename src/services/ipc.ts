@@ -32,6 +32,14 @@ export interface NativeResolved {
   streamKind?: string;
   /** 本地 HLS 失败时的回退地址（原始加密直链）。 */
   backupUrl?: string;
+  /**
+   * **源片真实总时长**（毫秒）。0 或缺失表示未知。
+   *
+   * 边转边播时浏览器算不出总时长（分片清单还没 ENDLIST），只能退回
+   * `seekable`/`buffered` 末尾——而那两个值随转码进度增长，时长会一路往上跳。
+   * 后端把这个值交下来，前端以它为权威，时长从此固定。
+   */
+  durationMs?: number;
 }
 
 export function isTauriEnvironment(): boolean {
@@ -673,6 +681,14 @@ async guoCover(seriesId: string): Promise<string | null> {
     // `{vid}.prefix.mp4`——只含开头一小段，几秒内就能出画。整集是另一条并发请求，
     // 调用方拿到前缀先播、等整集落盘再切过去，用户不必盯着加载卡等满 6-11 秒。
     // 后端在整集已在盘上时直接返回整集（cached=true），调用方按"这就是最终文件"处理。
+    /**
+     * **已废弃**：前缀先行开播（`{vid}.prefix.mp4`）的 IPC 出口。
+     *
+     * 方案 B（2026-10-08）之后前端不再走两段式 —— 整集 HLS 一路播到底，
+     * 因此没有任何调用点。保留它是因为 Rust 侧命令仍在注册（`main.rs` 的
+     * `invoke_handler`），删掉前端封装会让"命令存在但前端无出口"成为隐性状态；
+     * 真要清理应当前后端一起删，那是一次独立的改动。
+     */
     async resolveNativePrefix(seriesId: string, vid: string, contentType?: number, quality = 'auto'): Promise<NativeResolved> {
       if (!isTauriEnvironment()) throw new Error('原生短剧播放仅在桌面应用中可用。');
       const started = performance.now();
@@ -688,6 +704,28 @@ async guoCover(seriesId: string): Promise<string | null> {
       } catch (error) {
         void ipcService.diagnostics.uiLog(`前缀 resolve 失败 耗时=${Math.round(performance.now() - started)}ms ${errorText(error, '未知错误')}`);
         throw error;
+      }
+    },
+
+    /**
+     * **预转下一集的整集 HLS**（用户需求：集与集之间无缝切换）。
+     *
+     * 后端会把这一集转好放进 `vid-{vid}` 目录，**不占播放会话、不返回地址**，
+     * 因此这里 fire-and-forget：失败静默（预转是纯优化，失败时用户走"现场转"那条路）。
+     *
+     * 为什么值得调用：一集正片 50–140 秒，而整集转码只要 5.6 秒（实测 92.7 秒
+     * 正片）。上一集播放期间完全来得及备好下一集 —— 等用户连播到它时，
+     * `openStreamNative` 命中已转好的产物，切换**零等待**。
+     */
+    async prewarmStreamNative(seriesId: string, vid: string, contentType?: number): Promise<void> {
+      if (!isTauriEnvironment()) return;
+      try {
+        await invokeBackend('short_drama_app_prewarm_stream', {
+          input: { seriesId, vid, contentType, quality: 'auto' },
+        });
+      } catch (error) {
+        // 静默：预转失败不该影响任何用户可见行为。
+        void ipcService.diagnostics.uiLog(`预转未启动（静默） vid=${vid} ${errorText(error, '未知错误')}`);
       }
     },
 

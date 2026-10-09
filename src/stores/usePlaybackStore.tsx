@@ -2,7 +2,7 @@ import React, { createContext, useContext, useState, useRef, useEffect, useCallb
 import { PlaybackUiState, PlaybackSession } from '../types/playback';
 import { SeriesDetail, EpisodeItem } from '../types/series';
 import { ipcService, isTauriEnvironment } from '../services/ipc';
-import { attachSource, isHlsUrl, detachSource } from '../services/hlsAttach';
+import { attachSource, isHlsUrl, detachSource, takeHlsFatal } from '../services/hlsAttach';
 import { dismissPip, openPip } from '../services/pip';
 import { tracePlayback } from '../services/playbackTrace';
 import { useSettingsStore } from './useSettingsStore';
@@ -61,7 +61,7 @@ const PREPARED_POOL_MAX = 3;
  * 继续观看这种场景得不偿失，直接等整集。取 3 秒是保守值：只有从片头（或片头
  * 附近）开播才走前缀，而这正是红果点开就看的那个主路径。
  */
-const PREFIX_COVERAGE_SECONDS = 3;
+// （这里曾有 `PREFIX_COVERAGE_SECONDS`：前缀短源时代的"续播位置超出覆盖范围就跳过前缀"判定。方案 B 用整集 HLS 后不再需要。）
 
 interface PlaybackContextType {
   sessionId: number;
@@ -173,8 +173,128 @@ export interface PrepareStatus {
   etaSeconds: number | null;
 }
 
-/** 悬停预热的最大并发数：超过它就不再受理新的预热请求。 */
-const MAX_PREWARM_INFLIGHT = 2;
+/**
+ * 后台整集预热的并发上限。
+ *
+ * **它必须与「当前是否在跑流式转码」联动**——这是实测踩出来的：
+ * 用户会同时看到三路 ffmpeg 在抢 CPU（两路预取 + 一路流式），结果是正在播的
+ * 那一集整集重编码从 7 秒涨到 26–43 秒，而流式分片也来不及生成，播放器等不到
+ * 分片 → hls.js 重试耗尽 → 弹错误卡片。用户看到的正是「点进去转圈然后报错」。
+ *
+ * 所以：**流式转码在跑时一律不接新的整集预热**（0）。流式那段通常只有几十秒，
+ * 让 CPU 优先保证「正在看的那一路」远比多备一集重要。
+ *
+ * **上限是 1 而不是 2**（2026-10-09 实测下调）：显卡上的编码单元是**串行**的 ——
+ * 两路 NVENC 同时跑实测 9455ms + 9407ms，四路 20060ms × 4，总时长不因并发而减少，
+ * 只是把正在播的那一路挤慢。预热的唯一目的是"换集时产物已就绪"，而热备**一集**
+ * 就够覆盖连播；备两集换来的收益是零，代价是播放卡顿。
+ */
+const MAX_PREWARM_INFLIGHT = 1;
+
+/**
+ * 流式转码是否正在为本会话服务。
+ *
+ * 用模块级计数而不是 React state：预热闸门要在**同步路径**上读它（`startPrewarmResolve`
+ * 的开头），而 state 更新要等下一次渲染才可见，用它挡不住同一帧里已经排队的预热。
+ */
+let streamingSessionsActive = 0;
+
+/**
+ * 代际号：**只在开转码窗口时自增**（`beginStreamingWindow`），复位刻意不推进它。
+ *
+ * 复位后仍安全的原因：若这一集又起了流式，`beginStreamingWindow` 必然换代，旧延时
+ * 回调照样失效；若不再起流式，计数已经被复位成 0，旧回调那次递减落在 `Math.max(0, …)`
+ * 上，不会把任何东西减成负数。
+ *
+ * 为什么需要它：窗口的释放有一个**延时**（`STREAMING_TRANSCODE_SETTLE_MS`），
+ * 而延时回调是无主的 —— 若用户在这 6 秒内换集，`resetStreamingWindow()` 已经把
+ * 计数清零，随后那个旧回调仍会执行一次递减，把**新会话**的计数减掉，预取闸门
+ * 于是提前放开，本集转码与下一集的 worker 又会抢 CPU（审查 F2）。
+ *
+ * 有了代际号，延时回调只在自己那一代仍然有效时才减。
+ */
+let streamingGeneration = 0;
+
+function streamingInFlight(): boolean {
+  return streamingSessionsActive > 0;
+}
+
+/**
+ * 计数归零的最后一道保险。
+ *
+ * 为什么需要它：这个计数会**闸住整条整集预取链路**。只要有一条路径漏了释放
+ * （会话在某个 await 里被判废弃、异常提前 return、组件卸载导致续体不再跑），
+ * 计数就永久停在 1，之后所有预取静默失效——而症状只是"下一集变慢了"，
+ * 几乎不可能与这里联系起来。与其指望每条 return 都记得配对，不如给它一个上限：
+ * 流式转码的正常服务窗口就是几十秒（整集落盘后被替换），超过这个时间一定已经
+ * 不再服务于本次播放。
+ */
+const STREAMING_WINDOW_MAX_MS = 90_000;
+
+/**
+ * 出画之后、还要再按住预取闸门多久。
+ *
+ * 依据：整集转码实测 5.6 秒（92.7 秒正片），而首片 1.3 秒就绪 —— 出画时转码
+ * 大约还剩 4 秒。取 6 秒留一点余量，覆盖"源偏慢导致转码超出平均"的情况。
+ * 转完之后 `start_video_cache` 会把产物按 vid 缓存下来，换集回来也不用再转。
+ */
+const STREAMING_TRANSCODE_SETTLE_MS = 6_000;
+let streamingWindowTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 进入流式转码窗口：占用 CPU 期间暂停整集预取。 */
+function beginStreamingWindow(): void {
+  streamingSessionsActive += 1;
+  streamingGeneration += 1;
+  const generation = streamingGeneration;
+  if (streamingWindowTimer) clearTimeout(streamingWindowTimer);
+  streamingWindowTimer = setTimeout(() => {
+    // 代际不符说明这一轮窗口早已结束（换集复位过）：什么都不做。
+    if (generation !== streamingGeneration) return;
+    if (streamingSessionsActive > 0) {
+      tracePlayback(`流式转码窗口超时（${STREAMING_WINDOW_MAX_MS / 1000}s），强制放开预取闸门`);
+    }
+    streamingSessionsActive = 0;
+    streamingWindowTimer = null;
+  }, STREAMING_WINDOW_MAX_MS);
+}
+
+/**
+ * 延时结束窗口：给出画后的整集转码留出余量。
+ *
+ * 带回代际校验，理由见 `streamingGeneration` 的注释。
+ */
+function endStreamingWindowAfter(ms: number): void {
+  const generation = streamingGeneration;
+  window.setTimeout(() => {
+    if (generation !== streamingGeneration) return;
+    endStreamingWindow();
+  }, ms);
+}
+
+/** 退出流式转码窗口：递减，真正归零由超时兜底。 */
+function endStreamingWindow(): void {
+  streamingSessionsActive = Math.max(0, streamingSessionsActive - 1);
+  if (streamingSessionsActive === 0 && streamingWindowTimer) {
+    clearTimeout(streamingWindowTimer);
+    streamingWindowTimer = null;
+  }
+}
+
+/**
+ * 硬复位：换集时用。
+ *
+ * 与 `endStreamingWindow` 的差别是语义而非数值：换集意味着**上一个会话整体作废**
+ * （`playback_command stop` 已经把它那一路 ffmpeg 收掉了），所以这里不需要、
+ * 也不应该去猜"上一条链路自己减没减"——直接归零即可。用递减的话，只要有一条
+ * 路径漏了配对，计数就会慢慢涨上去并把整集预取永久关掉。
+ */
+function resetStreamingWindow(): void {
+  streamingSessionsActive = 0;
+  if (streamingWindowTimer) {
+    clearTimeout(streamingWindowTimer);
+    streamingWindowTimer = null;
+  }
+}
 
 /**
  * 把各种来源的错误压成一行可读文本。
@@ -201,7 +321,29 @@ function describeError(error: unknown): string {
  * 导致整条历史记录被后端拒绝。这种情况下退一步用 `seekable` / `buffered`
  * 的末尾值——它们描述"已确定可用的时间轴终点"，是这类源最接近真实的时长。
  */
+/**
+ * 当前 HLS 源的**真实总时长**（秒）。0 表示未知。
+ *
+ * 为什么是模块级变量而不是组件里的 ref：`usableDuration` 是模块级纯函数
+ * （`timeupdate` 监听器里每帧都调它），拿不到组件的 ref。而这个值在任一时刻
+ * 只有"当前那一集"的含义，模块级单例正好对应。
+ *
+ * 写入点在流式开播成功处（后端 `open_stream` 给的 `durationMs`），
+ * 清零点在 `resetStreamingSource`（换源/换集/退出播放器）。
+ */
+let streamingSourceTotalSeconds = 0;
 function usableDuration(video: HTMLVideoElement): number {
+  // 权威来源：**后端下发的源片真实时长**（`streamingSourceTotalRef`）。
+  //
+  // 为什么它必须优先：方案 B 的播放源是边解密边转的 HLS，转码没结束时清单里
+  // 只有已切好的分片、`#EXT-X-ENDLIST` 还没写，于是 `video.duration` 要么是
+  // `Infinity`、要么等于「已转到的位置」。旧实现直接退回下面那段
+  // `seekable`/`buffered` 末尾的兜底 —— 而那两个值**随转码进度增长**，
+  // 用户看到的时长于是一路往上跳（用户报的「时长显示不稳定」）。
+  //
+  // 只要拿到了源片总时长，它就是这个文件的客观属性，与转码进度无关。
+  const authoritative = streamingSourceTotalSeconds;
+  if (Number.isFinite(authoritative) && authoritative > 0) return authoritative;
   const native = video.duration;
   if (Number.isFinite(native) && native > 0) return native;
   const ends: number[] = [];
@@ -530,7 +672,38 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 甩进下一集，甚至把这一集记成"已看完"。谁把源换成了完整文件，就由谁清掉
    * 这个标记（切整集成功、整集链路起播成功）。
    */
-  const prefixSourceRef = useRef<{ episodeId: string; sessionId: number } | null>(null);
+  // 注：这里曾有 `prefixSourceRef`（记录「画面挂在只有开头一段的短源上」）。
+  // 方案 B 之后播放源是整集 HLS，不再存在"片段播到头"这种状态，故移除。
+
+  /**
+   * 把「当前源是流式 HLS」的标记复位。
+   *
+   * 必须有这个统一出口：这个标记会让 `handleError` 跳过备用直链与 Blob 两步
+   * （对本地 HLS 是正确的），但如果忘了复位，**下一次播放会继承它** ——
+   * 于是「退出播放器后重进同一集、且在转码完成前又失败」时，错误再次被静默
+   * 跳过，用户看不到任何提示（审查的 F3）。三个换源入口都调它。
+   */
+  const resetStreamingSource = () => {
+    streamingSourceRef.current = false;
+    // 时长权威值属于"这一集的这一个源"，换源即失效。
+    streamingSourceTotalSeconds = 0;
+  };
+
+  /**
+   * 当前画面是否挂在**本地流式 HLS**（`127.0.0.1/rtx/...` 那个 m3u8）上。
+   *
+   * 为什么需要这个标记：`handleError` 的三级兜底链里有一段会 `fetch(currentSrc)`
+   * 再把结果包成 Blob 重播——那对**文件**是对的，对流式 HLS **必然失败**：
+   * `currentSrc` 是一个 m3u8 播放列表，fetch 回来的是几百字节文本，当成媒体源
+   * 只会再报一次错，最终把用户送到「该媒体无法由 WebView 解码」那张卡片上。
+   * 而真实情况往往只是「转码还没吐出新分片」，等一两秒自己就好了。
+   *
+   * 所以流式源出错时直接跳过 Blob 那一步（备用直链也跳过：它是同一个源的
+   * 加密直链，WebView 解不了 CENC）。正确动作只有一个：让整集链路接管。
+   */
+  const streamingSourceRef = useRef<boolean>(false);
+
+
   /**
    * 是否正在把新源接管到主播放器（`adoptPreparedSource` / `playDirect`）。
    *
@@ -934,6 +1107,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       video.playbackRate = playbackRateRef.current;
       video.volume = isMutedRef.current ? 0 : volumeRef.current;
       video.muted = isMutedRef.current;
+      // 这里换上的是真实的本地媒体文件：兜底链可以从"流式源"模式退出来了。
+      streamingSourceRef.current = false;
 
       // 等首批可绘制数据到位再切入：旧帧一直保留到这一刻。
       const firstFrameReady = new Promise<void>(resolve => {
@@ -1013,6 +1188,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       video.playbackRate = playbackRateRef.current;
       video.volume = isMutedRef.current ? 0 : volumeRef.current;
       video.muted = isMutedRef.current;
+      // 这里喂给 <video> 的是真实媒体文件，不再是本地 HLS：兜底链恢复常规分支。
+      resetStreamingSource();
 
       const ready = new Promise<void>(resolve => {
         let settled = false;
@@ -1113,8 +1290,15 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       markSourceCommitted(sessionId, episodeId);
       await firstFrameReady;
       if (activeSessionRef.current !== sessionId) return 'stale';
-      if (video.error) {
-        noteFailure('流式 HLS 解码失败', video.error);
+      // 判死必须同时看 hls.js 的标记。
+      //
+      // `hls.js` 判 fatal 时我们只能 `dispatchEvent(new Event('error'))`，而它**不会**
+      // 设置 `video.error`（只读的 MediaError）。旧实现只判 `video.error`，于是这次
+      // 失败被完全忽略，代码继续走到 `startPlayback`，在无源可载的 `<video>` 上等满
+      // 有界看门狗（实测 8000ms，占那次 15.7 秒首屏的 51%）。
+      const hlsFatal = takeHlsFatal(video);
+      if (video.error || hlsFatal) {
+        noteFailure('流式 HLS 失败', video.error ?? new Error(hlsFatal ?? '未知'));
         return 'error';
       }
       video.playbackRate = playbackRateRef.current;
@@ -1167,22 +1351,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const cacheKey = episodeCacheKey(seriesId, episodeId, quality);
 
     /**
-     * 整集链路本体（即改造前的全部行为），只在"必须等完整文件"时才走：
-     * 前缀被跳过 / 前缀没命中 / 前缀播不起来 / 起播那一刻整集已经落盘。
-     * 复用同一个 `fullPromise`，所以无论走到这里几次，整集都只下载一次。
+     * 失败回退：走旧的「整集 mp4」链路。
+     *
+     * 方案 B 之后整集 HLS 是**唯一**的播放源，所以这段代码不再是另一条并行链路，
+     * 而是「HLS 起不来时还有一个能播的东西」。它仍然复用 `fullPromise`（整集解析
+     * 只跑一次），也仍然负责把结果登记进 `resolvedFileByVidRef` 供换集秒开。
      */
     const runFull = async (): Promise<PlayOutcome> => {
       try {
         const resolved = await fullPromise;
         if (activeSessionRef.current !== sessionId) return `stale`;
         const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition, episodeId, seriesId);
-        // 画面已经换成完整文件：前缀标记必须撤掉，否则这一集真播完时会被当成
-        // "前缀播到头"再重载一次。
-        if (outcome === `ok` && prefixSourceRef.current?.episodeId === episodeId) {
-          prefixSourceRef.current = null;
-        }
-        // 只有"源本身有问题"才撤掉登记。自动播放被拦（autoplay-blocked）时
-        // 文件是完好的，撤掉会导致下次重下一整集——白等 7 秒。
+        // 源本身有问题才撤掉登记；自动播放被拦时文件是完好的，撤掉会导致下次重下一整集。
         if (outcome === `error` && activeSessionRef.current === sessionId) {
           resolvedFileByVidRef.current.delete(cacheKey);
         }
@@ -1192,9 +1372,6 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         return `error`;
       }
     };
-    // 走原来的整集链路，并把它在途的 promise 记回 ref 上——`handleError` 的
-    // "本地解析在途就别弹错误页"闸门读的正是这个 ref，前缀先行不能让这道闸门
-    // 失效（整集没落盘之前，任何源错误都还该被兜住）。
     const startFull = (): Promise<PlayOutcome> => {
       const attempt = runFull();
       nativeResolveInFlightRef.current = attempt;
@@ -1204,157 +1381,87 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       });
     };
 
-    // 整集链路**先发车、先不 await**：Rust 侧两条链路是并发 worker（在途去重键
-    // 带 `:prefix` 后缀），谁先落盘谁先被用上。这里的 promise 是"最终一定会拿到
-    // 的完整文件"，也是唯一会写进 resolvedFileByVidRef 的东西——前缀路径永远不
-    // 登记，否则下次换集会命中一个只剩开头十几秒的短命文件。
+    // 整集 mp4 解析**仍然发车**：它是 HLS 起不来时唯一的退路。
+    //
+    // 但方案 B 下它**不再**是「画面已经在播、后台等它落盘再切源」的那条链路 ——
+    // 那个切源动作正是用户抱怨的「前 8 秒转换后面再进入」。
+    //
+    // Rust 侧 `open_stream` 与它是同一个 vid 的两次调用，`ensure_stream_cached`
+    // 让两边的签名只跑一次（省掉实测 3695ms 的重复 API 往返）。
     const fullPromise = ipcService.playback.resolveNative(seriesId, episodeId, contentType, quality)
       .then(resolved => {
-        // 解析成功立刻登记本地文件路径：换集/切清晰度第二次进入同一集时秒开。
         if (resolved.cached || resolved.sizeBytes > 0) {
           resolvedFileByVidRef.current.set(cacheKey, resolved.playUrl);
         }
         return resolved;
       });
-    // 前缀路径可能在拿到整集之前就返回（stale / 失败回退）：那之后没人 await
-  
-    // fullPromise 在极端情况下（会话早已切换）没人 await，必须自己挂一个
-    // no-op 捕获，否则会冒出 unhandled rejection。
     void fullPromise.catch(() => {});
-    // 续播时，前缀文件几乎立刻播到头，反而会先触发一次 ended —— 对"继续观看"
-    // 这条路径，老老实实等整集才是对的。
-    if (startPosition > PREFIX_COVERAGE_SECONDS) {
-      tracePlayback(`前缀起播 跳过（续播位置 ${startPosition.toFixed(1)}s 超出前缀覆盖范围）`);
-      return startFull();
-    }
 
-    // ===== 「先出画面」主路径：流式 HLS =====
-
+    // ===== 唯一主路径：整集 HLS 单源到底 =====
     //
-    // 这是用户明确要的"先把视频画面出来、播放的同时再加载"。实测对比：
-    //   流式 HLS   首片 1005–1126ms 落地（含 API 往返总首屏 3.1–3.5 秒）
-    //   前缀 mp4   整段 6219–7174ms（要先下载 2MB + 解密转码 + 落盘）
-    //   整集 mp4   6600–22320ms
-    //
-    // 它失败不是错误——整集链路早就在跑了，回退到前缀/整集即可。
-    // 注意它必须排在**前缀之前**：前缀要等下载完一段才能出画，而流式是边转边出。
+    // 实测依据（本机 RTX 5060 Laptop，真实红果加密源 1080p HEVC，正片 92.7 秒）：
+    //   ffmpeg NVENC 边解密边转 → 首片 1314ms、**整集 5.6 秒**、带 ENDLIST
+    //   hls.js 实播该产物：可拖动到 60s 与 85s，无错误
+    // 转码速度是 16 倍实时，两段式省不下任何东西，只带来切源观感
+    // （日志实证 `整集切换完成 位置=8.0s`）与两倍磁盘占用。
     const streamingStarted = performance.now();
+    beginStreamingWindow();
     const streaming = await ipcService.playback
       .openStreamNative(seriesId, episodeId, sessionId, contentType)
       .catch((error: unknown) => {
-        tracePlayback(`流式开播 未命中（回退前缀/整集） ${describeError(error)}`);
+        tracePlayback(`整集 HLS 未命中（回退整集文件） ${describeError(error)}`);
         return null;
       });
-    if (activeSessionRef.current !== sessionId) return `stale`;
-    if (streaming && streaming.cached !== true && streaming.streamKind === 'hls') {
+    if (activeSessionRef.current !== sessionId) {
+      endStreamingWindow();
+      return `stale`;
+    }
+    // 后端在「盘上只有旧链路 mp4」时会回 file 形态：那不是失败，就是走文件。
+    if (streaming && streaming.streamKind !== 'hls' && streaming.cached === true) {
+      endStreamingWindow();
+      tracePlayback('整集 HLS 未启用，后端返回已缓存的整集文件');
+      return startFull();
+    }
+    if (streaming && streaming.streamKind === 'hls') {
       const streamingOutcome = await playStreamingHls(
         streaming.playUrl, video, sessionId, startPosition, episodeId,
       );
-      if (streamingOutcome === `stale`) return `stale`;
+      if (streamingOutcome === `stale`) {
+        endStreamingWindow();
+        return `stale`;
+      }
       if (streamingOutcome === `ok`) {
-        tracePlayback(`流式开播 出画 耗时=${Math.round(performance.now() - streamingStarted)}ms（整集仍在后台下载）`);
-        // 与前缀同款标记：画面还挂在「非整集」源上，这一集播到头时不能算看完。
-        prefixSourceRef.current = { episodeId, sessionId };
-        // 后台等整集落盘切源（与下面前缀分支完全同一段逻辑，抽不抽都行——
-        // 但这里刻意**不抽**：抽成函数会让这段的会话复查与 ref 清理多一层间接，
-        // 而它恰恰是最需要一眼看清的地方）。
-        void (async () => {
-          try {
-            const resolved = await fullPromise;
-            if (activeSessionRef.current !== sessionId) return;
-            if (!resolved.playUrl || resolved.playUrl === streaming.playUrl) return;
-            const { convertFileSrc } = await import(`@tauri-apps/api/core`);
-            const assetUrl = convertFileSrc(resolved.playUrl);
-            const probe = await preloadSource(assetUrl, 0, 8000);
-            if (!probe) return;
-            if (activeSessionRef.current !== sessionId) {
-              disposePrepared({ url: assetUrl, element: probe });
-              return;
-            }
-            const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-            const switchedAt = performance.now();
-            const outcome = await adoptPreparedSource(
-              { url: assetUrl, element: probe }, video, sessionId, resumeAt, episodeId,
-            );
-            disposePrepared({ url: assetUrl, element: probe });
-            if (outcome !== `ok`) {
-              tracePlayback(`整集切换未完成（outcome=${outcome}，继续播流式源）`);
-              return;
-            }
-            prefixSourceRef.current = null;
-            tracePlayback(`整集切换完成 耗时=${Math.round(performance.now() - switchedAt)}ms 位置=${resumeAt.toFixed(1)}s 字节=${(resolved.sizeBytes / 1048576).toFixed(1)}MB`);
-          } catch (error) {
-            tracePlayback(`整集切换异常（继续播流式源） ${describeError(error)}`);
-          }
-        })();
+        tracePlayback(`整集 HLS 出画 耗时=${Math.round(performance.now() - streamingStarted)}ms（单源到底，不再切源）`);
+        streamingSourceRef.current = true;
+        // **钉住这一集的真实时长**：后端从 worker 拿到源片 `duration_ms`，
+        // 它是文件的客观属性，不随转码进度变化。`usableDuration` 以它为最高
+        // 优先级，进度条与时间读数从此不再"一路往上跳"。
+        // 拿不到（后端返回 0）时保持 0，退回浏览器侧的判定。
+        const totalMs = streaming.durationMs ?? 0;
+        if (Number.isFinite(totalMs) && totalMs > 0) {
+          streamingSourceTotalSeconds = totalMs / 1000;
+          // 立刻把权威时长推给 UI：第一次 timeupdate 可能还没到，
+          // 而用户从出画那一刻就应当看到正确的总时长。
+          setDuration(streamingSourceTotalSeconds);
+          tracePlayback(`时长权威值已固定 = ${streamingSourceTotalSeconds.toFixed(1)}s（源片真实时长）`);
+        }
+        // ⚠️ 窗口**不能在这里就关**：出画只说明首片写完了，而整集转码还在跑。
+        //
+        // 实测（92.7 秒正片）：首片 1314ms 可播，整集转码到 5.6 秒才结束。
+        // 若在出画时就放开预取闸门，之后那 4 秒里会同时跑「本集转码 + 下一集
+        // 的 worker 下载/转码」两路 ffmpeg —— 那正是之前三路抢 CPU、转码跟不上
+        // 播放的成因。
+        //
+        // 用一个覆盖转码余量的延时释放，比"立刻释放"正确、比"等后端通知"简单
+        // （不必为它新增一条 IPC）。超时释放本身还有 90 秒硬上限兜底，不会泄漏。
+        endStreamingWindowAfter(STREAMING_TRANSCODE_SETTLE_MS);
         return `ok`;
       }
-      // 流式播不起来：不弹错误页，继续走前缀/整集。
-      tracePlayback(`流式开播 失败（outcome=${streamingOutcome}，回退前缀）`);
+      endStreamingWindow();
+      tracePlayback(`整集 HLS 播放失败（outcome=${streamingOutcome}，回退整集文件）`);
     }
-
-    // 前缀失败不是错误，只是没享受到加速：整集链路早就在跑，继续等它就行。
-    const prefixStarted = performance.now();
-    const prefix = await ipcService.playback
-      .resolveNativePrefix(seriesId, episodeId, contentType, quality)
-      .catch((error: unknown) => {
-        tracePlayback(`前缀起播 未命中（继续等整集） ${describeError(error)}`);
-        return null;
-      });
-    if (!prefix) return startFull();
-    // 整集已在盘上时后端直接把整集当"前缀"还回来：没有第二条链路要等。
-    if (prefix.cached === true) return startFull();
-    if (activeSessionRef.current !== sessionId) return `stale`;
-
-    const prefixOutcome = await playLocalFile(prefix.playUrl, video, sessionId, startPosition, episodeId, seriesId);
-    if (prefixOutcome === `stale`) return `stale`;
-    if (prefixOutcome !== `ok`) {
-      // 前缀播不起来（片段解码失败、自动播放被拦）：**不弹错误页**，把结果交给
-      // 整集链路重新决定。此时整集多半已经在路上，不会比原实现更慢。
-      tracePlayback(`前缀起播 失败（outcome=${prefixOutcome}，回退整集）`);
-      return startFull();
-    }
-    prefixSourceRef.current = { episodeId, sessionId };
-    tracePlayback(`前缀起播 耗时=${Math.round(performance.now() - prefixStarted)}ms 字节=${(prefix.sizeBytes / 1048576).toFixed(1)}MB（整集仍在后台下载）`);
-
-    // 画面已经在前缀上了：后台等整集，落盘后把同一会话、同一 <video> 切到完整
-    // 文件。这段刻意 fire-and-forget —— 上层的 isSettled / 预取落点不该为一个
-    // "锦上添花"的切源多等 7 秒，而切源本身自带完整的失败退让。
-    void (async () => {
-      try {
-        const resolved = await fullPromise;
-        if (activeSessionRef.current !== sessionId) return;
-        if (!resolved.playUrl || resolved.playUrl === prefix.playUrl) return;
-        const { convertFileSrc } = await import(`@tauri-apps/api/core`);
-        const assetUrl = convertFileSrc(resolved.playUrl);
-        // 先让隐藏探针把整集解到可播，再交给 adoptPreparedSource：不调 load()、
-        // 旧帧一直保留到新源 loadeddata —— 这是"切源不黑屏"的全部依据。
-        const probe = await preloadSource(assetUrl, 0, 8000);
-        if (!probe) return;
-        if (activeSessionRef.current !== sessionId) {
-          disposePrepared({ url: assetUrl, element: probe });
-          return;
-        }
-        // 从前缀当前播放位置续上：两个文件同一源同一编码，直接按秒对齐即可。
-        const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-        const switchedAt = performance.now();
-        const outcome = await adoptPreparedSource(
-          { url: assetUrl, element: probe }, video, sessionId, resumeAt, episodeId,
-        );
-        disposePrepared({ url: assetUrl, element: probe });
-        if (outcome !== `ok`) {
-          // 切不过去就继续播前缀：用户已经看了十几秒画面，不该因为这次替换
-          // 失败而弹错或变黑。下次换集/重开会命中整集缓存，问题自然消失。
-          tracePlayback(`整集切换未完成（outcome=${outcome}，继续播前缀）`);
-          return;
-        }
-        prefixSourceRef.current = null;
-        tracePlayback(`整集切换完成 耗时=${Math.round(performance.now() - switchedAt)}ms 位置=${resumeAt.toFixed(1)}s 字节=${(resolved.sizeBytes / 1048576).toFixed(1)}MB`);
-      } catch (error) {
-        tracePlayback(`整集切换异常（继续播前缀） ${describeError(error)}`);
-      }
-    })();
-    return `ok`;
+    // 只剩「HLS 起不来」这一种情况：回退旧链路的整集文件。
+    return startFull();
   };
 
   // 统一的本地解析入口：把在途 promise 记到 ref 上，供 error 事件链等待复用。
@@ -1470,6 +1577,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    */
   const startPrewarmResolve = (seriesId: string, episodeId: string, contentType: number): boolean => {
     if (!isTauriEnvironment()) return false;
+    // 流式转码在跑时不接新的整集预热：三路 ffmpeg 抢 CPU 会让正在看的那一集
+    // 分片来不及生成（实测整集重编码从 7 秒涨到 26–43 秒）。详见 MAX_PREWARM_INFLIGHT。
+    // 返回 false 而不是抛错：预热本就是纯优化，不接受就只是没享受到加速。
+    if (streamingInFlight()) return false;
     if (prewarmInflightRef.current >= MAX_PREWARM_INFLIGHT) return false;
     const key = episodeCacheKey(seriesId, episodeId, 'auto');
     if (resolvedFileByVidRef.current.has(key)) return false; // 已缓存或已在途
@@ -1569,6 +1680,27 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 首拍延迟 800ms：换集瞬间前台解析正要拉起 worker，预取同时入队会让
     // 两者抢锁串行（worker 单实例），前台那一集白等一拍。让前台先跑。
     setTimeout(() => pumpPrefetchQueueForSession(sessionAtRequest), 800);
+
+    // ===== 预转**下一集**的整集 HLS（用户需求：集与集之间无缝切换）=====
+    //
+    // 上面那条队列预热的是**整集 mp4**，那是方案 B 的失败回退，不是播放主路径。
+    // 播放主路径是整集 HLS，而它的转码实测 5.6 秒（92.7 秒正片）—— 若不提前做，
+    // 连播到下一集时那 5.6 秒就是实打实的黑屏等待。
+    //
+    // 只预转**下一集**，不预转下三集：每路转码都会占满显卡编码单元约 6 秒，
+    // 而连播只关心下一集；下两集之后用户多半还没看到，提前转纯属与当前播放抢资源。
+    //
+    // 时机：延后到整集转码余量之后再发车（本集出画后 6 秒窗口内不打扰）。
+    // 一集正片至少几十秒，这个延迟对"下一集要用时"毫无影响。
+    const nextEpisode = series.episodes[idx + 1];
+    if (nextEpisode && series.type !== 'anime') {
+      window.setTimeout(() => {
+        // 会话已作废（用户切走/退出播放器）就不再预转：那台机器上正在播的
+        // 已经不是这一集了，占用转码资源只会拖慢用户真正在看的那一路。
+        if (activeSessionRef.current !== sessionAtRequest) return;
+        void ipcService.playback.prewarmStreamNative(series.id, nextEpisode.id, contentType);
+      }, STREAMING_TRANSCODE_SETTLE_MS + 1000);
+    }
   };
 
   /**
@@ -1614,6 +1746,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         prefetchPumpRunningRef.current = false;
         return;
       }
+      // ⚠️ 先判流式闸门，而且**必须在取值（shift）之前**判。
+      //
+      // `startPrewarmResolve` 对"流式窗口内"与"已缓存/已在途"都返回 false，而队列泵把
+      // false 一律当作"未受理"、立刻 `setTimeout(step, 0)` 去消费下一项 —— 于是若在这里
+      // 先把项 shift 出来、再让闸门拒掉，整条队列会在几十毫秒内被清空，一次预热都发不
+      // 出去。而流式窗口从出画起还要按住 6 秒，所以这个命中是必然的，不是边界情况。
+      // 症状是"整集 mp4 预热在播放期间彻底失效"：HLS 起不来要回退整集链路时得现场等
+      // 7 秒多。
+      if (streamingInFlight()) {
+        setTimeout(step, 500);
+        return;
+      }
       if (prewarmInflightRef.current >= MAX_PREWARM_INFLIGHT) {
         setTimeout(step, 400);
         return;
@@ -1624,7 +1768,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // nativeResolveInFlightRef，所以这个判断只对**前台**生效，不会自己卡自己。
       //
       // 必要性：单集解析要拉起 python worker + ffmpeg（下载 + 解密 + 转存），
-      // 前台 1 个加上预取 2 个就是 3 个进程同时抢带宽与 CPU。而前台那一集是
+      // 前台 1 个加上预取 1 个就是两路进程同时抢带宽与 CPU（预取上限降到 1 之后
+      // 最多就是这两路；此前是前台 1 + 预取 2 = 3 路）。而前台那一集是
       // 用户**正在等**的，预取只是"最好有"——让前台先跑完更符合直觉，
       // 也避免前台的探针预热被拖到超时（那会白白多绕一圈 playDirect）。
       if (nativeResolveInFlightRef.current) {
@@ -1785,6 +1930,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     if (activeSessionRef.current > 0) {
       void ipcService.playback.command(activeSessionRef.current, 'stop').catch(() => undefined);
     }
+    // 换集 = 上一个会话整体作废（`stop` 已收掉它那一路 ffmpeg），流式转码窗口随之清零。
+    // 这里用硬复位而不是递减：会话被替换时，上一条链路留在后台的续体可能再也执行不到
+    // 它自己的释放点，靠递减会让计数慢慢涨上去、把整集预取永久关掉。
+    resetStreamingWindow();
+    // 兜底链的分支判定也一并复位：新一集还没决定走哪条源。
+    streamingSourceRef.current = false;
     dismissPip();
     const qualitySwitchRequested = Boolean(
       qualityOverride
@@ -2528,6 +2679,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 看门狗必须一起收掉：它的续体会重起播、甚至重装载整集，留着就是"人已退出
     // 却仍被后台定时器拉起播放"。提示同时收回，播放器下次进来是干净的。
     stopStallWatchdog();
+    // 兜底链的分支判定同样作废：下次进播放器时新一集还没决定走哪条源，
+    // 留着旧标记会让那一次的错误被静默跳过（审查 F3）。
+    resetStreamingSource();
+    // 流式转码窗口一并归零（本次会话整体作废，`stop` 已收掉它那一路 ffmpeg）。
+    resetStreamingWindow();
     setStallNotice(null);
 
     const video = videoRef.current;
@@ -2790,24 +2946,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 旧实现无条件按 currentEpisode 写 100% 完成：交接期 currentEpisode 已经是
       // 下一集，于是一次播放结束会把下一集标成"已看完"，历史页随即显示错误的集数。
       const ctxEnded = handlerCtxRef.current;
-      // 前缀先行开播的副作用：前缀文件只有开头一小段（实测十几秒）。画面还挂在
-      // 前缀上就播到头时，这一集其实远没播完，而整集多半刚好落盘。就地重载同一集
-      // 接住它：openEpisode 会命中刚登记好的整集路径秒起，而且此时播放位置已远超
-      // `PREFIX_COVERAGE_SECONDS`，会**自动跳过前缀**——不存在"前缀播完 → 重载 →
-      // 又播前缀"的循环。放在落盘判定之前，是因为这一次 ended 并不代表看完。
-      const prefixSource = prefixSourceRef.current;
-      if (
-        prefixSource
-        && prefixSource.sessionId === activeSessionRef.current
-        && prefixSource.episodeId === (videoCommittedRef.current?.episodeId ?? ``)
-        && ctxEnded.currentSeries
-      ) {
-        prefixSourceRef.current = null;
-        const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-        tracePlayback(`前缀片段播到末尾 位置=${resumeAt.toFixed(1)}s，就地接整集`);
-        void openEpisodeRef.current(ctxEnded.currentSeries.id, prefixSource.episodeId, resumeAt);
-        return;
-      }
+      // 方案 B 删掉了这里的「前缀片段播到末尾 → 就地接整集」分支。
+      //
+      // 那一段是为「前缀只有开头十几秒」设计的补丁：短片段播到头时其实没播完，
+      // 需要重载同一集接住。现在播放源是**整集 HLS**（转码产物带 ENDLIST，
+      // 覆盖全片），播到末尾就是真的播完了 —— 再留这段只会把正常结束误判成
+      // 「片段到头」，白白重载一次。
       const committed = videoCommittedRef.current;
       const endedEpisodeId = committed?.episodeId ?? ctxEnded.currentEpisode?.id ?? null;
       if (endedEpisodeId && endedEpisodeId === ctxEnded.currentEpisode?.id) {
@@ -2852,14 +2996,39 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 事务，由它重试或判死。这里若抢先弹错误页，就会出现"视频已播起来、
       // 界面却停在错误页"，也会让 playDirect 的兜底完全失效。
       if (adoptingRef.current) return;
-      // 本地解析已在途（openEpisode 或 play() 拒绝分支已启动 worker）：
-      // 直链失败不代表应用内播不了，保持 opening 状态等待结果，禁止弹错误页或降级。
-      if (nativeResolveInFlightRef.current) return;
+      // 本地解析在途：直链失败不代表应用内播不了，保持 opening 等结果。
+      //
+      // ⚠️ 但**必须核对归属**。方案 B 之后整集 HLS 是唯一播放源，一旦这里
+      // 无脑早退，而那条在途 promise 其实属于**别的会话**（旧会话遗留、或解析
+      // 早已收口只剩一个未清的引用），这次 fatal 就会被完全吞掉：
+      // 下面的备用直链/Blob 会跳过、错误卡片也不弹，界面停在没有画面、没有报错、
+      // 也没有重试入口的状态 —— 那是比报错更糟的黑洞。
+      //
+      // 判据与 `startNativeResolve` 记账时写入的 sessionId 对齐：只有"属于当前
+      // 会话"的在途才有资格压住这次错误。
+      if (nativeResolveInFlightRef.current) {
+        const inflightSession = nativeResolveSessionRef.current;
+        const currentSession = activeSessionRef.current;
+        if (inflightSession === currentSession) return;
+        tracePlayback(
+          `handleError：在途解析属于会话 ${inflightSession}，当前 ${currentSession}，不早退`, 
+        );
+        nativeResolveInFlightRef.current = null;
+      }
       // 会话已作废（用户已离开播放器 / 已有更新的切换接管）：整条兜底链
       // （备用直链 → Blob → 本地解析）都不再启动——它们的续体最终都会
       // play()，等于人已退出却隐形开播。
       if (activeSessionRef.current !== Number(video.dataset.sessionId)) return;
       const ctx = handlerCtxRef.current;
+      // 本地流式 HLS 出错时**不能走备用直链与 Blob 这两步**：
+      //   - 备用直链是同一个源的 CENC 加密地址，WebView 根本解不开；
+      //   - Blob 那一步会把 `currentSrc`（一个 m3u8 播放列表）fetch 成几百字节
+      //     文本再当媒体源，必然再报一次错。
+      // 两者都会把一次「转码暂时没跟上」升级成「该媒体无法由 WebView 解码」的
+      // 错误卡片，而真实处置只有一个：让整集链路接管（它本来就在跑）。
+      if (streamingSourceRef.current) {
+        tracePlayback('流式源报错：跳过备用直链/Blob，交给整集链路接管');
+      } else {
       const backupUrl = backupUrlRef.current;
       if (backupUrl && !hasTriedBackupRef.current) {
         hasTriedBackupRef.current = true;
@@ -2948,6 +3117,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
             });
           });
         return;
+      }
       }
       // 已试过直链/备用/Blob 且无在途解析：此时才宣判失败。
       if (hasTriedNativeResolveRef.current) {

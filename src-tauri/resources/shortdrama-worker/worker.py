@@ -863,13 +863,51 @@ def fetch_stream(session: requests.Session, vid: str, device_id: str,
 # CPU——本机实测整集重编要 3.7~4.0 秒，是与下载并列的第二大块首开开销。
 # h264_nvenc 走 NVIDIA 专用编码硬件：输出同样是 H.264（VSR 只认编码格式，
 # 不认谁编的），但几乎不占 CPU。
+#
+# ⚠️ 与 Rust 侧 `media_enhance::video_encoder_args` **必须保持一致**：两边都产 H.264
+# 供同一块 <video> 播、都可能被切成 HLS 分片。参数一旦漂移，症状是"同一条链路
+# 换集后分片粒度、体积、首屏突然变样"，极难定位（2026-10-08 就发现 Rust 侧加了
+# GOP 控制而这里没有；2026-10-09 又发现 `-profile:v high` 与码率上限只在 Rust 侧）。
+# 参数表的权威注释在 `media_enhance.rs`，这里只写与之对齐的结论。
+#
+# `-g 48 -keyint_min 48 -sc_threshold 0`：把关键帧间隔钉在 **48 帧** —— 注意是帧数
+# 不是秒数，所以同一条参数在不同帧率的源上得到不同秒数：24fps ⇒ 2.0 秒、15fps ⇒ 3.2 秒
+# （实测的短剧源正是 15fps，分片因此稳定在 3.2 秒）。
+# 为什么必须用编码器 GOP 参数而不是 `-force_key_frames`：后者**对 NVENC 无效**，
+# 实测（同一集五组对照）不传时 HLS 分片被撑到 **8.33 秒**（源流自带关键帧间隔），
+# 而 hls_time=2 形同虚设 —— HLS 分片只能比 GOP 长、不能比它短。加上之后分片
+# 稳定在 3.2 秒、首片体积从 4.6MB 降到 1.8MB。
+#
+# `-maxrate 1100k -bufsize 2200k`：恒定质量模式（`-crf` / `-cq`）为了保质量会把
+# 码率放到源之上 —— 实测同一集 NVENC cq26 不加上限时输出 61.3MB，而这一集的源流
+# 总共只有 10.2MB；补上后 13.5MB，整集还快 243ms（要写盘的字节少了一个数量级）。
+# 1100k 取自该源约 0.9Mbps 的平均码率，留约 20% 余量。
 _X264_ARGS = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-              "-tune", "zerolatency", "-pix_fmt", "yuv420p"]
+              "-maxrate", "1100k", "-bufsize", "2200k",
+              "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-profile:v", "high",
+              "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
 _NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "26",
-               "-pix_fmt", "yuv420p", "-profile:v", "high"]
+               "-maxrate", "1100k", "-bufsize", "2200k",
+               "-pix_fmt", "yuv420p", "-profile:v", "high",
+               "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
+# 低配档：降分辨率（理由见 video_encoder_args 末尾分支）。crf 放宽一档，
+# 因为 720p 下同等 crf 的观感已经够用，再压码率省的是磁盘而不是时间。
+_X264_LOW_ARGS = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+                  "-maxrate", "1100k", "-bufsize", "2200k",
+                  "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-profile:v", "high",
+                  "-vf", "scale=-2:720",
+                  "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
 
 # 单个 worker 进程内只探测一次（每次播放都会起新进程，跨进程缓存没意义）。
 _ENCODER_CHOICE: list[list[str]] = []
+
+
+def _cpu_count() -> int:
+    """本机可用并行度；取不到时给保守默认 4（与 Rust 侧同一口径）。"""
+    try:
+        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return os.cpu_count() or 4
 
 
 def video_encoder_args(ffmpeg: str) -> list[str]:
@@ -884,13 +922,16 @@ def video_encoder_args(ffmpeg: str) -> list[str]:
     暴露。探测只编码 2 帧到 null muxer，不写盘。
 
     失效一律回落 libx264：兼容性优先，VSR 只要求"H.264"，不要求谁编的。
-    可用 TTV_SD_ENCODER=nvenc|x264 强制指定，用于对照实测。
+    可用 TTV_SD_ENCODER=x264 强制走 CPU 编码（对照实测用）；`nvenc` 这个取值等同
+    未设置 —— NVENC 只有真跑一次才可信，强制它是一句没有意义的承诺。
     """
     if _ENCODER_CHOICE:
         return _ENCODER_CHOICE[0]
     forced = os.getenv("TTV_SD_ENCODER", "").strip().lower()
     if forced == "x264":
-        _ENCODER_CHOICE.append(_X264_ARGS)
+        # 强制走 CPU 时**仍然按核数分档**：低配机若不降分辨率就会退回"一直转圈"，
+        # 而 Rust 侧同一台机器会判成 SoftwareLow —— 两边必须选出同一档。
+        _ENCODER_CHOICE.append(_X264_ARGS if _cpu_count() >= 8 else _X264_LOW_ARGS)
         return _ENCODER_CHOICE[0]
     probe_ok = False
     if forced != "x264":
@@ -910,7 +951,18 @@ def video_encoder_args(ffmpeg: str) -> list[str]:
                       "message": "硬件编码不可用，改用 CPU 编码"})
         except (OSError, subprocess.SubprocessError):
             probe_ok = False
-    _ENCODER_CHOICE.append(_NVENC_ARGS if probe_ok else _X264_ARGS)
+    if probe_ok:
+        _ENCODER_CHOICE.append(_NVENC_ARGS)
+    elif _cpu_count() >= 8:
+        # 没有硬件编码、但 CPU 核数够：libx264 ultrafast 实测约 8 倍实时，够边转边播。
+        _ENCODER_CHOICE.append(_X264_ARGS)
+    else:
+        # 低配机：**降分辨率**而不是只降码率。解码像素数直接决定解码与编码两个阶段
+        # 的算术量，减半分辨率等于把这块砍到四分之一；只降码率主要省带宽与磁盘，
+        # CPU 侧收益很小（Rust 侧实测 1080p cq26→cq34 只从 5499ms 降到 5429ms）。
+        emit({"event": "progress", "stage": "encoder",
+              "message": f"检测到低配设备（{_cpu_count()} 核），改用 720p 转码以保证流畅"})
+        _ENCODER_CHOICE.append(_X264_LOW_ARGS)
     return _ENCODER_CHOICE[0]
 
 

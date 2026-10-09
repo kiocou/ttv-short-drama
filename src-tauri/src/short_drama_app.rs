@@ -92,6 +92,97 @@ fn stream_cache() -> &'static Mutex<std::collections::HashMap<String, CachedStre
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// `stream` 子命令的**在途去重**表：同一 vid 的并发签名只跑一次。
+///
+/// 为什么需要：`resolve`（整集链路，现在只作为失败回退）与 `open_stream`（整集 HLS，
+/// 播放主路径）都会去取「加密直链 + CENC 密钥」，而那是**两次 App API 往返、固定
+/// 2.2 秒**的纯等待。实测日志里这两条命令在同一毫秒级窗口内一起发车（用户点播放时
+/// 前端同时发它们），却各自跑了一遍签名 —— 第 ③ 段 3695ms 就是这么来的。
+///
+/// 有了这张表：先到的那条把结果写进 stream 缓存，后到的直接读缓存（`peek_stream`），
+/// 或者在途时等前一条落地。省下的是一次完整的签名往返。
+fn stream_inflight() -> &'static Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static INFLIGHT: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 在途表项的存活上限（秒）。
+///
+/// 为什么需要：leader 若在摘除表项**之前**异常退场（panic 而非返回 Err），表项会
+/// 永久留着，此后每次打开该 vid 都进 follower 分支白等 20 秒（审查 S1）。
+/// 给它一个略大于 worker 自身超时的上限，超龄项在校验时顺手清掉。
+const STREAM_INFLIGHT_MAX_AGE_SECS: u64 = 120;
+
+/// 领取/查询在途权。返回 `true` 表示本次调用是 leader。
+///
+/// 顺带清掉超龄表项（僵尸 leader 留下的）。
+fn claim_stream_inflight(vid: &str) -> Result<bool, String> {
+    let mut guard = stream_inflight()
+        .lock()
+        .map_err(|_| "流签名在途表锁不可用。".to_string())?;
+    guard.retain(|_, started| started.elapsed().as_secs() < STREAM_INFLIGHT_MAX_AGE_SECS);
+    if guard.contains_key(vid) {
+        return Ok(false);
+    }
+    guard.insert(vid.to_owned(), std::time::Instant::now());
+    Ok(true)
+}
+
+fn release_stream_inflight(vid: &str) {
+    if let Ok(mut guard) = stream_inflight().lock() {
+        guard.remove(vid);
+    }
+}
+
+/// 取（或补齐）某 vid 的播放直链，**全进程去重**。
+///
+/// 命中 `stream` 缓存直接返回；否则领取在途权、跑一次 worker，落缓存后交还。
+/// 没领到在途权的调用方轮询等前一条落缓存（上限与 worker 自身超时同量级）。
+async fn ensure_stream_cached<R: Runtime>(
+    app: &AppHandle<R>,
+    vid: &str,
+    profile: HongguoAppProfile,
+) -> Result<CachedStream, String> {
+    if let Some(cached) = peek_stream(vid) {
+        return Ok(cached);
+    }
+    let acquired = claim_stream_inflight(vid)?;
+    if !acquired {
+        // 已有同 vid 的签名在跑：等它落缓存。两次 API 往返实测 2.2 秒，
+        // 给 20 秒余量（含网络抖动），超时后自己再跑一次兜底。
+        for _ in 0..80u32 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Some(cached) = peek_stream(vid) {
+                return Ok(cached);
+            }
+        }
+        // 超时兜底：不再无限等 leader。它可能已经异常退场（表项靠 TTL 清理），
+        // 也可能只是网络极慢。这里自跑一次并**顺手接管在途权**，避免后续调用
+        // 又以为有 leader 在跑而继续等。
+        crate::trace::log(format!("[红果] 等待在途签名超时，自跑一次 vid={vid}"));
+        let _ = claim_stream_inflight(vid);
+        let payload = match run_worker_subcommand(app, "stream", vid, "stream", profile).await {
+            Ok(payload) => {
+                store_stream(vid, &payload);
+                peek_stream(vid).ok_or_else(|| "签名结果未能落缓存。".to_owned())
+            }
+            Err(error) => Err(error),
+        };
+        release_stream_inflight(vid);
+        return payload;
+    }
+    let result = match run_worker_subcommand(app, "stream", vid, "stream", profile).await {
+        Ok(payload) => {
+            store_stream(vid, &payload);
+            peek_stream(vid).ok_or_else(|| "签名结果未能落缓存。".to_owned())
+        }
+        Err(error) => Err(error),
+    };
+    release_stream_inflight(vid);
+    result
+}
+
 /// 把一次 `stream` 的产物存进缓存。url 为空时直接丢弃，避免缓存一条废条目。
 fn store_stream(vid: &str, payload: &serde_json::Value) {
     let url = payload
@@ -228,6 +319,19 @@ pub struct ShortDramaAppPlayback {
     /// 本地 HLS 挂载失败时的回退地址（原始加密直链由调用方兜底）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_url: Option<String>,
+    ///
+    /// **源片真实总时长**（毫秒）。`None` 表示未知。
+    ///
+    /// 为什么必须由后端给：方案 B 的播放源是「边解密边转」的 HLS，转码没结束时
+    /// 清单里只有已经切好的分片、`#EXT-X-ENDLIST` 还没写 —— 浏览器侧的
+    /// `video.duration` 要么是 `Infinity`、要么等于「已转到的位置」。
+    /// 前端旧实现遇到 `Infinity` 会退回 `seekable` / `buffered` 末尾，而那两个值
+    /// **随转码进度增长**，于是用户看到的时长会一路往上跳。
+    ///
+    /// 而这个数字后端一直有：worker 的 `stream` 子命令早就返回 `duration_ms`
+    /// （`CachedStream` 里存着），只是没往前提。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -776,8 +880,33 @@ const CACHE_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// 文件可能正被播放器以只读方式打开，写入权限未必拿得到；拿不到就静默放弃，
 /// 下一次命中还会再试，不会影响播放。
 fn touch_cache_entry(path: &std::path::Path) {
+    if path.is_dir() {
+        touch_hls_directory(path);
+        return;
+    }
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
         let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// 把 HLS 会话目录的 mtime 推到"现在"，并返回该目录路径。
+///
+/// 为什么需要它：整集 HLS 目录（`rtx-vsr/vid-{vid}`）是方案 B 的播放源，
+/// 而它的 LRU 键取**目录内最新文件的 mtime**（见 `directory_usage`）。
+/// 正在播放中的目录若长时间没有被 touch，一旦用户把缓存上限调低触发
+/// `enforce_cache_budget_now`，它就可能被 LRU 选中 —— 那会把**正在播的**产物
+/// 抽走，后续分片全 404（审查 B1）。
+///
+/// 目录本身没有"写入时间"这一说法可靠地反映使用，所以显式把 `index.m3u8`
+/// 与 `init.mp4` 的 mtime 推到当前：它们是这个目录的代表文件，且播放器会
+/// 持续读它们。
+fn touch_hls_directory(directory: &std::path::Path) {
+    let now = std::time::SystemTime::now();
+    for name in ["index.m3u8", "init.mp4"] {
+        let target = directory.join(name);
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&target) {
+            let _ = file.set_modified(now);
+        }
     }
 }
 
@@ -831,11 +960,16 @@ fn enforce_cache_budget(keep: &std::path::Path) {
 }
 
 fn evict_channels_to_budget_unthrottled(keep: &std::path::Path) {
-    // 跨频道统一收敛：短剧与漫剧共享同一份预算。
+    // 跨频道统一收敛：短剧、漫剧与整集 HLS 共享同一份预算。
+    //
+    // `rtx-vsr/` 是方案 B 的整集 HLS 目录（每集约 58MB），必须计入——否则用户设的
+    // 缓存上限管不到它，看一集就多占 58MB。各会话目录由 `directory_usage` 按目录
+    // 整体计费，淘汰时整目录删除。
     evict_channels_to_budget(
         &[
             cache_dir().join("short-series"),
             cache_dir().join("motion-comic"),
+            cache_dir().join("rtx-vsr"),
         ],
         keep,
         cache_budget_bytes().load(Ordering::Relaxed),
@@ -884,7 +1018,17 @@ fn evict_channels_to_budget(
     let max_age = std::time::Duration::from_secs(max_age_seconds);
 
     // 收集所有频道下的整集缓存（跳过半成品与 keep）。
-    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    //
+    // 两类条目：
+    //   1. **文件** —— 旧链路的整集 mp4（`{vid}.mp4`）；
+    //   2. **目录** —— 方案 B 的整集 HLS 会话目录（`rtx-vsr/vid-{vid}/`），
+    //      含 `index.m3u8` + `init.mp4` + `seg-*.m4s`，按目录整体计费与淘汰。
+    //
+    // 为什么必须把目录也算进来：那批产物每集约 58MB（实测 92.7 秒正片），
+    // 而它们此前完全在预算之外 —— 唯一的回收是换集时 `remove_dir_all`，
+    // 也就是说"看得越多占得越多、用户设的上限管不着"。把目录纳入之后，
+    // LRU 淘汰按**整集**生效（不会出现删掉分片却留下清单的半残状态）。
+    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime, bool)> = Vec::new();
     let mut total: u64 = 0;
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -892,6 +1036,16 @@ fn evict_channels_to_budget(
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // HLS 会话目录：整体算一个条目。
+            if path.is_dir() {
+                let (size, stamp) = directory_usage(&path);
+                if size == 0 {
+                    continue;
+                }
+                total = total.saturating_add(size);
+                files.push((path, size, stamp, true));
+                continue;
+            }
             if !path.is_file() {
                 continue;
             }
@@ -910,7 +1064,7 @@ fn evict_channels_to_budget(
             }
             let stamp = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             total = total.saturating_add(size);
-            files.push((path, size, stamp));
+            files.push((path, size, stamp, false));
         }
     }
 
@@ -926,7 +1080,7 @@ fn evict_channels_to_budget(
     };
 
     // 第一步：过期清理。
-    for (path, size, stamp) in &files {
+    for (path, size, stamp, is_dir) in &files {
         if is_protected(path, *stamp) {
             continue;
         }
@@ -934,7 +1088,7 @@ fn evict_channels_to_budget(
             .duration_since(*stamp)
             .map(|age| age > max_age)
             .unwrap_or(false);
-        if expired && std::fs::remove_file(path).is_ok() {
+        if expired && remove_entry(path, *is_dir) {
             total = total.saturating_sub(*size);
             report.removed_files += 1;
             report.freed_bytes = report.freed_bytes.saturating_add(*size);
@@ -943,17 +1097,19 @@ fn evict_channels_to_budget(
 
     // 第二步：超量清理（LRU）。
     if total > budget_bytes {
-        let mut survivors: Vec<&(std::path::PathBuf, u64, std::time::SystemTime)> =
-            files.iter().filter(|(path, _, _)| path.exists()).collect();
-        survivors.sort_by_key(|(_, _, stamp)| *stamp);
-        for (path, size, stamp) in survivors {
+        let mut survivors: Vec<&(std::path::PathBuf, u64, std::time::SystemTime, bool)> = files
+            .iter()
+            .filter(|(path, _, _, _)| path.exists())
+            .collect();
+        survivors.sort_by_key(|(_, _, stamp, _)| *stamp);
+        for (path, size, stamp, is_dir) in survivors {
             if total <= budget_bytes {
                 break;
             }
             if is_protected(path, *stamp) {
                 continue;
             }
-            if std::fs::remove_file(path).is_ok() {
+            if remove_entry(path, *is_dir) {
                 total = total.saturating_sub(*size);
                 report.removed_files += 1;
                 report.freed_bytes = report.freed_bytes.saturating_add(*size);
@@ -964,18 +1120,71 @@ fn evict_channels_to_budget(
     report
 }
 
-/// 统计当前缓存占用（短剧 + 漫剧合计）。
+/// 删掉一个缓存条目：文件用 `remove_file`，HLS 会话目录用 `remove_dir_all`。
+///
+/// 目录**必须整目录删**：只删分片会留下一份指向不存在分片的清单，播放器拉到它
+/// 就会一连串 404 —— 那比"这一集没缓存"更糟，因为它看起来是"缓存命中"。
+fn remove_entry(path: &std::path::Path, is_dir: bool) -> bool {
+    if is_dir {
+        std::fs::remove_dir_all(path).is_ok()
+    } else {
+        std::fs::remove_file(path).is_ok()
+    }
+}
+
+/// 一个目录的 (总字节, 最新的 mtime)。
+///
+/// 用**最新**的 mtime 而不是最旧的：整集 HLS 在转码期间会不断写新分片，
+/// 用最旧的会把"正在写"的目录算成很久没碰过（它里面的 init.mp4 是最早写的），
+/// 于是刚转出来的产物可能立刻被淘汰。最新 mtime 在转完后还会被 `touch` 推到当下，
+/// 语义正好等于"这一集最近被用过"。
+fn directory_usage(path: &std::path::Path) -> (u64, std::time::SystemTime) {
+    let mut total: u64 = 0;
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return (0, newest);
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        total = total.saturating_add(meta.len());
+        if let Ok(stamp) = meta.modified() {
+            if stamp > newest {
+                newest = stamp;
+            }
+        }
+    }
+    (total, newest)
+}
+
+/// 统计当前缓存占用（短剧 + 漫剧 + 整集 HLS 合计）。
 pub fn cache_usage() -> CacheSweepReport {
     let mut total: u64 = 0;
     let mut count: u64 = 0;
     for dir in [
         cache_dir().join("short-series"),
         cache_dir().join("motion-comic"),
+        cache_dir().join("rtx-vsr"),
     ] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
+            // HLS 会话目录：整目录算一集。设置页显示的占用必须与实际一致，
+            // 否则用户清完缓存仍看到几十 MB 的落差。
+            if entry.path().is_dir() {
+                let (size, _) = directory_usage(&entry.path());
+                if size == 0 {
+                    continue;
+                }
+                total = total.saturating_add(size);
+                count += 1;
+                continue;
+            }
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
@@ -1009,10 +1218,24 @@ pub fn auto_clean_cache_on_start() -> CacheSweepReport {
         // 启动时没有任何 worker 在跑，陈旧门槛传 0 = 全部清理。
         sweep_cache_dir(&dir, Duration::from_secs(0), std::time::SystemTime::now());
     }
+    // `rtx-vsr/` 是方案 B 的整集 HLS 目录（每集约 58MB），必须与其它频道一起
+    // 计入预算与过期清理 —— 否则它在磁盘上只增不减，而用户设的上限管不到它。
+    // 此前这里只列了 short-series / motion-comic，与 `evict_channels_to_budget_unthrottled`
+    // 的注释（"三个频道共享同一份预算"）自相矛盾（审查 B2）。
+    let rtx_root = root.join("rtx-vsr");
+    sweep_cache_dir(
+        &rtx_root,
+        Duration::from_secs(0),
+        std::time::SystemTime::now(),
+    );
     // keep 指向一个不可能存在的路径：启动时没有任何"正在写入"的剧集。
     let sentinel = root.join("__none__");
     evict_channels_to_budget(
-        &[root.join("short-series"), root.join("motion-comic")],
+        &[
+            root.join("short-series"),
+            root.join("motion-comic"),
+            rtx_root,
+        ],
         &sentinel,
         cache_budget_bytes().load(Ordering::Relaxed),
         CACHE_MAX_AGE_SECONDS,
@@ -1099,28 +1322,13 @@ async fn ensure_h264_cache(
         .arg("-i")
         .arg(path);
     command
-        .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "20",
-            "-tune",
-            "zerolatency",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-        ])
+        .args(["-map", "0:v:0", "-map", "0:a:0?"])
+        // 编码参数与 `media_enhance::x264_args()` **同源**：这条链路产出的也是交给同一块
+        // `<video>` 播的 H.264，自己另抄一份就会漂移 —— 此前这里少了 `-profile:v high`、
+        // 码率上限与关键帧约束，于是"迁移出来的老集"与"新解析的集"seek 粒度、体积、
+        // 首帧时间都对不上（审查发现的第四条链路）。
+        .args(crate::media_enhance::x264_args())
+        .args(["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"])
         .arg(&partial);
     command
         .stdout(std::process::Stdio::null())
@@ -1205,6 +1413,7 @@ pub async fn short_drama_app_resolve<R: Runtime>(
             cached: true,
             stream_kind: None,
             backup_url: None,
+            duration_ms: None,
         })
     };
     if let Some(parent) = out_path.parent() {
@@ -1416,6 +1625,7 @@ pub async fn short_drama_app_resolve_prefix(
             cached: true,
             stream_kind: None,
             backup_url: None,
+            duration_ms: None,
         });
     }
 
@@ -1523,6 +1733,7 @@ fn prefix_payload(path: &std::path::Path) -> Option<ShortDramaAppPlayback> {
         cached: false,
         stream_kind: None,
         backup_url: None,
+        duration_ms: None,
     })
 }
 
@@ -1781,6 +1992,8 @@ async fn run_resolve_worker<R: Runtime>(
         cached: false,
         stream_kind: None,
         backup_url: None,
+        // 整集 mp4：时长由浏览器读文件头即得，不需要后端代劳。
+        duration_ms: None,
     })
 }
 
@@ -2895,90 +3108,168 @@ pub async fn short_drama_app_open_stream<R: Runtime>(
         return Err("VSR 开关已关闭，使用旧播放链路。".into());
     }
     let profile = HongguoAppProfile::from_input(input.content_type, input.app_id)?;
-    // 已缓存的整集优先：盘上有整集就没必要再起一路转码。
-    // 寻址与 resolve 主线同构（含旧版本直接写在根目录下的副本）。
-    let namespace_path = cache_dir()
-        .join(profile.cache_namespace)
-        .join(format!("{vid}.mp4"));
-    let legacy_path = cache_dir().join(format!("{vid}.mp4"));
-    let existing = std::iter::once(namespace_path)
-        .chain(std::iter::once(legacy_path))
-        .find(|path| path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false));
-    if let Some(path) = existing {
-        touch_cache_entry(&path);
-        return Ok(ShortDramaAppPlayback {
-            play_url: path.to_string_lossy().to_string(),
-            width: 0,
-            height: 0,
-            size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
-            cached: true,
-            stream_kind: None,
-            backup_url: None,
-        });
-    }
+    // ⚠️ **不再优先返回整集 mp4**。
+    //
+    // 方案 B（用户 2026-10-08 拍板）之后，这条链路是**唯一**的播放源：整集 HLS
+    // 从头播到尾，不再「先流式出画、等 mp4 落盘再切源」。理由见 CHANGELOG 与
+    // `media_enhance::start_video_cache`：整集转码实测 5.6 秒（92.7 秒正片，
+    // 16 倍实时），而两段式的代价是用户明确抱怨的「前 8 秒转换后面再进入」。
+    //
+    // 旧实现在这里返回 mp4 会让前端拿到 `stream_kind = None`（文件形态），
+    // 于是又走回「直连 mp4」那条老路 —— 那正是本次要退场的东西。
+    //
+    // 唯一例外：HLS 转码已经失败过、而盘上恰好有整集 mp4 时，由下面的错误分支
+    // 兜底回它（见函数末尾的 `fallback_to_cached_mp4`），不在这里抢道。
 
-    // 复用预签名直链（详情页/首页预热过的话，这一步省掉两次 App API 往返 = 2.5 秒）。
-    // 这是首屏耗时里最大的一块纯等待，命中与否直接决定 3.3 秒还是 5.8 秒。
-    let cached_stream = peek_stream(&vid);
-    let (source_url, decryption_key) = match cached_stream.clone() {
-        Some(cached) => (cached.url, cached.content_key),
-        None => {
-            let payload = run_worker_subcommand(&app, "stream", &vid, "stream", profile).await?;
-            let url = payload
-                .get("url")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            if url.is_empty() {
-                return Err("云端直链为空。".into());
-            }
-            let key = payload
-                .get("content_key")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            store_stream(&vid, &payload);
-            (url, key)
-        }
-    };
+    // 取播放直链：**全进程去重**。
+    //
+    // 这里曾经是「peek 缓存，未命中就自己跑一次 stream」。问题在于用户点播放时
+    // 前端会**同时**发 `open_stream` 与 `resolve`，两条都走签名链路，而那是两次
+    // App API 往返（固定 2.2 秒）的纯等待 —— 实测这段白跑一趟花了 3695ms。
+    // `ensure_stream_cached` 让后到的那条读缓存（或在途等待），同一 vid 只签一次。
+    let prefetched = peek_stream(&vid).is_some();
+    let cached_stream = ensure_stream_cached(&app, &vid, profile).await?;
+    let (source_url, decryption_key) =
+        (cached_stream.url.clone(), cached_stream.content_key.clone());
     crate::trace::log(format!(
-        "[红果] 流式开播 vid={vid} 复用预签名={} 会话={session_id}",
-        cached_stream.is_some()
+        "[红果] 流式开播 vid={vid} 预签名已命中={prefetched} 会话={session_id}"
     ));
 
     // 会话号必须落在 media_enhance 的地址空间里：stop(session_id) 由
     // playback_command 的 "stop" 分支统一调用，两处用同一个 id 才能被停掉。
-    match crate::media_enhance::start_with_key(
-        session_id,
-        &source_url,
-        Some(decryption_key.as_str()).filter(|key| !key.is_empty()),
-    )
-    .await
-    {
+    //
+    // 用 `start_video_cache` 而不是 `start_with_key`：整集 HLS 现在**就是**播放源
+    // （方案 B 不再切到 mp4），所以它必须按 vid 留存、换集不删、已转好则直接复用。
+    // 多次打开同一集的代价因此从「重转 5.6 秒」降到「读一次清单」。
+    let key = Some(decryption_key.as_str()).filter(|value| !value.is_empty());
+    match crate::media_enhance::start_video_cache(session_id, &vid, &source_url, key).await {
         Ok(url) => {
-            let (width, height) = cached_stream
-                .as_ref()
-                .map(|cached| (cached.width, cached.height))
-                .unwrap_or((0, 0));
+            // 把这份产物的 mtime 推到当下：它是"最近被用过"的证据，也是缓存
+            // 淘汰时唯一的保护（`keep` 只覆盖本次解析的那一个路径）。
+            touch_cache_entry(&crate::media_enhance::video_cache_dir(&vid));
             Ok(ShortDramaAppPlayback {
                 play_url: url,
-                width,
-                height,
+                width: cached_stream.width,
+                height: cached_stream.height,
                 size_bytes: 0,
-                // 不是整集，不能标 cached：调用方仍要等整集那条链路，
-                // 并在它落盘后切过去（否则拖到 2 秒后就没了）。
+                // 流转码产物：调用方按 HLS 挂载，不再等任何"整集文件"。
                 cached: false,
                 stream_kind: Some("hls".to_owned()),
                 backup_url: Some(source_url),
+                // **源片真实总时长**：这是「时长固定」的全部依据。
+                //
+                // 边转边播时浏览器算不出总时长（分片清单还没 ENDLIST），前端只能退回
+                // `seekable`/`buffered` 末尾，而那两个值随转码进度增长 —— 用户看到的
+                // 时长会一路往上跳。这里把 worker 已经返回的 `duration_ms` 交下去，
+                // 前端以它为权威，时长从此不随转码进度变。
+                duration_ms: Some(cached_stream.duration_ms).filter(|value| *value > 0),
             })
         }
         Err(error) => {
-            crate::trace::log(format!("[红果] 流式开播未启动：{error}"));
-            Err(format!("流式转码未启动：{error}"))
+            crate::trace::log(format!("[红果] 整集 HLS 未启动：{error}"));
+            // 回退顺序：盘上已有整集 mp4 → 用它（旧链路产物，仍可播）；否则报错，
+            // 由前端退到公开直链兜底。方案 B 删掉了"等 mp4 再切源"，但**不能**
+            // 删掉"HLS 起不来时还有一个能播的东西" —— 那是单源架构唯一的保险。
+            if let Some(playback) = cached_full_mp4(&vid, &profile) {
+                crate::trace::log(format!("[红果] 整集 HLS 失败，回退已缓存的 mp4 vid={vid}"));
+                return Ok(playback);
+            }
+            Err(format!("整集转码未启动：{error}"))
         }
     }
+}
+
+/// **预转下一集的整集 HLS**（用户需求：集与集之间无缝切换）。
+///
+/// 语义：后台把某一集转好放进 `vid-{vid}` 目录，**不占播放会话、不返回地址**。
+/// 等用户真的连播/点开那一集时，`short_drama_app_open_stream` 命中
+/// `#EXT-X-ENDLIST` 直接复用 —— 切换不需要任何等待。
+///
+/// 为什么值得单独做一条命令：一集正片 50–140 秒，而整集转码只要 5.6 秒
+/// （实测 92.7 秒正片）。上一集播放期间完全来得及备好下一集，用户却仍在为
+/// "播完才开始加载"等 6–11 秒 —— 那段等待本来可以完全不存在。
+///
+/// 失败一律静默（只记日志）：预转是纯优化，失败时用户走的就是"现场转"那条路。
+#[tauri::command]
+pub async fn short_drama_app_prewarm_stream<R: Runtime>(
+    app: AppHandle<R>,
+    input: ShortDramaAppResolveInput,
+) -> Result<(), String> {
+    let vid = input.vid.trim().to_owned();
+    if vid.is_empty() || !vid.chars().all(|c| c.is_ascii_digit()) {
+        return Err("缺少有效的集 vid。".into());
+    }
+    // VSR 开关关闭时不预转：那条链路的产物形态是 H.264 HLS，属于增强链路。
+    if !crate::vsr_is_enabled() {
+        return Ok(());
+    }
+    let profile = HongguoAppProfile::from_input(input.content_type, input.app_id)?;
+    // 直链复用同一份缓存：预转与播放共用 `ensure_stream_cached`，
+    // 因此这里不会又多跑一次签名。
+    let cached = ensure_stream_cached(&app, &vid, profile).await?;
+    let key = Some(cached.content_key.as_str()).filter(|value| !value.is_empty());
+    // 槽位号取一个远离播放会话号的大数段：播放会话从 100 起递增，
+    // 而这里用它只是为了让预转任务在 jobs 表中有个不冲突的键。
+    let slot = PREWARM_SESSION_BASE + (stable_slot_of(&vid) % 4096);
+    // fire-and-forget：预转是后台行为，不能让调用方等它转完（那就成了同步等待）。
+    let source_url = cached.url.clone();
+    let key_owned = key.map(str::to_owned);
+    let vid_owned = vid.clone();
+    tauri::async_runtime::spawn(async move {
+        crate::media_enhance::prewarm_video_cache(
+            &vid_owned,
+            &source_url,
+            key_owned.as_deref(),
+            slot,
+        )
+        .await;
+    });
+    Ok(())
+}
+
+/// 预转任务的槽位起点。取一个远离播放会话号（从 100 递增）的区段，避免撞号。
+const PREWARM_SESSION_BASE: u64 = 1_000_000;
+
+/// 由 vid 派生一个稳定的槽位偏移。
+///
+/// 同一集每次预转都用同一个槽位，于是「重复预转」会被 `start_in_directory` 的
+/// 同号替换逻辑天然去重；不同集则落到不同槽位，可以各自排队。
+fn stable_slot_of(vid: &str) -> u64 {
+    // 简单 FNV-1a：只要稳定且分布均匀，不需要密码学强度。
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in vid.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+/// 盘上是否有现成的整集 mp4（旧链路的产物）。有就返回文件形态的结果。
+///
+/// 这是方案 B 的**唯一退路**：整集 HLS 起不来（ffmpeg 缺失、源地址过期、显卡编码
+/// 崩掉）时，至少让用户还能播一个已经下好的文件，而不是直接黑屏。
+///
+/// 寻址与 `resolve` 主线同构，含旧版本直接写在缓存根目录下的副本。
+fn cached_full_mp4(vid: &str, profile: &HongguoAppProfile) -> Option<ShortDramaAppPlayback> {
+    let namespace_path = cache_dir()
+        .join(profile.cache_namespace)
+        .join(format!("{vid}.mp4"));
+    let legacy_path = cache_dir().join(format!("{vid}.mp4"));
+    let path = std::iter::once(namespace_path)
+        .chain(std::iter::once(legacy_path))
+        .find(|path| {
+            path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false)
+        })?;
+    touch_cache_entry(&path);
+    Some(ShortDramaAppPlayback {
+        play_url: path.to_string_lossy().to_string(),
+        width: 0,
+        height: 0,
+        size_bytes: path.metadata().map(|meta| meta.len()).unwrap_or(0),
+        cached: true,
+        stream_kind: None,
+        backup_url: None,
+        duration_ms: None,
+    })
 }
 /// 锁定集秒开：签名取回加密直链 + CENC 密钥，交给 libmpv 流播（不落盘）。
 #[tauri::command]
@@ -3329,16 +3620,40 @@ mod tests {
             let path = self.dir.join(name);
             std::fs::write(&path, vec![b'x'; bytes]).expect("write fixture");
             if age_secs > 0 {
-                let stamp = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .expect("open fixture")
-                    .set_modified(stamp)
-                    .expect("age fixture");
+                age_file(&path, age_secs);
             }
             path
         }
+
+        /// 建一个 HLS 会话目录：`index.m3u8` + `init.mp4` + 若干 `seg-*.m4s`。
+        ///
+        /// `age_secs` 施加在**全部**文件上 —— `directory_usage` 取最新的 mtime，
+        /// 所以只有全部调老，这个目录才会被当成「很久没用过」。
+        fn write_hls_dir(&self, name: &str, seg_bytes: usize, age_secs: u64) -> std::path::PathBuf {
+            let dir = self.dir.join(name);
+            std::fs::create_dir_all(&dir).expect("create hls dir");
+            std::fs::write(dir.join("index.m3u8"), b"#EXTM3U\n#EXT-X-ENDLIST\n").expect("m3u8");
+            std::fs::write(dir.join("init.mp4"), vec![b'i'; 16]).expect("init");
+            std::fs::write(dir.join("seg-00000.m4s"), vec![b's'; seg_bytes]).expect("seg");
+            std::fs::write(dir.join("seg-00001.m4s"), vec![b's'; seg_bytes]).expect("seg2");
+            if age_secs > 0 {
+                for entry in std::fs::read_dir(&dir).expect("read hls dir").flatten() {
+                    age_file(&entry.path(), age_secs);
+                }
+            }
+            dir
+        }
+    }
+
+    /// 把一个文件的 mtime 调到 `age_secs` 秒之前。
+    fn age_file(path: &std::path::Path, age_secs: u64) {
+        let stamp = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open fixture")
+            .set_modified(stamp)
+            .expect("age fixture");
     }
 
     impl Drop for CacheFixture {
@@ -3378,6 +3693,59 @@ mod tests {
         assert_eq!(fresh.metadata().expect("stat").len(), 100);
         assert_eq!(report.removed_files, 1);
         assert_eq!(report.freed_bytes, 100);
+    }
+
+    /// 回归：整集 HLS 的会话**目录**必须与整集 mp4 一起参与预算，且按整目录淘汰。
+    ///
+    /// 为什么这条必须有：方案 B 之后整集 HLS 是唯一播放源，每集约 58MB（实测
+    /// 92.7 秒正片）。旧实现 `evict_channels_to_budget` 只认 `.mp4` 文件、`rtx-vsr/`
+    /// 也不在白名单里，于是那批产物完全在用户预算之外 —— 看一集多占 58MB，
+    /// 而设置页显示的上限「形同虚设」。
+    #[test]
+    fn eviction_counts_hls_directories_as_one_entry() {
+        let fx = CacheFixture::new("hlsdir");
+        // 一个陈旧 HLS 目录（两个分片各 200 字节 + 清单/init，共约 400+ 字节）
+        // 与一个刚写入的小 mp4。
+        let old_dir = fx.write_hls_dir("vid-111", 200, 7200);
+        let fresh_file = fx.write("222.mp4", 50, 0);
+
+        // 预算 100 字节：目录被计价后必然超限，且它是唯一可淘汰项。
+        let report = super::evict_channels_to_budget(
+            std::slice::from_ref(&fx.dir),
+            &fresh_file,
+            100,
+            7 * 24 * 3600,
+            std::time::SystemTime::now(),
+        );
+
+        assert!(
+            !old_dir.exists(),
+            "HLS 会话目录必须被整体淘汰（只删分片会留下指向空分片的清单）"
+        );
+        assert!(fresh_file.exists(), "宽限期内的新文件不该被删");
+        assert_eq!(report.removed_files, 1, "目录算一个条目，不是四个");
+    }
+
+    /// 回归：目录的 LRU 键取**最新** mtime —— 正在转码的目录不会被误淘汰。
+    ///
+    /// 整集 HLS 在转码期间不断写新分片，而 `init.mp4` 是最早写的。若用最旧 mtime
+    /// 当键，「正在写」的目录会被算成很久没碰过，刚转出来的产物可能立刻被自己删掉。
+    #[test]
+    fn hls_directory_lru_uses_newest_mtime() {
+        let fx = CacheFixture::new("hlsnew");
+        // 目录里混一个新文件（模拟"正在写"）与几个老文件。
+        let active_dir = fx.write_hls_dir("vid-active", 200, 7200);
+        age_file(&active_dir.join("seg-00001.m4s"), 0);
+
+        let (_, stamp) = super::directory_usage(&active_dir);
+        let age = std::time::SystemTime::now()
+            .duration_since(stamp)
+            .map(|delta| delta.as_secs())
+            .unwrap_or(u64::MAX);
+        assert!(
+            age < 60,
+            "目录 mtime 应取最新（实测 {age}s 前），否则正在转码的目录会被误判为陈旧"
+        );
     }
 
     /// 回归：即便在预算内，keep 指向的文件也绝不能被删。
