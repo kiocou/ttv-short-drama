@@ -857,6 +857,38 @@ def fetch_stream(session: requests.Session, vid: str, device_id: str,
     }
 
 
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2})\.(\d{2})")
+
+
+def probe_duration_ms(ffmpeg: str, url: str, key_hex: str | None) -> int:
+    """用随包 ffmpeg 读一次源流元数据里的真实时长（毫秒）；读不到返回 0。
+
+    **为什么不能信上游那个 `duration` 字段**：同一集（ffmpeg 实测 61.17 秒）播放模型
+    给出来的值是 **100**，而它被当作毫秒用 —— 前端于是把"时长权威值"钉成 0.1 秒，
+    进度条显示 00:00 / 00:00 而且拖不动。单位与语义都不可靠，所以改成真的读一次。
+
+    代价很小且不落盘：`-t 0` 让 ffmpeg 打开输入、打印元数据后立刻退出（不解码）。
+    失败一律静默返回 0，由调用方决定退回什么。
+    """
+    if not ffmpeg or not url:
+        return 0
+    command = [ffmpeg, "-hide_banner", "-nostdin"]
+    if key_hex:
+        command += ["-decryption_key", key_hex]
+    command += ["-tls_verify", "0", "-rw_timeout", "8000000",
+                "-i", url, "-t", "0", "-f", "null", "-"]
+    try:
+        proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              text=True, timeout=15, **_no_window())
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    match = _DURATION_RE.search(proc.stderr or "")
+    if not match:
+        return 0
+    hours, minutes, seconds, centis = (int(part) for part in match.groups())
+    return (hours * 3600 + minutes * 60 + seconds) * 1000 + centis * 10
+
+
 # 两条编码路径的唯一区别就在这几项上；其余参数（音轨、faststart）两条共用。
 #
 # libx264/ultrafast/CRF20/zerolatency 是官方客户端同款参数，兼容性最好但纯
@@ -1447,6 +1479,22 @@ def stream_cmd(vid: str, device_id: str, install_id: str, content_type: int, aid
     """锁定集秒开：只解出直链+CENC 密钥交给 libmpv 流播，不落盘。"""
     session = http_session()
     stream_info = fetch_stream(session, vid, device_id, install_id, content_type, aid)
+    # 真实时长：优先真的读一次源流（上游那个字段实测会给出 100 这种荒谬值，而它被
+    # 当作毫秒用会让进度条恒为 00:00）。读不到才退回上游值，并且滤掉不可能是
+    # "毫秒时长"的小值 —— 宁可没有权威时长（前端退回 seekable/buffered 兜底），
+    # 也不要把 0.1 秒当成事实钉给用户看。
+    content_key = stream_info.get("content_key")
+    # 这一步的 content_key 是 **hex 字符串**（见 `collect_quality_variants` 的说明），
+    # 不是 bytes —— `-decryption_key` 要的也正是 hex。
+    key_hex = content_key if isinstance(content_key, str) and content_key else None
+    duration_ms = probe_duration_ms(
+        os.getenv("TTV_SD_FFMPEG", "").strip(),
+        stream_info["url"],
+        key_hex,
+    )
+    if duration_ms <= 0:
+        upstream_ms = int(stream_info.get("duration_ms") or 0)
+        duration_ms = upstream_ms if upstream_ms >= 1000 else 0
     payload = {
         "ok": True,
         "url": stream_info["url"],
@@ -1458,7 +1506,10 @@ def stream_cmd(vid: str, device_id: str, install_id: str, content_type: int, aid
         # 再经 TTV_SD_DIRECT_DURATION 交给 resolve。缺了它，直连解密那条链路
         # 换算不出下载百分比（out_time_us / 总时长），界面上只能退化成
         # "只有阶段提示、没有百分比"，看起来就像卡住不动。
-        "duration_ms": int(stream_info.get("duration_ms") or 0),
+        #
+        # 前端也读它（`NativeResolved.durationMs`）作为进度条总时长的最高优先级：
+        # 整集 HLS 在转完前 `video.duration` 要么是 Infinity、要么随转码进度往上跳。
+        "duration_ms": int(duration_ms),
         # codec 同理：它决定 resolve 是重封装还是整集重编码。
         "codec": str(stream_info.get("codec") or ""),
         "download_ua": DOWNLOAD_UA,

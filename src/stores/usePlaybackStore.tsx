@@ -1438,12 +1438,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // 优先级，进度条与时间读数从此不再"一路往上跳"。
         // 拿不到（后端返回 0）时保持 0，退回浏览器侧的判定。
         const totalMs = streaming.durationMs ?? 0;
-        if (Number.isFinite(totalMs) && totalMs > 0) {
+        // ⚠️ 下限保护：明显不是"一集的毫秒数"就不采纳。实机踩过一次 `100ms`
+        // （后端那个上游字段的单位不可靠）——把它当权威会让进度条恒为
+        // 00:00 / 00:00 且拖不动，比"没有权威值、退回浏览器侧兜底"糟得多。
+        if (Number.isFinite(totalMs) && totalMs >= 1000) {
           streamingSourceTotalSeconds = totalMs / 1000;
           // 立刻把权威时长推给 UI：第一次 timeupdate 可能还没到，
           // 而用户从出画那一刻就应当看到正确的总时长。
           setDuration(streamingSourceTotalSeconds);
           tracePlayback(`时长权威值已固定 = ${streamingSourceTotalSeconds.toFixed(1)}s（源片真实时长）`);
+        } else if (totalMs > 0) {
+          tracePlayback(`时长值可疑（${totalMs}ms < 1s），不采纳，退回浏览器侧判定`);
         }
         // ⚠️ 窗口**不能在这里就关**：出画只说明首片写完了，而整集转码还在跑。
         //

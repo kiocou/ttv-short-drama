@@ -2824,7 +2824,7 @@ async fn run_worker_subcommand<R: Runtime>(
     action: &'static str,
     profile: HongguoAppProfile,
 ) -> Result<serde_json::Value, String> {
-    let (python, worker, _ffmpeg) = worker_paths()?;
+    let (python, worker, ffmpeg) = worker_paths()?;
     let credentials = ensure_credentials()?;
 
     let mut command = tokio::process::Command::new(&python);
@@ -2833,6 +2833,9 @@ async fn run_worker_subcommand<R: Runtime>(
     command
         .env("PYTHONNOUSERSITE", "1")
         .env("PYTHONIOENCODING", "utf-8")
+        // 随包 ffmpeg 也交给 worker：`stream` 子命令要用它读一次源流的真实时长
+        // （播放模型里那个 duration 字段实测不可信），resolve 那条链路本来就有。
+        .env("TTV_SD_FFMPEG", &ffmpeg)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
