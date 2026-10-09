@@ -28,9 +28,9 @@ SOFTWARE.
   - src/                      前端应用代码
   - src-tauri/src/            Rust 后端代码
 
-以下路径**不在** MIT 授权范围内：它们是对第三方服务的对接实现（经**私有渠道**
-取得），其相关权利属于各自的权利人。这些文件仅供**个人本地使用与学习研究**，
-不得再分发、不得用于商业用途：
+以下路径**不在** MIT 授权范围内：它们要么是对第三方服务的对接实现（经**非公开接口**
+取得），要么是第三方组件。其相关权利属于各自的权利人。这些文件仅供**个人本地使用
+与学习研究**，不得再分发、不得用于商业用途：
 
   - src-tauri/resources/shortdrama-worker/liushen/
         第三方私有请求签名算法（xgorgon / sixgod / medusa 等）的实现。
@@ -38,8 +38,22 @@ SOFTWARE.
   - src-tauri/resources/shortdrama-worker/worker.py
         与第三方播放接口交互的实现，包含内容解密与访问控制的处理逻辑。
 
-如果你需要将本项目用于任何再分发场景，请先移除上述两处内容，
-或自行取得相应授权。
+  - src-tauri/guo-core/
+        Go 语言编写的站源适配内核，包含对多个第三方站源的目录 / 搜索 / 详情 /
+        取流对接实现。
+
+  - src-tauri/resources/guo-core/duanju_core.dll
+        由上述 Go 内核编译出的预编译二进制，随应用一起分发。
+
+  - src-tauri/resources/mpv/ffmpeg.exe
+        ffmpeg（**GPLv3** 构建）。按 GPLv3 的要求，其完整源码可从
+        https://ffmpeg.org/download.html 获取；本仓库只再分发未修改的官方构建。
+
+  - src-tauri/resources/python/ 与 src-tauri/resources/shortdrama-worker/site-packages/
+        嵌入式 CPython（PSF License）与若干第三方 Python 包，各自遵循其原始许可证。
+
+如果你需要将本项目用于任何再分发场景，请先移除上述内容，或自行取得相应授权。
+完整的第三方组件清单与许可证见 **THIRD-PARTY-NOTICES.md**。
 
 ================================================================================
 使用须知

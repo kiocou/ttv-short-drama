@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "TTV Short Drama",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "identifier": "com.ttv.shortdrama",
   "build": {
     "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 5175 --strictPort",
@@ -39,6 +39,12 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "kiocou",
+    "copyright": "Copyright (c) 2026 kiocou",
+    "category": "Entertainment",
+    "shortDescription": "短剧 / 漫剧 / 动漫桌面播放器",
+    "longDescription": "Windows 专属的短剧 / 漫剧 / 动漫桌面播放器：多源目录、无缝连播、画中画小窗、本地转码与缓存。仅供个人学习与技术研究。",
+    "licenseFile": "../LICENSE",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

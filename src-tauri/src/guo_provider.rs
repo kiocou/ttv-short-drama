@@ -109,42 +109,37 @@ pub const GUO_SOURCES: &[GuoSource] = &[
         name: "红果短剧 / 漫剧",
         adult: false,
     },
-    // 实测 30 条：多数"黄豆原创"（真人成人），但含"国漫"分类的《牧神记》《凡人190》。
-    // 成人条目实测：母上攻略 / 苏老师的裸贷人生 / 深渊调教。
+    // 实测 30 条：多数"黄豆原创"（真人成人），但含"国漫"分类的少量动漫条目。
     GuoSource {
         id: "huangdou",
         name: "黄豆",
         adult: true,
     },
     // 实测 20 条：分类恒为"短剧"，标题为成人真人条目。
-    // 成人条目实测：同学妈妈(无删减版) / 欧美成人片演员名条目。
     GuoSource {
         id: "huangju",
         name: "剧果",
         adult: true,
     },
     // 实测 20 条：分类恒为"短剧"，标签为成人题材；集数全部为 0。
-    // 成人条目实测：母子同淫 / 魔法少女淫乱之路（标签直白：乱伦/巨乳/中出）。
     GuoSource {
         id: "yeguo",
         name: "野果",
         adult: true,
     },
-    // 实测 72 条：日本 AV（无码中字 / 无码破解，含番号），真人。
+    // 实测 72 条：真人成人向内容（无码中字 / 无码破解）。
     GuoSource {
         id: "dsd",
         name: "帝果",
         adult: true,
     },
     // 实测 96 条：分类恒为 "AI 短剧"（AI 生成、真人外形），有集数。
-    // 成人条目实测：分类名即 "AI 短剧"，少妇白洁 / 滴滴代操。
     GuoSource {
         id: "huangguoai",
         name: "黄果 AI",
         adult: true,
     },
     // 实测 40 条：分类为 series/video 的混合条目，真人。
-    // 成人条目实测：母子同欢第2季 / 苏老师的裸贷人生。
     GuoSource {
         id: "huangguo-video",
         name: "黄果视频",
