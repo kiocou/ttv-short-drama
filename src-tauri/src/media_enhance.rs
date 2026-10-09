@@ -550,6 +550,42 @@ fn nvenc_available(ffmpeg: &std::path::Path) -> bool {
     verdict
 }
 
+/// 产物参数指纹文件名：写在 HLS 目录里，用来判断"这份产物是哪套编码参数转出来的"。
+///
+/// **为什么必须有它**：目录缓存是按 vid 长期复用的（看到 `#EXT-X-ENDLIST` 就直接播），
+/// 而参数会随版本调整（2026-10-09 就把固定 1100k 改成按源自适应、预设从 p1 提到 p4）。
+/// 没有指纹的话，升级后看到的是**旧参数转出来的旧产物** —— 修复对老集完全不生效，
+/// 用户只会觉得"别人的画质变好了、我这几集还是糊的"。
+const ENCODER_STAMP_FILE: &str = ".encoder-stamp";
+
+/// 当前编码参数指纹：换算公式版本 + 三档编码参数 + HLS 打包参数。
+///
+/// 刻意用**可读文本**而不是哈希：排查时可以直接打开产物目录里的这个文件，看到
+/// "这一集是按什么参数转出来的"。改了任何影响画面的参数（含 `rate_limits` 的倍数，
+/// 所以要同时改 `rate=` 那一段的版本号），指纹就会变、旧产物自动重转。
+fn encoder_fingerprint(ffmpeg: &std::path::Path) -> String {
+    let mut parts: Vec<String> = vec!["rate=v2:2.24x".to_owned()];
+    for args in [NVENC_ARGS, X264_ARGS, LOW_TIER_ARGS] {
+        parts.push(args.join(" "));
+    }
+    parts.push(hls_packaging_args(ffmpeg).join(" "));
+    parts.join(" | ")
+}
+
+/// 目录里的产物是不是**当前参数**转出来的。
+///
+/// 没有指纹文件的一律算过期：那是上一版留下的产物，重转一次的代价（几秒）远小于
+/// 让用户继续看糊掉的画面。
+fn artifact_is_current(directory: &std::path::Path) -> bool {
+    let Ok(ffmpeg) = crate::short_drama_app::ffmpeg_path() else {
+        return true;
+    };
+    match std::fs::read_to_string(directory.join(ENCODER_STAMP_FILE)) {
+        Ok(saved) => saved.trim() == encoder_fingerprint(&ffmpeg).trim(),
+        Err(_) => false,
+    }
+}
+
 /// 启动一条 H.264 HLS 增强流。源流失败时返回 Err，调用方继续用原 URL。
 pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> {
     // 这条链路（guo / 公开直链）拿不到档位信息，源码率交给 `rate_limits` 的默认值。
@@ -575,6 +611,17 @@ pub async fn start_video_cache(
     let directory = media_root().join(format!("vid-{vid}"));
     let playlist = directory.join("index.m3u8");
     // 1) 已完成（ENDLIST）的产物直接复用：这是「同一集第二次打开」的快路径。
+    //
+    // ⚠️ 但必须**先验参数指纹**：产物是按 vid 长期留存的，而编码参数会随版本变化，
+    // 直接复用等于让用户继续看旧参数（更糊）的画面 —— 见 `ENCODER_STAMP_FILE`。
+    // 指纹不符就把整个目录删掉重转（只删已完成、没有 ffmpeg 在写的那一份）。
+    if directory.is_dir()
+        && directory_of_inflight_vid(&directory).is_none()
+        && !artifact_is_current(&directory)
+    {
+        crate::trace::log(format!("[vsr] 产物是旧编码参数转的，丢弃重转 vid={vid}"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
     if let Ok(body) = std::fs::read_to_string(&playlist) {
         if body.contains("#EXT-X-ENDLIST") && directory.join("init.mp4").is_file() {
             let info = ensure_server().await?;
@@ -746,6 +793,13 @@ async fn start_in_directory(
 
     let ffmpeg = crate::short_drama_app::ffmpeg_path()?;
     let playlist = directory.join("index.m3u8");
+    // 落一枚参数指纹：持久目录（`vid-{vid}`）会被长期复用，而编码参数随版本变化，
+    // 复用前必须先比对它 —— 否则升级后用户看到的是旧参数转出来的旧产物（见
+    // `ENCODER_STAMP_FILE` 的说明）。写在起转码之前，于是"转了一半"的目录也带指纹。
+    let _ = std::fs::write(
+        directory.join(ENCODER_STAMP_FILE),
+        encoder_fingerprint(&ffmpeg),
+    );
     // 记下"转码这一段"的起点。整条首开时间线 = 解析(worker) + 等待就绪(这里)
     // + 播放器拉清单/首片，三者混在一个"很慢"里没法优化，所以每段各自落一行。
     crate::trace::log(format!(
@@ -1436,6 +1490,15 @@ pub async fn prewarm_video_cache(
 ) {
     let directory = video_cache_dir(vid);
     let playlist = directory.join("index.m3u8");
+    // 参数变了就把旧产物丢掉：否则预转会把"旧参数的成品"当成就绪而跳过，
+    // 用户点开时又在 `start_video_cache` 里重转一次，白等一轮。
+    // 正在转码的那一份不能删（那会把别的会话正在播的产物抽走）。
+    if directory.is_dir()
+        && directory_of_inflight_vid(&directory).is_none()
+        && !artifact_is_current(&directory)
+    {
+        let _ = std::fs::remove_dir_all(&directory);
+    }
     // 已经转好：什么都不用做。
     if let Ok(body) = std::fs::read_to_string(&playlist) {
         if body.contains("#EXT-X-ENDLIST") && directory.join("init.mp4").is_file() {
