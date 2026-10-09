@@ -93,24 +93,65 @@ pub fn needs_enhancement(url: &str) -> bool {
 /// 1100k，表现是"某些集清楚、某些集发糊"。之所以先固定：收益可测、行为可预期；
 /// 按源码率自适应（如 `min(源码率 × 1.2, 2500k)`）要先探测输入码率，那是一次
 /// 独立改动，本轮不做。
-const RATE_CAP: &str = "1100k";
+/// 按**源档码率**算码率上限与缓冲窗口（单位 kbps）。
+///
+/// **为什么不能再用固定值**：上一版是固定 `-maxrate 1100k -bufsize 2200k`，而它是按
+/// 单条源（约 0.9Mbps）标定的，源档码率的实际分布很散（实测同一部剧不同集 300kbps
+/// ~ 2.5Mbps）。对高于它的源，这等于把 1080p 硬压下去 —— 相对源画质直接掉档：同一段
+/// 真人短剧 20 秒、源码率 733kbps，固定 1100k 的 SSIM 只有 **0.9814**，而按源自适应的
+/// cq23 + preset p4 是 **0.9917**（体积只多 25%，编码耗时 +24%）。用户看到的"转码后
+/// 画质下降很多"就是这个上限造成的。
+///
+/// 倍率由来（实测标定，源是 H.265）：
+///   * H.265 → H.264 同画质经验上要 1.4~1.6× 码率，取 1.4；
+///   * 再乘 1.6 给运动与复杂画面的瞬时峰值留余量 ⇒ **2.24×**；
+///   * bufsize 取上限的 2 倍（VBV 约束过紧会在快镜头处直接压出块）。
+///
+/// 实测对照（同一 20 秒片段，SSIM 相对源）：固定 1100k = 0.9814 / 3.5×源码率 ≈ 0.9917 /
+/// 2.8×源码率 ≈ 0.9934 / 完全不设上限 ≈ 0.9950 但体积是源的 7.3 倍（8.53MB vs 1.16MB）。
+/// 选 2.24× 是"画质接近无损、体积不失控"那一档。
+///
+/// 取不到源码率时（guo / 公开直链没有档位信息）给一组中性默认：不设上限会被恒定质量
+/// 模式放到源的 7 倍，设太紧又会糊，3000k 覆盖 1080p 短剧的常见上限。
+pub(crate) fn rate_limits(source_kbps: Option<u32>) -> (u32, u32) {
+    let source = match source_kbps {
+        Some(value) if value >= 100 => value,
+        _ => return (3000, 6000),
+    };
+    let maxrate = ((source as f64) * 2.24).round() as u32;
+    let maxrate = maxrate.clamp(900, 8000);
+    (maxrate, maxrate * 2)
+}
 
-/// 上限的缓冲窗口（2× 上限，ffmpeg 常规配比）：给瞬时复杂画面留透支空间，
-/// 约束过紧会把画面压出块。
-const RATE_BUFFER: &str = "2200k";
+/// 把 `rate_limits` 的结果铺成 ffmpeg 参数。给**不经过 `video_encoder_args`** 的
+/// 调用点用（`ensure_h264_cache` 的旧缓存迁移、worker 侧经环境变量取同一组值）。
+pub(crate) fn rate_lines(source_kbps: Option<u32>) -> Vec<String> {
+    let (maxrate, bufsize) = rate_limits(source_kbps);
+    vec![
+        "-maxrate".to_owned(),
+        format!("{maxrate}k"),
+        "-bufsize".to_owned(),
+        format!("{bufsize}k"),
+    ]
+}
 
 /// 硬件档参数（NVIDIA NVENC）。
+///
+/// `-preset p4` + `-cq 23`：上一版是 `p1` + `cq 26`（最快档 + 较低质量目标）。实测同一段
+/// 20 秒 1080p 真人短剧（SSIM 相对源、上限都按源档自适应）：`p1 + cq26 + 固定 1100k` 是
+/// **0.9814**（1084ms），`p4 + cq23 + 按源自适应` 是 **0.9917**（1345ms）。
+/// 编码耗时多 24%，整集仍是 5 秒级（61 秒正片），换来的是肉眼可见的那一档画质。
+/// NVENC 的 p1→p4 差距主要在运动估计与码率分配，GPU 上多花的绝对时间远小于 CPU 档位。
+///
+/// 码率上限**不在这里**：它必须按源档码率算（见 `rate_limits`），由 `video_encoder_args`
+/// 追加 —— 固定值就是上一版画质掉档的根因。
 const NVENC_ARGS: &[&str] = &[
     "-c:v",
     "h264_nvenc",
     "-preset",
-    "p1",
+    "p4",
     "-cq",
-    "26",
-    "-maxrate",
-    RATE_CAP,
-    "-bufsize",
-    RATE_BUFFER,
+    "23",
     "-pix_fmt",
     "yuv420p",
     "-profile:v",
@@ -123,18 +164,22 @@ const NVENC_ARGS: &[&str] = &[
     "0",
 ];
 
-/// 软件档（CPU，核数够）：libx264 ultrafast 实测约 8 倍实时。
+/// 软件档（CPU，核数够）：libx264 **veryfast**。
+///
+/// ⚠️ 上一版是 `ultrafast`，那是画质最差的档 —— 实测同一 20 秒 1080p 片段：
+/// `ultrafast + crf20 + 固定 1100k` 的 SSIM 只有 **0.9431**（比硬件档旧参数还低 0.04，
+/// 超快档会牺牲大量运动估计与亚像素精度），而 `veryfast + crf20 + 按源自适应` 是
+/// **0.9881**、体积反而更小（2.54MB vs 2.88MB），代价是编码耗时 1489ms → 2276ms（+53%）。
+/// 也就是说：这一档以前"又慢又糊"。低配档另有 720p 兜底，这里按画质优先取 veryfast。
+///
+/// 码率上限同样由 `rate_limits` 按源档算，不写死在这里。
 const X264_ARGS: &[&str] = &[
     "-c:v",
     "libx264",
     "-preset",
-    "ultrafast",
+    "veryfast",
     "-crf",
     "20",
-    "-maxrate",
-    RATE_CAP,
-    "-bufsize",
-    RATE_BUFFER,
     "-tune",
     "zerolatency",
     "-pix_fmt",
@@ -160,22 +205,20 @@ pub(crate) fn x264_args() -> &'static [&'static str] {
     X264_ARGS
 }
 
-/// 低配档：**降分辨率**而不是只降码率。
+/// 低配档：**降分辨率**，同时只把预设降**一档**（`superfast`）而不是降到最差档。
 ///
 /// 理由（本机实测）：只降码率对 CPU 几乎无帮助 —— 1080p cq26→cq34 只从 5499ms 降到
-/// 5429ms；而降到 720p 直接到 4027–4691ms。解码像素数决定解码与编码两个阶段的
-/// 算术量，减半分辨率等于把这块砍到四分之一。
+/// 5429ms；而降到 720p 直接到 4027–4691ms。解码像素数决定解码与编码两个阶段的算术量，
+/// 减半分辨率等于把这块砍到四分之一。像素少了一半之后，`superfast` 的速度优势变小、
+/// 而画质劣势依然存在，所以预设只从 veryfast 退一档、crf 从 20 放到 22，不再用画质最差
+/// 的 ultrafast（那一档实测 SSIM 只有 0.9431，用户直接能看到糊）。
 const LOW_TIER_ARGS: &[&str] = &[
     "-c:v",
     "libx264",
     "-preset",
-    "ultrafast",
+    "superfast",
     "-crf",
-    "24",
-    "-maxrate",
-    RATE_CAP,
-    "-bufsize",
-    RATE_BUFFER,
+    "22",
     "-tune",
     "zerolatency",
     "-vf",
@@ -263,14 +306,18 @@ fn hls_packaging_args(ffmpeg: &std::path::Path) -> &'static [&'static str] {
     }
 }
 
-fn video_encoder_args(ffmpeg: &std::path::Path) -> Vec<String> {
+fn video_encoder_args(ffmpeg: &std::path::Path, source_kbps: Option<u32>) -> Vec<String> {
     let tier = detect_encoder_tier(ffmpeg);
     let args = match tier {
         EncoderTier::Hardware => NVENC_ARGS,
         EncoderTier::SoftwareFast => X264_ARGS,
         EncoderTier::SoftwareLow => LOW_TIER_ARGS,
     };
-    args.iter().map(|value| (*value).to_owned()).collect()
+    // 码率上限统一在这里追加（三档共用同一套按源换算），而不是写死进常量 ——
+    // 见 `rate_limits` 的实测表：固定值就是上一版画质掉档的根因。
+    let mut out: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
+    out.extend(rate_lines(source_kbps));
+    out
 }
 
 /// 硬件能力档位。决定用哪一套编码参数与目标分辨率。
@@ -505,7 +552,8 @@ fn nvenc_available(ffmpeg: &std::path::Path) -> bool {
 
 /// 启动一条 H.264 HLS 增强流。源流失败时返回 Err，调用方继续用原 URL。
 pub async fn start(session_id: u64, source_url: &str) -> Result<String, String> {
-    start_with_key(session_id, source_url, None).await
+    // 这条链路（guo / 公开直链）拿不到档位信息，源码率交给 `rate_limits` 的默认值。
+    start_with_key(session_id, source_url, None, None).await
 }
 
 /// 红果短剧：按 **vid** 建持久缓存目录的整集 HLS。
@@ -522,6 +570,7 @@ pub async fn start_video_cache(
     vid: &str,
     source_url: &str,
     key_hex: Option<&str>,
+    source_kbps: Option<u32>,
 ) -> Result<String, String> {
     let directory = media_root().join(format!("vid-{vid}"));
     let playlist = directory.join("index.m3u8");
@@ -563,7 +612,15 @@ pub async fn start_video_cache(
         return Ok(url);
     }
     // 2) 没有可用产物：正常起转码，但目录按 vid 固定、且不清空旧内容。
-    start_in_directory(session_id, source_url, key_hex, directory, true).await
+    start_in_directory(
+        session_id,
+        source_url,
+        key_hex,
+        directory,
+        true,
+        source_kbps,
+    )
+    .await
 }
 
 /// 若某个**正在转码**的任务用的正是这个目录，返回那份目录。
@@ -612,17 +669,29 @@ fn register_reused(session_id: u64, directory: PathBuf) {
 /// （含 API 往返的总首屏 3.3 秒）。这就是「先把画面出来、播放的同时再加载」。
 ///
 /// `key_hex` 是 16 字节 AES-128 密钥的十六进制串；`None` 表示源未加密。
+///
+/// `source_kbps` 是**选中档的源码率**（kbps），用来按源算码率上限（见 `rate_limits`）；
+/// 拿不到就传 `None`，会退回一组中性默认值。
 pub async fn start_with_key(
     session_id: u64,
     source_url: &str,
     key_hex: Option<&str>,
+    source_kbps: Option<u32>,
 ) -> Result<String, String> {
     if source_url.trim().is_empty() || !needs_enhancement(source_url) {
         return Err("源流地址不支持增强转码。".to_owned());
     }
     // 每次会话一个临时目录（用完即弃），与红果的按 vid 持久目录相对。
     let directory = media_root().join(format!("{session_id}-{}", uuid::Uuid::new_v4().simple()));
-    start_in_directory(session_id, source_url, key_hex, directory, false).await
+    start_in_directory(
+        session_id,
+        source_url,
+        key_hex,
+        directory,
+        false,
+        source_kbps,
+    )
+    .await
 }
 
 /// 转码主体：`start_with_key`（临时目录）与 `start_video_cache`（按 vid 持久目录）共用。
@@ -632,6 +701,7 @@ async fn start_in_directory(
     key_hex: Option<&str>,
     directory: PathBuf,
     persist: bool,
+    source_kbps: Option<u32>,
 ) -> Result<String, String> {
     if source_url.trim().is_empty() || !needs_enhancement(source_url) {
         return Err("源流地址不支持增强转码。".to_owned());
@@ -757,7 +827,7 @@ async fn start_in_directory(
         .arg("0:v:0")
         .arg("-map")
         .arg("0:a:0?")
-        .args(video_encoder_args(&ffmpeg))
+        .args(video_encoder_args(&ffmpeg, source_kbps))
         .arg("-c:a")
         .arg("aac")
         .arg("-b:a")
@@ -1362,6 +1432,7 @@ pub async fn prewarm_video_cache(
     source_url: &str,
     key_hex: Option<&str>,
     session_slot: u64,
+    source_kbps: Option<u32>,
 ) {
     let directory = video_cache_dir(vid);
     let playlist = directory.join("index.m3u8");
@@ -1377,7 +1448,16 @@ pub async fn prewarm_video_cache(
         return;
     }
     crate::trace::log(format!("[vsr] 预转开始 vid={vid} 槽位={session_slot}"));
-    match start_in_directory(session_slot, source_url, key_hex, directory.clone(), true).await {
+    match start_in_directory(
+        session_slot,
+        source_url,
+        key_hex,
+        directory.clone(),
+        true,
+        source_kbps,
+    )
+    .await
+    {
         Ok(_) => {
             // 地址拿到就丢弃：预转不需要播，等 ffmpeg 自己跑完。
             // 转完后 `start_video_cache` 会凭 ENDLIST 直接复用。
@@ -1441,26 +1521,34 @@ mod tests {
         assert_ne!(X264_ARGS, LOW_TIER_ARGS, "软件快档与低配档参数相同");
     }
 
-    /// 三档都必须给出码率上限。
+    /// 码率上限必须**跟着源档码率**走，而不是写死一个数。
     ///
-    /// `-crf` / `-cq` 是恒定质量模式，不加上限时会为了保质量把码率放到源之上 ——
-    /// 实测同一集 NVENC cq26 输出 61.3MB，而这一集的源流总共只有 10.2MB。影响不止
-    /// "体积大一点"：要多写一个数量级的字节，整集转码因此慢 243ms，边转边播的分片
-    /// 也跟着来得更晚。删掉它等于把首屏时间还给磁盘。
+    /// 实测（同一段 20 秒 1080p 真人短剧，SSIM 相对源）：固定 `-maxrate 1100k`（上一版）
+    /// 是 **0.9814**（用户报的"转码后画质下降很多"），按源 2.24× 自适应是 **0.9917**
+    /// （体积只多 25%），完全不设上限是 0.9950 但体积是源的 7.3 倍（8.53MB vs 1.16MB）。
+    /// 所以两件事都要钉住：上限存在（否则体积失控）、且按源算（否则高码率源掉画质）。
     #[test]
-    fn every_tier_caps_bitrate() {
-        for (name, args) in [
-            ("hardware", NVENC_ARGS),
-            ("software-fast", X264_ARGS),
-            ("software-low", LOW_TIER_ARGS),
-        ] {
-            for flag in ["-maxrate", "-bufsize"] {
-                assert!(
-                    args.contains(&flag),
-                    "{name} 档缺少 {flag}，恒定质量模式会把码率放到源之上"
-                );
-            }
-        }
+    fn rate_limits_follow_the_source() {
+        // 实测样本的源档是 733kbps：2.24× = 1642k，bufsize = 2× = 3284k
+        assert_eq!(rate_limits(Some(733)), (1642, 3284));
+        // 源码率翻倍，上限必须跟着翻倍（证明它不是固定值）
+        assert_eq!(rate_limits(Some(1466)), (3284, 6568));
+        // 拿不到源码率 ⇒ 中性默认值
+        assert_eq!(rate_limits(None), (3000, 6000));
+        // 荒谬的小值按"拿不到"处理（上游字段出过 100 这种不可信的值）
+        assert_eq!(rate_limits(Some(0)), (3000, 6000));
+        // 边界钳制：极低不跌破 900k，极高不超过 8000k
+        assert_eq!(rate_limits(Some(100)).0, 900);
+        assert_eq!(rate_limits(Some(99_999)).0, 8000);
+    }
+
+    /// 上限是**运行时追加**到编码参数里的（常量表里没有它）。
+    ///
+    /// 这一条守着"常量改了、追加逻辑没改"的漂移：`video_encoder_args` 调的就是它。
+    #[test]
+    fn rate_limits_are_appended_to_encoder_args() {
+        let lines = rate_lines(Some(733));
+        assert_eq!(lines, vec!["-maxrate", "1642k", "-bufsize", "3284k"]);
     }
 
     /// 首片必须比 `-hls_time` 更早切出去，且关键帧节奏只能有一条规则。

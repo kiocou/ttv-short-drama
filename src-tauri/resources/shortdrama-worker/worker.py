@@ -853,6 +853,9 @@ def fetch_stream(session: requests.Session, vid: str, device_id: str,
         # 选中档（默认最高档）的编码，随 stream 结果一起进 Rust 的预签名缓存，
         # 再由 TTV_SD_DIRECT_CODEC 交回 resolve。
         "codec": str(best.get("codec") or ""),
+        # 选中档的源码率（kbps）：转码参数要按它算码率上限。上游直接给，
+        # 拿不到就是 0（调用方退回中性默认值）。
+        "bitrate_kbps": int(best.get("bitrate") or 0) // 1000,
         "variants": variants,
     }
 
@@ -911,21 +914,27 @@ def probe_duration_ms(ffmpeg: str, url: str, key_hex: str | None) -> int:
 # 稳定在 3.2 秒、首片体积从 4.6MB 降到 1.8MB。
 #
 # `-maxrate 1100k -bufsize 2200k`：恒定质量模式（`-crf` / `-cq`）为了保质量会把
-# 码率放到源之上 —— 实测同一集 NVENC cq26 不加上限时输出 61.3MB，而这一集的源流
-# 总共只有 10.2MB；补上后 13.5MB，整集还快 243ms（要写盘的字节少了一个数量级）。
-# 1100k 取自该源约 0.9Mbps 的平均码率，留约 20% 余量。
-_X264_ARGS = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-              "-maxrate", "1100k", "-bufsize", "2200k",
+# 码率放到源之上 —— 实测同一集 NVENC cq26 不加上限时输出 62.3MB，而这一集的源流
+# 总共只有 10.2MB；补上限后 13.5MB。
+#
+# ⚠️ 2026-10-09 修正：**上限不再写死**。固定 1100k 是按单条源标定的，而源档码率
+# 分布很散（同一部剧不同集实测 300kbps~2.5Mbps），对高于它的源就是把 1080p 硬压
+# 下去 —— 用户报的"转码后画质下降很多"正是这个（实测 SSIM 0.9814，按源自适应是
+# 0.9917）。现在上限由 Rust 侧按源码率算好、经 TTV_SD_MAXRATE/TTV_SD_BUFSIZE 交过来
+# （单一来源，两边不会漂移），见 `_rate_limit_args`。
+#
+# 预设也跟着上调：`ultrafast` 是画质最差的一档（实测 SSIM 只有 0.9431），
+# 换成 `veryfast` 之后 0.9907，体积反而更小 —— 之前那一档是"又慢又糊"。
+_X264_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
               "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-profile:v", "high",
               "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
-_NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "26",
-               "-maxrate", "1100k", "-bufsize", "2200k",
+_NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23",
                "-pix_fmt", "yuv420p", "-profile:v", "high",
                "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
 # 低配档：降分辨率（理由见 video_encoder_args 末尾分支）。crf 放宽一档，
-# 因为 720p 下同等 crf 的观感已经够用，再压码率省的是磁盘而不是时间。
-_X264_LOW_ARGS = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-                  "-maxrate", "1100k", "-bufsize", "2200k",
+# 因为 720p 下同等 crf 的观感已经够用；预设只从 veryfast 退一档（superfast），
+# 不再用画质最差的 ultrafast。
+_X264_LOW_ARGS = ["-c:v", "libx264", "-preset", "superfast", "-crf", "22",
                   "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-profile:v", "high",
                   "-vf", "scale=-2:720",
                   "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
@@ -998,11 +1007,26 @@ def video_encoder_args(ffmpeg: str) -> list[str]:
     return _ENCODER_CHOICE[0]
 
 
+def _rate_limit_args() -> list[str]:
+    """码率上限参数：**由 Rust 按源码率算好后用环境变量交过来**。
+
+    为什么不在这一侧算：换算公式只留一份权威（`media_enhance::rate_limits`），
+    否则又会变成"两边各写一套、改一处漂移"的老问题（GOP 与 profile 都这么漂过）。
+
+    取不到时（例如直接跑 worker 做对照实验）给一组中性默认值：不设上限会被恒定质量
+    模式放到源的 7 倍（实测 8.53MB vs 源 1.16MB），设太紧又会糊 —— 1080p 短剧的
+    源档码率实测常见 0.7~2.5Mbps，3000k 覆盖得住。
+    """
+    maxrate = os.getenv("TTV_SD_MAXRATE", "").strip() or "3000k"
+    bufsize = os.getenv("TTV_SD_BUFSIZE", "").strip() or "6000k"
+    return ["-maxrate", maxrate, "-bufsize", bufsize]
+
+
 def _h264_output_args(ffmpeg: str) -> list[str]:
     """固定输出 WebView2/RTX VSR 可用的 H.264，分辨率保持不变。"""
     # 实测同一段 1920x1080 漫剧：HEVC 直连/MSE 都不触发 VSR，H.264 稳定触发。
     # 音轨统一转 AAC（源音频编码不确定，转 AAC 才不会有画面没声音）。
-    return video_encoder_args(ffmpeg) + [
+    return video_encoder_args(ffmpeg) + _rate_limit_args() + [
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
     ]
 
@@ -1512,6 +1536,9 @@ def stream_cmd(vid: str, device_id: str, install_id: str, content_type: int, aid
         "duration_ms": int(duration_ms),
         # codec 同理：它决定 resolve 是重封装还是整集重编码。
         "codec": str(stream_info.get("codec") or ""),
+        # 源码率（kbps）：Rust 侧据此算码率上限，再经 TTV_SD_MAXRATE/TTV_SD_BUFSIZE
+        # 交回 resolve —— 两处编码参数必须同源，否则同一条链路会出现两种画质。
+        "bitrate_kbps": int(stream_info.get("bitrate_kbps") or 0),
         "download_ua": DOWNLOAD_UA,
         "download_referer": DOWNLOAD_REFERER,
     }

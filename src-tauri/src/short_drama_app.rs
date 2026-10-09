@@ -72,6 +72,13 @@ struct CachedStream {
     width: u32,
     height: u32,
     duration_ms: i64,
+    /// 选中档的**源码率**（kbps）。
+    ///
+    /// 转码参数按它算码率上限（`media_enhance::rate_limits`）：源的码率分布很散
+    /// （实测 300kbps~2.5Mbps），用固定上限会把高码率的源硬压下去 —— 用户看到的就是
+    /// "转码后画质下降很多"。上游 `variants[*].bitrate` 直接给，取不到就是 0，
+    /// 届时退回中性默认值。
+    bitrate_kbps: u32,
     /// 选中档的编码标识（h264 / hevc / bytevc2 / ""）。
     ///
     /// worker 用它决定直连那一步是「重封装」还是「整集重编码」：源档已是 H.264
@@ -213,6 +220,10 @@ fn store_stream(vid: &str, payload: &serde_json::Value) {
             .get("duration_ms")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0),
+        bitrate_kbps: payload
+            .get("bitrate_kbps")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
         codec: payload
             .get("codec")
             .and_then(serde_json::Value::as_str)
@@ -1328,6 +1339,9 @@ async fn ensure_h264_cache(
         // 码率上限与关键帧约束，于是"迁移出来的老集"与"新解析的集"seek 粒度、体积、
         // 首帧时间都对不上（审查发现的第四条链路）。
         .args(crate::media_enhance::x264_args())
+        // 码率上限同样是按源算的，这条链路拿不到源码率 ⇒ 用中性默认值。
+        // 不能省：恒定质量模式不设上限会把产物放到源的数倍。
+        .args(crate::media_enhance::rate_lines(None))
         .args(["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"])
         .arg(&partial);
     command
@@ -1775,6 +1789,11 @@ async fn run_resolve_worker<R: Runtime>(
     // worker 重新解析、按 preferred_quality_height 现场选流，否则会把顶档流写进
     // `{vid}-{quality}.mp4`，之后该档位永远返回错的文件（参考实现每次都按
     // task.DownloadQuality 现场选流，不存在"跨档复用同一份实体"的设计）。
+    //
+    // 码率上限：按**源档码率**算，再交给 worker 的 ffmpeg（worker 侧 `_rate_limit_args`
+    // 读这两个环境变量）。换算公式只在 `media_enhance::rate_limits` 一处 —— 上一版是
+    // 两边各写死 1100k，而这个固定值会让高码率源掉画质（用户报的"转码后画质下降"）。
+    let mut rate_limits = crate::media_enhance::rate_limits(None);
     if requested_quality == "auto" {
         if let Some(cached) = peek_stream(&vid) {
             command
@@ -1784,11 +1803,16 @@ async fn run_resolve_worker<R: Runtime>(
                 .env("TTV_SD_DIRECT_HEIGHT", cached.height.to_string())
                 .env("TTV_SD_DIRECT_DURATION", cached.duration_ms.to_string())
                 .env("TTV_SD_DIRECT_CODEC", &cached.codec);
+            rate_limits = crate::media_enhance::rate_limits(
+                Some(cached.bitrate_kbps).filter(|value| *value >= 100),
+            );
         }
     }
     command
         .env("TTV_SD_FFMPEG", &ffmpeg)
         .env("TTV_SD_OUT", &out_path)
+        .env("TTV_SD_MAXRATE", format!("{}k", rate_limits.0))
+        .env("TTV_SD_BUFSIZE", format!("{}k", rate_limits.1))
         .env("PYTHONNOUSERSITE", "1")
         .env("PYTHONIOENCODING", "utf-8")
         // VSR 开关必须交给 worker：红果链路不经过 media_enhance，这是开关
@@ -3145,7 +3169,11 @@ pub async fn short_drama_app_open_stream<R: Runtime>(
     // （方案 B 不再切到 mp4），所以它必须按 vid 留存、换集不删、已转好则直接复用。
     // 多次打开同一集的代价因此从「重转 5.6 秒」降到「读一次清单」。
     let key = Some(decryption_key.as_str()).filter(|value| !value.is_empty());
-    match crate::media_enhance::start_video_cache(session_id, &vid, &source_url, key).await {
+    // 源码率一并交下去：转码的码率上限按它算（固定上限会把高码率源压糊）。
+    let source_kbps = Some(cached_stream.bitrate_kbps).filter(|value| *value >= 100);
+    match crate::media_enhance::start_video_cache(session_id, &vid, &source_url, key, source_kbps)
+        .await
+    {
         Ok(url) => {
             // 把这份产物的 mtime 推到当下：它是"最近被用过"的证据，也是缓存
             // 淘汰时唯一的保护（`keep` 只覆盖本次解析的那一个路径）。
@@ -3218,12 +3246,14 @@ pub async fn short_drama_app_prewarm_stream<R: Runtime>(
     let source_url = cached.url.clone();
     let key_owned = key.map(str::to_owned);
     let vid_owned = vid.clone();
+    let source_kbps = Some(cached.bitrate_kbps).filter(|value| *value >= 100);
     tauri::async_runtime::spawn(async move {
         crate::media_enhance::prewarm_video_cache(
             &vid_owned,
             &source_url,
             key_owned.as_deref(),
             slot,
+            source_kbps,
         )
         .await;
     });
