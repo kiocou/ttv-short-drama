@@ -18,33 +18,6 @@ import { EpisodeDrawer } from './EpisodeDrawer';
 import { DiagnosticsModal } from './DiagnosticsModal';
 import { Loader2, AlertCircle, RefreshCw, Copy, X, FastForward } from 'lucide-react';
 
-/** worker 上报的解析阶段 → 用户可读文案。 */
-const STAGE_LABEL: Record<string, string> = {
-  start: '正在启动云端解析…',
-  sign: '正在校验播放凭据…',
-  model: '正在获取播放信息…',
-  fallback: '正在获取分集直链…',
-  download: '正在缓存本集…',
-  transcode: '正在转换格式…',
-};
-
-/**
- * 各阶段的预估剩余秒数（下载阶段除外——那个用真实速率推算）。
- *
- * 依据实测：单集解析总计约 7.4 秒，其中
- *   - 签名 + API 往返     约 3.6 秒（Python 启动仅 0.3 秒，其余是签名计算与网络）
- *   - 下载 + 解密转存     约 3.9 秒（随集大小波动，按速率推算更准）
- * 这些常数用于"还没开始下载"时也能给出一个像样的等待预期，
- * 而不是让用户对着转圈猜。
- */
-const STAGE_BASELINE_SECONDS: Record<string, number> = {
-  start: 6,
-  sign: 5,
-  model: 4,
-  fallback: 3,
-  transcode: 1,
-};
-
 export const VideoSurface: React.FC = () => {
   const {
     videoRef,
@@ -62,8 +35,6 @@ export const VideoSurface: React.FC = () => {
     position,
     isMuted,
     playbackRate,
-    prepareStatus,
-    isSwitching,
     errorDetail,
     stallNotice,
     dismissStallNotice,
@@ -77,8 +48,6 @@ export const VideoSurface: React.FC = () => {
   const [isControlsVisible, setIsControlsVisible] = useState(true);
   // 控制器锁定（用户主动收起）状态；Esc 可解锁（PlayerControls 内部监听）。
   const [isLocked, setIsLocked] = useState(false);
-  // 平滑倒计时读数：worker 每 10% 才上报一次，直接用上报值会几秒才跳一下。
-  const [etaTick, setEtaTick] = useState<number | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   // 起播计时基准。用 ref 而不是 state：它只喂给日志，不该引发任何重渲染。
@@ -426,43 +395,11 @@ export const VideoSurface: React.FC = () => {
     return () => clearTimeout(timer);
   }, [isFullscreen]);
 
-  // 加载态的呈现方式取决于画面上是否已有内容：换集时主播放器保留了上一集的
-  // 最后一帧（切换路径刻意不调用 load()），此时用全屏遮罩等于把这一帧盖掉。
-  // readyState >= HAVE_CURRENT_DATA(2) 且已有播放进度，即认为"有旧帧可留"。
+  // 加载态只有一种呈现：右下角的小胶囊（spinner + "缓冲中…"）。
+  // 首次起播与换集走同一条路径——之前那种全屏遮罩会把旧帧盖掉，而且和换集时的
+  // 大卡片长得完全不同，同一个"正在等源"的状态出现两套视觉。具体的解析阶段、
+  // 百分比与预计秒数属于排查信息，统一挪到设置页的播放诊断面板。
   const isLoadingVisible = uiState.kind === 'opening' || uiState.kind === 'buffering';
-  const hasVisibleFrame = (videoRef.current?.readyState ?? 0) >= 2 && position > 0;
-  const loadingLabel = uiState.kind === 'buffering'
-    ? '缓冲中…'
-    : prepareStatus
-      ? prepareStatus.message || STAGE_LABEL[prepareStatus.stage] || '正在准备播放源…'
-      : '正在准备播放源…';
-
-  /**
-   * 本次解析的预计剩余秒数。
-   *
-   * 下载阶段用真实速率推算（store 侧采样相邻两次百分比），
-   * 下载开始前用阶段基准值。两者都是"还要多久"，而不是"已经过了多久"。
-   */
-  const estimatedRemaining = (() => {
-    if (!prepareStatus) return null;
-    if (prepareStatus.etaSeconds != null) return prepareStatus.etaSeconds + 1; // +1 秒解密转存
-    const base = STAGE_BASELINE_SECONDS[prepareStatus.stage];
-    return base ?? null;
-  })();
-
-  // 平滑递减：读数每秒往下走，避免每 10% 才跳一次造成"卡住了"的错觉。
-  useEffect(() => {
-    if (estimatedRemaining == null || !isLoadingVisible) {
-      setEtaTick(null);
-      return;
-    }
-    setEtaTick(estimatedRemaining);
-    const timer = setInterval(() => {
-      setEtaTick(prev => (prev == null || prev <= 1 ? 1 : prev - 1));
-    }, 1000);
-    return () => clearInterval(timer);
-    // 只在预估秒数变化时重置，避免每次 render 都重建定时器。
-  }, [estimatedRemaining, isLoadingVisible]);
 
   return (
     <div
@@ -519,9 +456,8 @@ export const VideoSurface: React.FC = () => {
       )}
 
       {/*
-        卡死提示：复用下方"正在切换"那张晶体卡片的样式与容器（不再造一个 toast
-        系统）。刻意挂在顶部而不是底部——卡死时 uiState 往往同时是 buffering，
-        底部的切换提示已经占着那个位置，两张卡叠在一起会互相盖住。
+        卡死提示：刻意挂在顶部而不是底部——卡死时 uiState 往往同时是 buffering，
+        底部正被"缓冲中…"胶囊占着，两张卡叠在一起会互相盖住。
 
         生命周期归 store：恢复成功后它自己置回 null，这里只管"用户手动关掉"。
       */}
@@ -546,70 +482,15 @@ export const VideoSurface: React.FC = () => {
       )}
 
       {/*
-        等待提示分两种，取决于用户是"切换"还是"首次进入"：
-
-        - **切换**（isSwitching）：用户已经等待过一次，需要知道还要多久。
-          给一个居下、不遮挡画面的提示卡，明确写出"切换到第 N 集 · 预计 X 秒"。
-        - **首次进入**（无旧帧）：画面本来就是空的，用全屏遮罩 + 进度。
-
-        后台预取（warmAdjacentEpisodes / 悬停预热）**不进入任何提示分支**，
-        对用户完全静默——这正是"播放时就该开始加载，但别打扰我"。
+        唯一的加载提示：右下角小胶囊。首次起播与换集共用同一形态，
+        不遮挡画面也不覆盖上一帧。详细的解析阶段/百分比/预计秒数见设置页
+        的「播放诊断日志」面板。
       */}
-      {isLoadingVisible && isSwitching && (
-        <div className="absolute bottom-28 inset-x-0 z-20 pointer-events-none flex justify-center">
-          <div className="min-w-[268px] px-4 py-3 rounded-2xl bg-black/70 shadow-2xl border border-white/15 flex flex-col gap-2.5">
-            <div className="flex items-center gap-2.5">
-              <Loader2 className="w-4 h-4 text-blue-400 animate-spin flex-shrink-0" />
-              <span className="text-xs font-semibold text-white whitespace-nowrap">
-                {currentEpisode
-                  ? `正在切换到第 ${currentEpisode.episodeNumber} 集`
-                  : '正在切换剧集'}
-              </span>
-              <span className="ml-auto text-xs font-bold font-mono tabular-nums text-blue-300 whitespace-nowrap">
-                {etaTick != null ? `约 ${etaTick} 秒` : '准备中'}
-              </span>
-            </div>
-            {/* 进度条：下载阶段用真实百分比，之前的阶段给一段循环动画，
-                让"正在签名/取直链"这段（实测约 3.6 秒）也有明确的进行感。 */}
-            <div className="h-1 w-full rounded-full bg-white/20 overflow-hidden">
-              {prepareStatus?.percent != null ? (
-                <div
-                  className="h-full bg-blue-400 rounded-full transition-[width] duration-300 ease-out"
-                  style={{ width: `${Math.min(100, Math.max(0, prepareStatus.percent))}%` }}
-                />
-              ) : (
-                <div className="h-full w-1/3 bg-blue-400 rounded-full animate-[eta-slide_1.1s_ease-in-out_infinite]" />
-              )}
-            </div>
-            <span className="text-[10px] text-white/60 text-center">
-              {loadingLabel}
-            </span>
-          </div>
-        </div>
-      )}
-
-      {isLoadingVisible && !isSwitching && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 backdrop-blur-xs pointer-events-none z-20">
-          <div className="p-4 min-w-[232px] rounded-2xl bg-white/85 backdrop-blur-xl shadow-fluent-lg flex flex-col items-center gap-3">
-            <Loader2 className="w-8 h-8 text-blue-600 animate-spin" />
-            <span className="text-xs font-semibold text-slate-800 text-center">
-              {loadingLabel}
-            </span>
-            {prepareStatus?.percent != null ? (
-              <>
-                <div className="w-44 h-1.5 rounded-full bg-slate-200/90 overflow-hidden">
-                  <div
-                    className="h-full bg-blue-600 rounded-full transition-[width] duration-300 ease-out"
-                    style={{ width: `${Math.min(100, Math.max(0, prepareStatus.percent))}%` }}
-                  />
-                </div>
-                <span className="text-[11px] font-mono text-slate-500">{prepareStatus.percent}%</span>
-              </>
-            ) : (
-              <span className="text-[10px] text-slate-400 text-center leading-relaxed">
-                首次播放需完整缓存本集，之后即可秒开
-              </span>
-            )}
+      {isLoadingVisible && (
+        <div className="absolute inset-x-0 bottom-32 z-20 pointer-events-none flex justify-center">
+          <div className="flex items-center gap-2 rounded-full bg-black/55 px-3 py-1.5 shadow-lg border border-white/10">
+            <Loader2 className="w-3.5 h-3.5 text-white/80 animate-spin flex-shrink-0" />
+            <span className="text-[11px] font-medium text-white/90 whitespace-nowrap">缓冲中…</span>
           </div>
         </div>
       )}

@@ -14,6 +14,13 @@ interface CatalogContextType {
   categories: string[];
   items: SeriesItem[];
   continueWatching: WatchHistoryItem | null;
+  /**
+   * 全部历史记录里的剧集 id。
+   *
+   * 「猜你喜欢」用它排除看过的内容——历史里出现过的剧不该再被推荐。这里直接
+   * 复用目录/续播本来就拉的那一次 `history.list()`，不额外发请求。
+   */
+  historySeriesIds: ReadonlySet<string>;
   isLoading: boolean;
   isLoadingMore: boolean;
   hasMore: boolean;
@@ -150,6 +157,7 @@ export const CatalogProvider: React.FC<CatalogProviderProps> = ({
   const [categories, setCategories] = useState<string[]>(['全部']);
   const [items, setItems] = useState<SeriesItem[]>([]);
   const [continueWatching, setContinueWatching] = useState<WatchHistoryItem | null>(null);
+  const [historySeriesIds, setHistorySeriesIds] = useState<ReadonlySet<string>>(() => new Set());
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
   const [hasMore, setHasMore] = useState<boolean>(false);
@@ -529,6 +537,7 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     const histories = await historiesPromise;
     if (requestId !== requestIdRef.current) return ok;
     setContinueWatching(histories[0] || null);
+    setHistorySeriesIds(new Set(histories.map(item => item.seriesId)));
     return ok;
   }, [audience, category, channel, refreshCategoryVocabulary, requestAllSources, sort, sources]);
 
@@ -555,6 +564,7 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     try {
       const histories = await ipcService.history.list();
       setContinueWatching(histories[0] || null);
+      setHistorySeriesIds(new Set(histories.map(item => item.seriesId)));
     } catch {
       // 辅助信息：拉取失败保持原值，不打扰用户。
     }
@@ -778,6 +788,7 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     categories,
     items,
     continueWatching,
+    historySeriesIds,
     isLoading,
     isLoadingMore,
     hasMore,
@@ -792,7 +803,7 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     prefetchMore,
     refreshContinueWatching,
   }), [
-    activeSources, audience, categories, category, channel, continueWatching, error, hasMore,
+    activeSources, audience, categories, category, channel, continueWatching, historySeriesIds, error, hasMore,
     isLoading, isLoadingMore, items, loadData, loadMore, prefetchMore, refreshContinueWatching,
     setChannel, sort,
   ]);

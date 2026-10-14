@@ -19,8 +19,56 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ipcService } from '../../services/ipc';
 import { useSettingsStore } from '../../stores/useSettingsStore';
+import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { FluentButton } from './FluentButton';
 import { ChevronDown, ClipboardCopy, Download, Trash2 } from 'lucide-react';
+
+/** 解析阶段 → 用户可读文案（与播放器原先的阶段表同一份口径）。 */
+const STAGE_LABEL: Record<string, string> = {
+  start: '正在启动云端解析…',
+  sign: '正在校验播放凭据…',
+  model: '正在获取播放信息…',
+  fallback: '正在获取分集直链…',
+  download: '正在缓存本集…',
+  transcode: '正在转换格式…',
+};
+
+/**
+ * 实时解析状态条。播放器界面只显示"缓冲中…"，阶段/百分比在这里展开。
+ *
+ * 独立成组件并且只在展开时挂载：设置页是常驻 DOM，若在 PlaybackLogPanel 本体
+ * 订阅整表播放状态，它会跟着 position/buffered 每秒重渲染，而面板里可能挂着
+ * 800 行日志——本仓库反复踩过"隐藏视图也在重渲染"这个坑。
+ */
+const LivePrepareStatus: React.FC = () => {
+  const { prepareStatus, isSwitching, currentEpisode } = usePlaybackStore();
+  if (!prepareStatus) return null;
+  return (
+    <div className="rounded-lg border border-blue-200/70 bg-blue-50/70 px-3 py-2 flex flex-col gap-1.5">
+      <div className="flex items-center gap-2 text-[11px]">
+        <span className="font-semibold text-blue-700">
+          {isSwitching && currentEpisode ? `切换到第 ${currentEpisode.episodeNumber} 集` : '当前解析'}
+        </span>
+        <span className="text-slate-600">
+          {prepareStatus.message || STAGE_LABEL[prepareStatus.stage] || '正在准备播放源…'}
+        </span>
+        {prepareStatus.percent != null && (
+          <span className="ml-auto font-mono text-blue-700">{prepareStatus.percent}%</span>
+        )}
+      </div>
+      <div className="h-1 w-full overflow-hidden rounded-full bg-blue-200/70">
+        {prepareStatus.percent != null ? (
+          <div
+            className="h-full rounded-full bg-blue-500 transition-[width] duration-300 ease-out"
+            style={{ width: `${Math.min(100, Math.max(0, prepareStatus.percent))}%` }}
+          />
+        ) : (
+          <div className="h-full w-1/3 rounded-full bg-blue-500 animate-[eta-slide_1.1s_ease-in-out_infinite]" />
+        )}
+      </div>
+    </div>
+  );
+};
 
 /** 轮询间隔。1.5s 足够跟上起播链路（毫秒级打点会几行一起到），又不至于刷屏。 */
 const POLL_MS = 1500;
@@ -145,6 +193,7 @@ export const PlaybackLogPanel: React.FC = () => {
 
       {open && (
         <div className="mt-3 flex flex-col gap-2">
+          <LivePrepareStatus />
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-500">
             <span>
               RTX VSR：

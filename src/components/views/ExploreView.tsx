@@ -68,6 +68,7 @@ export const ExploreView: React.FC = () => {
     categories,
     items,
     continueWatching,
+    historySeriesIds,
     isLoading,
     isLoadingMore,
     hasMore,
@@ -215,7 +216,7 @@ export const ExploreView: React.FC = () => {
    * 只剩一块时那一块独占整行——不为了对齐而留半屏空白。
    */
   const showContinueSlot = Boolean(continueWatching);
-  const showRandomSlot = hasRandomCandidates(visibleItems);
+  const showRandomSlot = hasRandomCandidates(visibleItems, historySeriesIds);
   const mergedTwoColumns = showContinueSlot && showRandomSlot;
 
   /**
@@ -572,7 +573,13 @@ if (!sentinel || !root || !hasMore) return;
           )}
 
           {showRandomSlot && (
-            <RandomWatchSection items={visibleItems} onWatch={handleRandomWatch} />
+            <RandomWatchSection
+              items={visibleItems}
+              excludeIds={historySeriesIds}
+              onWatch={handleRandomWatch}
+              onDetail={handleCardClick}
+              isMerged={mergedTwoColumns}
+            />
           )}
         </div>
       )}

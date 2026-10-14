@@ -58,7 +58,6 @@ export const AnimeVideoSurface: React.FC = () => {
     playbackRate,
     quality,
     qualities,
-    isSwitching,
     notice,
     streamKind,
     close,
@@ -371,52 +370,15 @@ export const AnimeVideoSurface: React.FC = () => {
       )}
 
       {/*
-        等待提示分两种：
-        - **首次进入**：画面本来就是空的，用全屏遮罩卡片（与短剧播放器同款浅色玻璃卡）；
-        - **切换**（isSwitching）：画面里还留着上一集的最后一帧，只给一张居下提示卡，
-          明确写出"正在切换到第 N 集"，绝不把那一帧盖掉。
+        加载/缓冲统一成同一枚小胶囊：首次进入、换集、中途缓冲都是"正在等源"，
+        分成全屏遮罩 + 大卡片 + 小胶囊三套只会让同一件事看起来像三种故障。
+        解析阶段与档位探测细节见设置页「播放诊断日志」。
       */}
-      {uiState.kind === 'opening' && !isSwitching && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 backdrop-blur-xs pointer-events-none z-20">
-          <div className="p-4 min-w-[232px] rounded-2xl bg-white/85 backdrop-blur-xl shadow-fluent-lg flex flex-col items-center gap-3">
-            <Loader2 className="w-8 h-8 text-blue-600 animate-spin" />
-            <span className="text-xs font-semibold text-slate-800 text-center">正在解析动漫源…</span>
-            <span className="text-[10px] text-slate-400 text-center leading-relaxed">
-              动漫为在线流：先解析线路与档位，再挂载播放
-            </span>
-          </div>
-        </div>
-      )}
-
-      {uiState.kind === 'opening' && isSwitching && (
-        <div className="absolute bottom-28 inset-x-0 z-20 pointer-events-none flex justify-center">
-          <div className="min-w-[268px] px-4 py-3 rounded-2xl bg-black/70 shadow-2xl border border-white/15 flex flex-col gap-2.5">
-            <div className="flex items-center gap-2.5">
-              <Loader2 className="w-4 h-4 text-blue-400 animate-spin flex-shrink-0" />
-              <span className="text-xs font-semibold text-white whitespace-nowrap">
-                {episode ? `正在切换到第 ${episode.episodeNumber} 集` : '正在切换剧集'}
-              </span>
-              <span className="ml-auto text-xs font-bold font-mono tabular-nums text-blue-300 whitespace-nowrap">
-                准备中
-              </span>
-            </div>
-            <div className="h-1 w-full rounded-full bg-white/20 overflow-hidden">
-              <div className="h-full w-1/3 bg-blue-400 rounded-full animate-[eta-slide_1.1s_ease-in-out_infinite]" />
-            </div>
-            <span className="text-[10px] text-white/60 text-center">正在解析动漫源…</span>
-          </div>
-        </div>
-      )}
-
-      {/*
-        缓冲态只给一个小胶囊，不用全屏遮罩：动漫是在线流，卡顿会反复出现，
-        每次卡一下就把画面盖住是倒退。
-      */}
-      {uiState.kind === 'buffering' && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
-          <div className="crystal-surface px-3.5 py-2.5 rounded-2xl flex items-center gap-2.5">
-            <Loader2 className="w-4 h-4 text-white animate-spin" />
-            <span className="text-xs font-semibold text-white/90">缓冲中…</span>
+      {(uiState.kind === 'opening' || uiState.kind === 'buffering') && (
+        <div className="absolute inset-x-0 bottom-32 z-20 pointer-events-none flex justify-center">
+          <div className="flex items-center gap-2 rounded-full bg-black/55 px-3 py-1.5 shadow-lg border border-white/10">
+            <Loader2 className="w-3.5 h-3.5 text-white/80 animate-spin flex-shrink-0" />
+            <span className="text-[11px] font-medium text-white/90 whitespace-nowrap">缓冲中…</span>
           </div>
         </div>
       )}
