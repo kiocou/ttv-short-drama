@@ -148,9 +148,14 @@ fn system_proxy() -> Option<Vec<reqwest::Proxy>> {
         .filter(|(kind, _)| *kind == REG_SZ)
         .map(|(_, bytes)| {
             // REG_SZ 是 UTF-16LE，去掉结尾的 NUL。
+            // 用 as_chunks 而不是 chunks_exact：CI 的 Clippy 1.99 把后者列为
+            // `chunks_exact_to_as_chunks`（-D warnings 下直接失败）。忽略余数
+            // 与原来的 chunks_exact 语义一致（REG_SZ 本来就应当偶数长度）。
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .take_while(|unit| *unit != 0)
                 .collect();
             String::from_utf16_lossy(&units)
