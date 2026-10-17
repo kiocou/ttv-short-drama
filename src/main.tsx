@@ -3,7 +3,11 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import { MiniPlayer } from './components/player/MiniPlayer';
 import { isPipWindow } from './services/pip';
+import { applyTheme, readTheme } from './services/theme';
 import './index.css';
+
+// 首次渲染之前就要落到 <html> 上：暗色用户不该先看到一帧浅色界面。
+applyTheme(readTheme());
 
 const rootElement = document.getElementById('root');
 if (rootElement) {

@@ -26,7 +26,11 @@ import React, { useEffect, useRef, useState } from 'react';
  *
  * ## 呈现规则（用户看到的）
  *
- * - 剧名首字占位**始终铺在最底层**：地址为空、还在加载、重试中、彻底失败，都不会留白框；
+ * - 封面没到（等视口 / 解析中 / 下载中 / 重试中）铺的是**扫光骨架块**，与列表骨架
+ *   `.shimmer-loading` 同一材质 —— 卡片因此从上到下都是"骨架形状"，不会出现封面那块
+ *   是灰底首字、周围网格骨架是扫光片的割裂；
+ * - 只有**确定拿不到封面**（地址为空、重试耗尽、guo 解析失败、20s 挂起兜底）才退回
+ *   剧名首字占位 —— 那时还挂扫光就是在撒谎"还在加载"；
  * - 图片在 `onLoad` 之前是透明的，**加载完成才淡入**——所以中途看到的是占位而不是半截空白；
  * - 加载慢/挂起时占位一直顶着，图片元素留在原地继续尝试，**一旦成功会自动浮现**，
  *   不会出现"等太久被前端判死、其实后来又加载好了"的浪费。
@@ -311,14 +315,25 @@ export const CoverImage: React.FC<CoverImageProps> = ({
     else setGivenUp(true);
   };
 
+  /**
+   * 还没像素、也没有认输 —— 此刻占位层该铺骨架。
+   * 空地址（`hasSource` 为假）不算：没有请求在跑，铺扫光就是撒谎。
+   */
+  const pending = hasSource && !loaded && !givenUp;
+
   return (
     <>
-      {/* 占位层：始终渲染在最底层，图片没成它就是最终画面 */}
+      {/* 占位层：始终渲染在最底层，图片没成它就是最终画面。
+          两种材质二选一 —— 还在等/还在下：扫光骨架块；确定拿不到：剧名首字。 */}
       <div
         ref={holderRef}
         className={`absolute inset-0 flex items-center justify-center ${placeholderClassName}`}
       >
-        <span className={`${placeholderTextClassName} font-bold text-slate-300 select-none`}>{char}</span>
+        {pending ? (
+          <span aria-hidden="true" className="block h-full w-full shimmer-loading" />
+        ) : (
+          <span className={`${placeholderTextClassName} font-bold text-slate-300 select-none`}>{char}</span>
+        )}
       </div>
       {/* 加载完成前保持透明：中途看到的是占位，而不是一块半截空白。
           `key={attempt}` 让每次重试都用新元素，避免复用上一次的失败状态。 */}

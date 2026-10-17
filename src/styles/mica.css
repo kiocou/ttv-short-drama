@@ -11,15 +11,29 @@
   --accent-primary: #0067c0;
   --accent-hover: #005bb5;
   --accent-light: rgba(0, 103, 192, 0.08);
+
+  /* 全站唯一的底衬。html / body / .mica-backdrop / .ttv-launch 都引用它，
+     不再各抄一份渐变 —— 之前浅色基准色在三处分别是 #f2f4f7 与 #f3f5f8，
+     启动动画撤层时会露出色差。暗色主题只覆盖这一个变量（见 dark.css）。 */
+  --theme-backdrop:
+    radial-gradient(1200px 800px at 12% 6%, rgba(211, 230, 252, 0.85) 0%, transparent 62%),
+    radial-gradient(1000px 720px at 88% 94%, rgba(231, 238, 249, 0.90) 0%, transparent 64%),
+    linear-gradient(180deg, #f5f7fa 0%, #eef2f7 100%);
 }
 
 /* Mica Backdrop Layer */
 .mica-backdrop {
-  background: 
-    radial-gradient(1200px 800px at 15% 10%, rgba(224, 239, 255, 0.75) 0%, transparent 60%),
-    radial-gradient(1000px 700px at 85% 85%, rgba(240, 246, 255, 0.85) 0%, transparent 60%),
-    radial-gradient(800px 600px at 50% 50%, rgba(255, 255, 255, 0.9) 0%, transparent 80%),
-    #f2f4f7;
+  background: var(--theme-backdrop);
+}
+
+/* 主内容画板与侧栏的圆角、边距、投影必须一致，否则一个像贴边窗口、
+   一个像浮层。这两处都只在这里定，视图里不再各写一份。 */
+.ttv-workspace-panel {
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  box-shadow:
+    0 16px 36px -6px rgba(15, 23, 42, 0.08),
+    0 4px 12px -2px rgba(15, 23, 42, 0.03);
 }
 
 /* Mica Acrylic Surfaces */
@@ -92,25 +106,100 @@
   background: rgba(0, 0, 0, 0.28);
 }
 
-/* Shimmer Loading Skeleton */
+/*
+  Shimmer Loading Skeleton：静态底色 + 一道高光从左扫到右。
+  底色刻意留在 .shimmer-loading 上而不是伪元素里，这样调用点的
+  `bg-violet-100/60`、`bg-slate-200/70` 等有色骨架仍能覆盖它。
+  高光条与元素等宽，靠 translateX 扫过，因此必须先 overflow: hidden。
+*/
+.shimmer-loading {
+  position: relative;
+  overflow: hidden;
+  background-color: #e2e8f0;
+  /* 凹槽三件套（上沿投影 / 下沿反光 / 内描边），与 .fluent-inset-* 同一套语汇。
+     用 box-shadow 而不是 border，免得挤动调用点已有的盒模型，也让调用点自带的
+     bg-* 有色骨架仍能覆盖底色。 */
+  box-shadow:
+    inset 0 2px 4px rgba(15, 23, 42, 0.13),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.9),
+    inset 0 0 0 1px rgba(148, 163, 184, 0.28);
+}
+
+.shimmer-loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  /* 亮带只占中间 ~30%，扫过去才有"一道光"的方向感，而不是整块泛白 */
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 35%,
+    rgba(255, 255, 255, 0.9) 50%,
+    rgba(255, 255, 255, 0) 65%
+  );
+  /* 只扫三趟就停：封面挂起/重试时这个骨架可能停留 20 秒，无限扫光会让整屏
+     卡片一直在闪，和"正在加载"的语义一起变成了永动机。停下后保留静态底色，
+     视觉上仍明确是占位，但不再抢注意力。 */
+  animation: shimmer 1.4s ease-in-out 3;
+}
+
 @keyframes shimmer {
   0% {
-    background-position: -200% 0;
+    transform: translateX(-100%);
   }
   100% {
-    background-position: 200% 0;
+    transform: translateX(100%);
   }
 }
 
-.shimmer-loading {
-  background: linear-gradient(
-    90deg,
-    rgba(240, 242, 245, 0.6) 25%,
-    rgba(255, 255, 255, 0.85) 50%,
-    rgba(240, 242, 245, 0.6) 75%
-  );
-  background-size: 200% 100%;
-  animation: shimmer 1.6s infinite ease-in-out;
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-loading::after {
+    animation: none;
+  }
+}
+
+/*
+  系列卡片的入场：按网格里的位置错峰 14px 上浮。
+
+  这里曾经同时存在两层动画：卡片自己的 `animate-fluent-card-in`，以及这条
+  `.ttv-grid-in > *`。两者写的是同一个 `animation` 属性，谁赢取决于选择器特异性
+  与 DOM 顺序——实测首页同一屏里，前两张跑 `fluentCardIn`、其余跑 `ttv-grid-rise`，
+  而且有些元素拿到的是旧动画实例，于是出现"有的不动、有的动得不一样"。
+  现在只剩这一层：卡片不再自带入场类，网格容器是唯一入口。
+
+  两条既定规矩（见 tailwind.config.js 的 fluent-card-in 长注释）：
+    - **只动 transform，不碰 opacity**：卡片宿主视图是常驻 DOM + display:none，
+      在隐藏祖先里创建的元素动画会卡在 0% 帧，若 0% 有 opacity:0 就永久空白；
+    - 加 delay 必须配 `backwards`，否则延迟期间元素先按终态出现、再跳回起点滑上来，
+      看起来就是闪一下。
+
+  第 13 项起没有 delay —— 滚动加载追加的卡片应当直接入场。
+*/
+@keyframes ttv-grid-rise {
+  from {
+    transform: translateY(14px) scale(0.97);
+  }
+  to {
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ttv-grid-in > *:nth-child(n) {
+    animation: ttv-grid-rise 0.35s var(--curve-fluent) backwards;
+  }
+
+  .ttv-grid-in > *:nth-child(2) { animation-delay: 35ms; }
+  .ttv-grid-in > *:nth-child(3) { animation-delay: 70ms; }
+  .ttv-grid-in > *:nth-child(4) { animation-delay: 105ms; }
+  .ttv-grid-in > *:nth-child(5) { animation-delay: 140ms; }
+  .ttv-grid-in > *:nth-child(6) { animation-delay: 175ms; }
+  .ttv-grid-in > *:nth-child(7) { animation-delay: 210ms; }
+  .ttv-grid-in > *:nth-child(8) { animation-delay: 245ms; }
+  .ttv-grid-in > *:nth-child(9) { animation-delay: 280ms; }
+  .ttv-grid-in > *:nth-child(10) { animation-delay: 315ms; }
+  .ttv-grid-in > *:nth-child(11) { animation-delay: 350ms; }
+  .ttv-grid-in > *:nth-child(12) { animation-delay: 385ms; }
 }
 
 /* Windows 11 Fluent Inset Tray / Embedded Button Group */

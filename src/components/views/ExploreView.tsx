@@ -10,6 +10,7 @@ import { StatusBadge } from '../common/StatusBadge';
 import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
 import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
+import { SeriesCardSkeleton } from '../common/SeriesCardSkeleton';
 import { HomeShelf } from '../common/HomeShelf';
 import { HomeShelfSection } from '../common/HomeShelfSection';
 import { RandomWatchSection, hasRandomCandidates, PICK_CARD_SHELL } from '../common/RandomWatchSection';
@@ -648,13 +649,7 @@ if (!sentinel || !root || !hasMore) return;
         {/* 骨架屏加载态 (保持相同舒适比例) */}
         {isLoading && items.length === 0 ? (
           <div className={SERIES_GRID_CLASS}>
-            {Array.from({ length: 12 }).map((_, i) => (
-              <div key={i} className="flex flex-col gap-2">
-                <div className="w-full aspect-[3/4] rounded-2xl shimmer-loading shadow-xs" />
-                <div className="h-4 w-3/4 rounded shimmer-loading" />
-                <div className="h-3.5 w-1/2 rounded shimmer-loading" />
-              </div>
-            ))}
+            {Array.from({ length: 12 }).map((_, i) => <SeriesCardSkeleton key={i} />)}
           </div>
         ) : error && items.length === 0 ? (
           <div className="py-20 flex flex-col items-center justify-center text-center gap-3">
@@ -690,24 +685,31 @@ if (!sentinel || !root || !hasMore) return;
               <span>正在切换，卡片马上回来…</span>
             </div>
           )}
-          {/* 切换题材/排序时保留旧卡片并压暗：清空会让整页闪白，而单纯保留旧
-              内容又会让用户以为"点了没反应"（旧实现只挂一行 11px 小字，几乎
-              看不见）。压暗 + 屏蔽点击同时表达"正在加载"和"这张卡不再属于
-              当前筛选"，避免用户点进一个已经不属于该题材的剧。 */}
-          <div className={`${SERIES_GRID_CLASS} transition-opacity duration-150 ${
-            isLoading ? 'opacity-40 saturate-50 pointer-events-none' : ''
-          }`}>
-            {catalogItems.map((series, index) => (
-              <SeriesCard
-                key={series.id}
-                series={series}
-                index={index}
-                onClick={handleCardClick}
-                onUnavailable={markSeriesUnavailable}
-                onPrefetch={handleCardPrefetch}
-              />
-            ))}
-          </div>
+          {/* 切换题材/排序：原地铺一层与真实卡片同构的骨架网格，而不是把旧卡片压暗。
+              压暗（`opacity-40 saturate-50`）留下的是"脏灰的旧封面"，与骨架、与旁边
+              的卡片都是两种材质，整页看起来像加载坏了；骨架与卡片同构，读起来只是
+              "这批结果正在换"。张数取旧卡片数（不是固定的 12）——换回去的那一刻
+              网格高度一致，滚动位置不会跳。骨架不可点，用户也不会点进上一批的剧。 */}
+          {isLoading ? (
+            <div className={SERIES_GRID_CLASS}>
+              {Array.from({ length: catalogItems.length }).map((_, i) => (
+                <SeriesCardSkeleton key={i} />
+              ))}
+            </div>
+          ) : (
+            <div className={`${SERIES_GRID_CLASS} ttv-grid-in`}>
+              {catalogItems.map((series, index) => (
+                <SeriesCard
+                  key={series.id}
+                  series={series}
+                  index={index}
+                  onClick={handleCardClick}
+                  onUnavailable={markSeriesUnavailable}
+                  onPrefetch={handleCardPrefetch}
+                />
+              ))}
+            </div>
+          )}
           </>
         )}
 

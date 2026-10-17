@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ProgressBar } from './ProgressBar';
 import { RollingPercent, RollingTime } from './RollingNumber';
-import { BOOST_RATE } from '../../services/boostController';
 import {
   Play,
   Pause,
@@ -49,7 +48,8 @@ export const FALLBACK_QUALITY_OPTIONS: PlayerQualityOption[] = [
   { label: '自动', value: 'auto', resolution: '由播放源自动选择' },
 ];
 
-// 档位与「长按加速」**互不影响**：长按永远是 BOOST_RATE（2x），与所选档位无关。
+// 这里的档位是**基准倍速**，与长按加速的档位（智能 / 1.5x / 2x / 3x）互不影响：
+// 松手后永远回到这里选的值。
 // 慢速档（0.5/0.75）保留是因为慢看本身有用；高速档（3x）保留是因为有人就想一直快放。
 const SPEED_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
 
@@ -417,7 +417,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowVolumeSlider(false);
                     }}
                     className={`btn-text-action${effectivePlaybackRate !== null ? ' is-boosting' : ''}`}
-                    title={`切换播放倍速（长按 ← / → 临时加速到 ${BOOST_RATE}x）`}
+                    title="切换播放倍速（长按 ← / → 临时加速，加速中按 ↑ / ↓ 换档）"
                   >
                     {effectivePlaybackRate !== null
                       ? `${effectivePlaybackRate}x 加速`
@@ -441,13 +441,11 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       </button>
                     ))}
                     {/*
-                      长按加速的落点写在这里：它是一个**固定值**，不随所选档位变化。
-                      用户看不到键盘提示的话，这个手势等于不存在。
+                      长按加速的落点写在这里：不看这行的话，用户根本不知道有这个手势。
+                      加速档位是另一套（起点是"智能"），与上面选的基准倍速无关。
                     */}
                     <div className="crystal-menu-note">
-                      {playbackRate >= BOOST_RATE
-                        ? `当前档位已不低于 ${BOOST_RATE}x，长按不加速`
-                        : `长按 ← / → 加速到 ${BOOST_RATE}x`}
+                      长按 ← / → 临时加速，加速中按 ↑ / ↓ 换档（智能 / 1.5x / 2x / 3x）
                     </div>
                   </div>
                 </div>

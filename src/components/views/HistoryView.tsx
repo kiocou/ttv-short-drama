@@ -35,7 +35,7 @@ function formatRelativeTime(timestamp: number): string {
 }
 
 export const HistoryView: React.FC = () => {
-  const { records, loadHistory, removeRecord, clearHistory } = useHistoryStore();
+  const { records, isLoading, loadHistory, removeRecord, clearHistory } = useHistoryStore();
   // 只订阅低频动作专线：整表订阅会让历史列表跟着播放进度重渲染。
   const { openEpisode } = usePlaybackActions();
   const { open: openAnimeEpisode } = useAnimePlayer();
@@ -136,7 +136,22 @@ export const HistoryView: React.FC = () => {
       </div>
 
       {/* 历史记录列表 */}
-      {records.length === 0 ? (
+      {/* 首次加载没有记录时才铺骨架：每次进页面 loadHistory 都会把 isLoading 置真，
+          有数据的情况下还挂骨架就是"进一次闪一次"。 */}
+      {isLoading && records.length === 0 ? (
+        <div className="flex flex-col gap-3" aria-busy="true">
+          {Array.from({ length: 4 }).map((_, index) => (
+            <MicaCard key={index} className="p-4 flex items-center gap-4">
+              <div className="h-[88px] w-16 shrink-0 rounded-xl shimmer-loading" />
+              <div className="flex min-w-0 flex-1 flex-col gap-2">
+                <div className="h-4 w-1/3 rounded shimmer-loading" />
+                <div className="h-3 w-2/5 rounded shimmer-loading" />
+                <div className="h-3 w-1/4 rounded shimmer-loading" />
+              </div>
+            </MicaCard>
+          ))}
+        </div>
+      ) : records.length === 0 ? (
         <div className="py-24 flex flex-col items-center justify-center text-center gap-3">
           <img src="/app-icon.png" alt="" className="w-14 h-14 object-contain opacity-60" draggable={false} />
           <p className="text-sm font-semibold text-slate-700">暂无观看历史</p>

@@ -34,7 +34,11 @@ import {
   FolderSearch,
   Activity,
   ChevronDown,
+  Palette,
+  Sun,
+  Moon,
 } from 'lucide-react';
+import { readTheme, saveTheme, type ThemeMode } from '../../services/theme';
 
 /* ==========================================================================
    统一样式原语
@@ -48,6 +52,16 @@ import {
 /** 条目标题 / 说明文字的字阶。全页只有这两级，不要再随手加第三级。 */
 const TITLE_CLS = 'text-xs font-semibold text-slate-800';
 const HINT_CLS = 'text-[11px] text-slate-400 leading-relaxed';
+
+/** 外观卡片的分段选项。 */
+const THEME_OPTIONS: {
+  id: ThemeMode;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [
+  { id: 'light', label: '浅色', icon: Sun },
+  { id: 'dark', label: '暗色', icon: Moon },
+];
 
 /**
  * 分段选项（单选 chip）的状态样式。
@@ -588,6 +602,8 @@ export const SettingsView: React.FC = () => {
   const { showToast, currentView } = useAppStore();
 
   const [isCleaning, setIsCleaning] = useState(false);
+  // 主题不进 UserSettings（那是 Rust 契约，见 services/theme.ts 的说明）。
+  const [theme, setTheme] = useState<ThemeMode>(readTheme);
   const enabledSources = settings.enabledSources;
 
   /**
@@ -620,11 +636,11 @@ export const SettingsView: React.FC = () => {
   >({ kind: 'idle' });
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
-  /** 已下载的安装包路径；静默安装失败时用它做「打开文件夹」退路。 */
+  /** 已下载的安装包路径；安装向导没能打开时用它做「打开文件夹」退路。 */
   const [savedPath, setSavedPath] = useState<string | null>(null);
-  /** 下载完成后正在静默安装（此时应用即将退出，界面不该再给可点的操作）。 */
+  /** 下载完成后正在打开安装向导（此时应用即将退出，界面不该再给可点的操作）。 */
   const [isInstalling, setIsInstalling] = useState(false);
-  /** 静默安装失败的原因。非 null 时才显示「打开文件夹」退路。 */
+  /** 安装向导没能打开的原因。非 null 时才显示「打开文件夹」退路。 */
   const [installError, setInstallError] = useState<string | null>(null);
   /** 当前版本号：从二进制里拿，不在前端另写一份。 */
   const [appVersion, setAppVersion] = useState('');
@@ -792,7 +808,42 @@ export const SettingsView: React.FC = () => {
           </p>
         </div>
 
-        {/* 1. 播放体验 */}
+        {/* 1. 外观 */}
+        <SectionCard icon={<Palette className="w-4 h-4 text-blue-600" />} title="外观">
+          <SettingRow
+            title="界面主题"
+            hint="暗色模式是黑红配色：黑底 + 红色强调，界面与播放器控制条一起变。选择会记住，重启后仍生效。"
+          >
+            {/* 分段选择沿用 CategoryBar 那套：选中项凸起、未选中只留文字。 */}
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100/80">
+              {THEME_OPTIONS.map(option => {
+                const Icon = option.icon;
+                const selected = theme === option.id;
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    aria-pressed={selected}
+                    onClick={() => {
+                      saveTheme(option.id);
+                      setTheme(option.id);
+                    }}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors duration-150 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 ${
+                      selected
+                        ? 'fluent-convex-tab text-slate-800'
+                        : 'text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
+          </SettingRow>
+        </SectionCard>
+
+        {/* 2. 播放体验 */}
         <SectionCard icon={<Tv className="w-4 h-4 text-blue-600" />} title="播放体验">
           <SettingRow
             title="视频清晰度"
@@ -848,7 +899,7 @@ export const SettingsView: React.FC = () => {
           </div>
         </SectionCard>
 
-        {/* 2. 视频源（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
+        {/* 3. 视频源（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
         <SectionCard icon={<Server className="w-4 h-4 text-blue-600" />} title="视频源">
           <p className={HINT_CLS}>
             勾选后这些源会一起汇入发现页——前两组进「短剧专区」与「漫剧次元」，
@@ -909,7 +960,7 @@ export const SettingsView: React.FC = () => {
           </div>
         </SectionCard>
 
-        {/* 3. 本地存储与缓存 */}
+        {/* 4. 本地存储与缓存 */}
         <SectionCard icon={<HardDrive className="w-4 h-4 text-blue-600" />} title="存储空间与本地缓存">
           <SettingRow
             title="剧集缓存"
@@ -961,13 +1012,13 @@ export const SettingsView: React.FC = () => {
           </div>
         </SectionCard>
 
-        {/* 4. 版本与更新 */}
+        {/* 5. 版本与更新 */}
         <SectionCard icon={<Sparkles className="w-4 h-4 text-blue-600" />} title="版本与更新">
           <SettingRow
             title="当前版本"
             hint={
               <>
-                从 GitHub Releases 拉取最新安装包，<span className="text-slate-600 font-medium">下载完成后会自动安装并重启应用</span>。
+               从 GitHub Releases 拉取最新安装包，<span className="text-slate-600 font-medium">下载完成后会打开安装向导</span>，按提示完成即可。
               </>
             }
           >
@@ -1050,7 +1101,7 @@ export const SettingsView: React.FC = () => {
                   // 安装阶段应用即将退出，不给任何可点的东西——点了也只是白点。
                   <span className="text-[11px] text-slate-500">安装程序启动后本应用会自动关闭…</span>
                 ) : installError && savedPath ? (
-                  // 静默安装没跑起来时的退路：把包暴露给用户自己双击，而不是重试一次
+                  // 安装向导没跑起来时的退路：把包暴露给用户自己双击，而不是重试一次
                   // 大概率同样失败的下载。
                   <FluentButton
                     variant="primary"
@@ -1074,14 +1125,14 @@ export const SettingsView: React.FC = () => {
               </div>
               {installError && (
                 <p className="text-[11px] text-amber-700 leading-relaxed">
-                  自动安装未启动：{installError}。已下载的安装包在下方可手动打开。
+                  安装程序未能启动：{installError}。已下载的安装包在下方可手动打开。
                 </p>
               )}
             </div>
           )}
         </SectionCard>
 
-        {/* 5. 关于与日志诊断 */}
+        {/* 6. 关于与日志诊断 */}
         <SectionCard icon={<FileText className="w-4 h-4 text-blue-600" />} title="客户端信息与诊断">
           <SettingRow
             title="TTV Short Drama 独立桌面客户端"

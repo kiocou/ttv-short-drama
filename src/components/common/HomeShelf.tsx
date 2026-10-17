@@ -2,6 +2,7 @@ import React from 'react';
 import { ChevronRight } from 'lucide-react';
 import { SeriesItem } from '../../types/catalog';
 import { SeriesCard } from './SeriesCard';
+import { SeriesCardSkeleton } from './SeriesCardSkeleton';
 
 interface HomeShelfProps {
   title: string;
@@ -82,14 +83,9 @@ export const HomeShelf: React.FC<HomeShelfProps> = ({
         注：上面的类名刻意不写成完整形式 —— Tailwind 的提取器会扫**注释原文**，
         注释里出现一个合法的类名就会真的把它编进产物。
       */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6">
+      <div className="ttv-grid-in grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6">
         {showSkeleton
-          ? Array.from({ length: 6 }).map((_, index) => (
-              <div key={index} className="flex flex-col gap-2">
-                <div className="w-full aspect-[3/4] rounded-2xl shimmer-loading shadow-xs" />
-                <div className="h-4 w-3/4 rounded shimmer-loading" />
-              </div>
-            ))
+          ? Array.from({ length: 6 }).map((_, index) => <SeriesCardSkeleton key={index} />)
           : items.map((series, index) => (
               <SeriesCard
                 key={series.id}

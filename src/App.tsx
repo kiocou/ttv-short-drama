@@ -23,7 +23,6 @@ import { ShelfMoreView } from './components/views/ShelfMoreView';
 import { VideoSurface } from './components/player/VideoSurface';
 import { AnimeVideoSurface } from './components/player/AnimeVideoSurface';
 import { PipReturnBridge } from './components/player/PipReturnBridge';
-import { UpdatePrompt } from './components/common/UpdatePrompt';
 import { LaunchAnimation } from './components/layout/LaunchAnimation';
 
 const AppContent: React.FC = () => {
@@ -180,7 +179,7 @@ const AppContent: React.FC = () => {
           <main 
             style={{ contain: 'layout paint' }}
             data-launch-part="content"
-            className="flex-1 min-w-0 h-full overflow-hidden relative bg-white/40"
+            className="ttv-workspace-panel flex-1 min-w-0 my-4 mr-4 overflow-hidden relative bg-white/50"
           >
             <div
               className={`h-full w-full ${currentView === 'explore' ? 'block animate-fluent-page-in' : 'hidden'}`}
@@ -250,12 +249,9 @@ const AppContent: React.FC = () => {
       {/* 画中画小窗回流：小窗关闭时接回播放/落历史（不渲染任何界面） */}
       <PipReturnBridge />
       <ToastContainer />
-      {/* 启动时的更新提示：常驻最上层，且自己管「检查 / 下载 / 安装」全过程。
-          放在这里而不是各个视图里，是为了让用户在任意页面都能收到它。 */}
-      <UpdatePrompt />
 
       {/*
-        启动进入动画（方案 05「轨道汇聚」）。放在最后 = 盖在 TitleBar 与 UpdatePrompt 之上。
+        启动进入动画（方案 05「轨道汇聚」）。放在最后 = 盖在 TitleBar 与更新弹窗之上。
         它自己管生命周期：动画跑完（或点击跳过）后 unmount，不留任何常驻 DOM 与内联样式。
         **不要**把它改成常驻 + display:none —— 那样会在"隐藏祖先里创建动画"，
         命中项目里已经记录过的坑（动画永久卡在 0% 帧）。

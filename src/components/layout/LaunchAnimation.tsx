@@ -27,7 +27,7 @@ import { startLaunchAudio, type LaunchAudioController } from '../../services/lau
  *    'both' 只是为了让**延迟期间**也停在 0% 帧（否则元素会先按原本的样子闪一下），
  *    收尾交给 cancel()。
  *
- * 2. **补间 `filter` 时必须把 `drop-shadow` 一起带上**（LOGO_SH）。
+ * 2. **补间 `filter` 时必须把 `drop-shadow` 一起带上**（见下面的 logoFilter）。
  *    `.ttv-launch-logo` 的 CSS 里挂着一条 drop-shadow，动画只写 blur() 的话
  *    fill 会把影子顶掉，品牌从此没有投影。同理，同一段动画的多个关键帧，
  *    filter 函数列表必须**同序同长**（blur / brightness / drop-shadow），
@@ -51,17 +51,9 @@ const FRAME_COUNT = 6;
  * 六张卡的底色。用渐变而不是真实封面：启动这一刻远程封面还没回来，
  * 而且这里只需要"内容"的象征，不需要真的剧集数据。
  */
-const FRAME_GRADIENTS = [
-  'linear-gradient(160deg,#6366f1,#a855f7)',
-  'linear-gradient(160deg,#0ea5e9,#22d3ee)',
-  'linear-gradient(160deg,#f43f5e,#fb923c)',
-  'linear-gradient(160deg,#10b981,#84cc16)',
-  'linear-gradient(160deg,#8b5cf6,#ec4899)',
-  'linear-gradient(160deg,#f59e0b,#ef4444)'
-];
-
-/** 品牌投影。凡是补间 filter 的地方都要把它拼上去，见文件头第 2 条。 */
-const LOGO_SH = ' drop-shadow(0 10px 26px rgba(109,71,230,.34))';
+/* 六张卡的底色写在 styles/launch.css 的 --launch-frame-1..6（浅色＝原彩色，
+   暗色＝黑红系）。放 CSS 里才能跟着 data-theme 自动换色，放 JS 里就得在两处
+   维护同一份色板。 */
 
 /* ── 几何：卡片 80×112 / 轨道 600×392（卡轨比 0.27）── */
 const RX = 300;
@@ -163,6 +155,14 @@ function buildPhaseA(root: HTMLElement): Animation[] {
 
   const EASE = 'cubic-bezier(.16,1,.3,1)';
 
+  /* 启动动画的强调色与品牌着色跟着主题走（浅色品牌紫 / 暗色黑红），取值见
+     styles/launch.css 的 :root。WAAPI 的关键帧不解析 var()，所以这里读成实参
+     再拼字符串；拼进 filter 时必须排在 drop-shadow **之前**——filter 从左到右
+     依次作用，色相旋转放后面会把刚设好的红色影子一起转走。 */
+  const themeVars = getComputedStyle(document.documentElement);
+  const accent = themeVars.getPropertyValue('--launch-accent-rgb').trim() || '109 71 230';
+  const logoTint = themeVars.getPropertyValue('--launch-logo-tint').trim();
+
   /* ─────────────────────────────────────────────────────────────
      光晕：脉冲式涨落，末次撞击时最亮。
      不是"慢慢变亮"——它和品牌弹簧同一节拍在跳，撞击才有"打到了"的感觉。
@@ -213,7 +213,7 @@ function buildPhaseA(root: HTMLElement): Animation[] {
   const LOGO_DUR = 1630;
   const lAt = (ms: number) => Number((ms / LOGO_DUR).toFixed(4));
   const logoFilter = (blurPx: number, brightness: number, y: number, drop: number, alpha: number) =>
-    `blur(${blurPx}px) brightness(${brightness}) drop-shadow(0 ${y}px ${drop}px rgba(109,71,230,${alpha}))`;
+    `blur(${blurPx}px) brightness(${brightness})${logoTint ? ` ${logoTint}` : ''} drop-shadow(0 ${y}px ${drop}px rgb(${accent} / ${alpha}))`;
   anim(
     logo,
     [
@@ -352,7 +352,7 @@ function buildPhaseA(root: HTMLElement): Animation[] {
     if (!el) return;
     el.style.width = `${size}px`;
     el.style.height = `${size}px`;
-    el.style.borderColor = 'rgba(109,71,230,.52)';
+    el.style.borderColor = `rgb(${accent} / .52)`;
     anim(
       el,
       [
@@ -768,11 +768,11 @@ export const LaunchAnimation: React.FC = () => {
       <div className="ttv-launch-orbit">
         <div className="ttv-launch-glow" />
         <div className="ttv-launch-guide" />
-        {FRAME_GRADIENTS.slice(0, FRAME_COUNT).map((gradient, index) => (
+        {Array.from({ length: FRAME_COUNT }, (_, index) => (
           <span
-            key={gradient}
+            key={index}
             className="ttv-launch-frame"
-            style={{ background: gradient }}
+            style={{ background: `var(--launch-frame-${index + 1})` }}
             data-frame={index}
           >
             <span className="ttv-launch-frame-title" />

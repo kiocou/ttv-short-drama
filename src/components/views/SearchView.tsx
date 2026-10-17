@@ -4,6 +4,7 @@ import { ipcService } from '../../services/ipc';
 import { CatalogFilter, SeriesItem } from '../../types/catalog';
 import { ArrowLeft, Loader2 } from 'lucide-react';
 import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
+import { SeriesCardSkeleton } from '../common/SeriesCardSkeleton';
 import { BackToTop } from '../common/BackToTop';
 import { FluentButton } from '../common/FluentButton';
 
@@ -12,6 +13,21 @@ type Channel = 'drama' | 'comic';
 /** 搜索默认频道：站点搜索接口不做频道过滤（实测所有结果都是 doc_type:23 的剧集），
  *  固定 drama 让 card 的 type 标记一致，避免两个频道搜出同一批结果的假象。 */
 const SEARCH_CHANNEL: Channel = 'drama';
+
+/**
+ * 两批结果按 id 合并，`base` 的顺序优先。
+ *
+ * 搜索是两条并行链（主结果 + App 联想），谁先回来由后端缓存与调度决定，不是
+ * 固定的先后。两者都只能**并入**已有列表，绝不能整体覆盖——覆盖会把屏幕上
+ * 已经画好的卡片换掉或重排（用户反馈："先出来几张，然后一批卡片突然把它们
+ * 顶掉"）。
+ */
+const mergeById = (base: SeriesItem[], extra: SeriesItem[]): SeriesItem[] => {
+  if (extra.length === 0) return base;
+  const seen = new Set(base.map(item => item.id));
+  const added = extra.filter(item => !seen.has(item.id));
+  return added.length > 0 ? [...base, ...added] : base;
+};
 
 /**
  * 搜索结果页。
@@ -64,6 +80,10 @@ export const SearchView: React.FC = () => {
   const requestIdRef = useRef(0);
   /** 首屏那一发的 filter：加载更多直接复用它翻页，在别处重建迟早漏字段。 */
   const filterRef = useRef<CatalogFilter | null>(null);
+  /** 本轮主结果（网页 + 动漫，含翻页）。null = 还没到。 */
+  const mainItemsRef = useRef<SeriesItem[] | null>(null);
+  /** 本轮 App 联想补充。它只补齐网页漏掉的分季条目，永远排在主结果之后。 */
+  const suggestItemsRef = useRef<SeriesItem[]>([]);
 
   /**
    * 换关键词（或清空）时把分页状态整体归零。
@@ -78,6 +98,9 @@ export const SearchView: React.FC = () => {
     setNextPage(2);
     setIsLoadingMore(false);
     setLoadMoreError(null);
+    // 本轮结果的合并基准一并归零：上一个词的主结果 / 联想不能混进新结果。
+    mainItemsRef.current = null;
+    suggestItemsRef.current = [];
   };
 
   useEffect(() => {
@@ -129,7 +152,8 @@ export const SearchView: React.FC = () => {
         .searchFast(filter)
         .then(page => {
           if (requestId !== requestIdRef.current) return;
-          setItems(page.items);
+          mainItemsRef.current = page.items;
+          setItems(mergeById(page.items, suggestItemsRef.current));
           setSourceNote(page.source ?? null);
           setDegraded(page.degraded === true);
           setHasMore(page.hasMore);
@@ -155,11 +179,10 @@ export const SearchView: React.FC = () => {
           if (!suggestions || requestId !== requestIdRef.current) return;
           // 联想按 id 去重后追加：它只是补齐网页漏掉的分季条目，
           // 不打断用户已经在看的首屏结果。
-          setItems(previous => {
-            const seen = new Set(previous.map(item => item.id));
-            const extra = suggestions.filter(item => !seen.has(item.id));
-            return extra.length > 0 ? [...previous, ...extra] : previous;
-          });
+          suggestItemsRef.current = suggestions;
+          // 主结果还没到就先不画：先画联想、等主结果到达再整体重排，
+          // 正是这次要修的那种跳动。
+          if (mainItemsRef.current) setItems(mergeById(mainItemsRef.current, suggestions));
         })
         .catch(() => {
           // 联想失败不影响已有结果。
@@ -187,11 +210,8 @@ export const SearchView: React.FC = () => {
       if (requestId !== requestIdRef.current) return;
       // 去重同样是必需的：后端 catalog_list 带关键词时也会合并 App 联想，
       // 联想是整批重复的，不滤掉每翻一页都会白长出同样几张卡片。
-      setItems(previous => {
-        const seen = new Set(previous.map(item => item.id));
-        const extra = result.items.filter(item => !seen.has(item.id));
-        return extra.length > 0 ? [...previous, ...extra] : previous;
-      });
+      mainItemsRef.current = mergeById(mainItemsRef.current ?? [], result.items);
+      setItems(mergeById(mainItemsRef.current, suggestItemsRef.current));
       setHasMore(result.hasMore);
       setTotal(result.total);
       setNextPage(page + 1);
@@ -275,8 +295,16 @@ export const SearchView: React.FC = () => {
               </div>
             )}
 
+            {/* 搜索中且还没有任何结果：骨架占住版面。首屏那一发要走整条来源链，
+                几秒内结果区整块空白的话，用户会以为搜索没触发。 */}
+            {!error && isLoading && items.length === 0 && (
+              <div className={SERIES_GRID_CLASS} aria-busy="true">
+                {Array.from({ length: 12 }).map((_, index) => <SeriesCardSkeleton key={index} />)}
+              </div>
+            )}
+
             {items.length > 0 && (
-              <div className={SERIES_GRID_CLASS}>
+              <div className={`${SERIES_GRID_CLASS} ttv-grid-in`}>
                 {items.map((series, index) => (
                   <SeriesCard
                     key={`${series.id}-${index}`}

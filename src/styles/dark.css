@@ -1,0 +1,326 @@
+/* ==========================================================================
+   TTV Short Drama · 暗色主题（黑红）
+   --------------------------------------------------------------------------
+   启用方式：<html data-theme="dark">，由 services/theme.ts 写入并记忆在
+   localStorage，设置页的「外观」卡片是唯一开关。
+
+   为什么走变量而不是给每个 className 补 dark: 变体：全站颜色类有 200+ 处，
+   逐个改既会漏、也会让以后新增的类默认掉回浅色。调色板已在 tailwind.config.js
+   里变量化，这里重定义一次就全站跟随（含 hover / ring / shadow / 渐变变体）。
+
+   white / black 不在变量表里，只按类名覆盖：它们同时被用作"浅色面板底"
+   （bg-white/80）和"深色区玻璃高光、遮罩"（播放器的 bg-white/15、
+   text-white/*、from-black/65）。这里只覆盖前一类，判定标准是**不透明度**：
+   >=40% 的白=面板，<=35% 的白=高光，一律不动。
+
+   选择器统一带 html[data-theme='dark'] 前缀（特异性 0,2,1+），因此不必关心
+   它与 tailwind utilities 的书写顺序——import 在 index.css 顶部也照样生效。
+   ========================================================================== */
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* 中性色：浅底↔深底、深字↔亮字整体对调。中间两档（300/400）刻意只微调，
+     它们同时被用在深底与浅底上，大幅移动哪一边都会踩另一边。
+     低端几档带一点红（R 略高于 G/B）：纯灰块夹在黑红底上会显脏，
+     像掉色的旧界面；这点偏色肉眼几乎看不出来，但整块灰不再是"死灰"。 */
+  --c-slate-50: 24 20 22;
+  --c-slate-100: 32 27 30;
+  --c-slate-200: 46 40 44;
+  --c-slate-300: 78 71 76;
+  --c-slate-400: 138 134 142;
+  --c-slate-500: 160 155 165;
+  --c-slate-600: 190 185 195;
+  --c-slate-700: 212 208 218;
+  --c-slate-800: 232 229 236;
+  --c-slate-900: 245 242 248;
+
+  /* 蓝＝全站强调色，暗色下整族转红（黑红配色的来源）。700 比 600 亮是有意的：
+     它专用于"浅底 chip 上的文字"，而暗色下那个底是深红。 */
+  --c-blue-50: 46 16 24;
+  --c-blue-100: 62 20 30;
+  --c-blue-200: 96 28 42;
+  --c-blue-300: 200 62 80;
+  --c-blue-400: 232 74 92;
+  --c-blue-500: 230 46 68;
+  --c-blue-600: 220 32 56;
+  --c-blue-700: 246 128 145;
+
+  /* 动漫专区紫：压暗底、提亮字，保留紫色语义。 */
+  --c-violet-50: 30 22 46;
+  --c-violet-100: 42 30 64;
+  --c-violet-200: 74 52 110;
+  --c-violet-300: 160 135 230;
+  --c-violet-400: 180 155 245;
+  --c-violet-500: 168 130 250;
+  --c-violet-600: 190 160 255;
+  --c-violet-700: 210 185 255;
+
+  /* 状态色：底一律压深、文字一律提亮——两头取值方向相反，别顺手抄一边。 */
+  --c-rose-50: 46 18 26;
+  --c-rose-100: 62 22 32;
+  --c-rose-200: 96 34 46;
+  --c-rose-400: 250 130 148;
+  --c-rose-500: 245 105 128;
+  --c-rose-600: 250 130 150;
+  --c-rose-700: 252 160 175;
+
+  --c-amber-50: 45 34 14;
+  --c-amber-200: 90 68 30;
+  --c-amber-300: 252 211 77;
+  --c-amber-400: 251 191 36;
+  --c-amber-500: 245 170 40;
+  --c-amber-600: 250 195 110;
+  --c-amber-700: 252 215 150;
+
+  --c-emerald-50: 16 38 30;
+  --c-emerald-200: 40 84 64;
+  --c-emerald-300: 110 231 183;
+  --c-emerald-400: 90 220 170;
+  --c-emerald-500: 70 205 155;
+  --c-emerald-600: 110 225 180;
+  --c-emerald-700: 140 235 200;
+
+  --c-purple-50: 34 24 50;
+  --c-purple-200: 76 54 112;
+  --c-purple-500: 180 140 255;
+  --c-purple-700: 210 180 255;
+
+  /* 红：窗口关闭键等本就该亮，只把 400 提一点以免在黑底上糊掉。 */
+  --c-red-400: 248 140 140;
+  --c-red-500: 240 90 90;
+  --c-red-600: 225 70 70;
+
+  --c-sky-300: 140 210 252;
+  --c-sky-400: 120 200 250;
+  --c-indigo-500: 150 145 250;
+  --c-orange-500: 250 165 85;
+
+  /* 播放器控制条的强调色（crystal.css 的 --fluent-blue / --fluent-sky）。
+     它们只在播放器内使用，跟着主题变红才不会有"界面红、进度条蓝"的割裂。 */
+  --fluent-blue: #e02a45;
+  --fluent-blue-hover: #c31e38;
+  --fluent-sky: #ff8296;
+
+  /* 启动动画的强调色（导轨 / 光晕 / 冲击环 / 品牌投影）与品牌图标的着色。
+     浅色主题是品牌紫（见 styles/launch.css 的 :root），这里换成黑红的那支红。
+     色相角是在 sRGB 上加 HueRotate 矩阵算出来的，白色像素不受影响。 */
+  --launch-accent-rgb: 224 42 69;
+  --launch-logo-tint: hue-rotate(106deg) saturate(1.35);
+
+  /* 启动动画那六张迷你卡的底色：浅色主题的彩色渐变（紫/蓝/橙/绿/粉/黄）
+     在黑红界面上像六块彩纸，整组压到红—酒红—暗橙这一段里，
+     只留明暗与色相的细微差别，"内容"的象征还在，颜色不再打架。 */
+  --launch-frame-1: linear-gradient(160deg, #7a1b2e, #3a0f18);
+  --launch-frame-2: linear-gradient(160deg, #5c1420, #260b10);
+  --launch-frame-3: linear-gradient(160deg, #a13324, #3c1410);
+  --launch-frame-4: linear-gradient(160deg, #43111b, #1b090d);
+  --launch-frame-5: linear-gradient(160deg, #8c1c3c, #330f1a);
+  --launch-frame-6: linear-gradient(160deg, #b83a2c, #3f1612);
+
+  /* 底衬只管这一处，body / .mica-backdrop / .ttv-launch 共用同一个值。
+     启动动画撤层那一帧必须与真实界面同底（见 launch.css 的约定 2），
+     所以三者只能引用同一个变量，不许各写一份渐变。 */
+  --theme-backdrop:
+    radial-gradient(900px 680px at 4% 0%, rgba(132, 26, 46, 0.34) 0%, transparent 58%),
+    radial-gradient(760px 560px at 58% 108%, rgba(64, 14, 26, 0.30) 0%, transparent 62%),
+    linear-gradient(180deg, #101014 0%, #08080b 100%);
+}
+
+html[data-theme='dark'],
+html[data-theme='dark'] body,
+html[data-theme='dark'] .mica-backdrop,
+html[data-theme='dark'] .ttv-launch {
+  background: var(--theme-backdrop);
+}
+
+html[data-theme='dark'] body {
+  color: #eef1f6;
+}
+
+/* --------------------------------------------------------------------------
+   白色面板 / 白色边框 / 黑色细线
+   -------------------------------------------------------------------------- */
+
+/* 高不透明度白＝面板底（卡片、顶栏、侧栏、浮层）。 */
+html[data-theme='dark'] :is(.bg-white, .bg-white\/75, .bg-white\/80, .bg-white\/85, .bg-white\/88, .bg-white\/90, .bg-white\/95) {
+  background-color: rgba(31, 26, 29, 0.88);
+}
+
+/* 主内容画板：与侧栏同一套浮层（圆角 + 细边 + 微投影），但比侧栏更透，
+   让背后的红色底衬透出来——这是"底 → 画板 → 卡片"三级里的中间层。
+   旧版是 rgba(16,16,19,.55) 的纯黑罩，把底衬盖死，于是主区像一块
+   独立窗口，与侧栏割裂。 */
+html[data-theme='dark'] .bg-white\/50 {
+  background-color: rgba(16, 12, 15, 0.20);
+}
+
+/* 其余低不透明度白＝局部底衬（说明块、小胶囊），比面板更透。 */
+html[data-theme='dark'] :is(.bg-white\/40, .bg-white\/70) {
+  background-color: rgba(20, 20, 25, 0.55);
+}
+
+/* 悬停**不再提亮**：分段选项卡、工具按钮上那块白斑在黑红界面里最扎眼。
+   拆两条写——纯 hover 类的元素本来没有底色，静默到透明；基础白底的元素
+   静默回自己的面板色。两者视觉上都等于"没变化"，但卡片仍靠位移 / 阴影
+   给反馈（MicaCard 的 hover:-translate-y-1.5 之类），不会失去可交互感。 */
+html[data-theme='dark'] :is(.hover\:bg-white, .hover\:bg-white\/50, .hover\:bg-white\/60, .hover\:bg-white\/80, .hover\:bg-white\/95):hover {
+  background-color: transparent;
+}
+
+html[data-theme='dark'] :is(.bg-white, .bg-white\/75, .bg-white\/80, .bg-white\/85, .bg-white\/88, .bg-white\/90, .bg-white\/95):hover {
+  background-color: rgba(31, 26, 29, 0.88);
+}
+
+/* 浮层投影：浅色主题的黑投影在黑底上等于没有，换成更深的一层，
+   否则侧栏与主画板会"贴"在背景上，看不出是浮起来的。 */
+html[data-theme='dark'] .ttv-workspace-panel,
+html[data-theme='dark'] aside {
+  box-shadow:
+    0 18px 44px -10px rgba(0, 0, 0, 0.72),
+    0 4px 14px -3px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+html[data-theme='dark'] :is(.border-white, .border-white\/80, .border-white\/90, .border-white\/95) {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* .ttv-workspace-panel 的描边写在手写 CSS 里，类名不含 border-white，
+   上面的工具类覆盖够不到它；主画板与侧栏的边线必须同为 10%。 */
+html[data-theme='dark'] .ttv-workspace-panel {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+html[data-theme='dark'] :is(.hover\:border-white, .border-white\/80):hover {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* 分隔用的极淡黑线（border-black/[0.04] 一族）在黑底上要反过来才看得见。 */
+html[data-theme='dark'] [class*="border-black/"] {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+/* 侧栏 / 标题栏的 hover:bg-black/[0.03|0.04] **刻意不做覆盖**：黑底上再叠黑
+   本来就看不见，而反向提亮成白 7% 正是"悬停会白一块"的来源。 */
+/* 卡片底 → 面板色的渐变（发现页"随便看看"、随机看卡片）：via/to 的白要变深。 */
+html[data-theme='dark'] :is(.via-white\/92, .via-white\/95) {
+  --tw-gradient-stops: var(--tw-gradient-from), rgb(27 27 32 / 0.92) var(--tw-gradient-via-position), var(--tw-gradient-to);
+}
+
+html[data-theme='dark'] .to-white\/88 {
+  --tw-gradient-to: rgb(27 27 32 / 0.88) var(--tw-gradient-to-position);
+}
+
+/* --------------------------------------------------------------------------
+   手写 CSS 表面（mica.css / index.css 的硬编码色）
+   -------------------------------------------------------------------------- */
+
+/* 品牌图标是紫底白三角的 PNG，暗色下把底色转到黑红。用色相旋转而不是换一张
+   图：滤镜矩阵每行和为 1，白色像素原样保留，播放三角不会被染。启动动画里
+   那张（.ttv-launch-logo）不走这条规则 —— 它的 filter 由 WAAPI 接管，
+   在 LaunchAnimation.tsx 里按同一个变量拼进关键帧。 */
+html[data-theme='dark'] img[src$="app-icon.png"]:not(.ttv-launch-logo) {
+  filter: var(--launch-logo-tint);
+}
+
+/* 骨架屏：底色 + 高光 + 凹槽三件套都要压暗，否则滚动加载时整片闪白。 */
+html[data-theme='dark'] .shimmer-loading {
+  background-color: #23232a;
+  box-shadow:
+    inset 0 2px 4px rgba(0, 0, 0, 0.5),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+html[data-theme='dark'] .shimmer-loading::after {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 35%,
+    rgba(255, 255, 255, 0.1) 50%,
+    rgba(255, 255, 255, 0) 65%
+  );
+}
+
+html[data-theme='dark'] ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+html[data-theme='dark'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* 分段选项 / 凸起瓦片。带 !important 的类必须同样用 !important 覆盖。 */
+html[data-theme='dark'] .fluent-convex-tab {
+  background: linear-gradient(180deg, #2b2b33 0%, #212128 100%) !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+  border-top-color: rgba(255, 255, 255, 0.18) !important;
+  box-shadow:
+    0 2px 5px -1px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.08) !important;
+}
+
+html[data-theme='dark'] .fluent-convex-tab:hover {
+  background: linear-gradient(180deg, #33333c 0%, #26262e 100%) !important;
+  box-shadow:
+    0 3px 8px -1px rgba(0, 0, 0, 0.6),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.1) !important;
+}
+
+html[data-theme='dark'] .fluent-raised-tile {
+  background: linear-gradient(180deg, #26262d 0%, #1e1e24 100%);
+  border-color: rgba(255, 255, 255, 0.1);
+  border-top-color: rgba(255, 255, 255, 0.16);
+  box-shadow:
+    0 3px 8px -2px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme='dark'] .fluent-raised-tile:hover {
+  border-color: rgba(232, 74, 92, 0.5);
+  box-shadow:
+    0 6px 16px -3px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.1);
+}
+
+html[data-theme='dark'] .fluent-raised-island {
+  background: rgba(26, 26, 31, 0.85);
+  border-color: rgba(255, 255, 255, 0.1);
+  border-top-color: rgba(255, 255, 255, 0.14);
+  box-shadow:
+    0 12px 36px -4px rgba(0, 0, 0, 0.6),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+/* 主操作按钮 / 悬停播放圆盘：浅色主题是蓝，暗色主题转红（黑红配色的落点）。 */
+html[data-theme='dark'] .fluent-raised-primary {
+  background: linear-gradient(180deg, #e2374f 0%, #c31f38 100%) !important;
+  border-color: #a81a30 !important;
+  border-top-color: rgba(255, 255, 255, 0.42) !important;
+  box-shadow:
+    0 4px 12px -2px rgba(224, 36, 64, 0.42),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.4),
+    inset 0 -1px 1px 0 rgba(0, 0, 0, 0.25) !important;
+}
+
+html[data-theme='dark'] .fluent-raised-primary:hover {
+  background: linear-gradient(180deg, #ee4a61 0%, #d32742 100%) !important;
+}
+
+html[data-theme='dark'] .fluent-convex-disc {
+  background: linear-gradient(180deg, #e2374f 0%, #c01d35 100%) !important;
+  box-shadow:
+    0 4px 14px 0 rgba(224, 36, 64, 0.45),
+    inset 0 1.5px 1.5px 0 rgba(255, 255, 255, 0.5),
+    inset 0 -1.5px 2px 0 rgba(0, 0, 0, 0.25) !important;
+}
+
+html[data-theme='dark'] .fluent-convex-disc:hover {
+  background: linear-gradient(180deg, #ee4a61 0%, #cf2540 100%) !important;
+}
+
+/* 全站焦点环（index.css）跟着变红。 */
+html[data-theme='dark'] button:focus-visible,
+html[data-theme='dark'] [role="button"]:focus-visible {
+  outline-color: rgba(224, 42, 69, 0.85);
+}

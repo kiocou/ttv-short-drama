@@ -4,6 +4,8 @@ import { useAppStore } from '../../stores/useAppStore';
 import { enterFullscreen, leaveFullscreen } from '../../services/windowFx';
 import { isTauriEnvironment } from '../../services/ipc';
 import { PlayerHud } from './PlayerHud';
+import { useBoostKeys } from './useBoostKeys';
+import { BoostToast } from './BoostToast';
 import { Loader2, AlertCircle, AlertTriangle, RefreshCw, SkipForward, Copy, X, Layers } from 'lucide-react';
 
 /**
@@ -129,6 +131,32 @@ export const AnimeVideoSurface: React.FC = () => {
   }, [isPlaying, handleUserActivity]);
 
   /**
+   * 长按 ← / → 临时加速，加速中 ↑ / ↓ 换档 —— 与短剧播放器**同一份**键位。
+   *
+   * 动漫此前压根没接这套键位（← / → 只有跳转），同一款控制条在短剧里能长按加速、
+   * 到这里就没反应，是用户直接报上来的不一致。
+   *
+   * 本组件只在播放时挂载，所以不用像短剧那样按 currentView 判断前台。
+   */
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  // 合并两个 ref：store 的 bindVideo 要拿到元素挂媒体监听，这里自己要读它写倍速。
+  // 用 useCallback 固定身份——内联箭头每次渲染都会让 React 先解绑再重绑。
+  const setVideoRef = useCallback((element: HTMLVideoElement | null) => {
+    videoRef.current = element;
+    bindVideo(element);
+  }, [bindVideo]);
+
+  const boost = useBoostKeys({
+    enabled: true,
+    isLocked,
+    getVideo: () => videoRef.current,
+    getBaseRate: () => playbackRate,
+    seekRelative,
+    stepVolume: (delta) => setVolume(Math.min(1, Math.max(0, volume + delta))),
+    onUserActivity: handleUserActivity,
+  });
+
+  /**
    * 指针位移过滤：播放时进度条读数会持续重绘，Chromium 会派发合成 mousemove，
    * 不去重的话控制条永远收不起来（短剧那边踩过同一个坑）。
    */
@@ -238,22 +266,6 @@ export const AnimeVideoSurface: React.FC = () => {
           event.preventDefault();
           togglePlay();
           break;
-        case 'ArrowLeft':
-          event.preventDefault();
-          seekRelative(-5);
-          break;
-        case 'ArrowRight':
-          event.preventDefault();
-          seekRelative(5);
-          break;
-        case 'ArrowUp':
-          event.preventDefault();
-          setVolume(Math.min(1, volume + 0.1));
-          break;
-        case 'ArrowDown':
-          event.preventDefault();
-          setVolume(Math.max(0, volume - 0.1));
-          break;
         case 'KeyF':
           event.preventDefault();
           void toggleFullscreen();
@@ -354,11 +366,21 @@ export const AnimeVideoSurface: React.FC = () => {
         动漫播放器按需挂载/销毁，所以这里刷新页面不会留下"上次那集的残留状态"。
       */}
       <video
-        ref={bindVideo}
+        ref={setVideoRef}
         className="w-full h-full object-contain cursor-pointer"
         onClick={handleSurfaceClick}
         playsInline
       />
+
+      {/*
+        长按加速提示（与短剧同一形态）。位置比短剧低一行：上面 top-6 那一格
+        已经给了"已进入全屏"提示，两者可能同时出现（进全屏后立刻按住方向键）。
+      */}
+      {boost && (
+        <div className="absolute top-16 inset-x-0 z-50 pointer-events-none flex justify-center">
+          <BoostToast level={boost.level} direction={boost.direction} />
+        </div>
+      )}
 
       {/* 全屏退出提示：纯原生全屏没有浏览器自带的提示条，短暂告知 Esc 可用。 */}
       {isFullscreen && showFsHint && (
@@ -461,6 +483,7 @@ export const AnimeVideoSurface: React.FC = () => {
         volume={volume}
         isMuted={muted}
         playbackRate={playbackRate}
+        effectivePlaybackRate={boost?.rate ?? null}
         currentQuality={quality}
         qualityOptions={qualities}
         onToggleLock={() => setIsLocked(value => !value)}

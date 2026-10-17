@@ -4,6 +4,7 @@ import { ipcService } from '../../services/ipc';
 import type { SeriesItem } from '../../types/catalog';
 import { Clapperboard, RefreshCw, Tv, ChevronDown, ChevronUp } from 'lucide-react';
 import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
+import { SeriesCardSkeleton } from '../common/SeriesCardSkeleton';
 import { BackToTop } from '../common/BackToTop';
 
 const PAGE_SIZE = 30;
@@ -216,13 +217,7 @@ export const AnimeView: React.FC = () => {
 
         {isLoading && items.length === 0 ? (
           <div className={SERIES_GRID_CLASS}>
-            {Array.from({ length: 12 }).map((_, i) => (
-              <div key={i} className="flex flex-col gap-2">
-                <div className="w-full aspect-[3/4] rounded-2xl shimmer-loading shadow-xs" />
-                <div className="h-4 w-3/4 rounded shimmer-loading" />
-                <div className="h-3.5 w-1/2 rounded shimmer-loading" />
-              </div>
-            ))}
+            {Array.from({ length: 12 }).map((_, i) => <SeriesCardSkeleton key={i} />)}
           </div>
         ) : error && items.length === 0 ? (
           <div className="py-20 flex flex-col items-center justify-center text-center gap-3">
@@ -235,7 +230,7 @@ export const AnimeView: React.FC = () => {
             <p className="text-xs text-slate-400">尝试切换其他分类</p>
           </div>
         ) : (
-          <div className={SERIES_GRID_CLASS}>
+          <div className={`${SERIES_GRID_CLASS} ttv-grid-in`}>
             {items.map((series, index) => (
               <SeriesCard
                 key={`${series.id}-${index}`}

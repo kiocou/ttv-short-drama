@@ -1,44 +1,78 @@
 /**
- * 「按住方向键临时加速」的状态机。
+ * 「按住方向键临时加速」的状态机 + 加速档位。
  *
  * 为什么单独抽一个文件：这件事**没法靠肉眼验证**。阈值、松手的归属
- * （这一次按下算加速还是算快退/快进）、恢复目标三件事叠在一起，只把时间与媒体
- * 元素都做成可注入的依赖，才能写出一组确定性的用例（`scripts/verify-boost.mjs`，
+ * （这一次按下算加速还是算快退/快进）、档位与恢复目标三件事叠在一起，只把时间与
+ * 媒体元素都做成可注入的依赖，才能写出一组确定性的用例（`scripts/verify-boost.mjs`，
  * 假时钟 + 假 video，不依赖真实定时器）。
  *
- * 语义约定（四条互相牵制，改任意一条都必须重跑那组用例）：
+ * 语义约定（五条互相牵制，改任意一条都必须重跑那组用例）：
  *   1. 按住达到 `holdMs` 且**当时确实在播**才进入加速；不到阈值就松手 = 一次普通快退/快进。
  *   2. 加速一旦生效，本次按下就**只属于加速**：松手只恢复倍速，不再跳转。
  *      否则用户会先看到画面加速播一段，松手瞬间又被弹到 ±5 秒处。
- *   3. 加速速率是**固定的 `BOOST_RATE`（2x）**，与用户当前所选档位无关。
- *      曾经的实现是「所选档位 × 3、上限 4x」，那是错的：用户在 0.5x 档只是想慢看，
- *      长按却把他送到 1.5x；在 2x 档长按又只多出 2 倍，同一手势在不同档位下
- *      效果差好几倍，完全不可预期。固定值才是「临时快进一下」该有的手感。
- *   3b. 但基准速率**已经达到或超过 `BOOST_RATE` 时不做任何事**。
- *      控制栏里有 3x 档，而长按只到 2x —— 不加这条，3x 用户长按会"加速"到 2x，
- *      也就是**减速**，而且画面还会弹一个「2x 加速播放」的提示，非常荒谬。
- *      「加速」这个手势的语义是"比现在更快"，达到上限就当它无效。
- *   4. 恢复目标永远是**用户设定的基准倍速**，不是 1。写死 1 会让倍速设定被悄悄改掉。
+ *   3. 每次长按都从 `DEFAULT_BOOST_LEVEL`（智能）起步，加速期间可用 ↑ / ↓ 换档。
+ *      不记住上一次的档位是有意的：长按是"临时快一下"，起点固定才可预期。
+ *   4. 实际速率取「档位速率」与「基准倍速」中的**较大者**。基准已经是 3x 时，
+ *      切到 1.5x 档不该把画面**降**速——"加速"这个手势的语义是"比现在更快"。
+ *   5. 恢复目标永远是**用户设定的基准倍速**，不是 1。写死 1 会让倍速设定被悄悄改掉。
  *
  * 暂停中长按不加速（没有意义），但松手仍算一次快退/快进——用户是在找位置。
  */
 
-/**
- * 长按方向键时的临时速率。
- *
- * **唯一来源**：VideoSurface（执行加速）与 PlayerHud（菜单里那行提示）都从这里 import。
- * 两边各写一个常量迟早会漂移——上一版就是各写了一份「倍数 3 / 上限 4」，
- * 改动时很容易只改一处，而症状是「菜单说 3x、实际加速到 4x」这种没人会去核对的不一致。
- */
-export const BOOST_RATE = 2;
-
 /** 长按判定阈值（毫秒）。低于它的按下仍是一次普通快退/快进。 */
 export const BOOST_HOLD_MS = 350;
+
+/**
+ * 加速档位。**数组顺序就是滚轮顺序**，且首档是每次长按的起点。
+ *
+ * 顺序不是随手排的：提示条的上/下邻居由它决定（智能的上方是 3x、下方是 1.5x，
+ * 与红果 App 的滚轮一致）。改顺序会直接改变用户看到的手感，不是纯展示细节。
+ */
+export const BOOST_LEVELS = ['smart', 1.5, 2, 3] as const;
+export type BoostLevel = (typeof BOOST_LEVELS)[number];
+
+/** 长按的起点档位。 */
+export const DEFAULT_BOOST_LEVEL: BoostLevel = 'smart';
+
+/**
+ * 智能档的速率：按**这一集的时长**选，短片更快。
+ *
+ * 短剧单集普遍 1-3 分钟，用 3x 刷完才是用户长按的意图；而长片（纪录片式的
+ * 动漫合集）给 3x 会直接跳过内容，所以随时长降档。
+ *
+ * 时长不可知（元数据没到、直播流）时给 2x：宁可保守，也不要在用户还没看到
+ * 时长时就替他做一个激进的假设。
+ */
+export function smartBoostRate(durationSec: number): number {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) return 2;
+  if (durationSec <= 10 * 60) return 3;
+  if (durationSec <= 30 * 60) return 2;
+  return 1.5;
+}
+
+/** 档位对应的速率。 */
+export function levelRate(level: BoostLevel, durationSec: number): number {
+  return level === 'smart' ? smartBoostRate(durationSec) : level;
+}
+
+/** 档位在 UI 上的名字（`3X` 这种大写是跟着提示条的形态定的）。 */
+export function levelLabel(level: BoostLevel): string {
+  return level === 'smart' ? '智能' : `${level}X`;
+}
+
+/** 按 step 在档位表里循环（-1 上一档、+1 下一档）。 */
+export function cycleBoostLevel(level: BoostLevel, step: number): BoostLevel {
+  const length = BOOST_LEVELS.length;
+  const index = BOOST_LEVELS.indexOf(level);
+  return BOOST_LEVELS[(((index + step) % length) + length) % length];
+}
 
 /** 只用到这两个成员，收窄接口以便测试注入假元素。 */
 export interface BoostTarget {
   paused: boolean;
   playbackRate: number;
+  /** 智能档要按时长选速率；元数据未就绪时是 NaN。 */
+  duration?: number;
 }
 
 export interface BoostControllerOptions {
@@ -53,14 +87,15 @@ export interface BoostControllerOptions {
   getBaseRate: () => number;
   /** 长按判定阈值（毫秒）。 */
   holdMs?: number;
-  /** 长按期间的固定速率。默认取本模块的 `BOOST_RATE`。 */
-  rate?: number;
+  /** 长按的起点档位。默认 `DEFAULT_BOOST_LEVEL`。 */
+  defaultLevel?: BoostLevel;
   /**
-   * 加速状态变化回调（进入 / 退出各一次），供 UI 显示与隐藏加速提示。
+   * 加速状态或档位变化回调（进入 / 换档 / 退出各一次），供 UI 显示。
    *
-   * 带上 `rate` 是因为提示要显示实际生效的速率；让调用方自己再算一遍迟早会不一致。
+   * 带上 `rate` 是因为提示条要显示**真实生效的速率**（含"不低于基准"的修正）；
+   * 让调用方自己再算一遍迟早会不一致。
    */
-  onChange?: (boosting: boolean, rate: number) => void;
+  onChange?: (boosting: boolean, rate: number, level: BoostLevel) => void;
   /** 定时器注入点（测试用假时钟）。 */
   setTimer?: (handler: () => void, ms: number) => number;
   clearTimer?: (id: number) => void;
@@ -75,16 +110,35 @@ export interface BoostController {
   cancel: () => void;
   /** 当前是否处于临时加速（供 UI 或日志使用）。 */
   isBoosting: () => boolean;
+  /** 加速期间切换档位（↑ 传 -1、↓ 传 +1）。未加速时无操作。 */
+  cycleLevel: (step: number) => void;
+  /** 当前档位。 */
+  getLevel: () => BoostLevel;
 }
 
 export function createBoostController(options: BoostControllerOptions): BoostController {
   const holdMs = options.holdMs ?? BOOST_HOLD_MS;
-  const rate = options.rate ?? BOOST_RATE;
+  const defaultLevel = options.defaultLevel ?? DEFAULT_BOOST_LEVEL;
   const setTimer = options.setTimer ?? ((handler, ms) => setTimeout(handler, ms) as unknown as number);
   const clearTimer = options.clearTimer ?? (id => clearTimeout(id));
 
   let timer: number | null = null;
   let boosting = false;
+  let level: BoostLevel = defaultLevel;
+
+  /**
+   * 把当前档位写进媒体元素，返回真实生效的速率。
+   *
+   * 取 max 而不是直接用档位值：基准已经比档位快时（3x 基准 + 1.5x 档），
+   * 按档位值写会把画面**降**速。见文件头第 4 条。
+   */
+  const apply = (): number => {
+    const video = options.getVideo();
+    const base = options.getBaseRate();
+    const target = Math.max(levelRate(level, video?.duration ?? 0), base);
+    if (video) video.playbackRate = target;
+    return target;
+  };
 
   const cancel = () => {
     if (timer !== null) {
@@ -95,7 +149,7 @@ export function createBoostController(options: BoostControllerOptions): BoostCon
       boosting = false;
       const video = options.getVideo();
       if (video) video.playbackRate = options.getBaseRate();
-      options.onChange?.(false, options.getBaseRate());
+      options.onChange?.(false, options.getBaseRate(), level);
     }
   };
 
@@ -108,11 +162,9 @@ export function createBoostController(options: BoostControllerOptions): BoostCon
         const video = options.getVideo();
         // 只在真正播放中加速。暂停时长按没有意义，还容易误触。
         if (!video || video.paused) return;
-        // 基准已达上限（3x 档）：长按不该把它**降**到 2x。见文件头 3b。
-        if (options.getBaseRate() >= rate) return;
         boosting = true;
-        video.playbackRate = rate;
-        options.onChange?.(true, rate);
+        level = defaultLevel;
+        options.onChange?.(true, apply(), level);
       }, holdMs);
     },
     release() {
@@ -123,5 +175,11 @@ export function createBoostController(options: BoostControllerOptions): BoostCon
     },
     cancel,
     isBoosting: () => boosting,
+    cycleLevel(step) {
+      if (!boosting) return;
+      level = cycleBoostLevel(level, step);
+      options.onChange?.(true, apply(), level);
+    },
+    getLevel: () => level,
   };
 }

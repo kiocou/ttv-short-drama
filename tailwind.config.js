@@ -1,4 +1,68 @@
 /** @type {import('tailwindcss').Config} */
+
+/*
+  调色板变量化。
+
+  每个色阶编译成 `rgb(var(--c-<族>-<阶>, <Tailwind 默认值>) / <alpha-value>)`：
+    - 第二个参数是回退值，浅色主题不定义任何变量，产物与变量化之前完全同色；
+    - 暗色主题（src/styles/dark.css）只重定义这批变量一次，全站 200+ 处颜色类
+      （含 hover:、ring-、shadow-、from-/via-/to- 变体）一起跟随，不必给每个
+      className 补 dark: 变体——那种改法既容易漏，也会让以后新增的类默认掉回浅色。
+
+  white / black 刻意**不**变量化：它们同时承担"浅色面板底"（bg-white/80）与
+  "深色区玻璃高光 / 遮罩"（播放器的 bg-white/15、text-white/*、from-black/65）
+  两种相反语义，反转任一种都会毁掉另一种。这两类在 dark.css 里按类名单独覆盖。
+*/
+const hexToRgb = (hex) => {
+  const n = parseInt(hex.slice(1), 16);
+  return `${(n >> 16) & 255} ${(n >> 8) & 255} ${n & 255}`;
+};
+
+/** 只列项目里真正用到的色阶：多一个就多一个要维护的暗色映射。 */
+const PALETTE = {
+  slate: {
+    50: '#f8fafc', 100: '#f1f5f9', 200: '#e2e8f0', 300: '#cbd5e1', 400: '#94a3b8',
+    500: '#64748b', 600: '#475569', 700: '#334155', 800: '#1e293b', 900: '#0f172a',
+  },
+  blue: {
+    50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe', 300: '#93c5fd',
+    400: '#60a5fa', 500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8',
+  },
+  violet: {
+    50: '#f5f3ff', 100: '#ede9fe', 200: '#ddd6fe', 300: '#c4b5fd',
+    400: '#a78bfa', 500: '#8b5cf6', 600: '#7c3aed', 700: '#6d28d9',
+  },
+  rose: {
+    50: '#fff1f2', 100: '#ffe4e6', 200: '#fecdd3',
+    400: '#fb7185', 500: '#f43f5e', 600: '#e11d48', 700: '#be123c',
+  },
+  amber: {
+    50: '#fffbeb', 200: '#fde68a', 300: '#fcd34d', 400: '#fbbf24',
+    500: '#f59e0b', 600: '#d97706', 700: '#b45309',
+  },
+  emerald: {
+    50: '#ecfdf5', 200: '#a7f3d0', 300: '#6ee7b7',
+    400: '#34d399', 500: '#10b981', 600: '#059669', 700: '#047857',
+  },
+  purple: { 50: '#faf5ff', 200: '#e9d5ff', 500: '#a855f7', 700: '#7e22ce' },
+  red: { 400: '#f87171', 500: '#ef4444', 600: '#dc2626' },
+  sky: { 300: '#7dd3fc', 400: '#38bdf8' },
+  indigo: { 500: '#6366f1' },
+  orange: { 500: '#f97316' },
+};
+
+const themedPalette = Object.fromEntries(
+  Object.entries(PALETTE).map(([family, steps]) => [
+    family,
+    Object.fromEntries(
+      Object.entries(steps).map(([step, hex]) => [
+        step,
+        `rgb(var(--c-${family}-${step}, ${hexToRgb(hex)}) / <alpha-value>)`,
+      ]),
+    ),
+  ]),
+);
+
 export default {
   content: [
     "./index.html",
@@ -7,6 +71,7 @@ export default {
   theme: {
     extend: {
       colors: {
+        ...themedPalette,
         mica: {
           light: '#f8fafc',
           card: 'rgba(255, 255, 255, 0.85)',
@@ -65,6 +130,9 @@ export default {
         'fluent-scale-in': 'fluentScaleIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards',
         'fluent-pop': 'fluentPop 0.22s cubic-bezier(0.34, 1.56, 0.64, 1) forwards',
         'fluent-slide-down': 'fluentSlideDown 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards',
+        // 侧栏导航图标被选中那一下的弹跳。**只动 transform，不碰 opacity**：
+        // 与上面几条同源——view 层是常驻 DOM，占位/透明类关键帧会留下永久残留。
+        'nav-icon-pop': 'navIconPop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1)',
       },
       keyframes: {
         fadeIn: {
@@ -109,6 +177,11 @@ export default {
         fluentSlideDown: {
           '0%': { opacity: '0', transform: 'translateY(-10px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        navIconPop: {
+          '0%': { transform: 'scale(0.72) rotate(-12deg)' },
+          '55%': { transform: 'scale(1.18) rotate(4deg)' },
+          '100%': { transform: 'scale(1) rotate(0deg)' },
         },
       }
     },

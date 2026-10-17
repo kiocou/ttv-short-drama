@@ -9,6 +9,7 @@ import {
   Trash2
 } from 'lucide-react';
 import { useAppStore } from '../../stores/useAppStore';
+import { VersionBadge } from './VersionBadge';
 import { ipcService, isTauriEnvironment } from '../../services/ipc';
 import type { ChannelType, SeriesItem } from '../../types/catalog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -331,9 +332,7 @@ export const TitleBar: React.FC = () => {
             <span className="font-bold text-xs tracking-tight text-slate-800 font-sans group-hover:text-blue-600 transition-colors">
               TTV 短剧
             </span>
-            <span className="text-[9px] font-bold text-blue-600 bg-blue-50/90 px-1.5 py-0.5 rounded-md border border-blue-200/60 shadow-2xs">
-              Mica
-            </span>
+            <VersionBadge />
           </div>
         </div>
       </div>

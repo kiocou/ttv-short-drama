@@ -144,7 +144,9 @@ export const DetailView: React.FC = () => {
   if (!detail) {
     return (
       <div className="flex-1 h-full overflow-hidden select-none pb-12" aria-busy="true">
-        <div className="max-w-6xl mx-auto px-6 sm:px-8 pt-5 flex flex-col gap-6 animate-pulse">
+        {/* 占位块统一用 .shimmer-loading（扫光 + 凹槽），与列表骨架同一套材质；
+            原先的 animate-pulse 是整体呼吸，和别的页面对不上。 */}
+        <div className="max-w-6xl mx-auto px-6 sm:px-8 pt-5 flex flex-col gap-6">
           <div className="flex items-center justify-between">
             <button
               onClick={goBack}
@@ -154,21 +156,21 @@ export const DetailView: React.FC = () => {
               <ArrowLeft className="w-4 h-4" />
               <span>返回发现</span>
             </button>
-            <div className="h-3 w-40 rounded-full bg-slate-200/80" />
+            <div className="h-3 w-40 rounded-full shimmer-loading" />
           </div>
           <div className="flex flex-col md:flex-row gap-7 items-start">
-            <div className="w-44 sm:w-52 aspect-[3/4] rounded-2xl bg-slate-200/80 flex-shrink-0" />
+            <div className="w-44 sm:w-52 aspect-[3/4] rounded-2xl shimmer-loading flex-shrink-0" />
             <div className="flex-1 flex flex-col gap-3 pt-0.5">
-              <div className="h-3 w-24 rounded-full bg-slate-200/80" />
-              <div className="h-7 w-64 rounded-xl bg-slate-200/80" />
-              <div className="h-3 w-full max-w-lg rounded-full bg-slate-200/60" />
-              <div className="h-3 w-4/5 max-w-md rounded-full bg-slate-200/60" />
-              <div className="h-11 w-40 rounded-xl bg-slate-200/80 mt-2" />
+              <div className="h-3 w-24 rounded-full shimmer-loading" />
+              <div className="h-7 w-64 rounded-xl shimmer-loading" />
+              <div className="h-3 w-full max-w-lg rounded-full shimmer-loading" />
+              <div className="h-3 w-4/5 max-w-md rounded-full shimmer-loading" />
+              <div className="h-11 w-40 rounded-xl shimmer-loading mt-2" />
             </div>
           </div>
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2.5">
             {Array.from({ length: 12 }).map((_, index) => (
-              <div key={index} className="h-9 rounded-lg bg-slate-200/70" />
+              <div key={index} className="h-9 rounded-lg shimmer-loading" />
             ))}
           </div>
         </div>

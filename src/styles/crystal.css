@@ -267,27 +267,107 @@
 
   刻意**不用 backdrop-filter**：本舞台内所有背景模糊都会把视频拉进合成器，
   直接让 RTX VSR 失效（见本文件第 2 节的长注释）。这里用纯色底。
+
+  外形是一块圆角卡片，右侧的滚轮故意比卡片高 4px：上下邻居档会被卡片边缘裁掉
+  一点点，"露出半行"正是滚轮该有的层次，否则三个档位看起来只是三行文字。
 */
 .ttv-boost-toast {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.72);
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  height: 46px;
+  /* 右边只留 8px：滚轮自带"上下邻居的半行"，贴边才不像被切掉 */
+  padding: 0 8px 0 16px;
+  border-radius: 13px;
+  background: rgba(0, 0, 0, 0.78);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
   color: #fff;
-  font-size: 12.5px;
-  font-weight: 600;
+  font-size: 13.5px;
+  font-weight: 700;
   letter-spacing: 0.2px;
+  overflow: hidden;
   animation: ttv-boost-in 0.14s ease-out;
+  /* 淡下去要慢（提示条已经没用了，别忽然闪一下）；点亮要快，见 :not(.is-dimmed) */
+  transition: opacity 0.9s ease;
 }
 
-.ttv-boost-toast-hint {
-  font-weight: 500;
+/* 长按满 5 秒后自己淡下去；换档会重新点亮并重新计时（见 BoostToast） */
+.ttv-boost-toast.is-dimmed {
+  opacity: 0.3;
+}
+
+/* 不在变淡状态 = 正在（重新）点亮，用短过渡才叫"立马" */
+.ttv-boost-toast:not(.is-dimmed) {
+  transition-duration: 0.12s;
+}
+
+.ttv-boost-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  margin-right: 9px;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+/*
+  档位滚轮：当前档居中，上下各露一个相邻档（暗、小），换档时整列一起滚。
+  只显示当前值的话，用户按 ↑ / ↓ 时看不出一共几档、也不知道按到第几个了。
+*/
+.ttv-boost-wheel {
+  width: 54px;
+  /* 比卡片内容高 4px：上下各被裁 2px，邻居档几乎完整、只贴边 */
+  height: 50px;
+  margin-left: 12px;
+  overflow: hidden;
+}
+
+.ttv-boost-wheel-track {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 50px;
+  /* 邻居档中心到当前档中心的距离 = 24/2 + 13/2，滚动位移就是它 */
+  --roll-step: 18.5px;
+}
+
+.ttv-boost-wheel-row {
+  height: 13px;
+  line-height: 13px;
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.6);
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.42);
+  font-variant-numeric: tabular-nums;
+}
+
+.ttv-boost-wheel-row.is-current {
+  height: 24px;
+  line-height: 24px;
+  font-size: 15.5px;
+  font-weight: 700;
+  color: #fff;
+}
+
+/*
+  整列一起位移，才是滚轮：新档从一边进来、旧档从另一边退出，邻居跟着走。
+  只让中间那行淡入淡出的话，看着就只是"数字变了"。
+  起点由 --roll-dir（±1）与 --roll-step 算出，末端带点过冲，停下时有惯性。
+
+  这里用 transform 而入场只用 opacity：位移本身就是要表达的东西。动画不保留
+  （没有 forwards），结束后回到无 transform 的状态；不变量 26 禁的是给 video
+  祖先挂**常驻**的 transform/filter，而这一层既不是 video 祖先，也不常驻。
+*/
+.ttv-boost-roll {
+  animation: ttv-boost-roll 0.26s cubic-bezier(0.2, 1.35, 0.5, 1);
+}
+
+@keyframes ttv-boost-roll {
+  from {
+    transform: translateY(calc(var(--roll-step) * var(--roll-dir, 0)));
+  }
+  to {
+    transform: translateY(0);
+  }
 }
 
 /*

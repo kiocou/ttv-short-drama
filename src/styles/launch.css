@@ -25,20 +25,35 @@
    命名沿用 crystal.css 的约定：结构件用 ttv- 前缀，不与其它视图冲突。
    ========================================================================== */
 
+/* 启动动画的强调色与品牌着色。浅色主题＝品牌紫；dark.css 换成黑红的那支红，
+   让"开屏"和暗色界面是同一套颜色。导轨 / 光晕 / 冲击环 / 品牌投影全从这里取色，
+   改色只改这一处（JS 侧的品牌 filter 关键帧也读同一对变量）。
+   tint 写成 hue-rotate(0deg) 而不是留空：空的自定义属性会被压缩器丢掉，
+   于是 var() 失效、整条 filter 声明作废，品牌反而失去投影。 */
+:root {
+  --launch-accent-rgb: 109 71 230;
+  --launch-logo-tint: hue-rotate(0deg);
+
+  /* 六张迷你海报卡的底色。用渐变而不是真实封面：启动这一刻远程封面还没回来，
+     这里只需要"内容"的象征。暗色主题在 dark.css 里整组换成黑红系。 */
+  --launch-frame-1: linear-gradient(160deg, #6366f1, #a855f7);
+  --launch-frame-2: linear-gradient(160deg, #0ea5e9, #22d3ee);
+  --launch-frame-3: linear-gradient(160deg, #f43f5e, #fb923c);
+  --launch-frame-4: linear-gradient(160deg, #10b981, #84cc16);
+  --launch-frame-5: linear-gradient(160deg, #8b5cf6, #ec4899);
+  --launch-frame-6: linear-gradient(160deg, #f59e0b, #ef4444);
+}
+
 .ttv-launch {
   position: absolute;
   inset: 0;
-  z-index: 70;                 /* 盖住 TitleBar(z-50) 与 UpdatePrompt(z-60) */
+  z-index: 70;                 /* 盖住 TitleBar(z-50) 与更新弹窗(z-60) */
   display: grid;
   place-items: center;
   overflow: hidden;
   cursor: pointer;
-  /* 抄自 src/styles/mica.css 的 .mica-backdrop，逐字一致 */
-  background:
-    radial-gradient(1200px 800px at 15% 10%, rgba(224, 239, 255, 0.75) 0%, transparent 60%),
-    radial-gradient(1000px 700px at 85% 85%, rgba(240, 246, 255, 0.85) 0%, transparent 60%),
-    radial-gradient(800px 600px at 50% 50%, rgba(255, 255, 255, 0.9) 0%, transparent 80%),
-    #f2f4f7;
+  /* 与 .mica-backdrop 共用同一个变量，见 mica.css 的 --theme-backdrop */
+  background: var(--theme-backdrop);
 }
 
 /* 跳过的淡出不用 class 管：动画层自身的 opacity 由 WAAPI 的 fill 占着，
@@ -73,7 +88,12 @@
   width: 480px;
   height: 480px;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(139, 108, 246, 0.30), rgba(56, 189, 248, 0.16) 46%, transparent 70%);
+  background: radial-gradient(
+    circle,
+    rgb(var(--launch-accent-rgb) / 0.30),
+    rgb(var(--launch-accent-rgb) / 0.16) 46%,
+    transparent 70%
+  );
   opacity: 0;
   z-index: 0;
 }
@@ -84,7 +104,7 @@
   width: 600px;
   height: 392px;
   border-radius: 50%;
-  border: 1px solid rgba(109, 71, 230, 0.22);
+  border: 1px solid rgb(var(--launch-accent-rgb) / 0.22);
   opacity: 0;
   z-index: 0;
 }
@@ -103,9 +123,9 @@
   width: 118px;
   height: 118px;
   display: block;
-  /* 这条影子会被 JS 里的 filter 补间一起带上（LOGO_SH 常量）。
+  /* 这条影子会被 JS 里的 filter 补间一起带上（LaunchAnimation 的 logoFilter）。
      只写 blur() 的话 fill 会把影子永久顶掉，品牌从此没有投影。 */
-  filter: drop-shadow(0 10px 26px rgba(109, 71, 230, 0.34));
+  filter: var(--launch-logo-tint) drop-shadow(0 10px 26px rgb(var(--launch-accent-rgb) / 0.34));
 }
 
 /* ── 迷你海报卡 ── */
@@ -161,7 +181,7 @@
   width: 120px;
   height: 120px;
   border-radius: 50%;
-  border: 1px solid rgba(109, 71, 230, 0.52);
+  border: 1px solid rgb(var(--launch-accent-rgb) / 0.52);
   opacity: 0;
   z-index: 4;
 }

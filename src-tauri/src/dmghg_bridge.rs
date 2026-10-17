@@ -304,26 +304,34 @@ impl DmghgBridge {
                 log_line(&format!("dmghg 分类表获取失败，退回全部: {error}"));
             }
         }
+        // 「全部」不是 dmghg 的频道：0 只是本地标签表里的占位 id，传给厂商 DLL
+        // 会落到它的默认频道（日漫），于是"全部"永远只显示日漫。真正的全量列表
+        // 必须**不带 channel 参数**，由服务端按全站口径返回。
         let channel_id = table
             .iter()
             .find(|(_, name)| name == &filter.category)
             .map(|(id, _)| *id)
-            .unwrap_or(0);
+            .filter(|id| *id > 0);
 
         let sort = if filter.sort.trim().is_empty() {
             "hits"
         } else {
             filter.sort.trim()
         };
-        let data = self.call(
-            "catalog.get_video_list",
-            json!({
-                "channel": channel_id,
+        let payload = match channel_id {
+            Some(channel) => json!({
+                "channel": channel,
                 "page": page,
                 "limit": page_size,
                 "sort": sort,
             }),
-        )?;
+            None => json!({
+                "page": page,
+                "limit": page_size,
+                "sort": sort,
+            }),
+        };
+        let data = self.call("catalog.get_video_list", payload)?;
 
         let total = data.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
         let items = collect_items(&data)
@@ -1224,8 +1232,26 @@ mod tests {
         let cold = tauri::async_runtime::block_on(catalog_async(filter.clone()))
             .expect("冷查应当成功（需要本机装动漫共和国客户端）");
         let cold_ms = cold_started.elapsed().as_millis();
-        println!("[缓存冒烟] 冷查 {}ms items={}", cold_ms, cold.items.len());
+        println!(
+            "[缓存冒烟] 全部冷查 {}ms items={} 分类={:?}",
+            cold_ms,
+            cold.items.len(),
+            cold.categories
+        );
         assert!(!cold.items.is_empty(), "列表不应为空");
+
+        // 「全部」必须真的返回全站口径，而不是落到 dmghg 的默认频道（日漫）。
+        // 这是用户报的那个现象本身：切到「全部」仍只看到日漫。
+        let mut japanese = filter.clone();
+        japanese.category = "日漫".into();
+        let jp = tauri::async_runtime::block_on(catalog_async(japanese)).expect("日漫冷查应当成功");
+        println!("[缓存冒烟] 日漫冷查 items={}", jp.items.len());
+        assert!(
+            cold.total > jp.total,
+            "「全部」的 total 必须大于单频道「日漫」（全部={} / 日漫={}）",
+            cold.total,
+            jp.total
+        );
 
         // 热查：必须命中缓存。
         let warm_started = std::time::Instant::now();

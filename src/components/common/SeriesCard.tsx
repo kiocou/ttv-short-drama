@@ -90,7 +90,10 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
       onMouseEnter={() => onPrefetch?.(series.id)}
       onFocus={() => onPrefetch?.(series.id)}
       tabIndex={0}
-      className="group flex flex-col cursor-pointer animate-fluent-card-in active:scale-95 transition-transform rounded-2xl"
+      // 入场动画只由宿主网格的 `.ttv-grid-in` 统一驱动。卡片自己再挂一条
+      // `animate-fluent-card-in` 会与容器规则抢同一个 animation 属性：结果是一部分卡
+      // 走容器规则、一部分走卡片规则，时长与延迟都对不上，看起来"有的动有的不动"。
+      className="group flex flex-col cursor-pointer active:scale-95 transition-transform rounded-2xl"
     >
       {/* 海报封面 (3:4 黄金竖屏比例) */}
       <div className="relative w-full aspect-[3/4] overflow-hidden bg-slate-100 rounded-t-2xl">

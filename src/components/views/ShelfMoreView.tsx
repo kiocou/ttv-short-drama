@@ -2,13 +2,13 @@ import React, { useCallback, useEffect, useRef, useState, ReactNode } from 'reac
 import { useAppStore, ShelfKind } from '../../stores/useAppStore';
 import { CatalogProvider, useCatalogStore } from '../../stores/useCatalogStore';
 import { useShelfFeed } from '../../stores/useShelfFeed';
-import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
 import { BackToTop } from '../common/BackToTop';
-import { CoverImage } from '../common/CoverImage';
-import { ipcService, errorText, coverResolver } from '../../services/ipc';
-import type { ChannelType, SeriesItem } from '../../types/catalog';
-import { ArrowLeft, ChevronRight, Flame, Play, Sparkles } from 'lucide-react';
+import { SeriesCard, SERIES_GRID_CLASS } from '../common/SeriesCard';
+import { SeriesCardSkeleton } from '../common/SeriesCardSkeleton';
+import { ipcService, errorText } from '../../services/ipc';
+import type { ChannelType } from '../../types/catalog';
+import { ArrowLeft, Flame, Sparkles } from 'lucide-react';
 
 /**
  * 首页货架的「更多」页。
@@ -34,8 +34,9 @@ import { ArrowLeft, ChevronRight, Flame, Play, Sparkles } from 'lucide-react';
  *
  * ## 版式与「我的追剧 / 观看历史」同构
  *
- * 同一个页面壳（`p-8 / max-w-5xl / mx-auto / gap-6`）、同一个页头（图标 + 标题 +
- * 副标题 + 底边框）、同一套 `MicaCard` 行卡。这是用户明确要求的对齐目标。
+ * 同一个页面壳（`p-5 / 全宽 / gap-5`）、同一个页头（图标 + 标题 +
+ * 副标题 + 底边框）、同一套 `SeriesCard` 海报网格。这是用户明确要求的对齐目标：
+ * 「更多」页不再另起一套行卡，首页怎么排，这里就怎么排。
  */
 
 const SHELF_META: Record<ShelfKind, {
@@ -112,10 +113,8 @@ const ShelfShell: React.FC<{
   const meta = SHELF_META[kind];
   const Icon = meta.icon;
   return (
-    <div
-      ref={scrollRef}
-      className="flex-1 h-full overflow-y-auto p-8 max-w-5xl mx-auto flex flex-col gap-6 select-none"
-    >
+    <div ref={scrollRef} className="h-full w-full overflow-y-auto p-5 select-none">
+      <div className="flex w-full flex-col gap-5">
       {/* 返回行：详情页同款。这一页不是导航栏的常驻目的地，不给返回入口用户只能
           靠左侧导航离开，而侧栏此时没有任何一项是选中态。 */}
       <div className="flex items-center justify-between">
@@ -129,21 +128,26 @@ const ShelfShell: React.FC<{
           <span>返回发现</span>
         </button>
 
-        <div className="flex items-center gap-2 text-xs text-slate-400">
-          <span>发现精选</span>
-          <span>/</span>
-          <span className="text-slate-700 font-semibold truncate max-w-xs">{meta.title} · 更多</span>
-        </div>
+        <span className="truncate text-xs text-slate-400">
+          发现精选 <span className="mx-1.5 text-slate-300">/</span>
+          <span className="font-semibold text-slate-700">{meta.title} · 更多</span>
+        </span>
       </div>
 
-      {/* 头部：与「我的追剧 / 观看历史」同一骨架 */}
+      {/* 头部：与发现页 / 动漫专区同一套页头，但保留「更多」的返回层级 */}
       <div className="flex items-center justify-between pb-4 border-b border-black/[0.05]">
         <div className="min-w-0">
-          <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2">
-            <Icon className={`w-5 h-5 ${meta.iconClass}`} />
+          <h1 className="flex items-center gap-2.5 text-base font-bold leading-tight text-slate-800">
+            <span className={`flex h-9 w-9 items-center justify-center rounded-xl border ${
+              kind === 'hot'
+                ? 'border-rose-200/60 bg-rose-50 text-rose-500'
+                : 'border-blue-200/60 bg-blue-50 text-blue-600'
+            }`}>
+              <Icon className="h-4.5 w-4.5" />
+            </span>
             <span>{meta.title} · 更多</span>
           </h1>
-          <p className="text-xs text-slate-400 mt-1 truncate">{subtitle}</p>
+          <p className="mt-1 truncate text-[11px] font-medium text-slate-400">{subtitle}</p>
         </div>
         {count > 0 && (
           <span className="text-xs text-slate-400 shrink-0">已加载 {count} 部</span>
@@ -160,6 +164,7 @@ const ShelfShell: React.FC<{
       {/* 回到顶部：与发现页 / 动漫专区同一套。放在页面壳里所以两条数据源（红果 App
           接口与 18+ 多源聚合）都自动带上，不会只有一边有。 */}
       <BackToTop targetRef={scrollRef} />
+      </div>
     </div>
   );
 };
@@ -238,87 +243,12 @@ const ShelfNotice: React.FC<{ title: string; detail: string; onRetry?: () => voi
 );
 
 const ShelfSkeleton: React.FC = () => (
-  <div className="flex flex-col gap-3">
-    {Array.from({ length: 6 }).map((_, index) => (
-      <div key={index} className="h-[120px] rounded-xl shimmer-loading" />
+  <div className={SERIES_GRID_CLASS}>
+    {Array.from({ length: 12 }).map((_, index) => (
+      <SeriesCardSkeleton key={index} />
     ))}
   </div>
 );
-
-/**
- * 行卡。与「我的追剧」的行卡同构：64×88 封面 + 标题 + 题材/来源 + 集数/评分 +
- * 右侧动作区。
- */
-const ShelfRow: React.FC<{
-  series: SeriesItem;
-  index: number;
-  onOpen: (seriesId: string) => void;
-}> = ({ series, index, onOpen }) => {
-  // 封面通道统一由 `coverResolver` 决定：guo 走 guo-core、红果的 HEIC 走后端转码、
-  // 其余直连。这里**不要**自己再写一遍判定 —— 首页走的是 `SeriesCard`，两边口径
-  // 一旦分叉就会出现"同一部剧在首页空白、点进来才有图"。
-  const resolveSrc = coverResolver(series.id, series.cover);
-
-  return (
-    <MicaCard
-      hoverable
-      onClick={() => onOpen(series.id)}
-      className="p-4 flex items-center justify-between gap-4 animate-fluent-card-in group"
-    >
-      <div className="flex items-center gap-4 min-w-0">
-        {/* 3:4 = 64×88。必须写 `h-[88px]`：`h-22` 不在 Tailwind 的 spacing 刻度里
-            （…/20/24/…），从来没被生成过——占位层是 `absolute inset-0`，父级没有
-            高度时它会塌成 0px，封面加载失败的小图会整个消失。 */}
-        <div className="relative w-16 h-[88px] rounded-xl overflow-hidden shadow-sm flex-shrink-0 bg-slate-100">
-          <CoverImage
-            src={series.cover}
-            title={series.title}
-            fallbackChar="剧"
-            placeholderTextClassName="text-base"
-            loading={index < 8 ? 'eager' : 'lazy'}
-            resolveSrc={resolveSrc}
-          />
-          <div className="absolute inset-0 bg-black/20 group-hover:bg-black/40 flex items-center justify-center transition-colors">
-            <Play className="w-5 h-5 text-white fill-current opacity-80 group-hover:opacity-100 transform group-hover:scale-110 transition-transform" />
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-1.5 min-w-0">
-          <h3 className="text-sm font-bold text-slate-900 truncate group-hover:text-blue-600 transition-colors">
-            {series.title}
-          </h3>
-          <div className="flex items-center gap-2 text-xs text-slate-400 min-w-0">
-            {series.tags[0] && (
-              <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-200/60 font-bold text-[10px] shrink-0">
-                {series.tags[0]}
-              </span>
-            )}
-            <span className="truncate">{series.origin}</span>
-          </div>
-          <span className="text-xs text-slate-400">
-            {series.episodesCount > 1 ? `${series.episodesCount} 集` : '集数未知'}
-            {series.rating ? ` · 评分 ${series.rating.toFixed(1)}` : ''}
-          </span>
-        </div>
-      </div>
-
-      <div className="p-1 bg-slate-100/80 rounded-xl border border-slate-200/60 shadow-inner flex items-center gap-1.5 flex-shrink-0">
-        <FluentButton
-          variant="secondary"
-          size="sm"
-          icon={<ChevronRight className="w-3.5 h-3.5" />}
-          onClick={(event) => {
-            event.stopPropagation();
-            onOpen(series.id);
-          }}
-          className="shadow-sm"
-        >
-          查看详情
-        </FluentButton>
-      </div>
-    </MicaCard>
-  );
-};
 
 /** 打开详情：顺手预取，点进去瞬时出内容（与发现页一致）。 */
 function useOpenDetail() {
@@ -455,9 +385,9 @@ const ShelfAppFeed: React.FC<{
           onRetry={error ? reload : undefined}
         />
       ) : (
-        <div className="flex flex-col gap-3">
+        <div className={`${SERIES_GRID_CLASS} ttv-grid-in`}>
           {items.map((series, index) => (
-            <ShelfRow key={series.id} series={series} index={index} onOpen={openDetail} />
+            <SeriesCard key={series.id} series={series} index={index} onClick={openDetail} />
           ))}
         </div>
       )}
@@ -512,9 +442,9 @@ const ShelfAggregatedList: React.FC<{
           onRetry={error ? () => void refreshCatalog('') : undefined}
         />
       ) : (
-        <div className="flex flex-col gap-3">
+        <div className={`${SERIES_GRID_CLASS} ttv-grid-in`}>
           {items.map((series, index) => (
-            <ShelfRow key={series.id} series={series} index={index} onOpen={openDetail} />
+            <SeriesCard key={series.id} series={series} index={index} onClick={openDetail} />
           ))}
         </div>
       )}
