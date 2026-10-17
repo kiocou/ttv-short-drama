@@ -13,8 +13,9 @@
        表现为"无法访问此页面"。
     3. **GitHub Release 单文件上限 100 MB**：本项目的 MSI 恒在 105 MB 上下，
        **传不上去**；只有 NSIS 的 *-setup.exe（约 77 MB）能传。脚本会自动挑包。
-    4. **release notes 应当等于 CHANGELOG 里该版本那一段**：手抄必然与正文脱节。
-       脚本直接从 CHANGELOG 抽取。
+   4. **release notes 只取「新增 / 修复 / 删除 / 优化」四节**：CHANGELOG 里
+      的实测数据、内部审查与实现细节留在仓库，不整段搬到 Release 页面。
+      脚本按固定顺序抽取；缺任意一节就报错，避免格式再次长歪。
 
   默认行为：四项检查 → 构建 → 抽 notes → gh release create（已存在则
   gh release upload --clobber 覆盖同名资产）。
@@ -126,8 +127,8 @@ if ($msi) {
 }
 $assets = @($setup.FullName)
 
-# 6. release notes = CHANGELOG 里该版本那一段
-Write-Step '从 CHANGELOG 抽取 release notes'
+# 6. release notes = CHANGELOG 里该版本的四个固定小节
+Write-Step '从 CHANGELOG 抽取 release notes（新增 / 修复 / 删除 / 优化）'
 $changelog = Get-Content (Join-Path $root 'CHANGELOG.md') -Raw
 $pattern = "(?ms)^##\s+" + [regex]::Escape($Version) + "\b.*?(?=^##\s|\z)"
 $section = [regex]::Match($changelog, $pattern)
@@ -135,12 +136,24 @@ if (-not $section.Success) {
     Write-Host ("CHANGELOG 里没有 " + $Version + " 这一段，请先补写") -ForegroundColor Yellow
     throw '缺少 CHANGELOG 段落'
 }
+$versionHeading = ($section.Value -split "`r?`n", 2)[0].Trim()
+$shortSections = @()
+foreach ($name in @('新增', '修复', '删除', '优化')) {
+    $sectionPattern = "(?ms)^###\s+" + [regex]::Escape($name) + "\s*$.*?(?=^###\s|^##\s|\z)"
+    $matched = [regex]::Match($section.Value, $sectionPattern)
+    if (-not $matched.Success) {
+        Write-Host ("CHANGELOG " + $Version + " 缺少「" + $name + "」小节") -ForegroundColor Yellow
+        throw '发布说明必须包含：新增 / 修复 / 删除 / 优化'
+    }
+    $shortSections += $matched.Value.Trim()
+}
+$shortBody = $versionHeading + $nl + $nl + ($shortSections -join ($nl + $nl))
 $notesPath = Join-Path $TmpDir ("release-notes-" + $tag + ".md")
 # 用显式拼接 + WriteAllText，不要用 Set-Content 拼接字符串：
 # 后者会把 header 与正文并成同一行，GitHub 上那一整行会被当成引用块，
 # 版本标题不再渲染成标题（0.2.8 发布时踩过）。
 $headerLine = "> 提交 " + $commit + " ｜ 产物：" + $setup.Name + "（NSIS, x64）"
-$notesText = $headerLine + $nl + $nl + $section.Value.Trim() + $nl
+$notesText = $headerLine + $nl + $nl + $shortBody + $nl
 [System.IO.File]::WriteAllText($notesPath, $notesText, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host ("notes: " + $notesPath)
 
