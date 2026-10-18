@@ -120,6 +120,24 @@ export function useBoostKeys({
   const cancelBoost = useCallback(() => controller.cancel(), [controller]);
 
   /**
+   * 用户在加速期间改了基准倍速：立即结束临时加速，画面回到新的基准倍速。
+   *
+   * 菜单改倍速会直接写 `video.playbackRate`，如果控制器仍认为自己在加速，
+   * 提示条会继续显示旧的加速值，直到松手才消失；用户看到的就是“切换倍速后
+   * 加速没了/视频像没在播”。这里在渲染后对齐一次，不额外暂停或 seek。
+   *
+   * 每次 render 都读 getBaseRate 是有意的：它只做一次数值比较，成本可以忽略，
+   * 却不需要让调用方再传一个新 prop，也不会因为依赖数组漏项而失效。
+   */
+  const lastBaseRateRef = useRef(getBaseRate());
+  useEffect(() => {
+    const baseRate = getBaseRate();
+    if (lastBaseRateRef.current === baseRate) return;
+    lastBaseRateRef.current = baseRate;
+    if (controller.isBoosting()) cancelBoost();
+  });
+
+  /**
    * 换集即结束加速。
    *
    * 与 `cancelBoost` 分开写而不是复用同一个 effect：这个 effect 只在**会话号变化**

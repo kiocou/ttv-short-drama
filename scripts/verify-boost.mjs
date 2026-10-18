@@ -323,6 +323,31 @@ check('多按几档仍然回到自己', cycleBoostLevel('smart', 4), 'smart');
   check('未加速时 cancel：仍不处于加速', controller.isBoosting(), false);
 }
 
+// 20) 加速被外部 cancel（例如切换基准倍速）后，松手不能再补一次跳转。
+//
+// 外层在基准倍速变化时会先 cancel() 结束临时加速；如果 release() 仍按
+// “当前是否 boosting”判断，这次 keyup 会被误判成普通快退/快进，画面突然跳 5 秒。
+{
+  const { clock, controller } = harness();
+  controller.press();
+  clock.tick(400);
+  controller.cancel();
+  check('加速被外部收掉后松手：不再跳转', controller.release(), false);
+}
+
+// 21) 下一次按下仍会重新计时，不会被上一次的“已消费”状态污染。
+{
+  const { clock, video, controller } = harness();
+  controller.press();
+  clock.tick(400);
+  controller.cancel();
+  controller.release();
+  controller.press();
+  clock.tick(400);
+  check('外部 cancel 后再次长按：仍能加速', video.playbackRate, 3);
+  check('外部 cancel 后再次长按：仍处于加速', controller.isBoosting(), true);
+}
+
 console.log('');
 console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 process.exit(fail === 0 ? 0 : 1);

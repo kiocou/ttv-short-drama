@@ -5,6 +5,7 @@ import { ipcService, isTauriEnvironment } from '../services/ipc';
 import { attachSource, isHlsUrl, detachSource, takeHlsFatal } from '../services/hlsAttach';
 import { dismissPip, openPip } from '../services/pip';
 import { tracePlayback } from '../services/playbackTrace';
+import { shouldFinishAtBufferedTail } from '../services/playbackTail';
 import { useSettingsStore } from './useSettingsStore';
 
 /**
@@ -363,6 +364,18 @@ function usableDuration(video: HTMLVideoElement): number {
   }
   const candidates = ends.filter(value => Number.isFinite(value) && value > 0);
   return candidates.length > 0 ? Math.max(...candidates) : 0;
+}
+
+/** 当前媒体元素最后一个连续缓冲区间的末端；没有可读区间时返回 0。 */
+function bufferedEndSeconds(video: HTMLVideoElement): number {
+  try {
+    if (video.buffered && video.buffered.length > 0) {
+      return video.buffered.end(video.buffered.length - 1);
+    }
+  } catch {
+    // 尚未就绪的媒体元素访问 buffered 可能抛错：按“没有缓冲信息”处理。
+  }
+  return 0;
 }
 
 /**
@@ -3015,7 +3028,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
        * "网络慢卡在中段"误判成播完（中段离结尾远得多）。
        */
       const total = usableDuration(video);
-      if (total > 0 && video.currentTime >= total - 1.5) {
+      if (shouldFinishAtBufferedTail({
+        currentTime: video.currentTime,
+        duration: total,
+        bufferedEnd: bufferedEndSeconds(video),
+        paused: video.paused,
+        seeking: video.seeking,
+      })) {
         // 复用 handleEnded 的完整语义（落盘进度、连播、全剧播完）——
         // 它已经处理了"这次结束属不属于当前集""要不要自动跳下一集"这些闸门。
         handleEndedRef.current?.();

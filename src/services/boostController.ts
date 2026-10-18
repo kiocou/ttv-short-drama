@@ -124,6 +124,14 @@ export function createBoostController(options: BoostControllerOptions): BoostCon
 
   let timer: number | null = null;
   let boosting = false;
+  /**
+   * 本次按下是否已经用于加速。
+   *
+   * 不能只看 `boosting`：用户在加速中切换基准倍速时，外层会先 cancel()
+   * 收掉加速；如果这时只按 `boosting` 判断，随后 keyup 会把同一次按下
+   * 误判成普通快进/快退，画面会突然跳 5 秒。
+   */
+  let pressConsumed = false;
   let level: BoostLevel = defaultLevel;
 
   /**
@@ -157,21 +165,24 @@ export function createBoostController(options: BoostControllerOptions): BoostCon
     press() {
       // 先收上一次：连续按下（自动重复之外的异常、或用户快速换按键）只留一个定时器。
       cancel();
+      pressConsumed = false;
       timer = setTimer(() => {
         timer = null;
         const video = options.getVideo();
         // 只在真正播放中加速。暂停时长按没有意义，还容易误触。
         if (!video || video.paused) return;
         boosting = true;
+        pressConsumed = true;
         level = defaultLevel;
         options.onChange?.(true, apply(), level);
       }, holdMs);
     },
     release() {
-      const wasBoosting = boosting;
+      const shouldSeek = !pressConsumed;
       cancel();
+      pressConsumed = false;
       // 加速过 -> 这次按下已经用在加速上，不该再跳转。
-      return !wasBoosting;
+      return shouldSeek;
     },
     cancel,
     isBoosting: () => boosting,
