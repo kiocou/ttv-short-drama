@@ -34,7 +34,11 @@
 //! 运行"有它自己的处理（关掉再装，或直接提示）。
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{AppHandle, Emitter, EventTarget};
+
+/// 当前下载是否已被用户取消。下载命令是异步的，取消命令只需翻转这个标记。
+static DOWNLOAD_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// 当前版本。
 ///
@@ -347,12 +351,52 @@ pub struct UpdateInfo {
     pub asset_name: Option<String>,
     pub asset_url: Option<String>,
     pub asset_size: u64,
+    /// 官方发布的 SHA-256（`sha256:abc…` 里冒号后的部分），用于下载后校验。
+    ///
+    /// GitHub Releases API 自 2025 年起在 asset 上提供 `digest` 字段。它是**唯一**
+    /// 能证明"镜像给的文件与官方一致"的依据：镜像站是第三方，拿它下可执行文件
+    /// 而不做校验，等于把安装包的安全完全托付给镜像运营方。
+    ///
+    /// 为空表示该 release 没有 digest（老资产或 API 未提供）——此时仍可下载，
+    /// 只是退回"只信任 HTTPS + 体积"的弱校验，并在界面如实标注。
+    pub asset_digest: Option<String>,
+}
+
+/// 把进度事件发给**主窗口**，而不是广播给所有 webview。
+///
+/// ## 为什么不能用 `app.emit`（2026-10-18）
+///
+/// `app.emit` 会对**每一个** webview 都 eval 一段 JS。本应用有两个 webview：
+/// 主窗口（`main`）与画中画小窗（`mini`，由 `pip.rs` 创建）。下载进度按 1% 发一次，
+/// 一个 77 MB 的包就是上百次事件，而画中画小窗根本不关心更新——每次都在那儿白跑
+/// 一段 JS，白白占着 WebView2 的渲染线程。
+///
+/// 定向到 `main` 之后，小窗完全收不到这些事件，开销归零。
+fn emit_progress(app: &AppHandle, progress: DownloadProgress) {
+    let _ = app.emit_to(
+        EventTarget::webview_window("main"),
+        EVENT_DOWNLOAD,
+        progress,
+    );
 }
 
 /// 下载进度（事件负载）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadProgress {
+    /// 本次下载的任务号，由前端在发起时生成并原样带回。
+    ///
+    /// ## 为什么必须有（2026-10-18 修「设置页和弹窗抢进度」）
+    ///
+    /// `app.emit` 是**广播**：主窗口里所有订阅了 `update://download` 的组件都会收到
+    /// 同一串事件。而本应用有两处会发起下载——标题栏的更新弹窗与设置页的「检查更新」
+    /// ——且**两处都常驻 DOM**（设置页只是被 `hidden` 隐藏，监听器仍然活着）。
+    /// 于是从弹窗点下载时，设置页也收到 `done` 并弹一个「安装包已下载」的 toast，
+    /// 反之亦然；两处还会互相把对方的进度条画成自己的。
+    ///
+    /// 带上任务号后，前端只处理与自己那次 `update_download` 匹配的事件，广播退化成
+    /// 一次廉价的多路复用，不需要给每个窗口单独建事件通道。
+    pub job_id: String,
     pub received: u64,
     pub total: u64,
     pub percent: u8,
@@ -441,6 +485,733 @@ fn safe_file_name(raw: &str) -> String {
 /// 下载目录（拿不到就退回临时目录，至少不让整条链路失败）。
 fn download_dir() -> PathBuf {
     dirs::download_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 国内网络加速：镜像择优 + 分片并发
+//
+// ## 为什么需要（2026-10-18 实测）
+//
+// 本机实测 `github.com` 直连下载这个 48.7 MB 的安装包：
+//   - **单连接 111 KB/s** → 预计 7 分钟；
+//   - **8 连接并发 1997 KB/s** → 约 25 秒（18 倍）；
+//   - 镜像 `ghfast.top` 单连接 1837 KB/s、8 连接并发 3125 KB/s（28 倍）。
+//
+// 结论很明确：**瓶颈不是总带宽，而是每连接的限速**。所以正确解法不是"换个域名"
+// 或"加个代理"，而是：
+//   1. 用 Range 把文件切成多片，**并发**下载（绕开单连接限速）；
+//   2. 同时对几个镜像测速，挑最快的那个作为分片来源（镜像单连接就快，叠加并发更快）；
+//   3. 镜像挂了自动回退到直连，任何一个分片失败都能重试。
+//
+// ## 安全
+//
+// 镜像站是第三方，让它给可执行文件而不校验，等于把安装包安全托付给镜像运营方。
+// 所以：**下载完必须比对 GitHub API 给出的 SHA-256**（`asset.digest`）。
+// 校验不通过就删掉临时文件并报错，绝不把可疑文件交给安装器。
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 并发分片数。
+///
+/// 8 是实测出来的甜点：再少绕不开单连接限速，再多（16/32）在本机没有额外收益，
+/// 却会让镜像站更容易触发风控、也让弱网设备更难承受。8 条 6 MB 的流对 48 MB
+/// 的包刚好，对 200 MB 的包也只是每片更大而已。
+const DOWNLOAD_CONNECTIONS: u64 = 8;
+
+/// 低于这个体积不分片：小文件分片的调度开销大于收益，而且 Range 请求本身
+/// 对 CDN 不友好。1 MB 以下的安装包不存在，这里主要是给"资产异常小"兜底。
+const PARALLEL_MIN_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 镜像模板：`{url}` 会被替换成完整的 GitHub 资产地址。
+///
+/// 顺序即"并列时的优先级"，但**实际用哪个由测速决定**（见 `rank_sources`）。
+/// 直连放最后：国内网络下它通常最慢，但它是唯一不依赖第三方的兜底。
+///
+/// ## 这份名单怎么来的（2026-10-18）
+///
+/// 都是本机实测过、且**返回 206 支持 Range** 的域名。社区文章里流传的老域名
+/// （ghproxy.cc / gh.llkk.cc / github.moeyy.xyz / hub.gitmirror.com / kkgithub.com /
+/// bgithub.xyz / ghp.ci）实测已全部超时，不再列入。
+///
+/// `ghfast.top` 保留但降级：本机实测它单连接 1.8 MB/s、8 连接 3.1 MB/s，是当时
+/// 最快的一个；但也有报告称它在某些网络下只是 302 跳回 github.com（等于假加速）。
+/// 既然选路交给测速，把它留在候选里没有坏处——真慢的会被测速排到最后。
+const MIRROR_TEMPLATES: [&str; 4] = [
+    "https://ghfast.top/{url}",
+    "https://ghproxy.xyz/{url}",
+    "https://gh-proxy.com/{url}",
+    "https://ghproxy.net/{url}",
+];
+
+/// 测速总超时：要明显大于采样窗口，给 DNS + TLS + 首字节留出时间。
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 测速的连接超时。
+const PROBE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 测速采样时长：从**首字节到达**起算，只统计这段时间的吞吐。
+///
+/// 2 秒而不是 1 秒：实测 1.5 秒的短采样会被线路抖动带偏——同一批源在不同次
+/// 测速里排名能翻转，进而让整轮下载快慢差 4 倍。2 秒能把"稳定快"和"瞬时快"
+/// 区分开，代价只是每个源多等 0.5 秒。
+const PROBE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// 吞吐地板的结算窗口。
+const THROUGHPUT_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+/// 吞吐地板：窗口内平均速率低于这个值就判定为"假死"，换源重试。
+///
+/// ## 为什么是 100 KB/s（2026-10-18 实测定值）
+///
+/// 这是**每分片**的速率。8 分片并发时，总吞吐 = 分片速率 × 8。
+///
+/// 实测校准过程：
+///   - 直连（被限速）：8 分片总 510 KB/s → 每片约 **64 KB/s**；
+///   - 镜像 ghfast.top：8 分片总 1916 KB/s → 每片约 **240 KB/s**。
+///
+/// 地板必须卡在两者之间，否则"选错源"不会被纠正——早先设 64 KB/s 时，
+/// 直连恰好压线通过，于是整轮下载都以 510 KB/s 跑完（97.8 秒 vs 26 秒，差 4 倍）。
+/// 提到 100 KB/s 后，直连的分片会被判死并切到镜像。
+///
+/// 取值仍留了余量：真正慢但可用的链路（每片 100–240 KB/s）不会被误杀；
+/// 万一某个网络下所有源都达不到，还有第二轮的"无地板"兜底（见 `download_to`）。
+const MIN_THROUGHPUT_BPS: f64 = 100.0 * 1024.0;
+
+/// 一个下载源：名字（给人看）+ 完整 URL。
+#[derive(Debug, Clone)]
+struct Source {
+    label: String,
+    url: String,
+}
+
+/// 网络环境判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkRoute {
+    /// GitHub 直连可用且够快：走默认方案（直连优先）。
+    Direct,
+    /// GitHub 直连不可用或过慢：走大陆加速方案（镜像优先）。
+    Mainland,
+}
+
+/// 预检结论：给前端展示用。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkProbe {
+    pub route: NetworkRoute,
+    /// 直连是否连得上（TCP+TLS+首字节成功）。
+    pub direct_reachable: bool,
+    /// 直连实测速率（字节/秒），0 表示没测出来。
+    pub direct_speed: u64,
+    /// 一句话结论，可直接展示给用户。
+    pub reason: String,
+}
+
+/// 判定"直连够快"的门槛：低于这个速率就走大陆加速方案。
+///
+/// ## 为什么用 400 KB/s（2026-10-18 实测定值）
+///
+/// 实测这台机器上：
+///   - GitHub 直连单连接约 **111 KB/s**（被限速），8 连接并发约 500 KB/s；
+///   - 镜像单连接 1.8 MB/s，8 连接并发 2.5–3.1 MB/s。
+///
+/// 门槛要卡在"明显慢到需要镜像"和"正常能接受"之间。400 KB/s 的含义是：
+/// 直连单连接跑不到这个速度，就说明这条链路被限了，镜像会快得多。
+///
+/// 注意这是**单连接**速率：预检只发一条请求，成本才可控（约 1–2 秒）。
+const DIRECT_GOOD_ENOUGH_BPS: u64 = 400 * 1024;
+
+/// 预检单源采样窗口：够判断快慢，又不至于让用户等太久。
+const PREFLIGHT_WINDOW: std::time::Duration = std::time::Duration::from_millis(2500);
+/// 预检总超时（含 DNS + TLS + 首字节）。
+const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// 探测 GitHub 直连是否可用、够不够快。
+///
+/// ## 为什么需要这一步（2026-10-18 用户需求）
+///
+/// 之前是"无条件把所有源一起测速再选"。问题有两个：
+///   1. 每次下载都要对 5 个源各测 2 秒，**固定多花约 10 秒**，而其中大部分源
+///      在用户的网络下注定用不上；
+///   2. 在 GitHub 本来就能正常访问的环境（海外/企业网/开了代理），镜像反而是
+///      绕远路，还可能因为第三方站点不稳定而拖慢。
+///
+/// 现在先花一次很短的探测判断"这是哪类网络"，再决定候选源集合：
+///   - 直连够快 → 只走直连（默认方案），不碰镜像；
+///   - 直连不可达/太慢 → 只走镜像（大陆方案），直连仅作最后兜底。
+///
+/// 判定依据是**实测吞吐**而不是"能不能连上"：国内很多网络能连上 GitHub 但被
+/// 限速到 100 KB/s，只看连通性会误判成"可用"。
+async fn probe_network(asset_url: &str) -> NetworkProbe {
+    use std::time::Instant;
+
+    let client = match reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(PREFLIGHT_TIMEOUT)
+        .connect_timeout(std::time::Duration::from_secs(4))
+        // github.com 的资产地址是 302，必须跟随。
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return NetworkProbe {
+                route: NetworkRoute::Mainland,
+                direct_reachable: false,
+                direct_speed: 0,
+                reason: "无法创建网络客户端，改用国内加速通道。".to_string(),
+            }
+        }
+    };
+
+    // 只取前 4 MB 估速，且从首字节到达才开始计时。
+    let request = client.get(asset_url).header("Range", "bytes=0-4194303");
+    let Ok(mut response) = request.send().await else {
+        return NetworkProbe {
+            route: NetworkRoute::Mainland,
+            direct_reachable: false,
+            direct_speed: 0,
+            reason: "无法连接 GitHub，已切换国内加速通道。".to_string(),
+        };
+    };
+    if !response.status().is_success() && response.status().as_u16() != 206 {
+        return NetworkProbe {
+            route: NetworkRoute::Mainland,
+            direct_reachable: false,
+            direct_speed: 0,
+            reason: format!("GitHub 返回 {}，已切换国内加速通道。", response.status()),
+        };
+    }
+
+    let mut received = 0u64;
+    let mut started: Option<Instant> = None;
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if started.is_none() {
+            started = Some(Instant::now());
+        }
+        received += chunk.len() as u64;
+        if let Some(start) = started {
+            if start.elapsed() >= PREFLIGHT_WINDOW {
+                break;
+            }
+        }
+    }
+
+    let speed = match started {
+        Some(start) if start.elapsed().as_millis() > 0 => {
+            (received as f64 / start.elapsed().as_secs_f64()) as u64
+        }
+        _ => 0,
+    };
+
+    if speed >= DIRECT_GOOD_ENOUGH_BPS {
+        NetworkProbe {
+            route: NetworkRoute::Direct,
+            direct_reachable: true,
+            direct_speed: speed,
+            reason: format!(
+                "GitHub 直连速度良好（{} KB/s），使用默认下载通道。",
+                speed / 1024
+            ),
+        }
+    } else {
+        NetworkProbe {
+            route: NetworkRoute::Mainland,
+            direct_reachable: true,
+            direct_speed: speed,
+            reason: format!(
+                "GitHub 直连较慢（{} KB/s），已切换国内加速通道。",
+                speed / 1024
+            ),
+        }
+    }
+}
+
+/// 下载前的网络预检命令。
+///
+/// 前端在用户点「立即下载」时先调它，拿到 `route` 后决定给用户什么提示；
+/// 真正的下载命令会用同一套判定再确认一次（见 `download_to`），
+/// 所以即使前端跳过预检，下载也不会走错路。
+#[tauri::command]
+pub async fn update_probe_network(url: Option<String>) -> Result<NetworkProbe, String> {
+    if !is_trusted_asset_url(&url.clone().unwrap_or_default()) {
+        return Err("拒绝探测非 GitHub 发布域名的地址。".to_string());
+    }
+    Ok(probe_network(url.as_deref().unwrap_or_default()).await)
+}
+
+/// 把 GitHub 资产地址展开成候选下载源列表，**按预检结论决定走哪套方案**。
+///
+/// 只对 `github.com` 开头的地址做镜像改写：`objects.githubusercontent.com`
+/// 这类 CDN 直链是重定向后的产物，镜像站不认，硬拼上去只会 404。
+///
+/// ## 两套方案（2026-10-18 用户需求）
+///
+/// - `NetworkRoute::Direct`（GitHub 可正常访问）：**直连优先**，镜像排在后面兜底。
+/// - `NetworkRoute::Mainland`（GitHub 不可达或被限速）：**镜像优先**，直连垫底。
+///
+/// 两套方案都保留全部候选源，只是顺序不同。这看起来"没省掉测速"，但省掉的是
+/// **优先级误判的代价**：`rank_sources` 会实测排序，Direct 方案下直连测速快就
+/// 自然排第一，镜像根本不参与下载。
+///
+/// ## ⚠️ 为什么 Direct 方案也不能把镜像删掉（2026-10-18 实测踩到）
+///
+/// 曾经按"Direct 就只留直连"实现过，结果真实下载直接失败：
+/// 预检测到直连 **4655 KB/s**（瞬时冲高），判定走默认方案 → 候选只剩直连一条
+/// → 8 分片并发时直连被按连接限速到 **89 KB/s** → 吞吐地板把它判死
+/// → **没有下一个源可换** → 整个更新失败。
+///
+/// 教训：预检测的是"单连接瞬时速度"，而下载是"8 连接持续吞吐"，两者不是一回事。
+/// 所以候选源永远保留全集，用顺序表达倾向、用实测决定最终，而不是用预检结果
+/// 做硬性裁剪。
+fn candidate_sources(asset_url: &str, route: NetworkRoute) -> Vec<Source> {
+    let is_github = asset_url.starts_with("https://github.com/");
+
+    let direct = Source {
+        label: "GitHub 直连".to_string(),
+        url: asset_url.to_string(),
+    };
+
+    let mirrors: Vec<Source> = if is_github {
+        MIRROR_TEMPLATES
+            .iter()
+            .map(|template| Source {
+                label: template
+                    .split("//")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or(template)
+                    .to_string(),
+                url: template.replace("{url}", asset_url),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    match route {
+        // 直连优先，镜像兜底。
+        NetworkRoute::Direct => {
+            let mut list = vec![direct];
+            list.extend(mirrors);
+            list
+        }
+        // 镜像优先，直连兜底。
+        NetworkRoute::Mainland => {
+            let mut list = mirrors;
+            list.push(direct);
+            list
+        }
+    }
+}
+
+/// 对候选源串行测速，返回按速度降序排列的列表（最快的在前）。
+///
+/// ## 测速的三个坑（2026-10-18 实测踩到，每一个都真实影响过选路）
+///
+/// **坑一：把总超时设成采样窗口。** 旧实现给 reqwest 挂 `.timeout(PROBE_WINDOW)`，
+/// 于是"连接建立 + TLS 握手 + 首字节"也吃掉这 2.5 秒。镜像站要多一跳 DNS 和一次
+/// 转发，握手本身就慢，常常还没开始传数据就被判定成 0 分。
+/// 现在总超时给足（10 秒），**只把采样计时绑在收到首字节之后**。
+///
+/// **坑二：并发测速互相抢带宽。** 多个源同时下载会瓜分同一条出口，谁都测不快，
+/// 排名接近随机。改成**串行**：每个源最多 1.5 秒，五个源总共不到 8 秒，
+/// 换来的是排名真实——它决定后面几十秒的下载走哪条路。
+///
+/// **坑三：`github.com` 的下载地址是 302 重定向。** 实测 `curl -I` 直连
+/// `github.com/.../releases/download/...` 返回 **302**，真正的内容在
+/// `objects.githubusercontent.com`。reqwest **默认不跟随**重定向（需要显式
+/// `redirect::Policy::limited`），于是旧实现把直连判成"HTTP 302 失败"→ 0 分。
+/// 而 0 分的源在稳定排序里会保持原位置，直连又恰好排在列表最后……
+/// 一旦所有源都被判 0 分（比如全都没跟随重定向），排序退化成原顺序，
+/// 直连反而"赢"了——这正是实测里"明明 ghfast.top 有 1.1 MB/s，主源却是直连"的原因。
+///
+/// 现在：显式启用重定向跟随，并且**得 0 分的源一律沉到列表末尾**（按原相对顺序），
+/// 保证"有速度的源"永远排在"测不出速度的源"前面。
+async fn rank_sources(sources: Vec<Source>, route: NetworkRoute) -> Vec<Source> {
+    use std::time::Instant;
+
+    let mut scored: Vec<(Source, u64)> = Vec::new();
+    for source in sources {
+        let client = match reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            // 总超时要明显大于采样窗口：留出 DNS + TLS + 首字节的时间。
+            .timeout(PROBE_TIMEOUT)
+            .connect_timeout(PROBE_CONNECT_TIMEOUT)
+            // ⚠️ 必须显式跟随重定向：github.com 的资产地址是 302。
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                scored.push((source, 0));
+                continue;
+            }
+        };
+
+        let request = client.get(&source.url).header("Range", "bytes=0-4194303");
+        let Ok(mut response) = request.send().await else {
+            scored.push((source, 0));
+            continue;
+        };
+        if !response.status().is_success() && response.status().as_u16() != 206 {
+            scored.push((source, 0));
+            continue;
+        }
+
+        // 计时从**首字节到达**才开始：握手时间不该算进带宽。
+        let mut received = 0u64;
+        let mut started: Option<Instant> = None;
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if started.is_none() {
+                started = Some(Instant::now());
+            }
+            received += chunk.len() as u64;
+            if let Some(start) = started {
+                if start.elapsed() >= PROBE_WINDOW {
+                    break;
+                }
+            }
+        }
+        let speed = match started {
+            Some(start) if start.elapsed().as_millis() > 0 => {
+                (received as f64 / start.elapsed().as_secs_f64()) as u64
+            }
+            _ => 0,
+        };
+        scored.push((source, speed));
+    }
+
+    // ## 直连降权（仅在"大陆方案"下生效）
+    //
+    // 实测四次里两次把直连选成主源，而那两次都是 69–98 秒；选到镜像时 26–43 秒。
+    // 原因很实在：直连测速时偶尔能瞬时冲到几百 KB/s（CDN 边缘节点缓存命中），
+    // 但**多连接并发时会被按连接限速**——测速看到的速度不代表并发下的表现。
+    //
+    // ## 但现在有了网络预检，降权必须按方案区分（2026-10-18 修正）
+    //
+    // 预检已经判断过"这台机器能不能好好连 GitHub"：
+    //   - `Mainland`：GitHub 本来就不行，直连再"测速好看"也不可信 → 继续硬降权，
+    //     保证镜像优先。这是原来那条结论成立的范围。
+    //   - `Direct`：预检实测直连是快的，此时若还硬降权，等于**否定了预检的意义**
+    //     ——用户网络明明好，却被强行拽去走第三方镜像，既绕远路又把安装包
+    //     交给外部站点。
+    //
+    // 所以降权只在 Mainland 方案下做。
+    if route == NetworkRoute::Mainland {
+        let any_mirror_usable = scored
+            .iter()
+            .any(|(source, speed)| *speed > 0 && source.label != "GitHub 直连");
+        if any_mirror_usable {
+            for (source, speed) in scored.iter_mut() {
+                if source.label == "GitHub 直连" {
+                    // 压到 1：低于任何能测出速度的镜像，但高于完全失败的 0。
+                    *speed = 1;
+                }
+            }
+        }
+    }
+
+    // 快的在前。
+    //
+    // 得 0 分的源（测不出速度：连接失败、超时、返回非 2xx）一律沉到末尾，
+    // 但彼此之间保持原相对顺序——`sort_by_key` 是稳定排序，用
+    // `Reverse(speed)` 就能让"有速度的"排在"没速度的"之前，且同分不重排。
+    //
+    // 这条不是锦上添花：如果所有源都判 0 分（比如全都没跟随 302 重定向），
+    // 旧逻辑会退化成原顺序，而直连恰好排在最后……实际表现就是"直连莫名当上主源"。
+    // 现在至少保证：只要有一个源测出了速度，它一定排在直连前面。
+    scored.sort_by_key(|(_, speed)| std::cmp::Reverse(*speed));
+    scored.into_iter().map(|(source, _)| source).collect()
+}
+
+/// 分片下载中的一个任务：字节区间 + 落地路径。
+///
+/// 序号体现在 `path`（`part0`、`part1`…）上，拼接时按序号顺序读回来，
+/// 因此不需要单独存一个 `index` 字段。
+#[derive(Debug, Clone)]
+struct Chunk {
+    start: u64,
+    end: u64,
+    path: PathBuf,
+}
+
+/// 把总长度切成若干片（最后一片吃掉余数）。
+fn plan_chunks(total: u64, temp_dir: &Path) -> Vec<Chunk> {
+    let count = DOWNLOAD_CONNECTIONS.min(total.div_ceil(PARALLEL_MIN_BYTES).max(1));
+    let size = total.div_ceil(count);
+    let mut chunks = Vec::new();
+    let mut start = 0u64;
+    let mut index = 0u64;
+    while start < total {
+        let end = (start + size).min(total) - 1;
+        chunks.push(Chunk {
+            start,
+            end,
+            path: temp_dir.join(format!("part{index}")),
+        });
+        start = end + 1;
+        index += 1;
+    }
+    chunks
+}
+
+/// 分片并发下载，全部成功后按序拼接成 `target`。
+///
+/// 进度由 `report` 在**等待任务期间**按累计字节数轮询上报：分片任务本身只累加
+/// 原子计数，不直接发事件——这样无论多少片并发，事件频率都由这里统一节流。
+async fn download_parallel(
+    sources: &[Source],
+    total: u64,
+    target: &Path,
+    job_id: &str,
+    report: &(dyn Fn(u64, u64) + Sync),
+    enforce_floor: bool,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    // 分片临时目录：和目标文件同盘，最后的 rename 才是原子的。
+    let temp_dir = target.with_extension("parts");
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir)
+        .await
+        .map_err(|error| format!("无法创建临时目录：{error}"))?;
+
+    let chunks = plan_chunks(total, &temp_dir);
+    let downloaded = Arc::new(AtomicU64::new(0));
+    if sources.is_empty() {
+        return Err("没有可用的下载源。".to_string());
+    }
+
+    let mut tasks = Vec::new();
+    for chunk in chunks {
+        let chunk_for_task = chunk;
+        // ## 分片集中在测速最优的源上（2026-10-18 实测定论）
+        //
+        // 曾经试过"分片轮转分配到不同源"，想用分散来规避选错源。实测否决了它：
+        //   - 轮转（8 片分散到 5 个源）：54–87 秒，最差 118 秒；
+        //   - 单源 ghfast.top × 8 连接：**20 秒下完 48.7 MB（2492 KB/s）**。
+        //
+        // 原因：不同镜像共享同一条运营商出口带宽，跨源并发反而互相争抢、还会
+        // 叠加各镜像自己的限速策略。而单源多连接正好绕开"每连接限速"这个真正的
+        // 瓶颈。所以正确做法是：**认准一个源，把连接数拉满**。
+        //
+        // 那"选错源"怎么办？靠回退链 + 吞吐地板兜住：某个源整体偏慢时，各分片
+        // 的 8 秒窗口结算会把它判死，自动换到链上的下一个源。选错只是慢一点，
+        // 不会错到底。
+        // 回退链就是测速排序本身：快→慢，逐个尝试。
+        let chain: Vec<Source> = sources.to_vec();
+        let job = job_id.to_string();
+        let downloaded = Arc::clone(&downloaded);
+        tasks.push(tokio::spawn(async move {
+            let mut last_error = String::new();
+            for source in chain {
+                if should_cancel(&job) {
+                    return Err("已取消下载".to_string());
+                }
+                match fetch_chunk(&source, &chunk_for_task, &job, &downloaded, enforce_floor).await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(last_error)
+        }));
+    }
+
+    // 等所有分片完成，期间每 200ms 报一次累计进度。
+    let pending = tasks;
+    loop {
+        if pending.iter().all(|task| task.is_finished()) {
+            break;
+        }
+        report(downloaded.load(AtomicOrdering::Relaxed), total);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    for task in pending {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                return Err(error);
+            }
+            Err(join_error) => {
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                return Err(format!("下载任务异常：{join_error}"));
+            }
+        }
+    }
+    report(total, total);
+
+    // 按 index 顺序拼接：并发写各自的分片文件，最后顺序读回来。
+    let mut file = tokio::fs::File::create(target)
+        .await
+        .map_err(|error| format!("无法创建文件：{error}"))?;
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut index = 0u64;
+        loop {
+            let part = temp_dir.join(format!("part{index}"));
+            if !part.exists() {
+                break;
+            }
+            let mut part_file = tokio::fs::File::open(&part)
+                .await
+                .map_err(|error| format!("无法读取分片：{error}"))?;
+            tokio::io::copy(&mut part_file, &mut file)
+                .await
+                .map_err(|error| format!("写入失败：{error}"))?;
+            index += 1;
+        }
+        file.flush()
+            .await
+            .map_err(|error| format!("写入失败：{error}"))?;
+    }
+    drop(file);
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    Ok(())
+}
+
+/// 取单个分片并落盘；失败时删掉半截文件，方便重试。
+async fn fetch_chunk(
+    source: &Source,
+    chunk: &Chunk,
+    job_id: &str,
+    downloaded: &std::sync::atomic::AtomicU64,
+    enforce_floor: bool,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    use tokio::io::AsyncWriteExt;
+
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(20))
+        // github.com 的资产地址是 302 → objects.githubusercontent.com，必须跟随。
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|error| format!("无法创建下载客户端：{error}"))?;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client
+            .get(&source.url)
+            .header("Range", format!("bytes={}-{}", chunk.start, chunk.end))
+            .send(),
+    )
+    .await
+    .map_err(|_| format!("{} 连接超时", source.label))?
+    .map_err(|error| format!("{} 请求失败：{error}", source.label))?;
+
+    // 206 才是真的按分片返回；200 说明服务端忽略了 Range（整包返回），
+    // 这时继续读会把 48 MB 全下 8 遍——必须立刻放弃，换源。
+    if response.status().as_u16() != 206 {
+        return Err(format!(
+            "{} 不支持分片（HTTP {}）",
+            source.label,
+            response.status()
+        ));
+    }
+
+    let mut response = response;
+    let mut file = tokio::fs::File::create(&chunk.path)
+        .await
+        .map_err(|error| format!("无法创建分片文件：{error}"))?;
+
+    // ## 吞吐地板：卡住就换源（2026-10-18 实测补）
+    //
+    // 实测踩到的真实现象：下载到 42 MB / 48 MB 时速度掉到近乎 0，而且**永远不恢复**，
+    // 最后靠 60 秒无数据超时才失败。原因是镜像/直连会"吊着连接"——TCP 不断开，
+    // 但服务端不再推数据。只看"有没有数据"是检测不出来的，必须看**吞吐速率**。
+    //
+    // 这里每 8 秒检查一次：这段时间的增量低于 MIN_THROUGHPUT 就判定为"假死"，
+    // 放弃当前源、交给调用方换下一个源重试。地板值取 64 KB/s——比实测最慢的
+    // 可用链路（约 90 KB/s）低一档，避免把"慢但能走"的源误杀。
+    let mut window_start = std::time::Instant::now();
+    let mut window_bytes = 0u64;
+
+    loop {
+        if should_cancel(job_id) {
+            drop(file);
+            let _ = tokio::fs::remove_file(&chunk.path).await;
+            return Err("已取消下载".to_string());
+        }
+        let next = tokio::time::timeout(std::time::Duration::from_secs(60), response.chunk())
+            .await
+            .map_err(|_| format!("{} 传输中断（60 秒无数据）", source.label))?
+            .map_err(|error| format!("{} 传输中断：{error}", source.label))?;
+        let Some(chunk_bytes) = next else {
+            break;
+        };
+        file.write_all(&chunk_bytes)
+            .await
+            .map_err(|error| format!("写入失败：{error}"))?;
+        let len = chunk_bytes.len() as u64;
+        downloaded.fetch_add(len, AtomicOrdering::Relaxed);
+        window_bytes += len;
+
+        // 每过 THROUGHPUT_WINDOW 结算一次：这段时间的平均速率低于地板就换源。
+        // `enforce_floor=false`（第二轮）时不判速——只求走完，不求快。
+        if enforce_floor && window_start.elapsed() >= THROUGHPUT_WINDOW {
+            let speed = window_bytes as f64 / window_start.elapsed().as_secs_f64();
+            if speed < MIN_THROUGHPUT_BPS {
+                drop(file);
+                let _ = tokio::fs::remove_file(&chunk.path).await;
+                // 已下载的字节要还回去，否则换源重下会让进度条虚高。
+                downloaded.fetch_sub(window_bytes, AtomicOrdering::Relaxed);
+                return Err(format!(
+                    "{} 速度过低（{:.0} KB/s），切换下载源",
+                    source.label,
+                    speed / 1024.0
+                ));
+            }
+            window_start = std::time::Instant::now();
+            window_bytes = 0;
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|error| format!("写入失败：{error}"))?;
+    drop(file);
+
+    // 体积必须对得上：少一片就是坏包，不能交给安装器。
+    let actual = tokio::fs::metadata(&chunk.path)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let expected = chunk.end - chunk.start + 1;
+    if actual != expected {
+        let _ = tokio::fs::remove_file(&chunk.path).await;
+        return Err(format!(
+            "{} 分片不完整（{actual}/{expected} 字节）",
+            source.label
+        ));
+    }
+    Ok(())
+}
+
+/// 计算文件的 SHA-256（流式，不把整个安装包读进内存）。
+async fn sha256_of(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| format!("无法读取安装包：{error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| format!("读取安装包失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// 查询最新 Release。
@@ -538,10 +1309,21 @@ pub async fn update_check() -> Result<UpdateInfo, String> {
             .and_then(|value| value.get("size"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
+        // `digest` 形如 `sha256:234bd2…`，只取冒号后的十六进制部分；
+        // 非 sha256 的算法一律丢弃（本项目的校验只认 SHA-256）。
+        asset_digest: asset
+            .and_then(|value| value.get("digest"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| raw.strip_prefix("sha256:"))
+            .map(|hex| hex.trim().to_ascii_lowercase())
+            .filter(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())),
     })
 }
 
 /// 下载安装包到系统下载目录，全程通过 `update://download` 事件上报进度。
+///
+/// `job_id` 由前端生成并原样回填到每一条进度事件里，用于把广播事件路由回发起方
+/// （见 `DownloadProgress::job_id` 的注释）。前端不传时后端补一个空串，行为不变。
 ///
 /// 返回落地路径（同时也会随最后一次进度事件给出）。
 #[tauri::command]
@@ -549,20 +1331,35 @@ pub async fn update_download(
     app: AppHandle,
     url: String,
     file_name: String,
+    job_id: Option<String>,
+    digest: Option<String>,
 ) -> Result<String, String> {
+    let job_id = job_id.unwrap_or_default();
+    // 新一次下载开始，先把上一次遗留的取消标记全部清掉：
+    // 全局标记是旧的"取消一切"语义，定向标记可能属于已经结束的上一号任务。
+    // 不清就会让新下载刚起步就被判定为"已取消"。
+    DOWNLOAD_CANCELLED.store(false, Ordering::SeqCst);
+    *CANCELLED_JOB
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
     if !is_trusted_asset_url(&url) {
         return Err("拒绝下载非 GitHub 发布域名的地址。".to_string());
     }
     let target = download_dir().join(safe_file_name(&file_name));
 
-    let result = download_to(&app, &url, &target).await;
+    // digest 由 `update_check` 从 GitHub API 取得并随 UpdateInfo 传给前端，
+    // 下载时再带回来。走前端一圈而不是在 Rust 侧重查一次，是为了避免多打一次
+    // API（未认证配额只有 60 次/小时，全机共享）。
+    let result = download_to(&app, &url, &target, &job_id, digest.as_deref()).await;
     match &result {
         Ok(()) => {
-            let _ = app.emit(
-                EVENT_DOWNLOAD,
+            let size = target.metadata().map(|meta| meta.len()).unwrap_or(0);
+            emit_progress(
+                &app,
                 DownloadProgress {
-                    received: target.metadata().map(|meta| meta.len()).unwrap_or(0),
-                    total: target.metadata().map(|meta| meta.len()).unwrap_or(0),
+                    job_id: job_id.clone(),
+                    received: size,
+                    total: size,
                     percent: 100,
                     done: true,
                     error: None,
@@ -573,9 +1370,10 @@ pub async fn update_download(
         }
         Err(error) => {
             // 失败也要发一次 done：前端若只靠事件收尾，漏发就会永远停在进度条上。
-            let _ = app.emit(
-                EVENT_DOWNLOAD,
+            emit_progress(
+                &app,
                 DownloadProgress {
+                    job_id: job_id.clone(),
                     received: 0,
                     total: 0,
                     percent: 0,
@@ -589,18 +1387,183 @@ pub async fn update_download(
     }
 }
 
-async fn download_to(app: &AppHandle, url: &str, target: &Path) -> Result<(), String> {
-    use std::io::Write;
+/// 取消正在进行的下载。
+///
+/// ## 为什么带 `job_id`（2026-10-18）
+///
+/// 旧实现是一个全局的 `DOWNLOAD_CANCELLED` 布尔：任意一处点「取消」都会把
+/// **所有**在跑的下载停掉。本应用有两处能发起下载（标题栏弹窗、设置页），
+/// 用户在弹窗里取消时，设置页那次后台下载也会跟着失败——反之亦然。
+///
+/// 现在记下"被取消的是哪一号任务"：`update_download` 只在任务号对得上时
+/// 才收手。不传 `job_id` 时保持旧语义（取消全部），向后兼容。
+#[tauri::command]
+pub fn update_cancel_download(job_id: Option<String>) {
+    match job_id {
+        Some(id) if !id.is_empty() => {
+            *CANCELLED_JOB
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(id);
+        }
+        _ => DOWNLOAD_CANCELLED.store(true, Ordering::SeqCst),
+    }
+}
 
-    // 下载不吃 client() 的 20 秒总超时：77 MB 的安装包在慢速网络下必然超。
-    // 这里单独建一个只设连接超时的客户端。
+/// 本次要取消的任务号（`None` 表示没有定向取消请求）。
+static CANCELLED_JOB: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 这一号任务是否应当停止。
+///
+/// 两个来源取或：全局取消标记（旧语义），或定向取消了同一个任务号。
+fn should_cancel(job_id: &str) -> bool {
+    if DOWNLOAD_CANCELLED.load(Ordering::SeqCst) {
+        return true;
+    }
+    let guard = CANCELLED_JOB
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    guard.as_deref().is_some_and(|id| id == job_id)
+}
+
+/// 下载安装包：镜像择优 → 分片并发 → SHA-256 校验。
+///
+/// ## 链路（2026-10-18 重写，解决国内下载慢）
+///
+/// 1. **测速**：把"直连 + 各镜像"并发探一遍，按实测速率排序。
+/// 2. **分片并发**：用 Range 把文件切成 8 片同时下。这是提速的关键——
+///    实测单连接被限到 111 KB/s，8 连接能到 2 MB/s，镜像上更到 3 MB/s。
+/// 3. **回退**：某个分片在首选源上失败，自动换下一个源重试；全部失败才报错。
+/// 4. **校验**：下完比对 GitHub API 给的 SHA-256。镜像不可信，这一步不能省。
+///
+/// 小文件（< 2 MB）或拿不到总长度时退回单连接顺序下载——分片对它们没有收益，
+/// 反而多几次握手。
+async fn download_to(
+    app: &AppHandle,
+    url: &str,
+    target: &Path,
+    job_id: &str,
+    digest: Option<&str>,
+) -> Result<(), String> {
+    // 先写临时文件、成功后再改名：中途失败不会在下载目录留下一个"看起来是安装包"
+    // 的半截文件，用户下次也不会误点它。
+    let temp = target.with_extension("download");
+
+    // 进度节流：每 1% 发一次。再密就是纯噪音，再疏进度条会一跳一跳。
+    let last_percent = std::sync::atomic::AtomicI64::new(-1);
+    let report = |received: u64, total: u64| {
+        if total == 0 {
+            return;
+        }
+        let percent = (received.saturating_mul(100) / total).min(100) as i64;
+        if last_percent.swap(percent, Ordering::Relaxed) == percent {
+            return;
+        }
+        emit_progress(
+            app,
+            DownloadProgress {
+                job_id: job_id.to_string(),
+                received,
+                total,
+                percent: percent.clamp(0, 100) as u8,
+                done: false,
+                error: None,
+                path: None,
+            },
+        );
+    };
+
+    // ① 预检：先判断这是哪类网络，再决定候选源集合。
     //
-    // 必须挂系统代理：reqwest 不读 Windows 的「Internet 设置」，而 release 资产的
-    // 下载域名在直连时可能根本连不上（见 system_proxy 的实测记录）。
+    // 这一步是用户明确要求的"预处理判断"：GitHub 能正常访问就走默认方案，
+    // 不能就切大陆加速方案。判定用实测吞吐（见 `probe_network` 的注释）。
+    //
+    // 复用前端刚调过的结果没有意义（那是几秒前的事），但**跳过预检**有意义：
+    // 下载本身马上就要发请求，多一次 1–2 秒的探测是可接受的成本，
+    // 换来的是"只对真正可能用上的源测速"，总耗时反而更短。
+    let network = probe_network(url).await;
+
+    // ② 按预检结论取候选源，并实测排序（预检只是粗判，实测才定最终主源）。
+    let sources = candidate_sources(url, network.route);
+    let ranked = rank_sources(sources, network.route).await;
+    let primary = ranked
+        .first()
+        .ok_or_else(|| "没有可用的下载源。".to_string())?
+        .clone();
+
+    let (total, ranged) = probe_length(&primary.url).await?;
+    if should_cancel(job_id) {
+        return Err("已取消下载".to_string());
+    }
+
+    // ② 下载。
+    //
+    // ## 两轮策略（2026-10-18 实测补）
+    //
+    // 第一轮：启用吞吐地板（64 KB/s / 8s），快速淘汰"假死"的源，争取最快完成。
+    // 第二轮：**关闭地板**，只要求能走完。
+    //
+    // 为什么需要第二轮：如果用户网络对每个源都慢（比如被限到 70 KB/s），第一轮
+    // 会把所有源都判死、整个更新直接失败——那比"慢一点但能装上"糟糕得多。
+    // 第二轮保证任何能连通的环境都能把包装下来，只是不保证快。
+    let mut last_error = String::new();
+    let mut succeeded = false;
+    for round in 0..2u8 {
+        let enforce_floor = round == 0;
+        let attempt = if ranged && total >= PARALLEL_MIN_BYTES {
+            download_parallel(&ranked, total, &temp, job_id, &report, enforce_floor).await
+        } else {
+            download_single(&primary.url, &temp, total, job_id, &report, enforce_floor).await
+        };
+        match attempt {
+            Ok(()) => {
+                succeeded = true;
+                break;
+            }
+            Err(error) => {
+                if should_cancel(job_id) {
+                    return Err("已取消下载".to_string());
+                }
+                last_error = error;
+                // 第一轮失败多半是"源太慢"，重排一次序再试（网络状况可能已变）。
+                if enforce_floor {
+                    continue;
+                }
+            }
+        }
+    }
+    if !succeeded {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(format!("下载失败：{last_error}"));
+    }
+
+    // ③ 校验：镜像给的文件必须与 GitHub 官方 digest 一致。
+    if let Some(expected) = digest {
+        let actual = sha256_of(&temp).await?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(format!(
+                "安装包校验失败（SHA-256 不匹配），已删除下载文件。\n预期：{expected}\n实际：{actual}\n请重试；若反复失败，说明下载链路被篡改或镜像返回了错误内容。"
+            ));
+        }
+    }
+
+    tokio::fs::rename(&temp, target)
+        .await
+        .map_err(|error| format!("无法完成保存：{error}"))?;
+    Ok(())
+}
+
+/// 探测总长度与是否支持 Range。
+///
+/// 用 `Range: bytes=0-0` 发一个 1 字节请求：能同时拿到
+/// `Content-Range: bytes 0-0/51038598`（总长）和 `206`（支持分片）两个事实，
+/// 比先 HEAD 再 GET 少一次往返。服务端忽略 Range 时退回 `Content-Length`。
+async fn probe_length(url: &str) -> Result<(u64, bool), String> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        // 大文件下载：连接超时给宽一点，但不要设总超时。
-        .connect_timeout(std::time::Duration::from_secs(20));
+        .connect_timeout(std::time::Duration::from_secs(20))
+        // github.com 的资产地址是 302，不跟随就永远拿不到 Content-Range。
+        .redirect(reqwest::redirect::Policy::limited(5));
     if let Some(proxies) = system_proxy() {
         for proxy in proxies {
             builder = builder.proxy(proxy);
@@ -610,9 +1573,13 @@ async fn download_to(app: &AppHandle, url: &str, target: &Path) -> Result<(), St
         .build()
         .map_err(|error| format!("无法创建下载客户端：{error}"))?;
 
-    let mut response = client.get(url).send().await.map_err(|error| {
-        // reqwest 的 Display 经常只有一句 `error sending request for url (...)`，
-        // 把 source 链一并带上，否则用户（和排查者）看不出是连不上、TLS 失败还是被重置。
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.get(url).header("Range", "bytes=0-0").send(),
+    )
+    .await
+    .map_err(|_| "下载失败：连接下载源超过 30 秒没有响应。".to_string())?
+    .map_err(|error| {
         let mut detail = error.to_string();
         let mut source = std::error::Error::source(&error);
         while let Some(cause) = source {
@@ -622,55 +1589,114 @@ async fn download_to(app: &AppHandle, url: &str, target: &Path) -> Result<(), St
         }
         format!("下载失败：{detail}")
     })?;
-    if !response.status().is_success() {
-        return Err(format!("下载失败：GitHub 返回 {}", response.status()));
+
+    if !response.status().is_success() && response.status().as_u16() != 206 {
+        return Err(format!("下载失败：下载源返回 {}", response.status()));
     }
+
+    // `Content-Range: bytes 0-0/51038598` → 取斜杠后的总长。
+    let ranged_total = response
+        .headers()
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit('/').next())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+
+    if let Some(total) = ranged_total {
+        return Ok((total, true));
+    }
+    // 服务端忽略了 Range：按整包长度走单连接。
     let total = response.content_length().unwrap_or(0);
+    Ok((total, false))
+}
 
-    // 先写临时文件、成功后再改名：中途失败不会在下载目录留下一个"看起来是安装包"
-    // 的半截文件，用户下次也不会误点它。
-    let temp = target.with_extension("download");
-    let mut file =
-        std::fs::File::create(&temp).map_err(|error| format!("无法创建文件：{error}"))?;
-    let mut received: u64 = 0;
-    let mut last_percent: i64 = -1;
+/// 单连接顺序下载（小文件 / 服务端不支持 Range 时的退路）。
+async fn download_single(
+    url: &str,
+    temp: &Path,
+    total: u64,
+    job_id: &str,
+    report: &(dyn Fn(u64, u64) + Sync),
+    enforce_floor: bool,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
 
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("下载中断：{error}"))?
-    {
-        file.write_all(&chunk)
-            .map_err(|error| format!("写入失败：{error}"))?;
-        received += chunk.len() as u64;
-
-        // 每 1% 发一次事件：再密就是纯噪音，再疏进度条会一跳一跳。
-        // 用 checked_div 而不是 `if total > 0`：这既是 clippy 的要求，也把
-        // “拿不到 Content-Length 就不报百分比”这件事写进了类型里。
-        let percent = received
-            .checked_mul(100)
-            .and_then(|scaled| scaled.checked_div(total))
-            .map(|value| value.min(100) as i64)
-            .unwrap_or(-1);
-        if percent != last_percent {
-            last_percent = percent;
-            let _ = app.emit(
-                EVENT_DOWNLOAD,
-                DownloadProgress {
-                    received,
-                    total,
-                    percent: percent.clamp(0, 100) as u8,
-                    done: false,
-                    error: None,
-                    path: None,
-                },
-            );
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(20))
+        // github.com 的资产地址是 302，必须跟随才能取到内容。
+        .redirect(reqwest::redirect::Policy::limited(5));
+    if let Some(proxies) = system_proxy() {
+        for proxy in proxies {
+            builder = builder.proxy(proxy);
         }
     }
-    file.flush().map_err(|error| format!("写入失败：{error}"))?;
+    let client = builder
+        .build()
+        .map_err(|error| format!("无法创建下载客户端：{error}"))?;
+
+    let mut response =
+        tokio::time::timeout(std::time::Duration::from_secs(30), client.get(url).send())
+            .await
+            .map_err(|_| "下载失败：连接下载源超过 30 秒没有响应。".to_string())?
+            .map_err(|error| format!("下载失败：{error}"))?;
+
+    if !response.status().is_success() && response.status().as_u16() != 206 {
+        return Err(format!("下载失败：下载源返回 {}", response.status()));
+    }
+
+    let mut file = tokio::fs::File::create(temp)
+        .await
+        .map_err(|error| format!("无法创建文件：{error}"))?;
+    let mut received: u64 = 0;
+    // 与分片下载同一套吞吐地板：卡住的连接要能被识别出来。
+    let mut window_start = std::time::Instant::now();
+    let mut window_bytes = 0u64;
+    loop {
+        if should_cancel(job_id) {
+            drop(file);
+            let _ = tokio::fs::remove_file(temp).await;
+            return Err("已取消下载".to_string());
+        }
+        let next = tokio::time::timeout(std::time::Duration::from_secs(60), response.chunk())
+            .await
+            .map_err(|_| "下载中断：超过 60 秒没有收到新数据。".to_string())?
+            .map_err(|error| format!("下载中断：{error}"))?;
+        let Some(bytes) = next else {
+            break;
+        };
+        file.write_all(&bytes)
+            .await
+            .map_err(|error| format!("写入失败：{error}"))?;
+        let len = bytes.len() as u64;
+        received += len;
+        window_bytes += len;
+        report(received, total);
+
+        if enforce_floor && window_start.elapsed() >= THROUGHPUT_WINDOW {
+            let speed = window_bytes as f64 / window_start.elapsed().as_secs_f64();
+            if speed < MIN_THROUGHPUT_BPS {
+                drop(file);
+                let _ = tokio::fs::remove_file(temp).await;
+                return Err(format!(
+                    "下载速度过低（{:.0} KB/s），切换下载源",
+                    speed / 1024.0
+                ));
+            }
+            window_start = std::time::Instant::now();
+            window_bytes = 0;
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|error| format!("写入失败：{error}"))?;
     drop(file);
 
-    std::fs::rename(&temp, target).map_err(|error| format!("无法完成保存：{error}"))?;
+    // 有总长度就必须对得上，否则是坏包。
+    if total > 0 && received != total {
+        let _ = tokio::fs::remove_file(temp).await;
+        return Err(format!("下载不完整（{received}/{total} 字节）"));
+    }
     Ok(())
 }
 
@@ -753,6 +1779,20 @@ fn resolve_installable(path: &Path, allowed_dir: &Path) -> Result<PathBuf, Strin
 /// **不传 `/S`**：静默模式的失败路径没有界面，会把"更新没装上"变成一件无声的事
 /// （0.2.23 的实测记录）。向导会把同一类失败变成可见的确认框或错误框。
 ///
+/// ## 必须传 `/UPDATE`（2026-10-18 补）
+///
+/// Tauri 的 NSIS 模板用 `/UPDATE` 决定 `$UpdateMode`：
+///   - **带** `/UPDATE`：走升级分支 —— 跳过"已安装 → 重装/卸载"的维护页，
+///     跳过快捷方式重建，卸载段也不删快捷方式。这是"更新"该有的样子。
+///   - **不带**：NSIS 认为用户是**手动双击安装包**，于是先弹维护页问
+///     "要重装还是卸载"，选错就直接把应用卸掉。用户点"立即更新"却看到
+///     卸载选项，体验非常糟糕。
+///
+/// 官方 `tauri-plugin-updater` 的 `updater_parameters()` 里 `/UPDATE` 是**恒定**
+/// 拼进去的，这里对齐同一套约定。`/R`（装完自动拉起新版本）刻意**不传**：
+/// 本应用的安装模式是 `currentUser` + 完整向导，用户点完向导后自己启动更可控，
+/// 也避免安装器在我们的进程还没完全退出时就去拉起新进程。
+///
 /// 四道安全校验在 `resolve_installable` 里（AGENTS.md 不变量 13 补充五），这里只负责
 /// 启动与退出。参数以独立 argv 传递，不经过 shell。
 ///
@@ -780,6 +1820,8 @@ pub fn update_install(app: AppHandle, path: String) -> Result<(), String> {
     let real = resolve_installable(&PathBuf::from(&path), &download_dir())?;
 
     std::process::Command::new(&real)
+        // 升级语义：跳过 NSIS 的"重装/卸载"维护页（见上面 `/UPDATE` 那段）。
+        .arg("/UPDATE")
         .spawn()
         .map_err(|error| format!("无法启动安装程序：{error}"))?;
 
@@ -912,6 +1954,199 @@ mod tests {
         std::fs::write(&file, data).expect("改写内容");
         let error = resolve_installable(&file, &dir).unwrap_err();
         assert!(error.contains("格式不正确"), "实际错误：{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 国内加速：分片规划与镜像候选 ──────────────────────────────────
+
+    #[test]
+    fn plans_chunks_that_cover_every_byte_exactly_once() {
+        let dir = std::env::temp_dir().join("ttv-chunk-plan");
+        for total in [PARALLEL_MIN_BYTES, 5 * 1024 * 1024, 51_038_598u64] {
+            let chunks = plan_chunks(total, &dir);
+            assert!(!chunks.is_empty(), "total={total} 没有切出分片");
+            // 第一片必须从 0 开始。
+            assert_eq!(chunks[0].start, 0, "total={total}");
+            // 最后一片必须正好到 total-1。
+            assert_eq!(chunks.last().unwrap().end, total - 1, "total={total}");
+            // 相邻分片必须首尾相接：既不重叠也不留缝。
+            for pair in chunks.windows(2) {
+                assert_eq!(
+                    pair[0].end + 1,
+                    pair[1].start,
+                    "total={total} 分片之间有断裂或重叠"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn caps_chunk_count_at_the_connection_limit() {
+        // 一个 200 MB 的包也不该切出超过 DOWNLOAD_CONNECTIONS 片：
+        // 再多不会更快，只会让镜像更容易风控。
+        let dir = std::env::temp_dir().join("ttv-chunk-cap");
+        let chunks = plan_chunks(200 * 1024 * 1024, &dir);
+        assert!(
+            chunks.len() as u64 <= DOWNLOAD_CONNECTIONS,
+            "切出了 {} 片，超过上限",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    fn mainland_route_prefers_mirrors_with_direct_as_last_resort() {
+        let github = "https://github.com/o/r/releases/download/v1/x.exe";
+        let sources = candidate_sources(github, NetworkRoute::Mainland);
+        // 最后一个永远是直连（兜底）。
+        assert_eq!(sources.last().unwrap().url, github);
+        assert_eq!(sources.last().unwrap().label, "GitHub 直连");
+        // 镜像数量 = 模板数量，且都带上了原始地址。
+        assert_eq!(sources.len(), MIRROR_TEMPLATES.len() + 1);
+        for source in &sources[..MIRROR_TEMPLATES.len()] {
+            assert!(source.url.contains(github), "镜像地址丢了原始 URL");
+            assert!(source.url.starts_with("https://"), "镜像必须是 HTTPS");
+        }
+    }
+
+    #[test]
+    fn direct_route_puts_the_origin_first_but_keeps_mirrors_as_fallback() {
+        // ## 这条测试守着一个真实事故（2026-10-18）
+        //
+        // 曾经把 Direct 方案实现成"候选只剩直连"，结果真实下载直接失败：
+        // 预检看到直连瞬时 4655 KB/s → 判定 Direct → 候选只有直连
+        // → 8 连接并发时被限速到 89 KB/s → 吞吐地板判死 → **无源可换** → 更新失败。
+        //
+        // 所以 Direct 方案必须是"直连排第一 + 镜像仍留在后面兜底"，
+        // 而不是"删掉镜像"。这条断言就是防它退回去。
+        let github = "https://github.com/o/r/releases/download/v1/x.exe";
+        let sources = candidate_sources(github, NetworkRoute::Direct);
+        assert_eq!(sources.len(), MIRROR_TEMPLATES.len() + 1, "镜像不能被裁掉");
+        assert_eq!(sources[0].url, github, "直连应排第一");
+        assert_eq!(sources[0].label, "GitHub 直连");
+        // 后面必须还有镜像可换。
+        assert!(
+            sources[1..]
+                .iter()
+                .all(|source| source.url.contains(github)),
+            "兜底源应当是镜像"
+        );
+    }
+
+    #[test]
+    fn leaves_cdn_urls_untouched() {
+        // objects.githubusercontent.com 这类 CDN 直链镜像站不认，硬拼只会 404，
+        // 所以无论走哪套方案都只有直连一条候选。
+        let cdn = "https://objects.githubusercontent.com/abc?sig=1";
+        for route in [NetworkRoute::Direct, NetworkRoute::Mainland] {
+            let sources = candidate_sources(cdn, route);
+            assert_eq!(sources.len(), 1, "route={route:?}");
+            assert_eq!(sources[0].url, cdn);
+        }
+    }
+
+    #[test]
+    fn accepts_only_well_formed_sha256_digests() {
+        // 从 GitHub 的 `sha256:hex` 里只取 hex，且必须 64 位。
+        let good = "sha256:234bd20a1ddec666dbc95232912964c79277742c2753d779963abe36190e0673";
+        let parsed = good
+            .strip_prefix("sha256:")
+            .map(|hex| hex.trim().to_ascii_lowercase())
+            .filter(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(parsed.is_some());
+        // 非 sha256 算法或长度不对的一律丢弃。
+        for bad in ["md5:abc", "sha256:tooshort", "sha256:zz"] {
+            let parsed = bad
+                .strip_prefix("sha256:")
+                .map(|hex| hex.trim().to_ascii_lowercase())
+                .filter(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(parsed.is_none(), "{bad} 不该被当成有效 digest");
+        }
+    }
+
+    #[test]
+    fn hashes_a_file_with_sha256() {
+        // 用一个已知内容的文件验证流式哈希实现。
+        // "abc" 的 SHA-256 是固定值，便于人工核对。
+        let dir = std::env::temp_dir().join("ttv-sha256-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let file = dir.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("写文件");
+        let hash = tauri::async_runtime::block_on(sha256_of(&file)).expect("计算哈希");
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 真实网络的端到端下载测试：验证「镜像择优 + 分片并发 + SHA-256 校验」这条链路
+    /// 在真实网络上确实能跑通、且确实比单连接快。
+    ///
+    /// 默认 `#[ignore]`：它依赖外网、耗时几十秒，不该在每次 `cargo test` 里跑。
+    /// 需要时手动执行：
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture download_real_asset
+    /// ```
+    ///
+    /// 断言的是**正确性**（字节数、SHA-256）而不是速度——速度取决于当时的网络，
+    /// 写进断言只会变成随机失败的测试。速度打印到 stdout 供人工判断。
+    #[test]
+    #[ignore = "依赖外网，手动执行：cargo test -- --ignored --nocapture download_real_asset"]
+    fn download_real_asset_matches_official_digest() {
+        const URL: &str = "https://github.com/kiocou/ttv-short-drama/releases/download/v0.2.26/TTV.Short.Drama_0.2.26_x64-setup.exe";
+        const DIGEST: &str = "234bd20a1ddec666dbc95232912964c79277742c2753d779963abe36190e0673";
+
+        let dir = std::env::temp_dir().join("ttv-real-download-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let target = dir.join("setup.exe");
+
+        let started = std::time::Instant::now();
+        tauri::async_runtime::block_on(async {
+            // 与真实链路一致：先预检，再按结论取候选源。
+            let network = probe_network(URL).await;
+            println!(
+                "\n网络预检：route={:?} 直连={} KB/s — {}",
+                network.route,
+                network.direct_speed / 1024,
+                network.reason
+            );
+            let sources = candidate_sources(URL, network.route);
+            println!("候选源 {} 个，开始测速…", sources.len());
+            let ranked = rank_sources(sources, network.route).await;
+            for (index, source) in ranked.iter().enumerate() {
+                println!("  {}. {}", index + 1, source.label);
+            }
+            let primary = ranked.first().expect("至少有一个源").clone();
+            let (total, ranged) = probe_length(&primary.url).await.expect("探测长度");
+            println!(
+                "主源 = {}，总长 = {total} 字节，支持分片 = {ranged}",
+                primary.label
+            );
+
+            let report = |received: u64, total: u64| {
+                if total > 0 && received % (10 * 1024 * 1024) < 256 * 1024 {
+                    println!("  进度 {}/{} 字节", received, total);
+                }
+            };
+            download_parallel(&ranked, total, &target, "test-job", &report, true)
+                .await
+                .expect("并发下载失败");
+
+            let actual = sha256_of(&target).await.expect("计算哈希");
+            assert_eq!(actual, DIGEST, "SHA-256 与官方 digest 不一致");
+        });
+        let elapsed = started.elapsed();
+        let size = std::fs::metadata(&target).expect("读文件").len();
+        println!(
+            "\n✅ 下载 + 校验完成：{} 字节，耗时 {:.1}s，平均 {:.0} KB/s",
+            size,
+            elapsed.as_secs_f64(),
+            size as f64 / elapsed.as_secs_f64() / 1024.0
+        );
+        assert_eq!(size, 51_038_598, "体积与官方发布不一致");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

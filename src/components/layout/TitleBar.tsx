@@ -225,11 +225,38 @@ export const TitleBar: React.FC = () => {
     });
   };
 
+  /**
+   * 标题栏拖动窗口。
+   *
+   * ## ⚠️ 必须校验事件真的发生在标题栏内部（2026-10-18 修「更新弹窗所有按钮点了没反应」）
+   *
+   * React 的事件**按 fiber 树（组件树）派发，不是按 DOM 树**。更新弹窗用
+   * `createPortal` 挂到了 `document.body`，DOM 上它和标题栏已经没关系了，
+   * 但在 React 的组件树里它仍然是 `TitleBar` 的后代（`VersionBadge` 里渲染的）。
+   *
+   * 于是弹窗里任何一次 `mousedown` 都会沿组件树冒泡到这里的 `<header>`：
+   *   - 旧代码只判断 `target.closest('[data-window-interactive]')`，
+   *     而弹窗里的按钮当然不带这个属性 → 判定成"用户要拖窗口"；
+   *   - `startDragging()` 让系统进入窗口拖动模态，鼠标被窗口捕获，
+   *     `mouseup` 不再落到按钮上 → 浏览器不派发 `click`。
+   *
+   * 结果就是弹窗里**三颗按钮全部失效**（连"取消"都关不掉），因为它们的
+   * `onClick` 从来没被触发过。这不是弹窗的样式问题，也不是后端 IPC 的问题。
+   *
+   * 修法：用 `currentTarget.contains(target)` 确认事件确实落在标题栏的 DOM 子树里。
+   * Portal 出来的节点不在其中，因此从源头就被拒绝——这比在弹窗里逐个
+   * `stopPropagation` 更可靠：以后任何再挂 Portal 的浮层（下拉、命令面板）
+   * 都自动免疫这个坑。
+   */
   const handleDragStart = async (event: React.MouseEvent<HTMLElement>) => {
     if (event.button !== 0 || !isTauriEnvironment()) return;
 
-    const target = event.target as HTMLElement;
-    if (target.closest('[data-window-interactive]')) return;
+    const target = event.target as Node;
+    // Portal 里的节点不是标题栏的 DOM 后代：直接放行，绝不触发窗口拖动。
+    if (!event.currentTarget.contains(target)) return;
+
+    const element = target as HTMLElement;
+    if (element.closest?.('[data-window-interactive]')) return;
 
     try {
       await getCurrentWindow().startDragging();

@@ -6,6 +6,7 @@ import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
 import {
   checkForUpdate,
+  createDownloadJobId,
   downloadUpdate,
   formatBytes,
   installUpdate,
@@ -31,6 +32,7 @@ import {
   Server,
   Sparkles,
   FolderSearch,
+  Power,
   Activity,
   ChevronDown,
   Palette,
@@ -850,6 +852,15 @@ export const SettingsView: React.FC = () => {
     return () => { disposed = true; };
   }, [canUpdate]);
 
+  /**
+   * 本次下载的任务号。
+   *
+   * 后端进度是 `app.emit` 广播，而标题栏的更新弹窗也常驻 DOM 且订阅同一事件。
+   * 不带任务号就会出现：在设置页下载，弹窗那边也收到 `done`、进度条互相覆盖。
+   * 这里只认自己发起的这一次（见 `DownloadProgress.jobId` 的注释）。
+   */
+  const updateJobRef = useRef<string | null>(null);
+
   // 订阅下载进度。放 useEffect 而不是在点击里临时监听：React 18+ 的 StrictMode
   // 会刻意重挂组件，临时监听很容易被重挂弄丢一次进度。
   useEffect(() => {
@@ -857,15 +868,13 @@ export const SettingsView: React.FC = () => {
     let unlisten: (() => void) | null = null;
     void listenDownloadProgress(next => {
       if (disposed) return;
+      // 只处理本组件发起的那次下载。
+      if (!updateJobRef.current || next.jobId !== updateJobRef.current) return;
       setProgress(next);
       if (next.done) {
         setIsDownloading(false);
-        if (next.path) {
-          setSavedPath(next.path);
-          showToast(`安装包已下载（${next.path}）`, 'success');
-        } else if (next.error) {
-          showToast(`下载失败：${next.error}`, 'error');
-        }
+        if (next.path) setSavedPath(next.path);
+        if (next.error) showToast(`下载失败：${next.error}`, 'error');
       }
     }).then(off => {
       if (disposed) off();
@@ -882,8 +891,6 @@ export const SettingsView: React.FC = () => {
     setSavedPath(null);
     setInstallError(null);
     setIsInstalling(false);
-    setInstallError(null);
-    setIsInstalling(false);
     setProgress(null);
     try {
       const info = await checkForUpdate();
@@ -896,6 +903,13 @@ export const SettingsView: React.FC = () => {
     }
   };
 
+  /**
+   * 只下载，**不自动安装**。
+   *
+   * 需求是"下载完成后提示，询问是否关闭程序"。旧实现下载完立刻调 `installUpdate`，
+   * 用户还没看清发生了什么进程就被结束了；失败时又只剩一条 toast，无从补救。
+   * 现在下载完成进入「已就绪」态，由用户自己点「关闭程序并安装」。
+   */
   const handleDownload = async () => {
     if (updateState.kind !== 'result') return;
     const { info } = updateState;
@@ -903,33 +917,39 @@ export const SettingsView: React.FC = () => {
       showToast('该发布没有可下载的安装包', 'warning');
       return;
     }
+    const jobId = createDownloadJobId();
+    updateJobRef.current = jobId;
     setIsDownloading(true);
     setProgress(null);
+    setInstallError(null);
+    setSavedPath(null);
     try {
       // 进度走事件，这里只等最终路径；下载失败会抛错，同时事件也会带一次 done。
-      const path = await downloadUpdate(info.assetUrl, info.assetName);
+      const path = await downloadUpdate(info.assetUrl, info.assetName, jobId, info.assetDigest);
       setSavedPath(path);
-      // 下载完成就装上：用户点的是「更新」，不是「帮我把文件存下来」。
-      // installUpdate 成功会让后端直接退出应用，这里不会返回。
-      setIsInstalling(true);
-      try {
-        await installUpdate(path);
-        // 走到这里说明应用没有退出——后端已 exit，属于不该发生的状态，如实报出来，
-        // 免得界面永远停在「正在安装…」。
-        setIsInstalling(false);
-        setInstallError('安装器已启动，但应用未能自动退出，请手动关闭后重试。');
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setIsInstalling(false);
-        setInstallError(message);
-        showToast(`自动安装未启动：${message}`, 'error');
-      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       showToast(`下载失败：${message}`, 'error');
+    } finally {
       setIsDownloading(false);
     }
-};
+  };
+
+  /** 用户在「已就绪」态确认：启动安装向导，后端会先返回、再退出本进程。 */
+  const handleInstall = async () => {
+    if (!savedPath) return;
+    setIsInstalling(true);
+    setInstallError(null);
+    try {
+      await installUpdate(savedPath);
+      // 正常情况下后端已 spawn 安装器并会在 800ms 后退出本进程，这里不会返回。
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setIsInstalling(false);
+      setInstallError(message);
+      showToast(`自动安装未启动：${message}`, 'error');
+    }
+  };
 
   const handleReveal = async () => {
     if (!savedPath) return;
@@ -1337,11 +1357,29 @@ export const SettingsView: React.FC = () => {
                 </p>
               )}
 
-              {/* 下载 / 安装进度。安装阶段没有百分比，用一条不确定宽度的脉冲条如实表达
-                  "正在进行"，而不是拿下载的百分比假装还在下载。 */}
+              {/* 下载 / 安装进度。**放在操作按钮上方**（需求 1）：
+                  用户的视线从"我点了什么"自然落到"它在做什么"，而不是先看到按钮
+                  再回头找进度。安装阶段没有百分比，用脉冲条如实表达"正在进行"，
+                  而不是拿下载的百分比假装还在下载。 */}
               {(isDownloading || isInstalling) && (
                 <div className="flex flex-col gap-1.5">
-                  <div className="h-1.5 w-full rounded-full bg-blue-200/60 overflow-hidden">
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-[11px] font-semibold text-slate-700">
+                      {isInstalling ? '正在启动安装程序' : '正在下载更新'}
+                    </span>
+                    {!isInstalling && (
+                      <span className="text-[11px] font-mono font-bold text-blue-600">
+                        {progress?.percent ?? 0}%
+                      </span>
+                    )}
+                  </div>
+                  <div
+                    className="h-2 w-full rounded-full bg-blue-200/60 overflow-hidden"
+                    role="progressbar"
+                    aria-valuenow={isInstalling ? undefined : progress?.percent ?? 0}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                  >
                     {isInstalling ? (
                       <div className="h-full w-1/3 bg-blue-600 animate-pulse" />
                     ) : (
@@ -1353,11 +1391,26 @@ export const SettingsView: React.FC = () => {
                   </div>
                   <span className="text-[10px] font-mono text-slate-500">
                     {isInstalling
-                      ? '下载完成，正在启动安装程序…'
+                      ? '下载完成，正在启动安装向导…'
                       : progress && progress.total > 0
                         ? `${formatBytes(progress.received)} / ${formatBytes(progress.total)} · ${progress.percent}%`
-                        : '正在连接…'}
+                        : progress && progress.received > 0
+                          ? `已下载 ${formatBytes(progress.received)}`
+                          : '正在连接…'}
                   </span>
+                </div>
+              )}
+
+              {/* 下载完成：询问是否关闭程序并安装（需求 2）。 */}
+              {!isDownloading && !isInstalling && savedPath && (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2.5 flex items-start gap-2">
+                  <Check className="w-3.5 h-3.5 text-emerald-600 mt-0.5 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[11px] font-bold text-emerald-800">安装包已下载完成</p>
+                    <p className="text-[11px] leading-relaxed text-emerald-700 mt-0.5">
+                      安装需要先关闭本程序。是否现在关闭程序并开始安装？
+                    </p>
+                  </div>
                 </div>
               )}
 
@@ -1368,14 +1421,44 @@ export const SettingsView: React.FC = () => {
                 ) : installError && savedPath ? (
                   // 安装向导没跑起来时的退路：把包暴露给用户自己双击，而不是重试一次
                   // 大概率同样失败的下载。
-                  <FluentButton
-                    variant="primary"
-                    size="sm"
-                    icon={<FolderSearch className="w-3.5 h-3.5" />}
-                    onClick={handleReveal}
-                  >
-                    打开安装包所在文件夹
-                  </FluentButton>
+                  <>
+                    <FluentButton
+                      variant="primary"
+                      size="sm"
+                      icon={<Power className="w-3.5 h-3.5" />}
+                      onClick={() => void handleInstall()}
+                    >
+                      重试安装
+                    </FluentButton>
+                    <FluentButton
+                      variant="secondary"
+                      size="sm"
+                      icon={<FolderSearch className="w-3.5 h-3.5" />}
+                      onClick={handleReveal}
+                    >
+                      打开安装包所在文件夹
+                    </FluentButton>
+                  </>
+                ) : savedPath ? (
+                  // 已下载：由用户决定何时关闭程序并安装（需求 3）。
+                  <>
+                    <FluentButton
+                      variant="primary"
+                      size="sm"
+                      icon={<Power className="w-3.5 h-3.5" />}
+                      onClick={() => void handleInstall()}
+                    >
+                      关闭程序并安装
+                    </FluentButton>
+                    <FluentButton
+                      variant="secondary"
+                      size="sm"
+                      icon={<FolderSearch className="w-3.5 h-3.5" />}
+                      onClick={handleReveal}
+                    >
+                      打开所在文件夹
+                    </FluentButton>
+                  </>
                 ) : (
                   <FluentButton
                     variant="primary"
@@ -1384,7 +1467,7 @@ export const SettingsView: React.FC = () => {
                     icon={<Download className="w-3.5 h-3.5" />}
                     onClick={handleDownload}
                   >
-                    {isDownloading ? '正在下载…' : '下载并安装'}
+                    {isDownloading ? '正在下载…' : '立即下载'}
                   </FluentButton>
                 )}
               </div>

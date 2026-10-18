@@ -29,7 +29,10 @@ use crate::short_drama_app::{
 };
 use crate::storage::Database;
 use crate::trace::{trace_clear, trace_tail, trace_ui_log};
-use crate::update::{app_version, update_check, update_download, update_install, update_reveal};
+use crate::update::{
+    app_version, update_cancel_download, update_check, update_download, update_install,
+    update_probe_network, update_reveal,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1708,7 +1711,9 @@ fn main() {
             pip_dismiss,
             pip_is_open,
             update_check,
+            update_probe_network,
             update_download,
+            update_cancel_download,
             update_reveal,
             update_install,
             app_version,
