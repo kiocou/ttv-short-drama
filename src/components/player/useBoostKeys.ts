@@ -118,6 +118,10 @@ export function useBoostKeys({
   const controller = controllerRef.current;
 
   const cancelBoost = useCallback(() => controller.cancel(), [controller]);
+  /** 当前按住的 ← / →；跨集时用它区分“仍按住”与“已经松手”。 */
+  const heldArrowRef = useRef<string | null>(null);
+  /** 跨集时新一集开始播放后，需要把仍按住的临时加速重新写进去。 */
+  const reapplyOnPlayRef = useRef(false);
 
   /**
    * 用户在加速期间改了基准倍速：立即结束临时加速，画面回到新的基准倍速。
@@ -151,8 +155,30 @@ export function useBoostKeys({
   useEffect(() => {
     if (lastSessionRef.current === sessionId) return;
     lastSessionRef.current = sessionId;
-    cancelBoost();
+    if (heldArrowRef.current && controller.isBoosting()) {
+      reapplyOnPlayRef.current = true;
+    } else {
+      reapplyOnPlayRef.current = false;
+      cancelBoost();
+    }
   }, [sessionId, cancelBoost]);
+
+  /**
+   * 换集后新源会先把倍速写回基准值；等它真正开始播放时再把仍按住的加速
+   * 重新应用。没有这条，提示条虽然还在，实际倍速却已经掉回 1x/基准值。
+   */
+  useEffect(() => {
+    const video = getVideoRef.current();
+    if (!video) return;
+    const handlePlaying = () => {
+      if (!reapplyOnPlayRef.current) return;
+      reapplyOnPlayRef.current = false;
+      if (!heldArrowRef.current || !controller.isBoosting()) return;
+      controller.reapply();
+    };
+    video.addEventListener('playing', handlePlaying);
+    return () => video.removeEventListener('playing', handlePlaying);
+  }, [controller, sessionId]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -168,6 +194,7 @@ export function useBoostKeys({
         case 'ArrowRight':
           event.preventDefault();
           activityRef.current();
+          heldArrowRef.current = event.code;
           // 按住到阈值 → 进入加速；不到阈值就松手 → 一次普通快退/快进。
           // 两者共用同一次按下，所以加速起效后由 keyup 吞掉这次跳转。
           controller.press();
@@ -196,6 +223,8 @@ export function useBoostKeys({
       const target = event.target as HTMLElement | null;
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
       if (!enabled || isLocked) return;
+      heldArrowRef.current = null;
+      reapplyOnPlayRef.current = false;
       // release() 同时收掉长按定时器并恢复倍速，并告诉你这次按下的归属：
       // 已经用在加速上就不再跳转，未到阈值则是一次普通快退/快进。
       if (controller.release()) seekRef.current(event.code === 'ArrowLeft' ? -5 : 5);

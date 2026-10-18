@@ -112,6 +112,8 @@ export interface BoostController {
   isBoosting: () => boolean;
   /** 加速期间切换档位（↑ 传 -1、↓ 传 +1）。未加速时无操作。 */
   cycleLevel: (step: number) => void;
+  /** 新一集开始播放后，把仍有效的临时加速重新写入当前媒体元素。 */
+  reapply: () => void;
   /** 当前档位。 */
   getLevel: () => BoostLevel;
 }
@@ -189,6 +191,10 @@ export function createBoostController(options: BoostControllerOptions): BoostCon
     cycleLevel(step) {
       if (!boosting) return;
       level = cycleBoostLevel(level, step);
+      options.onChange?.(true, apply(), level);
+    },
+    reapply() {
+      if (!boosting) return;
       options.onChange?.(true, apply(), level);
     },
     getLevel: () => level,

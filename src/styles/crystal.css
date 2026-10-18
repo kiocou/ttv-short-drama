@@ -25,6 +25,19 @@
   --fluent-blue-hover: #005bb5;
   --fluent-sky: #38bdf8;
 
+  /*
+   * 进度条语义色与主题强调色分开。
+   *
+   * 浅色主题的按钮仍用蓝色，但进度条一旦跟着 --fluent-blue 走，就会出现
+   * “已播放蓝、缓冲白”的两色割裂；暗色主题又因为变量被重映射成红，看起来
+   * 反而正常。进度条因此固定使用黑红家族：浅色/暗色下都是同一套红。
+   */
+  --progress-played-from: #ff7184;
+  --progress-played-to: #e02a45;
+  --progress-buffer: rgba(224, 42, 69, 0.46);
+  --progress-track: rgba(224, 42, 69, 0.22);
+  --progress-glow: rgba(224, 42, 69, 0.72);
+
   /* 平缓动效曲线 */
   --curve-fluent: cubic-bezier(0.16, 1, 0.3, 1);
 
@@ -412,10 +425,10 @@
       rgba(128,128,128,0.55) 叠白 → 约 185（差 70）；叠黑 → 约 70（差 70）。
     上缘再补一条高光，暗场景下轮廓更明确。
   */
-  background: rgba(148, 163, 184, 0.62);
+  background: var(--progress-track);
   box-shadow:
-    0 -1px 0 rgba(255, 255, 255, 0.34),
-    0 0 5px rgba(0, 0, 0, 0.38);
+    0 -1px 0 rgba(255, 255, 255, 0.3),
+    0 0 5px rgba(0, 0, 0, 0.32);
   z-index: 35;
   opacity: 0;
   transform: translateY(100%);
@@ -453,7 +466,7 @@
     极亮/极暗两种画面上都能看见。纯白（rgba(255,255,255,*)）在白底上同样会归零，
     所以这里也走中性灰 —— 叠白约 230（与底轨 185 差 45）、叠黑约 128（与底轨 70 差 58）。
   */
-  background: rgba(226, 232, 240, 0.88);
+  background: var(--progress-buffer);
   transition: width 0.2s linear;
 }
 
@@ -468,9 +481,9 @@
     实测那条蓝线在白西装画面上同样"看不见"。改成蓝色 + 一圈同色发光，
     让它靠**边缘**而不是靠明度在亮背景上立住。
   */
-  background: linear-gradient(180deg, #ff7184, var(--fluent-blue));
+  background: linear-gradient(180deg, var(--progress-played-from), var(--progress-played-to));
   box-shadow:
-    0 0 8px rgba(224, 42, 69, 0.72),
+    0 0 8px var(--progress-glow),
     0 0 0 0.5px rgba(255, 255, 255, 0.52);
   /* 用 scaleX 而非 width：进度每帧更新时避免触发布局重排 */
   transform-origin: left center;
@@ -596,7 +609,7 @@
   position: relative;
   width: 100%;
   height: 4px;
-  background: rgba(255, 255, 255, 0.22);
+  background: var(--progress-track);
   border-radius: 9999px;
   transition: height 0.15s ease;
 }
@@ -609,14 +622,14 @@
 .progress-buffer {
   position: absolute;
   inset: 0 auto 0 0;
-  background: rgba(255, 255, 255, 0.38);
+  background: var(--progress-buffer);
   border-radius: 9999px;
 }
 
 .progress-played {
   position: absolute;
   inset: 0 auto 0 0;
-  background: var(--fluent-blue);
+  background: linear-gradient(90deg, var(--progress-played-from), var(--progress-played-to));
   border-radius: 9999px;
   transform-origin: left center;
   will-change: transform;
@@ -628,9 +641,9 @@
   width: 12px;
   height: 12px;
   background: #fff;
-  border: 2px solid var(--fluent-blue);
+  border: 2px solid var(--progress-played-to);
   border-radius: 50%;
-  box-shadow: 0 0 6px rgba(0, 120, 212, 0.5);
+  box-shadow: 0 0 6px var(--progress-glow);
   transform: translate(-50%, -50%) scale(0);
   transition: transform 0.15s ease;
   pointer-events: none;

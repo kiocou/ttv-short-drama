@@ -348,6 +348,25 @@ check('多按几档仍然回到自己', cycleBoostLevel('smart', 4), 'smart');
   check('外部 cancel 后再次长按：仍处于加速', controller.isBoosting(), true);
 }
 
+// 22) 跨集时新源会把倍速写回基准值，reapply 要把仍按住的加速重新写入。
+{
+  const { clock, video, controller } = harness({ baseRate: 1 });
+  controller.press();
+  clock.tick(400);
+  video.playbackRate = 1;
+  controller.reapply();
+  check('跨集后 reapply：恢复临时加速速率', video.playbackRate, 3);
+  check('跨集后 reapply：仍处于加速态', controller.isBoosting(), true);
+}
+
+// 23) 未加速时 reapply 必须是空操作，不能偷偷改用户倍速。
+{
+  const { video, controller } = harness({ baseRate: 1.25 });
+  video.playbackRate = 1.25;
+  controller.reapply();
+  check('未加速时 reapply：不改倍速', video.playbackRate, 1.25);
+}
+
 console.log('');
 console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 process.exit(fail === 0 ? 0 : 1);
