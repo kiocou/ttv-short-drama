@@ -282,6 +282,47 @@ check('多按几档仍然回到自己', cycleBoostLevel('smart', 4), 'smart');
   check('短按：不触发加速提示', notices, []);
 }
 
+// 18) 换集必须结束加速，且倍速回到基准。
+//
+// 这是 0.2.25 修的那个 bug：长按加速时切下一集，`openEpisode` 会把
+// `video.playbackRate` 重置成基准倍速（新一集不该继承上一集的临时加速），
+// 但加速控制器不自知 —— `boosting` 仍是 true、提示条留在画面上。
+// `useBoostKeys` 现在把「会话号变化」翻译成一次 `cancel()`。
+//
+// 这里直接验 `cancel()` 的语义：它必须同时（a）写回基准倍速、
+// （b）发出 boosting=false 的回调，两者缺一都会让 UI 与实际脱钩。
+{
+  const { clock, controller, notices, video } = harness({ baseRate: 1 });
+  controller.press();
+  clock.tick(400);
+  check('换集前：处于加速', controller.isBoosting(), true);
+  check('换集前：倍速已被提高', video.playbackRate, 3);
+
+  // 模拟 useBoostKeys 在会话号变化时调的那一次 cancel()。
+  controller.cancel();
+
+  check('换集后：不再处于加速', controller.isBoosting(), false);
+  check('换集后：倍速回到基准', video.playbackRate, 1);
+  check('换集后：发出退出回调（提示条据此消失）', notices.at(-1), {
+    boosting: false,
+    rate: 1,
+    level: 'smart',
+  });
+}
+
+// 19) 未加速时 cancel() 必须是空操作。
+//
+// `useBoostKeys` 的会话 effect 在换集时无条件调一次 cancel()。如果 cancel()
+// 在未加速时也写 playbackRate，那么「用户设了 1.25x、换集」就会被写回……
+// 恰好也是 1.25x（基准），看起来无害。但若用户在换集瞬间正把倍速从 2x 改到
+// 1.25x，这个写入会用**旧闭包里的基准值**覆盖新值。空操作才是安全的。
+{
+  const { controller, notices } = harness({ baseRate: 1.25 });
+  controller.cancel();
+  check('未加速时 cancel：不产生任何回调', notices, []);
+  check('未加速时 cancel：仍不处于加速', controller.isBoosting(), false);
+}
+
 console.log('');
 console.log('通过 ' + pass + ' 项，失败 ' + fail + ' 项');
 process.exit(fail === 0 ? 0 : 1);

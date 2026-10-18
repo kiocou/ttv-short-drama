@@ -30,6 +30,25 @@ interface UseBoostKeysOptions {
   stepVolume: (delta: number) => void;
   /** 用户有操作（用于喂控制条自动隐藏定时器）。 */
   onUserActivity: () => void;
+  /**
+   * 当前播放会话号。**变化即视为换集**，会强制收掉正在进行的加速。
+   *
+   * ## 为什么必须有它（2026-10-18 修「长按加速时切下一集，倍速就变回正常」）
+   *
+   * 换集走的是 store 的 `openEpisode`：它会把 `video.playbackRate` 重新写成
+   * **用户基准倍速**（`playbackRateRef.current`），这是对的 —— 新一集不该继承
+   * 上一集的临时加速。
+   *
+   * 但加速控制器**不知道这件事**：它的 `boosting` 仍是 true、`onChange` 仍挂着
+   * 提示条。于是：
+   *   1. 换集瞬间画面回到基准倍速（看起来"恢复正常定速"）；
+   *   2. 用户松手时 `release()` → `cancel()` 又写一次基准倍速（无害，但白写）；
+   *   3. 更糟的是**如果用户没松手**（比如按着 → 触发连播跳集），提示条会一直
+   *      挂在画面上，而倍速其实早就是基准值 —— 提示与实际状态脱钩。
+   *
+   * 传会话号进来，让换集成为一个明确的"结束加速"事件，三处状态一次对齐。
+   */
+  sessionId: number;
 }
 
 /**
@@ -50,6 +69,7 @@ export function useBoostKeys({
   seekRelative,
   stepVolume,
   onUserActivity,
+  sessionId,
 }: UseBoostKeysOptions): BoostState | null {
   const [boost, setBoost] = useState<BoostState | null>(null);
 
@@ -98,6 +118,23 @@ export function useBoostKeys({
   const controller = controllerRef.current;
 
   const cancelBoost = useCallback(() => controller.cancel(), [controller]);
+
+  /**
+   * 换集即结束加速。
+   *
+   * 与 `cancelBoost` 分开写而不是复用同一个 effect：这个 effect 只在**会话号变化**
+   * 时跑，不在挂载时跑（挂载时没必要，`boosting` 本来就是 false）。
+   *
+   * 用 ref 记住上一次的会话号而不是把 `sessionId` 直接进依赖后无条件 cancel：
+   * 后者会在每次 render 都调一次 `cancel()`，而 `cancel()` 在未加速时是空操作、
+   * 加速时会**立刻降速** —— 用户长按期间任何一次无关的重渲染都会打断加速。
+   */
+  const lastSessionRef = useRef(sessionId);
+  useEffect(() => {
+    if (lastSessionRef.current === sessionId) return;
+    lastSessionRef.current = sessionId;
+    cancelBoost();
+  }, [sessionId, cancelBoost]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {

@@ -35,6 +35,7 @@ export const VideoSurface: React.FC = () => {
     stallNotice,
     dismissStallNotice,
     finishedAll,
+    sessionId,
   } = usePlaybackStore();
 
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
@@ -243,6 +244,9 @@ export const VideoSurface: React.FC = () => {
     seekRelative,
     stepVolume: (delta) => setVolume(Math.min(1, Math.max(0, volume + delta))),
     onUserActivity: handleUserActivity,
+    // 换集即结束加速：新一集由 store 把 playbackRate 重置成基准倍速，
+    // 而加速控制器若不自知，提示条会留在画面上、与实际倍速脱钩。
+    sessionId,
   });
 
   // 键盘全局快捷键

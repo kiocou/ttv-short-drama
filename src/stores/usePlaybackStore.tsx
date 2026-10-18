@@ -2856,6 +2856,20 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     autoNext: settings.autoNext,
   };
 
+  /**
+   * `handleEnded` 的稳定引用。
+   *
+   * 为什么需要它：`handleWaiting` 在"已播到结尾附近却仍在等数据"时要复用
+   * `handleEnded` 的完整语义（落盘、连播、全剧播完），但这两个监听器都只在
+   * 挂载时绑定一次（见下方那段「监听器只绑定一次」的说明），`handleEnded`
+   * 的闭包早于后者定义、也拿不到最新的 `currentEpisode`。
+   *
+   * 用 ref 转发而不是把 `handleWaiting` 也改成依赖数组重建：媒体事件监听器
+   * **绝不能重绑** —— 那会把监听挂到已被丢弃的旧元素上（进度条 00:00 那个
+   * 经典故障）。ref 是这里唯一不破坏该不变量的做法。
+   */
+  const handleEndedRef = useRef<(() => void) | null>(null);
+
   // 看门狗唯一的定时器型资源，组件卸载必须收口。Provider 理论上与窗口同寿，
   // 但 HMR 与严格模式会重挂载，漏掉就是一条常驻 interval。
   useEffect(() => () => { stopStallWatchdog(); }, [stopStallWatchdog]);
@@ -2978,6 +2992,35 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 转圈图标闪一下，加重"卡顿"的观感。
       if (!video.currentSrc && !video.src) return;
       if (video.readyState >= 3) return;
+      /**
+       * 已经播到结尾附近却还在等数据 → **这不是缓冲，是播完了**。
+       *
+       * ## 为什么必须在这里判（2026-10-18 修「播到最后一直缓冲」）
+       *
+       * 播放源是边转边播的整集 HLS。最后一小段分片落地之前，`video` 会停在
+       * 倒数第二片的末尾并派发 `waiting`，界面于是显示「缓冲中…」—— 提示本身
+       * 没错，问题在**之后没有出口**：
+       *
+       *   - ffmpeg 早已转完（清单里有 `#EXT-X-ENDLIST`），`buffered` 不再增长；
+       *   - 看门狗因此判定"卡死"，第 1 级恢复是把 `currentTime` 写回原处 ——
+       *     可那里本来就没有下一帧，seek 之后依然没数据；
+       *   - 第 2 级重装载同一集，播到同一位置再卡一次（额度用尽后弹错误卡）。
+       *
+       * 而浏览器**不会**在这种情况下派发 `ended`：`ended` 要求播放位置真的到达
+       * 时长末尾，差半秒停在缓冲上就不算。用户看到的就是"最后一直在转圈，
+       * 切下一集才恢复正常"。
+       *
+       * 判据用「离结尾不到 1.5 秒」而不是严格相等：不同源的时长权威值有几十
+       * 毫秒误差，HLS 最后一片也可能只有 0.5–1 秒。1.5 秒足够覆盖，又不会把
+       * "网络慢卡在中段"误判成播完（中段离结尾远得多）。
+       */
+      const total = usableDuration(video);
+      if (total > 0 && video.currentTime >= total - 1.5) {
+        // 复用 handleEnded 的完整语义（落盘进度、连播、全剧播完）——
+        // 它已经处理了"这次结束属不属于当前集""要不要自动跳下一集"这些闸门。
+        handleEndedRef.current?.();
+        return;
+      }
       // 缓冲**不**卸看门狗：解码线程卡死时 `waiting` 照样会派发且再也不回来，
       // 在这里卸掉它恰好会漏掉本次要治的那个症状。区分"慢网缓冲"与"真卡死"
       // 靠的是看门狗里那条"没有新数据在进"——缓冲期间 buffered 还在长。
@@ -3057,6 +3100,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
       playNextEpisodeRef.current();
     };
+
+    // 交给 `handleWaiting` 复用（见 `handleEndedRef` 的说明）。
+    handleEndedRef.current = handleEnded;
 
     const handleError = () => {
       // 清理旧源时 WebView2 可能派发一次空源 error，不应覆盖真实播放状态。

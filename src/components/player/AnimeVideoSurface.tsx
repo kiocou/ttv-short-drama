@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { enterFullscreen, leaveFullscreen } from '../../services/windowFx';
@@ -154,6 +154,18 @@ export const AnimeVideoSurface: React.FC = () => {
     seekRelative,
     stepVolume: (delta) => setVolume(Math.min(1, Math.max(0, volume + delta))),
     onUserActivity: handleUserActivity,
+    // 换集即结束加速：新一集会由 store 把 playbackRate 重置成基准倍速，
+    // 而加速控制器若不自知，提示条会留在画面上、与实际倍速脱钩。
+    // 动漫 store 没有暴露数字会话号，用「剧 + 集」的字符串哈希当等价标识 ——
+    // 它只用于"变了没有"的比较，不需要全局唯一。
+    sessionId: useMemo(() => {
+      const key = `${series?.id ?? ''}::${episode?.id ?? ''}`;
+      let hash = 0;
+      for (let index = 0; index < key.length; index += 1) {
+        hash = (hash * 31 + key.charCodeAt(index)) | 0;
+      }
+      return hash;
+    }, [series?.id, episode?.id]),
   });
 
   /**
