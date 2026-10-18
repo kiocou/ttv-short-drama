@@ -26,17 +26,14 @@
   --fluent-sky: #38bdf8;
 
   /*
-   * 进度条语义色与主题强调色分开。
-   *
-   * 浅色主题的按钮仍用蓝色，但进度条一旦跟着 --fluent-blue 走，就会出现
-   * “已播放蓝、缓冲白”的两色割裂；暗色主题又因为变量被重映射成红，看起来
-   * 反而正常。进度条因此固定使用黑红家族：浅色/暗色下都是同一套红。
+   * 进度条语义色跟随主题：浅色用蓝色已播放段 + 白色轨道，
+   * 暗色在 dark.css 里换成红色已播放段 + 白色轨道。
    */
-  --progress-played-from: #ff7184;
-  --progress-played-to: #e02a45;
-  --progress-buffer: rgba(224, 42, 69, 0.46);
-  --progress-track: rgba(224, 42, 69, 0.22);
-  --progress-glow: rgba(224, 42, 69, 0.72);
+  --progress-played-from: #4da3ff;
+  --progress-played-to: #0078d4;
+  --progress-buffer: rgba(255, 255, 255, 0.38);
+  --progress-track: rgba(255, 255, 255, 0.22);
+  --progress-glow: rgba(0, 120, 212, 0.58);
 
   /* 平缓动效曲线 */
   --curve-fluent: cubic-bezier(0.16, 1, 0.3, 1);

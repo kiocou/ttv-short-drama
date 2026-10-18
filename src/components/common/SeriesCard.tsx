@@ -47,6 +47,22 @@ interface SeriesCardProps {
   series: SeriesItem;
   index: number;
   /**
+   * 左上角的前置徽章文案，如「第2季」。
+   *
+   * 只由详情页的「猜你喜欢」传：那里推荐的绝大多数条目是**同一系列的其它季**，
+   * 「这是第几季」就是这张卡最重要的信息——而 `tags[0]` 是题材，读不出季号。
+   *
+   * 为什么不做成"往 tags 前面插一条"：`tags` 是源数据的题材列表，拿它当展示
+   * 通道等于篡改源数据（同一部剧在发现页与详情页会显示不同的标签）。这里传的是
+   * 从标题里解析出来的事实，单独一个字段，不碰 `tags`。
+   *
+   * 传字符串而不是对象：`React.memo` 是浅比较，对象字面量每次渲染都是新引用，
+   * 会让整张卡的 memo 失效。
+   */
+  seasonBadge?: string;
+  /** 前置徽章配色：`next` 是接续的后续季（强调），`previous` 是前作（弱化）。 */
+  seasonBadgeTone?: 'next' | 'previous';
+  /**
    * 货架栏目的强调色，与栏目标题左侧那道色条同色。只有首页两颗货架会传，
    * 用于在卡片顶部压一条 3px 色条，把"编辑精选"和下面的完整目录区分开
    * （用户报告："和目录卡没区别，缺精选感"）。不传则完全不渲染。
@@ -70,7 +86,7 @@ interface SeriesCardProps {
   onUnavailable?: (seriesId: string) => void;
 }
 
-export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index, accent, onClick, onUnavailable, onPrefetch }) => {
+export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index, accent, seasonBadge, seasonBadgeTone = 'next', onClick, onUnavailable, onPrefetch }) => {
   const isAnime = series.type === 'anime';
   /** 徽章占了 tags[0]，副标题只展示剩下的标签；没有就干脆空着。 */
   const tagLine = series.tags.slice(1, 3).join(' · ');
@@ -132,23 +148,39 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
           />
         )}
 
-        {/* 顶部左侧：题材 chip。
+        {/* 顶部左侧：季号徽章 + 题材 chip。
             取不到标签就整块不渲染。这里此前兜底成「动漫」或「热门」，是在替源
             数据编造源没说过的断言（"热门"更是在伪造热度），与不变量 8 同一类；
             频道类型已由徽章配色、封面占位字、标题悬停色三处传达。
 
+            季号徽章排在题材前面且配色独立：它回答的是"这是第几季"，是详情页
+            接续推荐里最该先看到的一格；题材是次要信息，跟着排在后面。
+
             `max-w-[7.5rem]` + `truncate`：窄卡（货架在 xl 是 6 列）上长题材名
             会一直顶到右上角的评分/追剧竖列上去。写死上限比让它自然换行 / 溢出
             更可控。 */}
-        {series.tags[0] && (
+        {(seasonBadge || series.tags[0]) && (
           <div className="absolute inset-x-2 top-2 z-10 flex items-center gap-1.5">
-            <span
-              className={`truncate rounded-md px-2 py-0.5 text-[10px] font-bold text-white shadow-xs max-w-[7.5rem] ${
-                isAnime ? 'bg-violet-600/95' : 'bg-blue-600/95'
-              }`}
-            >
-              {series.tags[0]}
-            </span>
+            {seasonBadge && (
+              <span
+                className={`shrink-0 rounded-md px-2 py-0.5 text-[10px] font-bold text-white shadow-xs ring-1 ring-inset ring-white/25 ${
+                  seasonBadgeTone === 'next'
+                    ? 'bg-emerald-600/95'
+                    : 'bg-indigo-600/95'
+                }`}
+              >
+                {seasonBadge}
+              </span>
+            )}
+            {series.tags[0] && (
+              <span
+                className={`truncate rounded-md px-2 py-0.5 text-[10px] font-bold text-white shadow-xs max-w-[7.5rem] ${
+                  isAnime ? 'bg-violet-600/95' : 'bg-blue-600/95'
+                }`}
+              >
+                {series.tags[0]}
+              </span>
+            )}
           </div>
         )}
 

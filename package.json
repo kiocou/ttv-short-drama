@@ -11,6 +11,11 @@
     "verify:boost": "node --experimental-strip-types scripts/verify-boost.mjs",
     "verify:tail": "node --experimental-strip-types scripts/verify-playback-tail.mjs",
     "verify:random-pick": "node --experimental-strip-types scripts/verify-random-pick.mjs",
+    "verify:season-label": "node --experimental-strip-types scripts/verify-season-label.mjs",
+    "verify:related-section": "node scripts/verify-related-section.mjs",
+    "verify:related-pick": "node scripts/verify-related-pick.mjs",
+    "verify:related-batch": "node scripts/verify-related-batch.mjs",
+    "verify:season-priority": "node scripts/verify-season-priority.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

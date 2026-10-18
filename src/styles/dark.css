@@ -102,6 +102,13 @@ html[data-theme='dark'] {
   --fluent-blue-hover: #c31e38;
   --fluent-sky: #ff8296;
 
+  /* 播放器进度条：暗色主题使用红色已播放段 + 白色轨道。 */
+  --progress-played-from: #ff7184;
+  --progress-played-to: #e02a45;
+  --progress-buffer: rgba(255, 255, 255, 0.38);
+  --progress-track: rgba(255, 255, 255, 0.22);
+  --progress-glow: rgba(224, 42, 69, 0.72);
+
   /* 启动动画的强调色（导轨 / 光晕 / 冲击环 / 品牌投影）与品牌图标的着色。
      浅色主题是品牌紫（见 styles/launch.css 的 :root），这里换成黑红的那支红。
      色相角是在 sRGB 上加 HueRotate 矩阵算出来的，白色像素不受影响。 */

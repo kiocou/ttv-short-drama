@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
 import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
@@ -9,10 +9,10 @@ import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
 import { StatusBadge } from '../common/StatusBadge';
+import { RelatedSeriesSection } from '../common/RelatedSeriesSection';
 import { 
   Play, 
   ArrowLeft, 
-  ShieldCheck, 
   ChevronDown, 
   ChevronUp,
   Tv,
@@ -200,6 +200,25 @@ export const DetailView: React.FC = () => {
   useEffect(() => () => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
   }, []);
+
+  /**
+   * 「猜你喜欢」里点一张卡：就地换成那一部的详情。
+   *
+   * 走 `navigateTo('detail', id)` 而不是别的入口：`navigateTo` 只在**视图真的变化**
+   * 时才写 `previousView`，所以从详情页进另一部详情不会污染返回栈——返回仍然是
+   * 用户最初进来的那个页面，而不是"上一部剧的详情"（那会让返回键看起来像失效）。
+   *
+   * 稳定引用（`useCallback` + 稳定依赖）：`SeriesCard` 是 `React.memo` 的，每次渲染
+   * 新建的箭头函数会让整栏卡片全部重渲染。
+   *
+   * ⚠️ **必须定义在下面那个 `if (!detail) return` 之前**。详情还没到手时组件走的是
+   * 骨架屏那条早退分支，钩子却已经在这里执行过一次；把 `useCallback` 放在早退之后，
+   * 详情到达的那一帧钩子数量会从 N 跳到 N+1，React 直接抛
+   * "Rendered more hooks than during the previous render" —— 整页白屏（实测踩过）。
+   */
+  const handleOpenRelated = useCallback((seriesId: string) => {
+    navigateTo('detail', seriesId);
+  }, [navigateTo]);
 
   /*
     详情还没到手时的占位。
@@ -534,42 +553,10 @@ export const DetailView: React.FC = () => {
           )}
         </MicaCard>
 
-        {/* 播放解析专线与健康度 */}
-        <MicaCard className="p-5 flex flex-col gap-3">
-          <h3 className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-            <ShieldCheck className="w-4 h-4 text-emerald-600" />
-            <span>可用播放解析通道与健康度</span>
-          </h3>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {detail.sources.length > 0 ? detail.sources.map((src) => (
-              <div
-                key={src.id}
-                className="p-3 rounded-xl bg-white/70 border border-slate-200/70 shadow-xs flex items-center justify-between"
-              >
-                <div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-semibold text-slate-800">
-                      {src.name}
-                    </span>
-                    {src.isPrimary && (
-                      <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">
-                        默认
-                      </span>
-                    )}
-                  </div>
-                  <span className="text-[10px] text-slate-400">
-                    延迟 {src.pingMs}ms
-                  </span>
-                </div>
-                <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-sm" />
-              </div>
-            )) : (
-              <div className="md:col-span-3 p-3 rounded-xl bg-white/70 border border-slate-200/70 text-xs text-slate-500">
-                播放源由当前项目后端在打开集数时按需解析，页面不会暴露签名 URL。
-              </div>
-            )}
-          </div>
-        </MicaCard>
+        {/* 猜你喜欢：同系列接续季优先，凑不满一屏用同频道其它剧补位。
+            替换掉原来的「可用播放解析通道与健康度」面板——那一块的数据源
+            （`detail.sources`）在真实链路里恒为空，永远只显示一句占位文案。 */}
+        <RelatedSeriesSection detail={detail} onOpen={handleOpenRelated} />
       </div>
 
       {/* 选集弹窗 (Modal) */}
