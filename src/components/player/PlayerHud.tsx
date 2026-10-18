@@ -196,8 +196,8 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
       }${!hudShown && !isLocked ? ' is-auto-hidden' : ''}`}
     >
       {/*
-        常驻贴边迷你进度条。
-        放在 HUD 之外：它不跟控制条一起淡出，任何状态下都保留当前位置。
+        收起态的贴边迷你进度条。
+        放在 HUD 之外：HUD 整体淡出时它才登场，独立于那层透明度。
       */}
       <MiniProgress
         position={position}
@@ -651,7 +651,7 @@ interface MiniProgressProps {
 }
 
 /**
- * 贴着窗口最底部的一条 3.5px 进度条，控制条展开时也常驻。
+ * 控制器收起后贴着窗口最底部的一条 3.5px 进度条。
  *
  * **只作进度显示，不接受任何操作**——锁定态的语义是"除解锁外一切输入失效"
  * （单击/双击画面、快捷键、长按倍速都已屏蔽，这里若还能拖动跳转就成了漏网
