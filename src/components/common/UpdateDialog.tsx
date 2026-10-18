@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Sparkles, X, Download } from 'lucide-react';
 import {
   downloadUpdate,
@@ -67,12 +68,20 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({ info, onClose }) => 
       const path = await downloadUpdate(info.assetUrl, info.assetName);
       setSavedPath(path);
       setPhase('installing');
+      /**
+       * 安装这一步**必然会把本进程结束掉**（后端 spawn 安装包后 800ms 退出）。
+       *
+       * 所以这里不能像旧实现那样在 resolve 之后写一句"应用未能自动退出"——
+       * 那是在描述一个正常流程。现在改成：
+       *   - resolve  → 显示"正在重启，请稍候"，然后什么都不做，等进程消失；
+       *   - reject   → 只有真的启动失败（路径非法、文件损坏）才落错误态。
+       *
+       * `installUpdate` 抛错时前端还活着，用户能看错误、能点"打开所在文件夹"。
+       */
       try {
         await installUpdate(path);
-        // 正常情况下后端已经 exit 了，应用正在关闭。走到这里说明没退出，
-        // 如实说明而不是让界面永远转下去。
-        setPhase('idle');
-        setError('安装程序已启动，但应用未能自动退出，请手动关闭后重试。');
+        setError(null);
+        // 保持 `installing` 相位：界面停在"正在重启…"，不再给任何可点按钮。
       } catch (installError) {
         setPhase('idle');
         setError(installError instanceof Error ? installError.message : String(installError));
@@ -85,7 +94,23 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({ info, onClose }) => 
 
   const busy = phase !== 'idle';
 
-  return (
+  /**
+   * 必须用 Portal 挂到 `<body>`，不能就地渲染。
+   *
+   * ## 为什么（2026-10-18 修「更新弹窗撑破、文字竖排」）
+   *
+   * 这个弹窗的宿主是 `VersionBadge` → `TitleBar`，而标题栏上有 `backdrop-blur-xl`。
+   * **`backdrop-filter` 会为后代创建包含块**，于是弹窗根节点的 `fixed inset-0`
+   * 不再是"相对视口"，而是**相对那条 40px 高的标题栏** —— 宽高被压扁成一条，
+   * 里面的文字只能逐字换行，看起来就是"弹窗炸了、界面出错"。
+   *
+   * 同类坑在项目里已有记录（`App.tsx` 关于 `contain: layout paint` 与 fixed 的注释）。
+   * 挂到 body 之后，`fixed` 恢复相对视口，与宿主有没有滤镜/变换/contain 全都无关。
+   *
+   * 用 Portal 而不是把弹窗上提到 `App` 顶层：前者不需要把"谁发现了新版本"这件事
+   * 沿着组件树往上搬，`VersionBadge` 仍然是唯一的发现方与持有方。
+   */
+  return createPortal(
     <div className="fixed inset-0 z-[60] flex items-start justify-center pt-[12vh] px-6">
       <div className="absolute inset-0 bg-slate-900/25" onClick={busy ? undefined : onClose} />
       <div className="relative w-full max-w-md rounded-2xl bg-white shadow-fluent-lg border border-slate-200/80 p-5 flex flex-col gap-3">
@@ -132,7 +157,7 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({ info, onClose }) => 
             </div>
             <span className="text-[10px] font-mono text-slate-500">
               {phase === 'installing'
-                ? '下载完成，正在打开安装向导…'
+                ? '安装程序已启动，应用即将重启…'
                 : progress && progress.total > 0
                   ? `${formatBytes(progress.received)} / ${formatBytes(progress.total)} · ${progress.percent}%`
                   : '正在连接…'}
@@ -174,6 +199,7 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({ info, onClose }) => 
           </FluentButton>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };

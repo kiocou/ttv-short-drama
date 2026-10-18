@@ -748,13 +748,33 @@ fn resolve_installable(path: &Path, allowed_dir: &Path) -> Result<PathBuf, Strin
     Ok(real)
 }
 
-/// 启动安装向导，并退出本应用让出文件锁。
+/// 启动安装包，然后**延后**退出本应用让出文件锁。
 ///
 /// **不传 `/S`**：静默模式的失败路径没有界面，会把"更新没装上"变成一件无声的事
-/// （文件头有 0.2.23 的实测记录）。向导会把同一类失败变成可见的确认框或错误框。
+/// （0.2.23 的实测记录）。向导会把同一类失败变成可见的确认框或错误框。
 ///
 /// 四道安全校验在 `resolve_installable` 里（AGENTS.md 不变量 13 补充五），这里只负责
 /// 启动与退出。参数以独立 argv 传递，不经过 shell。
+///
+/// ## ⚠️ 为什么不能在这里同步 `app.exit(0)`（2026-10-18 修「点更新没反应、界面出错」）
+///
+/// 旧实现在 `spawn()` 之后**同步**调 `app.exit(0)`。这是 `#[tauri::command]` 的
+/// 同步函数，运行在 WebView 的 IPC 处理线程上 —— `app.exit()` 会立刻拆掉窗口与
+/// WebView，**而这条 IPC 的返回值还没写回前端**。前端 `await installUpdate(path)`
+/// 于是永远不落定：`phase` 卡在 `installing`、按钮永久禁用、进度条永远停在最后
+/// 一格，整个弹窗变成死的。用户看到的就是"点了没反应、关也关不掉"。
+///
+/// 现在的顺序是：
+///   1. `spawn()` 安装包；
+///   2. **先把 `Ok(())` 返回给前端**（命令正常结束，Promise 正常 resolve）；
+///   3. 另起线程等一小会儿，再 `app.exit(0)`。
+///
+/// 第 3 步的等待有两个作用：给前端一点时间把"正在安装"的界面收尾，也给安装器
+/// 一点时间真正拿到 exe 句柄 —— 否则可能出现安装器刚启动、我们还在退出，
+/// 它去覆盖 `ttv-short-drama.exe` 时撞上 `os error 32`（文件被占用）。
+///
+/// 用 `std::thread` 而不是 `tauri::async_runtime::spawn`：退出是一个**进程级**
+/// 动作，不该排在 tokio 的任务队列里等前面那些 IO 任务。
 #[tauri::command]
 pub fn update_install(app: AppHandle, path: String) -> Result<(), String> {
     let real = resolve_installable(&PathBuf::from(&path), &download_dir())?;
@@ -763,9 +783,11 @@ pub fn update_install(app: AppHandle, path: String) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("无法启动安装程序：{error}"))?;
 
-    // 安装器要覆盖本应用的 exe 与随包资源，必须等本进程彻底退出。先把界面收掉，避免
-    // 用户在安装的几秒里以为程序卡死。
-    app.exit(0);
+    // 关键：**返回之后**再退出。见上面那段长注释。
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        app.exit(0);
+    });
     Ok(())
 }
 
