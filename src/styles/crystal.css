@@ -412,13 +412,13 @@
       rgba(128,128,128,0.55) 叠白 → 约 185（差 70）；叠黑 → 约 70（差 70）。
     上缘再补一条高光，暗场景下轮廓更明确。
   */
-  background: rgba(128, 128, 128, 0.55);
+  background: rgba(148, 163, 184, 0.62);
   box-shadow:
-    0 -1px 0 rgba(255, 255, 255, 0.28),
-    0 0 5px rgba(0, 0, 0, 0.35);
+    0 -1px 0 rgba(255, 255, 255, 0.34),
+    0 0 5px rgba(0, 0, 0, 0.38);
   z-index: 35;
-  opacity: 0;
-  transform: translateY(100%);
+  opacity: 1;
+  transform: translateY(0);
   pointer-events: none;
   transition:
     opacity 0.28s var(--curve-fluent),
@@ -426,16 +426,7 @@
     height 0.15s ease;
 }
 
-/*
-  收起（锁定）态与自动隐藏态下露出。is-locked 由 PlayerControls 挂在
-  HUD 容器上；.ttv-player.is-locked 前缀是历史遗留写法，一并保留兼容。
-*/
-.is-locked .ttv-mini-progress,
-.is-auto-hidden .ttv-mini-progress,
-.ttv-player.is-locked .ttv-mini-progress {
-  opacity: 1;
-  transform: translateY(0);
-}
+/* 底边进度条常驻：控制条展开、自动隐藏、锁定三种状态都能看见。 */
 
 /*
   这里曾有三条 `:hover { height: 6px }` 的加粗规则，但它们**永远不会触发**：
@@ -452,7 +443,7 @@
     极亮/极暗两种画面上都能看见。纯白（rgba(255,255,255,*)）在白底上同样会归零，
     所以这里也走中性灰 —— 叠白约 230（与底轨 185 差 45）、叠黑约 128（与底轨 70 差 58）。
   */
-  background: rgba(216, 216, 216, 0.92);
+  background: rgba(226, 232, 240, 0.88);
   transition: width 0.2s linear;
 }
 
@@ -467,10 +458,10 @@
     实测那条蓝线在白西装画面上同样"看不见"。改成蓝色 + 一圈同色发光，
     让它靠**边缘**而不是靠明度在亮背景上立住。
   */
-  background: linear-gradient(180deg, #4da3ff, var(--fluent-blue));
+  background: linear-gradient(180deg, #ff7184, var(--fluent-blue));
   box-shadow:
-    0 0 10px rgba(0, 120, 212, 0.85),
-    0 0 0 0.5px rgba(255, 255, 255, 0.5);
+    0 0 8px rgba(224, 42, 69, 0.72),
+    0 0 0 0.5px rgba(255, 255, 255, 0.52);
   /* 用 scaleX 而非 width：进度每帧更新时避免触发布局重排 */
   transform-origin: left center;
   will-change: transform;
@@ -486,7 +477,7 @@
   transform: none;
   /* 与已播段同族但更亮、并带白色外描边：时长未知时它独自出现在底轨上，
      必须在极亮画面上也有轮廓（纯色版本实测只有 41 的亮度差，在白西装上会糊掉）。 */
-  background: linear-gradient(180deg, #7cc0ff, #3d94e8);
+  background: linear-gradient(180deg, #ff8b9c, #d92543);
   box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.6);
   /*
     刻意**不做**无限循环动画。原设想是加一段 opacity 呼吸提示"还在加载"，

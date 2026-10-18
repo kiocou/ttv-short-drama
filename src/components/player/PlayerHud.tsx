@@ -196,8 +196,8 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
       }${!hudShown && !isLocked ? ' is-auto-hidden' : ''}`}
     >
       {/*
-        收起态的贴边迷你进度条。
-        放在 HUD 之外：HUD 整体淡出时它才刚登场，必须独立于那层透明度。
+        常驻贴边迷你进度条。
+        放在 HUD 之外：它不跟控制条一起淡出，任何状态下都保留当前位置。
       */}
       <MiniProgress
         position={position}
@@ -651,7 +651,7 @@ interface MiniProgressProps {
 }
 
 /**
- * 控制器收起后贴着窗口最底部的一条 3.5px 进度条。
+ * 贴着窗口最底部的一条 3.5px 进度条，控制条展开时也常驻。
  *
  * **只作进度显示，不接受任何操作**——锁定态的语义是"除解锁外一切输入失效"
  * （单击/双击画面、快捷键、长按倍速都已屏蔽，这里若还能拖动跳转就成了漏网
@@ -663,7 +663,7 @@ interface MiniProgressProps {
  * 时长尚未就绪（duration ≤ 0）时**不能把已播段也画成 0**：源刚起播的那几秒、
  * 或后端返回的容器还没解析出时长时，整条会只剩底轨 —— 用户看到的是"进度条
  * 不见了"。这种情况按"已加载但未知进度"处理，铺一段低饱和度填充，
- * 至少让人看得出"控制器收起了、这里有一条进度条"。
+ * 至少让人看得出这里有一条进度条。
  */
 export const MiniProgress: React.FC<MiniProgressProps> = ({
   position,
