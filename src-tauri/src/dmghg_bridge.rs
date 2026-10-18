@@ -304,9 +304,7 @@ impl DmghgBridge {
                 log_line(&format!("dmghg 分类表获取失败，退回全部: {error}"));
             }
         }
-        // 「全部」不是 dmghg 的频道：0 只是本地标签表里的占位 id，传给厂商 DLL
-        // 会落到它的默认频道（日漫），于是"全部"永远只显示日漫。真正的全量列表
-        // 必须**不带 channel 参数**，由服务端按全站口径返回。
+        // 「全部」不是 dmghg 的频道：0 只是本地标签表里的占位 id。
         let channel_id = table
             .iter()
             .find(|(_, name)| name == &filter.category)
@@ -318,6 +316,41 @@ impl DmghgBridge {
         } else {
             filter.sort.trim()
         };
+
+        // ===== 「全部」：多频道聚合 =====
+        //
+        // ## 为什么必须聚合（2026-10-18 实测）
+        //
+        // 旧实现在「全部」时**不带 channel 参数**，理由是注释里写的"由服务端按
+        // 全站口径返回"。实测推翻了这个前提 —— 不带 channel 时 DLL 落到它的
+        // **默认频道（日漫）**，返回的是日漫那 12 条：
+        //
+        //   channel 缺失 / 0  → total=12   样例：五等分的新娘 / 星灵感应 …
+        //   channel=20 日漫   → total=12
+        //   channel=21 国漫   → total=26   样例：剑来 / 斩神 / 完美世界 …
+        //   channel=32 少儿   → total=871  样例：哆啦A梦 / 喜羊羊 / 熊出没 …
+        //
+        // 用户报的「全部内容推荐还是日漫、看不到其他类型」就是这一条造成的：
+        // 界面标着「全部」，数据源却只有日漫。
+        //
+        // 也没有全站命令可退（`catalog.get_home` / `get_recommend` / `get_all`
+        // 实测全部 `command_not_supported`）。所以「全部」只能由这一层把各频道
+        // 拼起来 —— 这也是唯一诚实的做法：**"全部"就是"每个频道的并集"**。
+        //
+        // 取舍：按各频道自己的热门顺序轮流取（round-robin），而不是"先把日漫
+        // 取满再取国漫"。后者会让第一页仍然是清一色日漫，等于换了个写法的同一个
+        // bug。轮流取能保证首页第一屏就出现多种类型。
+        if channel_id.is_none() {
+            let channels: Vec<i64> = table
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| *id > 0)
+                .collect();
+            if !channels.is_empty() {
+                return self.catalog_across_channels(&channels, page, page_size, sort, table);
+            }
+        }
+
         let payload = match channel_id {
             Some(channel) => json!({
                 "channel": channel,
@@ -353,6 +386,113 @@ impl DmghgBridge {
     }
 
     // -- 详情 -------------------------------------------------------------
+
+    /// 「全部」口径：把各频道的同一页轮流取一遍，拼成混合列表。
+    ///
+    /// ## 取法：round-robin，而不是"逐频道填满"
+    ///
+    /// 每个频道取 `ceil(page_size / 频道数)` 条（至少 2 条），然后**轮流**放进
+    /// 结果。这样第一页就同时出现日漫 / 国漫 / 少儿 / 美漫，而不是"先 30 条日漫
+    /// 再 30 条国漫"——后者虽然数据上也算"全部"，但用户第一屏看到的仍然是
+    /// 清一色日漫，和修复前没有区别。
+    ///
+    /// ## 为什么每个频道都要取第 `page` 页
+    ///
+    /// 聚合是"无状态"的：调用方翻到第 N 页，我们就把每个频道的第 N 页各取一条
+    /// 子集拼起来。这样翻页语义与单频道一致，也不需要服务端游标。
+    ///
+    /// ## 失败容忍
+    ///
+    /// 单个频道失败（网络抖动 / 该频道下架）只跳过它，不影响其余频道 ——
+    /// 这与 `anime_provider` 的多源聚合口径一致：少一个频道好过整页空。
+    fn catalog_across_channels(
+        &self,
+        channels: &[i64],
+        page: u32,
+        page_size: u32,
+        sort: &str,
+        table: Vec<(i64, String)>,
+    ) -> Result<CatalogPage, String> {
+        let page_size = page_size.max(1) as usize;
+        // 每个频道取多少条：够轮流铺满一页，又不至于把请求数放大太多。
+        // 下限 2 是让"只有两三个频道有数据"时也能凑出可见的多样性。
+        let per_channel = (page_size / channels.len().max(1)).max(2);
+
+        // 逐频道取一页。这里**串行**：DLL 内部是同一份网络栈 + 同一个 service
+        // 句柄，并发调用只会互相阻塞（实测 `get_channels` 与列表调用不能并行）。
+        // 串行代价可接受：每频道一次 IPC，实测单次 40–120ms。
+        let mut buckets: Vec<Vec<SeriesItem>> = Vec::with_capacity(channels.len());
+        let mut total = 0usize;
+        let mut any_ok = false;
+        for channel in channels {
+            let payload = json!({
+                "channel": channel,
+                "page": page,
+                "limit": per_channel,
+                "sort": sort,
+            });
+            match self.call("catalog.get_video_list", payload) {
+                Ok(data) => {
+                    any_ok = true;
+                    total += data.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let items = collect_items(&data)
+                        .iter()
+                        .filter_map(parse_series_item)
+                        .collect::<Vec<_>>();
+                    buckets.push(items);
+                }
+                Err(error) => {
+                    log_line(&format!("dmghg 聚合跳过频道 {channel}: {error}"));
+                    buckets.push(Vec::new());
+                }
+            }
+        }
+        if !any_ok {
+            return Err("dmghg 全部频道均读取失败。".to_string());
+        }
+
+        // 轮流取：第 0 轮从每个频道取第 1 条，第 1 轮取第 2 条……
+        // 用 id 去重（同一部剧可能同时挂在"日漫"和"剧场"下）。
+        let mut items: Vec<SeriesItem> = Vec::with_capacity(page_size);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut round = 0usize;
+        'outer: loop {
+            let mut took_any = false;
+            for bucket in &buckets {
+                if let Some(item) = bucket.get(round) {
+                    took_any = true;
+                    if seen.insert(item.id.clone()) {
+                        items.push(item.clone());
+                        if items.len() >= page_size {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if !took_any {
+                break;
+            }
+            round += 1;
+            // 兜底：某个频道的 bucket 异常长时也不无限转。
+            if round > page_size * 2 {
+                break;
+            }
+        }
+
+        // has_more：任一频道还有下一页就允许继续翻。
+        let has_more = total > (page as usize) * page_size;
+
+        Ok(CatalogPage {
+            total,
+            has_more,
+            items,
+            page,
+            categories: table.into_iter().map(|(_, name)| name).collect(),
+            next_cursor: has_more.then(|| (page + 1).to_string()),
+            source: "动漫共和国".into(),
+            degraded: false,
+        })
+    }
 
     pub fn detail(&self, series_id: &str) -> Result<SeriesDetail, String> {
         let raw_id = strip_prefix(series_id);

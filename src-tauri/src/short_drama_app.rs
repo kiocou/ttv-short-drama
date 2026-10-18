@@ -2405,7 +2405,10 @@ pub async fn short_drama_app_episode_counts<R: Runtime>(
 // ---------------------------------------------------------------------------
 
 /// 一页分区列表。
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` 是给磁盘缓存用的：`read_shelf_cache` 要把落盘的 JSON 读回来。
+/// 加它不会影响 Tauri 命令的序列化契约（那边只用到 `Serialize`）。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShelfFeedPage {
     pub items: Vec<SeriesItem>,
@@ -2534,6 +2537,36 @@ pub async fn shelf_feed<R: Runtime>(
     channel: &str,
     cursor: Option<&str>,
 ) -> Result<ShelfFeedPage, String> {
+    // ===== 首页首屏：优先读磁盘缓存 =====
+    //
+    // ## 为什么必须落盘（2026-10-18）
+    //
+    // 每次 `feed` 都要 `spawn` 一个**新的 python.exe**（见 `run_worker_subcommand`），
+    // Python 冷启动 + 解释器初始化实测 200–400ms，而首屏一次要拉 4 路
+    // （正在热播 + 新剧 × 两个频道），合计接近 1 秒，还要叠加网络。
+    //
+    // 前端 `useShelfFeed` 有 3 分钟内存缓存，但它随进程消失 —— 用户关掉应用再
+    // 打开，一切从头开始。日志实测：首帧 1.19s → 目录出结果 8.36s，其中约
+    // 6 秒花在等这 4 个进程 + 站方响应上。用户感知就是「点图标卡一会儿才开始加载」。
+    //
+    // 现在把**第一页**（cursor 为空，也就是首屏那一次）落盘。第二次启动直接
+    // 命中，0 进程、0 网络。只缓存第一页：翻页结果时效性更强、体积更大，
+    // 而首屏才是"打开就等"的那一段。
+    //
+    // 过期策略：10 分钟。红果自己的榜单缓存是 30 分钟，这里取更短一档 ——
+    // 首页内容陈旧比多等一秒更伤。
+    const SHELF_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+    let cache_key = format!("shelf-{kind}-{channel}-first");
+    let is_first_page = cursor
+        .map(str::trim)
+        .map(|value| value.is_empty())
+        .unwrap_or(true);
+    if is_first_page {
+        if let Some(cached) = read_shelf_cache(&cache_key, SHELF_CACHE_TTL) {
+            return Ok(cached);
+        }
+    }
+
     let spec = shelf_feed_spec(kind, channel, cursor)?;
     // 恒用短剧档（content_type 1 / aid 8662）：实测 aid 8662 的列表接口同时服务
     // 短剧与漫剧（漫剧由 `select_items.genre` 表达），而 8704 已被网关静默拒绝
@@ -2550,7 +2583,7 @@ pub async fn shelf_feed<R: Runtime>(
                 .collect()
         })
         .unwrap_or_default();
-    Ok(ShelfFeedPage {
+    let page = ShelfFeedPage {
         items,
         has_more: payload
             .get("hasMore")
@@ -2562,7 +2595,51 @@ pub async fn shelf_feed<R: Runtime>(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned),
-    })
+    };
+    // 只缓存**非空**结果：空页往往是站方抖动或凭据失效，把它缓存 10 分钟
+    // 等于把一次故障固定下来。
+    if is_first_page && !page.items.is_empty() {
+        write_shelf_cache(&cache_key, &page);
+    }
+    Ok(page)
+}
+
+/// 首页货架第一页的磁盘缓存目录。
+fn shelf_cache_dir() -> PathBuf {
+    cache_dir().join("shelf-feed")
+}
+
+/// 读一份未过期的货架缓存。任何失败（不存在/过期/解析失败）都返回 `None`，
+/// 让调用方老老实实去拉网络 —— 缓存是纯优化，坏了绝不能影响正确性。
+fn read_shelf_cache(key: &str, ttl: std::time::Duration) -> Option<ShelfFeedPage> {
+    let path = shelf_cache_dir().join(format!("{key}.json"));
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok()?;
+    if modified.elapsed().ok()? > ttl {
+        return None;
+    }
+    let body = std::fs::read_to_string(&path).ok()?;
+    let page: ShelfFeedPage = serde_json::from_str(&body).ok()?;
+    if page.items.is_empty() {
+        return None;
+    }
+    crate::trace::log(format!(
+        "[红果] 货架命中磁盘缓存 {key}（{} 条）",
+        page.items.len()
+    ));
+    Some(page)
+}
+
+/// 写一份货架缓存。失败静默 —— 写不进去只是下次多等一秒。
+fn write_shelf_cache(key: &str, page: &ShelfFeedPage) {
+    let dir = shelf_cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(body) = serde_json::to_string(page) else {
+        return;
+    };
+    let _ = std::fs::write(dir.join(format!("{key}.json")), body);
 }
 
 /// 前端「更多」页调用：按分区拉一页。

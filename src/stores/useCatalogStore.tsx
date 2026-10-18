@@ -24,6 +24,15 @@ interface CatalogContextType {
   isLoading: boolean;
   isLoadingMore: boolean;
   hasMore: boolean;
+  /** 无限流因「整页被去重」而停下（不是真的到底）。见 `dedupedStop` 的说明。 */
+  dedupedStop: boolean;
+  /**
+   * 已落地的页数。**与 `items.length` 是两件事** —— 去重为空的页也会 +1。
+   *
+   * 给 `usePrefetchBackstop` 当收敛信号：它必须每页都重新量一次几何，
+   * 否则某一页没带来新卡片时无限流会停住。
+   */
+  pagesLoaded: number;
   error: string | null;
   /** 本次目录实际聚合了哪些源（用于页面角标如实展示覆盖范围）。 */
   activeSources: string[];
@@ -161,6 +170,24 @@ export const CatalogProvider: React.FC<CatalogProviderProps> = ({
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
   const [hasMore, setHasMore] = useState<boolean>(false);
+  /**
+   * 已落地的页数。**与 `items.length` 是两件事**。
+   *
+   * 某一页去重后可能一条新卡片都没有（多源页码错位、站方对越界页回退到同一页），
+   * 此时 `items.length` 不变，但"确实又翻了一页"。`usePrefetchBackstop` 需要一个
+   * 每页都会变的信号来重新量几何，否则那一页之后兜底不再触发，无限流停住。
+   *
+   * 与 `useShelfFeed` 的 `pagesLoaded` 同构 —— 两条数据源用同一个收敛信号。
+   */
+  const [pagesLoaded, setPagesLoaded] = useState<number>(0);
+  /**
+   * 无限流是否因为「这一页的卡片全被去重吃掉」而停下（而不是真的到底）。
+   *
+   * 两者在界面上必须分开说：真到底 → 「已加载全部公开内容」；去重停住 →
+   * 给一条重试入口。混成一种状态会让用户以为这一栏只有这么点内容，
+   * 而实际上站方还有下一页（见 `commitPage` 里的 ① / ② 两种含义）。
+   */
+  const [dedupedStop, setDedupedStop] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [activeSources, setActiveSources] = useState<string[]>([]);
   /**
@@ -459,6 +486,11 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     }
 
     setError(null);
+    // 新一轮首屏：去重停住的状态必须一起复位，否则上一栏留下的"没有更多了"
+    // 会跟着新频道/新题材一直显示。
+    setDedupedStop(false);
+    // 页数信号也归零：它只描述"本轮翻了几页"，跨轮累加会让兜底一直以为在推进。
+    setPagesLoaded(0);
     const base: Omit<CatalogFilter, 'source' | 'page' | 'cursor'> = {
       channel,
       category,
@@ -666,7 +698,22 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     );
     categoryVocabularyRef.current[vocabularyKey(sourceKey, channel)] = mergedCategories;
     setCategories(mergedCategories);
+    // `fresh.length === 0` 有两种完全不同的含义，不能混为一谈：
+    //
+    //   ① 站方说这一页之后没有了（`res.hasMore === false`）→ 真的到底；
+    //   ② 站方说还有、但这一页的卡片**全被去重吃掉了**（`res.hasMore === true`）
+    //      → 页码错位（多源并发时某源返回了已加载过的页）、或站方对越界页码
+    //      回退到同一页。此时停是对的（继续请求只会空转），但**不能对用户
+    //      宣称"已加载全部"** —— 那是在撒谎，而且把重试入口也一并藏了。
+    //
+    // 第 ② 种情况此前静默地把 hasMore 置 false，界面显示"已加载全部公开内容"，
+    // 用户以为这一栏就这么多内容。现在把它如实标出来（见 `dedupedStop`）。
+    const stoppedByDedup = res.hasMore && fresh.length === 0;
     setHasMore(res.hasMore && fresh.length > 0);
+    setDedupedStop(stoppedByDedup);
+    // 每落地一页就 +1，与"这一页带来几条新卡片"无关 ——
+    // `usePrefetchBackstop` 靠它重新量几何。
+    setPagesLoaded(previous => previous + 1);
     // 翻页成功：清零失败计数，否则一次抖动就会把熔断阈值推满。
     loadMoreFailuresRef.current = 0;
   }, [category, audience, channel, sort, sources]);
@@ -792,6 +839,8 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     isLoading,
     isLoadingMore,
     hasMore,
+    dedupedStop,
+    pagesLoaded,
     error,
     activeSources,
     setChannel,
@@ -804,6 +853,8 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     refreshContinueWatching,
   }), [
     activeSources, audience, categories, category, channel, continueWatching, historySeriesIds, error, hasMore,
+    dedupedStop,
+    pagesLoaded,
     isLoading, isLoadingMore, items, loadData, loadMore, prefetchMore, refreshContinueWatching,
     setChannel, sort,
   ]);

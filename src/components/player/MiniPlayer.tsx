@@ -253,13 +253,20 @@ export const MiniPlayer: React.FC = () => {
   }, [report]);
 
   /**
-   * 连播预取：起播稳定后把下一集的解析提前做掉。
+   * 连播预取：起播稳定后把**下一集的整集 HLS**提前转好。
    *
-   * 红果整集解析实测约 7.4 秒（签名 + 下载 + 解密），此前只挂在 ended 事件里，
-   * 每一集播完都要黑等一轮——预取把这段等待藏进上一集的播放时间里（一集
-   * 50~140 秒，足够后台备好）。prefetchNative 是纯缓存预热：产物落盘、跨会话
-   * 有效，没有会话语义要守；命中后前台 resolveNative 直接秒回。失败静默，
-   * 前台播放时自然重试。延后 3 秒是让当前集先把首屏带宽吃稳。
+   * ## 为什么从 `prefetchNative` 改成 `prewarmStreamNative`（2026-10-17）
+   *
+   * `prefetchNative` 走 `short_drama_app_resolve`，产物是**整集 mp4**（下载 + 解密
+   * + 重编码，实测单集 13~27MB、7~10 秒）。方案 B 之后整集 HLS 才是播放源，
+   * 那份 mp4 只有「HLS 起不来」时才会被读到 —— 在正常连播路径上一秒都用不到。
+   *
+   * 而它的代价很实在：小窗里的这一路（边转边播的 HLS）正与后台"下整集 mp4"的
+   * worker 抢磁盘和 CPU，表现就是「播着播着卡一下」（主窗口日志里已复现：
+   * 连下四集整集后出现 `媒体 waiting 缓冲等待`）。
+   *
+   * `prewarmStreamNative` 产出 `vid-{vid}` 目录下的整集 HLS，正是连播到下一集
+   * 时要播的东西；命中时 `open_stream` 零等待（实测 132ms 返回 → 368ms 出画）。
    *
    * 动漫/guo 不预取：它们走 playback.open 取直链（秒级轻请求），且直链有
    * 时效，提前拿到的 URL 到播时可能已失效。
@@ -278,11 +285,10 @@ export const MiniPlayer: React.FC = () => {
     if (prefetchTimerRef.current !== null) window.clearTimeout(prefetchTimerRef.current);
     prefetchTimerRef.current = window.setTimeout(() => {
       prefetchTimerRef.current = null;
-      void ipcService.playback.prefetchNative(
+      void ipcService.playback.prewarmStreamNative(
         plan.seriesId,
         next.id,
         plan.contentType ?? 1,
-        plan.quality || 'auto',
       );
     }, 3000);
   }, []);

@@ -115,10 +115,53 @@ export async function attachSource(video: HTMLVideoElement, url: string): Promis
       // 补齐重试之后，"等首段"这件事交回给播放器：后端可以立刻返回地址，
       // 首段由这里按 4 次清单重试 + 8 次分片重试等到。数值与动漫专区
       // （`animePlayback.ts`）保持一致，两个播放面不该有两套起播脾气。
+      //
+      // ⚠️ 但**只配 MaxRetry 是不够的，必须同时把退避改成线性**。
+      //
+      // 上面那四个 `*LoadingMaxRetry` 是 hls.js 的**已废弃**键，`mergeConfig` 会把
+      // 它们映射进 `*LoadPolicy.default.errorRetry.maxNumRetry`，而**退避策略不在
+      // 映射范围内** —— 它保留 policy 里的默认值，也就是指数退避
+      // （`getRetryDelay`：`Math.pow(2, retryCount) * retryDelayMs`，见
+      // `hls.js/src/utils/error-helper.ts`）。于是"多给几次重试"实际换来的是
+      // 1s → 2s → 4s → 8s 的等待，**次数越多，白等越久**。
+      //
+      // 实测（ttv-playback.log，会话 103，真实红果源）：后端在首片落地前返回地址，
+      // 播放器连吃四次 503，时间戳 337.445 → 338.449 → 340.452 → 344.456 → 352.461，
+      // 差值精确等于 1s/2s/4s/8s，**累计 15 秒纯空等**，该次首开总耗时 22418ms
+      // —— 其中三分之二是在等自己的重试定时器，而不是等 ffmpeg。
+      //
+      // 本地代理是 127.0.0.1 回环：一次 503 的往返成本是**亚毫秒级**，任何秒级
+      // 退避在这里都毫无意义。线性 250ms 让 4 次重试的总等待从 15s 降到 1s。
       manifestLoadingMaxRetry: 4,
       levelLoadingMaxRetry: 4,
       fragLoadingMaxRetry: 8,
       fragLoadingRetryDelay: 500,
+      // 显式写 policy（一旦写了 policy，上面那批废弃键就不再参与映射，
+      // 所以两者的 maxNumRetry 必须保持一致，否则等于悄悄改了重试次数）。
+      manifestLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 20000,
+          timeoutRetry: { maxNumRetry: 4, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+          errorRetry: { maxNumRetry: 4, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+        },
+      },
+      playlistLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 20000,
+          timeoutRetry: { maxNumRetry: 4, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+          errorRetry: { maxNumRetry: 4, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+        },
+      },
+      fragLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 120000,
+          timeoutRetry: { maxNumRetry: 8, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+          errorRetry: { maxNumRetry: 8, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+        },
+      },
     });
     (video as unknown as Record<string, unknown>)[HLS_KEY] = hls;
     hls.on(Hls.Events.ERROR, (_event, data) => {

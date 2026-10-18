@@ -1355,15 +1355,60 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const cacheKey = episodeCacheKey(seriesId, episodeId, quality);
 
     /**
+     * 整集 mp4 解析：**惰性发车**，按需只跑一次。
+     *
+     * ## 为什么不再无条件先发
+     *
+     * 旧实现在函数开头就 `void ipcService.playback.resolveNative(...)`，理由是
+     * 「HLS 起不来时它得在跑」。但代价被长期忽略了，实测日志（会话 111）：
+     *
+     *   - 131.823s `[红果] worker 启动` ← resolve 拉的 worker
+     *   - 137.873s `[vsr] start 会话=111` ← open_stream 拉的另一路
+     *   两条链路各自跑了一遍签名（`预签名已命中=false` 出现在 137.868s，
+     *   也就是**整整 6.06 秒之后**才拿到直链），并且 resolve 那个 worker
+     *   还会立刻开始下载整集（日志里同一集实测 16.9MB~57.1MB）并重编码。
+     *
+     * 后果是两路 python + 一路 ffmpeg 抢 CPU 与磁盘：同一次开播
+     * `就绪判定 ready=false 进程存活=true 等待=1522ms` —— ffmpeg 1.5 秒内
+     * 吐不出首片。而全日志 293 次 ready=true 的会话，首片中位只有 761ms。
+     * 也就是说，**是 resolve 自己把首片拖慢了一倍**。
+     *
+     * 方案 B 之后整集 mp4 的唯一用途是「HLS 起不来时的退路」，而 HLS 起不来的
+     * 概率很低（VSR 关闭时才是确定性的）。为这条退路在每次开播时都付两路进程
+     * 的代价，明显不划算。
+     *
+     * ## 现在的策略
+     *
+     * - 只在**真的需要**时发车：HLS 失败走 `startFull`，或 HLS 出画后由
+     *   `warmFullAfterStreaming` 补一次（那时 CPU 已经空出来，且能覆盖
+     *   「播到一半 HLS 挂了」这种后发故障）。
+     * - 用 `fullPromise` 缓存，重复调用只跑一次。
+     */
+    let fullPromise: Promise<{ playUrl: string; cached: boolean; sizeBytes: number }> | null = null;
+    const ensureFullPromise = () => {
+      if (!fullPromise) {
+        fullPromise = ipcService.playback.resolveNative(seriesId, episodeId, contentType, quality)
+          .then(resolved => {
+            if (resolved.cached || resolved.sizeBytes > 0) {
+              resolvedFileByVidRef.current.set(cacheKey, resolved.playUrl);
+            }
+            return resolved;
+          });
+        void fullPromise.catch(() => {});
+      }
+      return fullPromise;
+    };
+
+    /**
      * 失败回退：走旧的「整集 mp4」链路。
      *
      * 方案 B 之后整集 HLS 是**唯一**的播放源，所以这段代码不再是另一条并行链路，
-     * 而是「HLS 起不来时还有一个能播的东西」。它仍然复用 `fullPromise`（整集解析
-     * 只跑一次），也仍然负责把结果登记进 `resolvedFileByVidRef` 供换集秒开。
+     * 而是「HLS 起不来时还有一个能播的东西」。它复用同一个 `fullPromise`
+     * （整集解析只跑一次），也仍然负责把结果登记进 `resolvedFileByVidRef` 供换集秒开。
      */
     const runFull = async (): Promise<PlayOutcome> => {
       try {
-        const resolved = await fullPromise;
+        const resolved = await ensureFullPromise();
         if (activeSessionRef.current !== sessionId) return `stale`;
         const outcome = await playLocalFile(resolved.playUrl, video, sessionId, startPosition, episodeId, seriesId);
         // 源本身有问题才撤掉登记；自动播放被拦时文件是完好的，撤掉会导致下次重下一整集。
@@ -1385,21 +1430,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       });
     };
 
-    // 整集 mp4 解析**仍然发车**：它是 HLS 起不来时唯一的退路。
-    //
-    // 但方案 B 下它**不再**是「画面已经在播、后台等它落盘再切源」的那条链路 ——
-    // 那个切源动作正是用户抱怨的「前 8 秒转换后面再进入」。
-    //
-    // Rust 侧 `open_stream` 与它是同一个 vid 的两次调用，`ensure_stream_cached`
-    // 让两边的签名只跑一次（省掉实测 3695ms 的重复 API 往返）。
-    const fullPromise = ipcService.playback.resolveNative(seriesId, episodeId, contentType, quality)
-      .then(resolved => {
-        if (resolved.cached || resolved.sizeBytes > 0) {
-          resolvedFileByVidRef.current.set(cacheKey, resolved.playUrl);
-        }
-        return resolved;
-      });
-    void fullPromise.catch(() => {});
+    // 整集 mp4 解析**不再在这里发车**（见 `ensureFullPromise` 的长注释）。
+    // 它只在两种时刻启动：HLS 失败走 `startFull`，或 HLS 出画后由下面那段
+    // 延时补发一次 —— 那时 ffmpeg 已收工，CPU 才真正空出来。
 
     // ===== 唯一主路径：整集 HLS 单源到底 =====
     //
@@ -1474,6 +1507,22 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // 用一个覆盖转码余量的延时释放，比"立刻释放"正确、比"等后端通知"简单
         // （不必为它新增一条 IPC）。超时释放本身还有 90 秒硬上限兜底，不会泄漏。
         endStreamingWindowAfter(STREAMING_TRANSCODE_SETTLE_MS);
+        // ⚠️ **不要在这里补发整集 mp4 解析**（2026-10-17 实测卡顿回归后移除）。
+        //
+        // 曾在这里延时 `STREAMING_TRANSCODE_SETTLE_MS + 1000` 调 `ensureFullPromise()`，
+        // 理由是「给 HLS 挂掉留个退路」。但实测证明这笔账算错了：
+        //
+        //   312.402s  媒体 playing（HLS 正常出画）
+        //   313.156s  resolve 请求开始（25.4MB）  ← 本行触发的补发
+        //   323.062s  resolve 请求开始（19.4MB）
+        //   424.083s  媒体 waiting 缓冲等待        ← 用户感知的「播着播着卡一下」
+        //
+        // 用户正在看的这一集是**边转边播**的 HLS：ffmpeg 还在往磁盘写后续分片。
+        // 此时再起一路 worker 下 20MB+ 的整集 mp4，两者抢的是同一块磁盘与 CPU ——
+        // 而那份 mp4 在整个正常播放路径上**一次都不会被读到**。
+        //
+        // 「HLS 挂了怎么办」这个担心由 `startFull` 覆盖：真出问题时它才现场发车，
+        // 那时 CPU 是空闲的，多等几秒也远好过让用户全程卡顿。
         return `ok`;
       }
       endStreamingWindow();
@@ -1598,71 +1647,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   /**
-   * 发起一次后台整集预热（内部实现，所有预热入口共用同一个并发闸门）。
+   * 预取队列（已停用，仅保留声明以缩小本次 diff）。
    *
-   * 闸门是必要的：warmAdjacentEpisodes 一次要备 3 集，悬停入口还可能同时进来；
-   * 若不限并发，鼠标扫过一屏选集就能让十几个 worker 同时抢带宽与 CPU，
-   * 结果正在播的那一集反而更卡——适得其反。
-   *
-   * 返回是否真的发起了请求。
-   */
-  const startPrewarmResolve = (seriesId: string, episodeId: string, contentType: number): boolean => {
-    if (!isTauriEnvironment()) return false;
-    // 流式转码在跑时不接新的整集预热：三路 ffmpeg 抢 CPU 会让正在看的那一集
-    // 分片来不及生成（实测整集重编码从 7 秒涨到 26–43 秒）。详见 MAX_PREWARM_INFLIGHT。
-    // 返回 false 而不是抛错：预热本就是纯优化，不接受就只是没享受到加速。
-    if (streamingInFlight()) return false;
-    if (prewarmInflightRef.current >= MAX_PREWARM_INFLIGHT) return false;
-    const key = episodeCacheKey(seriesId, episodeId, 'auto');
-    if (resolvedFileByVidRef.current.has(key)) return false; // 已缓存或已在途
-    resolvedFileByVidRef.current.set(key, '__prefetching__');
-    prewarmInflightRef.current += 1;
-    // 占位必须保证最终释放：网络异常会被吞掉，若不在约定时间内收尾，
-    // '__prefetching__' 会永久占住 key，导致该集再也无法被预热或被快路径命中。
-    const guard = setTimeout(() => {
-      if (resolvedFileByVidRef.current.get(key) === '__prefetching__') {
-        resolvedFileByVidRef.current.delete(key);
-      }
-    }, 330_000);
-    // 只发一次请求：prefetchNative 与 resolveNative 调用的是同一条
-    // short_drama_app_resolve 命令，串成 .then 链等于把同一集解析两遍。
-    void ipcService.playback
-      .resolveNative(seriesId, episodeId, contentType, 'auto')
-      .then(async resolved => {
-        clearTimeout(guard);
-        if (!resolved.playUrl) {
-          resolvedFileByVidRef.current.delete(key);
-          return;
-        }
-        resolvedFileByVidRef.current.set(key, resolved.playUrl);
-        // 解析成功只是"文件在盘上"，首帧还没解。顺手再预解一次并入池，
-        // 切集时就能整段跳过 preloadSource（那 200~600ms 的缝就在这里）。
-        // 失败静默：预解只是加速手段，拿不到就退回原来的慢路径。
-        try {
-          const { convertFileSrc } = await import('@tauri-apps/api/core');
-          await pushPreparedPool(key, convertFileSrc(resolved.playUrl));
-        } catch {
-          // 忽略：预解失败不影响解析成果
-        }
-      })
-      .catch(() => {
-        clearTimeout(guard);
-        resolvedFileByVidRef.current.delete(key);
-      })
-      .finally(() => {
-        prewarmInflightRef.current = Math.max(0, prewarmInflightRef.current - 1);
-      });
-    return true;
-  };
-
-  /**
-   * 预取队列：播放期间把"接下来可能被点开"的集按优先级排队，逐个在后台解析。
-   *
-   * 为什么需要队列而不是一次性并发：
-   * - 单集解析实测约 7.4 秒（签名 3.6s + 下载解密 3.9s），而一集时长 50~140 秒，
-   *   所以**只要持续排队，播放期间完全来得及把后面几集都备好**；
-   * - 反过来若一次并发很多个，worker 会互相抢带宽与 CPU，正在播的那一集反而更卡。
-   * 因此这里用"顺序推进 + 并发上限"：既覆盖更深的往后集数，又不影响当前播放。
+   * 它原本驱动「下三集 + 上一集」的**整集 mp4** 后台解析（`startPrewarmResolve`），
+   * 2026-10-17 因实测播放卡顿整体移除：那份 mp4 在方案 B 之后不是播放源，
+   * 下载它只会和正在播的边转边播 HLS 抢磁盘与 CPU。
+   * 详见 `warmAdjacentEpisodes` 里的实测时间线。
    */
   const prefetchQueueRef = useRef<Array<{ seriesId: string; episodeId: string; contentType: number }>>([]);
   // 队列的**属主会话**：换集后新会话会重灌队列，而旧泵还活着的那个短窗口里
@@ -1671,12 +1661,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const prefetchPumpRunningRef = useRef<boolean>(false);
 
   /**
-   * 播放期间预热后续集数（下三集优先，其次上一集兜底回看）。
+   * 本集出画后，为**下一集**预热整集 HLS（连播无缝切换）。
    *
-   * 旧实现只备 idx+1/idx+2，用户进剧后若直接跳到第 5 集仍要等完整解析；
-   * 而且预取曾经挂在 handlePlaying 上、占位符还会被快路径跳过，等于从未生效。
-   * 现在改成 openEpisode 落点即入队，由队列泵在播放期间持续消费——
-   * 目标是"用户随手点后面任意一集，大概率已经在本机"。
+   * ## 名字的历史包袱
+   *
+   * 它曾叫「warmAdjacentEpisodes」，负责预取「下三集 + 上一集」的**整集 mp4**
+   * 并灌进 `prefetchQueueRef`。那条链路已于 2026-10-17 停用（实测导致播放卡顿，
+   * 见下面那段长注释），现在函数体里只剩「预转下一集的整集 HLS」这一件事。
+   * 名字保留是为了不动调用点（`openEpisode` 的两处），语义已由注释钉住。
+   *
+   * ## 为什么只预转下一集
+   *
+   * 每路转码会占满显卡编码单元约 6 秒，而连播只关心下一集；下两集之后用户
+   * 多半还没看到，提前转纯属与当前播放抢资源（NVENC 串行是实测结论）。
    */
   const warmAdjacentEpisodes = (
     series: SeriesDetail,
@@ -1687,39 +1684,32 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const idx = series.episodes.findIndex(e => e.id === currentEpisodeId);
     if (idx < 0) return;
     const contentType = series.type === 'comic' ? 1004 : 1;
-    // 每次重新排队前先清空旧队列：换了剧或换了集之后，之前的预测已经过时。
-    prefetchQueueRef.current = [];
-    // 队列易主：新会话从现在起拥有它（旧泵醒来时据此判断"该不该清"，见审查 F4）。
-    prefetchQueueOwnerRef.current = sessionAtRequest;
-    if (sessionAtRequest <= 0) {
-      // 会话号还没建立（不该发生）：不设属主，交给泵的会话校验兜底。
-      prefetchQueueOwnerRef.current = 0;
-    }
-    // 旧队列对应的首帧预解也随之作废——那些集已经不是"接下来要播的"了。
+    // 首帧预解池随会话作废——那些集已经不是"接下来要播的"了。
     // 必须连同 dispose 一起清，只清 Map 不释放会让解码器挂在脱离文档流的
     // video 上直到 WebView 回收。
     drainPreparedPool();
-    // 下三集优先（连播与随手点开的主要目标），上一集兜底"回看"。
-    const next = series.episodes.slice(idx + 1, idx + 4);
-    const prev = series.episodes[idx - 1] ? [series.episodes[idx - 1]] : [];
-    const targets = [...next, ...prev];
-    // 先把整个序列一次性登记为"在途"，避免队列还没轮到某一集时，
-    // 悬停预热又对同一集发起第二次解析（后端虽有 leader/follower 去重，
-    // 但前端这一层多打一次请求同样浪费）。
-    targets.forEach(target => {
-      const key = episodeCacheKey(series.id, target.id, 'auto');
-      if (!resolvedFileByVidRef.current.has(key)) {
-        prefetchQueueRef.current.push({
-          seriesId: series.id,
-          episodeId: target.id,
-          contentType,
-        });
-      }
-    });
-    // 交给泵消费。泵会在消费过程中校验会话，用户切走后立即停止。
-    // 首拍延迟 800ms：换集瞬间前台解析正要拉起 worker，预取同时入队会让
-    // 两者抢锁串行（worker 单实例），前台那一集白等一拍。让前台先跑。
-    setTimeout(() => pumpPrefetchQueueForSession(sessionAtRequest), 800);
+    // ⚠️ **整集 mp4 预取队列已停用**（2026-10-17，实测卡顿回归）。
+    //
+    // 原实现预取「下三集 + 上一集」，每集都是 worker 下载整集 + 解密 + 重编码
+    // （实测单集 13~27MB、7~10 秒）。方案 B 之后整集 mp4 **已经不是播放源**
+    // （整集 HLS 才是），它只是「HLS 起不来」的退路 —— 也就是说这条队列花掉
+    // 的带宽与 CPU，在正常播放路径上**一秒钟都用不到**。
+    //
+    // 代价是实测出来的。ttv-playback.log 一次连播里：
+    //   299.310s  resolve 请求开始（20.3MB）
+    //   304.757s  resolve 请求开始（26.2MB）   ← 两路 worker 并行
+    //   312.402s  媒体 playing
+    //   313.156s  resolve 请求开始（25.4MB）   ← 边播边下第三路
+    //   323.062s  resolve 请求开始（19.4MB）
+    //   424.083s  媒体 waiting 缓冲等待        ← 用户感知的「播着播着卡一下」
+    //
+    // 也就是说：用户在看的这一集（HLS，边转边播）正在与最多两路"下整集 mp4"
+    // 的 worker 抢磁盘与 CPU。而按项目自己的实测记录，NVENC 编码单元是**串行**的，
+    // 预取不仅没加速任何东西，还把正在播的那一路挤慢了。
+    //
+    // 现在只保留下面那段「预转下一集的整集 HLS」—— 那才是换集时真正要用的产物。
+    // 队列相关的 `prefetchQueueRef` / `prefetchQueueOwnerRef` / `startPrewarmResolve`
+    // 已随之成为死代码，保留在文件里只为缩小本次 diff；下一次清理可整体移除。
 
     // ===== 预转**下一集**的整集 HLS（用户需求：集与集之间无缝切换）=====
     //
@@ -1784,79 +1774,38 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       });
   }, []);
 
-  /// 带会话校验的队列泵入口：用户切走后不再为旧会话继续占用带宽。
-  const pumpPrefetchQueueForSession = (sessionAtQueueBuild: number) => {
-    if (prefetchPumpRunningRef.current) return;
-    prefetchPumpRunningRef.current = true;
-    const step = () => {
-      if (activeSessionRef.current !== sessionAtQueueBuild) {
-        // ⚠️ 只清**属于我这个旧会话**的队列。
-        //
-        // 新会话（换集后）会灌进自己的队列并起一个新泵，但泵有"同时只跑一个"的守卫
-        // （`prefetchPumpRunningRef`）—— 旧泵还活着时新泵直接被挡掉，而旧泵醒来发现
-        // 会话不符，若在这里无条件清空，清掉的正是**新会话刚灌进去的队列**，
-        // 此后又没有任何泵会重启，该集的 mp4 预热全失效（审查 F4）。
-        if (prefetchQueueOwnerRef.current === sessionAtQueueBuild) {
-          prefetchQueueRef.current = [];
-          prefetchQueueOwnerRef.current = 0;
-        }
-        prefetchPumpRunningRef.current = false;
-        return;
-      }
-      // ⚠️ 先判流式闸门，而且**必须在取值（shift）之前**判。
-      //
-      // `startPrewarmResolve` 对"流式窗口内"与"已缓存/已在途"都返回 false，而队列泵把
-      // false 一律当作"未受理"、立刻 `setTimeout(step, 0)` 去消费下一项 —— 于是若在这里
-      // 先把项 shift 出来、再让闸门拒掉，整条队列会在几十毫秒内被清空，一次预热都发不
-      // 出去。而流式窗口从出画起还要按住 6 秒，所以这个命中是必然的，不是边界情况。
-      // 症状是"整集 mp4 预热在播放期间彻底失效"：HLS 起不来要回退整集链路时得现场等
-      // 7 秒多。
-      if (streamingInFlight()) {
-        setTimeout(step, 500);
-        return;
-      }
-      if (prewarmInflightRef.current >= MAX_PREWARM_INFLIGHT) {
-        setTimeout(step, 400);
-        return;
-      }
-      // 前台正在解析（换集 / 自动连播）时，暂缓后台预取。
-      //
-      // 预取走的是 startPrewarmResolve → 直接调 resolveNative，不会登记
-      // nativeResolveInFlightRef，所以这个判断只对**前台**生效，不会自己卡自己。
-      //
-      // 必要性：单集解析要拉起 python worker + ffmpeg（下载 + 解密 + 转存），
-      // 前台 1 个加上预取 1 个就是两路进程同时抢带宽与 CPU（预取上限降到 1 之后
-      // 最多就是这两路；此前是前台 1 + 预取 2 = 3 路）。而前台那一集是
-      // 用户**正在等**的，预取只是"最好有"——让前台先跑完更符合直觉，
-      // 也避免前台的探针预热被拖到超时（那会白白多绕一圈 playDirect）。
-      if (nativeResolveInFlightRef.current) {
-        setTimeout(step, 500);
-        return;
-      }
-      const next = prefetchQueueRef.current.shift();
-      if (!next) {
-        prefetchPumpRunningRef.current = false;
-        return;
-      }
-      const accepted = startPrewarmResolve(next.seriesId, next.episodeId, next.contentType);
-      // 未受理（已缓存/在途）就立刻继续下一项，不占用节奏。
-      setTimeout(step, accepted ? 250 : 0);
-    };
-    step();
-  };
-
   /**
    * 为指定集提前预热（详情页选集悬停、选集抽屉悬停）。
    *
    * 从"用户瞄上某一集"到"真正点进播放器"通常有几百毫秒到数秒的间隔，
-   * 这段时间足以让 worker 把该集下载推进一截。此前只有进入播放器之后才
-   * 才开始预取，等于白白丢掉这段本可以利用的时间。
+   * 这段时间足以让后端把该集备好。此前只有进入播放器之后才开始预取，
+   * 等于白白丢掉这段本可以利用的时间。
+   *
+   * ## 预热什么：整集 HLS，而不是整集 mp4（2026-10-17 改）
+   *
+   * 旧实现走 `startPrewarmResolve` → `resolveNative`，也就是让 worker **下载整集
+   * mp4 + 解密 + 重编码**（实测单集 13~27MB、7~10 秒）。方案 B 之后整集 HLS 才是
+   * 播放源，那份 mp4 只有「HLS 起不来」时才会被读到 —— 预热它等于为一个几乎不会
+   * 发生的场景，提前烧掉 20MB 带宽和一路 worker 的 CPU。
+   *
+   * 代价在实机上非常直观（ttv-playback.log）：用户在选集抽屉里滑过几集，
+   * 后台就会并行起两路 worker 下整集，正在播的那一路（边转边播的 HLS）
+   * 抢不到磁盘，表现就是「播着播着卡一下」。
+   *
+   * 改为 `prewarmStreamNative`：它产出 `vid-{vid}` 目录下的整集 HLS，正是用户
+   * 点下去要播的东西。命中时 `open_stream` 直接复用、**零等待**（实测 132ms
+   * 返回 → 368ms 出画），没命中也只是没享受到加速。
    */
   const prewarmEpisode = (seriesId: string, episodeId: string, contentType = 1) => {
     // 动漫源是流式 m3u8，没有"本地文件"可预热；起 worker 只会白跑一遍
     // 签名链路再失败（worker 只认红果 vid）。动漫的加载靠 openEpisode 直连。
     if (currentSeries?.type === 'anime' || seriesId.startsWith('anime_')) return;
-    startPrewarmResolve(seriesId, episodeId, contentType);
+    // guo 源走 guo-core 本地媒体服务，预取由 `prefetchGuoNext` 单独负责。
+    if (seriesId.startsWith('guo:')) return;
+    // ⚠️ 播放中不预热：编码单元是串行的（NVENC 实测），此刻发车只会挤慢
+    // 正在播的那一路。悬停发生在播放器内（选集抽屉）时命中这里。
+    if (streamingInFlight()) return;
+    void ipcService.playback.prewarmStreamNative(seriesId, episodeId, contentType);
   };
 
   const playLocalFile = async (
@@ -2024,6 +1973,22 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     setSessionId(newSessionId);
     if (!qualitySwitchRequested) {
       setUiState({ kind: 'opening', sessionId: newSessionId, episodeId: episodeId || '' });
+      // ===== 换集必须把进度/时长/缓冲一起归零 =====
+      //
+      // 历史坑（用户实机报告）：进度条停在某一位置时点「下一集」，进度条不刷新、
+      // 画面也定格在旧位置开始播。根因是这三项**只有** `timeupdate` / `seek` 会写，
+      // 而换集时新源从 `currentTime=0` 开始、第一次 `timeupdate` 到来之前，
+      // UI 一直读着上一集残留的 `position`：
+      //   - 进度条停在旧位置（视觉上"没刷新"）；
+      //   - `ProgressBar` 的拖动值也来自它，用户看到的"定格在进度条位置"正是
+      //     旧 position 被当成新一集的起播点渲染出来。
+      // 新源真正出画后 `handlePlaying` / `handleTimeUpdate` 会立刻用真实值覆盖，
+      // 所以这里归零不会造成"跳回 0 再跳回去"的抖动。
+      //
+      // ⚠️ 切清晰度例外：那是同一集的同一位置，归零会让进度条瞬间跳到 0。
+      setPosition(0);
+      setDuration(0);
+      setBuffered(0);
     }
 
     // ===== 切换的瞬间就停掉旧视频 =====
@@ -2446,7 +2411,45 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           if (pauseIfStale(newSessionId, video)) return;
           video.muted = preferredMuted;
           setIsPlaying(true);
-          setUiState({ kind: 'playing', sessionId: newSessionId, position: startPosition });
+          // ⚠️ 用 `video.currentTime` 而不是 `startPosition`：这条路径的源是
+          // guo 本地媒体服务的 HLS/直链，`startPosition > 0` 时那次 seek 可能
+          // 还没落地（`loadedmetadata` 尚未触发），写死 `startPosition` 会让
+          // 进度条与画面脱钩。取元素真值是唯一可靠的来源。
+          setUiState({ kind: 'playing', sessionId: newSessionId, position: video.currentTime });
+          // ===== 主动补齐时长与进度（用户报告：新区域卡片进度/时长全是 0）=====
+          //
+          // guo 源走的是这条「公开直链」分支，**不经过** `openStreamNative`，
+          // 因此 `streamingSourceTotalSeconds` 永远是 0（日志可证：`时长权威值
+          // 已固定` 只出现在红果 HLS 路径上）。而 `usableDuration` 退回到
+          // `video.duration` 时，guo 的 HLS 直链常报 `Infinity`；再退到
+          // `seekable`/`buffered` 时若首片还没入缓冲就是 **0** —— 于是进度条
+          // 恒为 00:00 / 00:00，但画面照常播（用户看到的正是这个）。
+          //
+          // 这里在起播后主动推一次真值，并且挂一个 `durationchange` 兜底：
+          // 边转边播/流式源的 `duration` 是**后来才**从 Infinity 变成真实值的，
+          // 只在起播这一刻读一次会永久错过它。
+          const syncTimeline = () => {
+            if (activeSessionRef.current !== newSessionId) return;
+            const dur = usableDuration(video);
+            if (dur > 0) setDuration(dur);
+            const cur = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+            if (cur >= 0) setPosition(cur);
+          };
+          syncTimeline();
+          const onDurationChange = () => syncTimeline();
+          video.addEventListener('durationchange', onDurationChange);
+          video.addEventListener('loadedmetadata', onDurationChange);
+          // 清理：源被换掉（新的会话开始）时这两个监听必须撤掉，否则会一直
+          // 往已经作废的会话里写状态。用一次性定时器做不到"会话作废即撤"，
+          // 所以挂在 video 上、由 `detachSource` 之外的这条路径自己收尾。
+          const timelineCleanup = () => {
+            video.removeEventListener('durationchange', onDurationChange);
+            video.removeEventListener('loadedmetadata', onDurationChange);
+          };
+          video.addEventListener('emptied', timelineCleanup, { once: true });
+          // 30 秒后无条件摘掉：guo 的源一旦稳定，`duration` 不会再变，留着监听
+          // 只会在每次 seek 时白跑一遍 `usableDuration`（它要读 seekable/buffered）。
+          window.setTimeout(timelineCleanup, 30000);
         }).catch((error: unknown) => {
           if (activeSessionRef.current !== newSessionId) return; // 会话已作废：不补播、不弹错误卡
           // WebView2 may reject the first gesture-less attempt only because it has audio.
@@ -2582,8 +2585,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
               currentQuality,
               currentSeries.type === 'comic' ? 1004 : 1,
               videoRef.current,
-              activeSessionRef.current,
-              position,
+              // ⚠️ 起播点必须取**元素真值**，不能用 React state 的 `position`。
+              //
+              // `position` 是 `timeupdate` 的节流镜像（约 4 次/秒），换集归零后
+              // 到第一次 `timeupdate` 之间它是 0；而在正常播放中它又可能比真实
+              // `currentTime` 落后最多 250ms。用它当恢复点会让「点一下继续播放」
+              // 出现回退或从 0 重来的观感。元素自身的 `currentTime` 才是唯一真值。
+              Number.isFinite(videoRef.current.currentTime) ? videoRef.current.currentTime : 0,
             );
           })();
           void attempt.then(result => {
@@ -2679,8 +2687,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     if (quality === currentQuality) return;
     setCurrentQuality(quality);
     if (currentSeries && currentEpisode) {
-      // 保持当前播放位置平滑切清晰度
-      void openEpisode(currentSeries.id, currentEpisode.id, position, quality);
+      // 保持当前播放位置平滑切清晰度。
+      // 取元素真值而非 state 的 `position`：后者是 timeupdate 的节流镜像，
+      // 切换瞬间可能落后最多 250ms，表现为"切完清晰度回退了一点"。
+      const at = videoRef.current && Number.isFinite(videoRef.current.currentTime)
+        ? videoRef.current.currentTime
+        : position;
+      void openEpisode(currentSeries.id, currentEpisode.id, at, quality);
     }
   };
 

@@ -16,7 +16,12 @@ pub struct CatalogFilter {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// 目录/货架里的一张剧集卡。
+///
+/// `Deserialize` 是给**磁盘缓存**用的（`short_drama_app::read_shelf_cache`
+/// 要把落盘的 JSON 读回来）。加上它不影响 Tauri 命令的序列化契约 ——
+/// 命令出口只用 `Serialize`，多实现一个 trait 不会改变线上格式。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeriesItem {
     pub id: String,
@@ -293,6 +298,29 @@ pub struct UserSettings {
     /// `#[serde(default)]` 对 bool 只会给 `false`，所以走 `default_true`。
     #[serde(default = "default_true")]
     pub vsr_enabled: bool,
+    /// 红果官网链路（`provider.rs` 的 `/category` 抓取）走不走系统代理。
+    ///
+    /// ## 为什么要做成用户可选项，而不是"自动判断"
+    ///
+    /// 自动判断已经试过两轮，两轮都栽在同一处：**取样时刻不一致**。
+    /// `DramaProvider::new()` 在进程启动时把注册表里的代理固化进连接器，
+    /// 而兜底逻辑却去问"此刻"的注册表。代理软件退出、`ProxyEnable` 翻成 0
+    /// 之后两者就对不上 —— 主客户端继续往没人监听的端口发请求（`10061`），
+    /// 而兜底又因为"当下没配代理"而不创建。
+    ///
+    /// 现在是**双保险**：启动时做一次 TCP 连通性探测把明显不通的代理判死
+    /// （`probe_proxy_on_startup`），同时把最终决定权交给用户 —— 有些环境
+    /// （企业网、非常规代理）自动探测必然判错，只有人能给出正确答案。
+    ///
+    /// 取值：`auto`（默认，探测可用才用）/ `direct`（永不走代理）/ `proxy`（总是走）。
+    /// 旧设置记录没有这个字段，serde default 给 `auto`，与修复前行为一致。
+    #[serde(default = "default_proxy_mode")]
+    pub proxy_mode: String,
+}
+
+/// `proxy_mode` 的默认值。抽成函数是因为 `#[serde(default = "...")]` 只接受路径。
+fn default_proxy_mode() -> String {
+    "auto".into()
 }
 
 /// `#[serde(default)]` 对 bool 只会给 `false`；需要默认为真的字段走这个。
@@ -314,6 +342,7 @@ impl Default for UserSettings {
             enabled_sources: vec!["hongguo".to_string()],
             launch_sound: true,
             vsr_enabled: true,
+            proxy_mode: "auto".into(),
         }
     }
 }

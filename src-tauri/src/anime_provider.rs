@@ -64,18 +64,32 @@ impl AnimeProvider {
             .tcp_nodelay(true)
             .build()
             .map_err(|error| error.to_string())?;
-        // 启动时探一次数据源并写进日志：否则"卡片怎么还是暴风的"没法查。
+        // 数据源探测**不能在这里同步做**。
         //
-        // 三行原先是 `println!`：本进程是 windows 子系统、没有控制台，等于没写。
-        // 用户反馈"动漫区怎么老是暴风源"时，日志里一行证据都没有。改走 trace。
-        if use_dmghg() {
-            crate::trace::log("[anime] 数据源: 动漫共和国（正式源）");
-        } else {
-            crate::trace::log("[anime] 数据源: 暴风资源（兜底源）");
-            if let Some(error) = crate::dmghg_bridge::init_error() {
-                crate::trace::log(format!("[anime] dmghg 不可用原因: {error}"));
+        // `use_dmghg()` 会触发 `dmghg_bridge` 的 `OnceLock` 初始化，也就是
+        // **同步加载外部 DLL**（实测 274–364ms，是 setup 里最重的一项）。
+        // 而它的唯一作用是写一行日志告诉排查者"现在用的是哪个源"——
+        // 让这件事挡住窗口创建、挡住第一帧，代价和收益完全不成比例。
+        //
+        // 现在改成后台线程异步探一次：窗口照常出现，日志在几百毫秒后补齐。
+        // 真正需要 dmghg 的地方（`catalog` / `detail`）会自己触发初始化，
+        // 那时用户已经在等动漫列表了，这笔开销本来就是必须付的。
+        //
+        // ⚠️ 不要改回同步：日志的时间戳会变，但"启动快 360ms"是用户能感觉到的。
+        std::thread::spawn(|| {
+            // 启动时探一次数据源并写进日志：否则"卡片怎么还是暴风的"没法查。
+            //
+            // 三行原先是 `println!`：本进程是 windows 子系统、没有控制台，等于没写。
+            // 用户反馈"动漫区怎么老是暴风源"时，日志里一行证据都没有。改走 trace。
+            if use_dmghg() {
+                crate::trace::log("[anime] 数据源: 动漫共和国（正式源）");
+            } else {
+                crate::trace::log("[anime] 数据源: 暴风资源（兜底源）");
+                if let Some(error) = crate::dmghg_bridge::init_error() {
+                    crate::trace::log(format!("[anime] dmghg 不可用原因: {error}"));
+                }
             }
-        }
+        });
         Ok(Self { client })
     }
 

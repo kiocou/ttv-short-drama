@@ -168,22 +168,8 @@ fn system_proxy() -> Option<Vec<reqwest::Proxy>> {
         return None;
     }
 
-    // 两种写法都要认：`host:port` 与 `http=host:port;https=host:port`。
-    let pick = |scheme: &str| -> Option<String> {
-        server
-            .split(';')
-            .map(str::trim)
-            .find_map(|entry| match entry.split_once('=') {
-                Some((key, value)) if key.trim().eq_ignore_ascii_case(scheme) => {
-                    Some(value.trim().to_string())
-                }
-                None if !entry.is_empty() => Some(entry.to_string()),
-                _ => None,
-            })
-            .filter(|value| !value.is_empty())
-    };
-    let http = pick("http")?;
-    let https = pick("https").unwrap_or_else(|| http.clone());
+    let http = parse_proxy_server(&server, "http")?;
+    let https = parse_proxy_server(&server, "https").unwrap_or_else(|| http.clone());
 
     // 代理地址非法时静默放弃，退回直连（检查更新仍能跑，只是可能失败时会如实报错）。
     let mut proxies = Vec::new();
@@ -195,6 +181,123 @@ fn system_proxy() -> Option<Vec<reqwest::Proxy>> {
     }
     // 一个都没配上就不返回：避免调用方以为“已经挂了代理”而实际是空列表。
     (!proxies.is_empty()).then_some(proxies)
+}
+
+/// 从 `ProxyServer` 字符串里取出某个 scheme 的地址。
+///
+/// 两种写法都要认：`host:port` 与 `http=host:port;https=host:port`。
+/// 拆成独立函数是为了让 `system_proxy_address()` 能复用同一套解析——
+/// 两份实现漂移的话，"探测的地址"与"实际挂的地址"就会对不上。
+fn parse_proxy_server(server: &str, scheme: &str) -> Option<String> {
+    server
+        .split(';')
+        .map(str::trim)
+        .find_map(|entry| match entry.split_once('=') {
+            Some((key, value)) if key.trim().eq_ignore_ascii_case(scheme) => {
+                Some(value.trim().to_string())
+            }
+            None if !entry.is_empty() => Some(entry.to_string()),
+            _ => None,
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// 系统代理的 `host:port`（HTTP 那一路）。没配代理返回 `None`。
+///
+/// 给 `provider::DramaProvider::probe_proxy_on_startup` 做启动自检用：
+/// 它只需要"该去连哪个端口"，不需要构造 `reqwest::Proxy`。
+///
+/// **注意它与 `system_proxy()` 的区别**：那个返回的是已经构造好的
+/// `reqwest::Proxy` 列表（挂到客户端上），这个只回答地址。两者共用
+/// `parse_proxy_server` 解析，不会漂移。
+pub(crate) fn system_proxy_address() -> Option<String> {
+    system_proxy_server().and_then(|server| parse_proxy_server(&server, "http"))
+}
+
+/// 读注册表里的 `ProxyServer`（**仅在 `ProxyEnable` 为真时**返回）。
+fn system_proxy_server() -> Option<String> {
+    #[cfg(not(windows))]
+    {
+        None
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Registry::{
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+            REG_SZ,
+        };
+
+        fn read_value(
+            key: windows_sys::Win32::System::Registry::HKEY,
+            name: &str,
+        ) -> Option<(u32, Vec<u8>)> {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut kind: u32 = 0;
+            let mut size: u32 = 0;
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut kind,
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            };
+            if status != 0 || size == 0 {
+                return None;
+            }
+            let mut buffer = vec![0u8; size as usize];
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut kind,
+                    buffer.as_mut_ptr(),
+                    &mut size,
+                )
+            };
+            if status != 0 {
+                return None;
+            }
+            Some((kind, buffer))
+        }
+
+        let sub_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut key: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub_key.as_ptr(), 0, KEY_READ, &mut key) };
+        if status != 0 {
+            return None;
+        }
+        let enabled = read_value(key, "ProxyEnable")
+            .filter(|(kind, bytes)| *kind == REG_DWORD && bytes.len() >= 4)
+            .map(|(_, bytes)| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .unwrap_or(0)
+            != 0;
+        let server = read_value(key, "ProxyServer")
+            .filter(|(kind, _)| *kind == REG_SZ)
+            .map(|(_, bytes)| {
+                let units: Vec<u16> = bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_le_bytes(*pair))
+                    .take_while(|unit| *unit != 0)
+                    .collect();
+                String::from_utf16_lossy(&units)
+            })
+            .unwrap_or_default();
+        unsafe { RegCloseKey(key) };
+        if !enabled || server.trim().is_empty() {
+            return None;
+        }
+        Some(server)
+    }
 }
 
 /// 给任意 reqwest 客户端构造器挂上系统代理。
@@ -213,8 +316,15 @@ pub(crate) fn with_system_proxy(builder: reqwest::ClientBuilder) -> reqwest::Cli
 
 /// 本机是否配了可用的系统代理。
 ///
-/// 给调用方判断"要不要准备一条直连兜底"用：没配代理的机器上，代理路径与直连路径
-/// 本来就是同一条，兜底只会白建一个连接池。见 `provider::fallback_direct_client`。
+/// 曾经给 `provider::fallback_direct_client` 当"要不要准备直连兜底"的判据。
+/// **那个用法已废弃**（2026-10-18）：它读的是**当下**的注册表，而主客户端是在
+/// 进程启动时建好的，两者取样时刻不同 —— 代理在启动后关闭时，兜底会被这个
+/// `false` 挡住，而主客户端还在往已关闭的端口发请求（`os error 10061`）。
+/// 现在直连兜底无条件创建，见 `provider::fallback_direct_client` 的注释。
+///
+/// 保留这个函数是因为它语义清晰、将来若要做"代理可用性探测"仍会用到；
+/// 当前没有调用点。
+#[allow(dead_code)]
 pub(crate) fn has_system_proxy() -> bool {
     system_proxy().is_some()
 }

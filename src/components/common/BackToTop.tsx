@@ -104,14 +104,26 @@ export const BackToTop: React.FC<BackToTopProps> = ({ targetRef, threshold = 320
             : 'pointer-events-none translate-y-4 scale-90 opacity-0'
         }`}
       >
-        {/* 滚动进度环：外圈淡蓝底 + 蓝色进度。`-rotate-90` 让起点回到 12 点方向。 */}
+        {/* 滚动进度环：外圈淡强调色底 + 强调色进度。`-rotate-90` 让起点回到 12 点方向。
+            
+            ⚠️ 颜色**必须走 CSS 变量**（`--c-blue-600`），不能写死 `#0067c0`。
+            
+            暗色主题的实现方式是**重映射 Tailwind 的颜色变量**（`dark.css` 里把
+            `--c-blue-600` 从蓝改成红 `220 32 56`），而不是逐条覆盖选择器。
+            写死的十六进制值绕过了这套机制，于是暗色下这个环永远是蓝的 ——
+            而按钮其余部分（`hover:text-blue-600`）已经跟着变红，一个按钮上
+            两种强调色并存。用户截图报的正是这个。
+            
+            用 `rgb(var(--c-blue-600) / α)` 而不是 `--color-*` 之类：项目里的变量
+            存的是**空格分隔的 RGB 三元组**（见 dark.css），这样既能在需要时加
+            透明度，又不必为每个不透明度再开一个变量。 */}
         <svg aria-hidden="true" viewBox="0 0 44 44" className="absolute inset-0 h-full w-full -rotate-90">
           <circle
             cx="22"
             cy="22"
             r={RING_RADIUS}
             fill="none"
-            stroke="rgba(0, 103, 192, 0.13)"
+            stroke="rgb(var(--c-blue-600) / 0.13)"
             strokeWidth="2"
           />
           <circle
@@ -120,7 +132,7 @@ export const BackToTop: React.FC<BackToTopProps> = ({ targetRef, threshold = 320
             cy="22"
             r={RING_RADIUS}
             fill="none"
-            stroke="#0067c0"
+            stroke="rgb(var(--c-blue-600))"
             strokeWidth="2"
             strokeLinecap="round"
             strokeDasharray={RING_CIRCUMFERENCE}

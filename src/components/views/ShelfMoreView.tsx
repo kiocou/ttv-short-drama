@@ -323,22 +323,42 @@ const PREFETCH_DISTANCE_PX = 2400;
  * 这是这套机制唯一的收敛条件。`isLoadingMore` 也必须在依赖里，否则会在同一帧里
  * 连发好几次（`loadMore` 有单飞，但会白跑几轮 setState）。
  */
+/**
+ * 几何兜底：实测"哨兵离视口底部还有多远"，仍在缓冲线内就继续补。
+ *
+ * ## 为什么依赖里必须有 `progress`，且它不能只是 `itemCount`
+ *
+ * 旧实现用 `itemCount` 当收敛信号：每落一页就重新量一次，缓冲被填满就自然停下。
+ * 但它有一个致命盲区 —— **某一页去重后为空时 `itemCount` 不变**。
+ * 那时：
+ *   - effect 不重跑 → 兜底不再触发；
+ *   - 而 `useInfiniteScroll` 的 observer 也只在"穿过阈值"时回调，哨兵一直
+ *     停在视口内的话它同样不会再发事件；
+ *   - 于是无限流停在那里，底部还挂着上一次的"正在加载更多…"。
+ *
+ * 这正是用户报的「无限流不彻底」的第三条根因。
+ *
+ * 现在调用方传进来的是 `items.length + pagesLoaded`（页数每次请求都 +1），
+ * 于是**每一页落地都会重新量一次**，无论这一页有没有带来新卡片。
+ * `loadMore` 自身的单飞保证不会因此并发。
+ */
 function usePrefetchBackstop(
   scrollRef: React.RefObject<HTMLDivElement | null>,
   sentinelRef: React.RefObject<HTMLDivElement | null>,
   hasMore: boolean,
   isLoadingMore: boolean,
-  itemCount: number,
+  /** 进度信号：每落地一页就变，与"这一页有没有新卡片"无关。 */
+  progress: number,
   loadMore: () => void,
 ) {
   useEffect(() => {
-    if (!hasMore || isLoadingMore || itemCount === 0) return;
+    if (!hasMore || isLoadingMore || progress === 0) return;
     const sentinel = sentinelRef.current;
     const root = scrollRef.current;
     if (!sentinel || !root) return;
     const distance = sentinel.getBoundingClientRect().top - root.getBoundingClientRect().bottom;
     if (distance <= PREFETCH_DISTANCE_PX) loadMore();
-  }, [hasMore, isLoadingMore, itemCount, loadMore, scrollRef, sentinelRef]);
+  }, [hasMore, isLoadingMore, progress, loadMore, scrollRef, sentinelRef]);
 }
 
 const ShelfAppFeed: React.FC<{
@@ -346,13 +366,14 @@ const ShelfAppFeed: React.FC<{
   channel: ChannelType;
   onBack: () => void;
 }> = ({ kind, channel, onBack }) => {
-  const { items, isLoading, isLoadingMore, hasMore, error, loadMore, reload } = useShelfFeed(kind, channel);
+  const { items, isLoading, isLoadingMore, hasMore, error, loadMore, reload, pagesLoaded } = useShelfFeed(kind, channel);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const openDetail = useOpenDetail();
 
   useInfiniteScroll(scrollRef, sentinelRef, hasMore, loadMore);
-  usePrefetchBackstop(scrollRef, sentinelRef, hasMore, isLoadingMore, items.length, loadMore);
+  // 进度信号用「页数」而不是「条目数」：去重为空的页也要能触发兜底重算。
+  usePrefetchBackstop(scrollRef, sentinelRef, hasMore, isLoadingMore, pagesLoaded, loadMore);
 
   const meta = SHELF_META[kind];
   const noun = channel === 'comic' ? '漫剧' : '短剧';
@@ -401,7 +422,7 @@ const ShelfAggregatedList: React.FC<{
   kind: ShelfKind;
   onBack: () => void;
 }> = ({ kind, onBack }) => {
-  const { items, isLoading, isLoadingMore, hasMore, error, loadMore, refreshCatalog } = useCatalogStore();
+  const { items, isLoading, isLoadingMore, hasMore, error, loadMore, refreshCatalog, pagesLoaded } = useCatalogStore();
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const openDetail = useOpenDetail();
@@ -410,7 +431,8 @@ const ShelfAggregatedList: React.FC<{
   // 观察器，也会让几何兜底在同一帧里反复触发。
   const handleLoadMore = useCallback(() => { void loadMore(''); }, [loadMore]);
   useInfiniteScroll(scrollRef, sentinelRef, hasMore, handleLoadMore);
-  usePrefetchBackstop(scrollRef, sentinelRef, hasMore, isLoadingMore, items.length, handleLoadMore);
+  // 进度信号用「页数」而不是「条目数」：去重为空的页也要能触发兜底重算。
+  usePrefetchBackstop(scrollRef, sentinelRef, hasMore, isLoadingMore, pagesLoaded, handleLoadMore);
 
   const meta = SHELF_META[kind];
   const subtitle = `${meta.aggregated} · 内容`;

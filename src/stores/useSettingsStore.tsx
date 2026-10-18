@@ -34,6 +34,12 @@ export const SettingsProvider: React.FC<{ children: ReactNode }> = ({ children }
           // undefined，若原样透传，设置页的开关与 Rust 侧的默认值会各说各话。
           // 与 launchSound 同样的 `!== false` 判定——默认开，只有显式 false 才关。
           vsrEnabled: saved.vsrEnabled !== false,
+          // 代理模式同样要归一：旧记录没有这个字段（展开后是 undefined），
+          // 直接透传会让设置页的分段控件没有任何一项被选中 —— 看起来像坏了。
+          // 未知值也一并回落到 auto，与 Rust 侧 `normalize_proxy_mode` 一致。
+          proxyMode: saved.proxyMode === 'direct' || saved.proxyMode === 'proxy'
+            ? saved.proxyMode
+            : 'auto',
         });
       })
       .catch(error => console.warn('Settings load failed:', error));

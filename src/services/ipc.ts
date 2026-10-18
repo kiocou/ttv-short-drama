@@ -195,6 +195,9 @@ export const DEFAULT_SETTINGS: UserSettings = {
   // 默认开：现状（引入 media_enhance 之后）默认就走 VSR 转码链路，
   // 默认关会让老用户升级后行为突变。详见 types/settings.ts 的字段注释。
   vsrEnabled: true,
+  // 默认 auto：探测决定用不用系统代理。旧记录缺这个字段时也落到这里，
+  // 与修复前的行为一致。详见 types/settings.ts 的字段注释。
+  proxyMode: 'auto',
 };
 
 function loadStorage<T>(key: string, fallback: T): T {
@@ -934,6 +937,26 @@ async guoCover(seriesId: string): Promise<string | null> {
    * 千万别每次传 0，那样每 1.5 秒会把 2000 行全量搬过 IPC 一次。
    */
   diagnostics: {
+    /**
+     * 代理连通性自检（设置页「检测网络」按钮）。
+     *
+     * 三件事一次问清：系统代理配的是什么、那个端口通不通、直连能不能取到目录。
+     * 这个项目在代理上栽过三次（目录全灭 / 更新失败 / guo 源 403），
+     * 每次症状都是同一句「加载失败」，而原因在几十行日志之外 ——
+     * 这条命令把那段推理一次做完。
+     */
+    async proxyDiagnose(): Promise<{
+      proxyAddress: string | null;
+      proxyReachable: boolean;
+      directCatalogOk: boolean;
+      proxyDead: boolean;
+    }> {
+      if (!isTauriEnvironment()) {
+        throw new Error('代理检测仅在桌面应用中可用。');
+      }
+      return invokeBackend('proxy_diagnose');
+    },
+
     /** 前端打点。写进与后端同一条日志流，方便按时间顺序拼出完整起播链路。 */
     async uiLog(message: string): Promise<void> {
       if (!isTauriEnvironment()) return;

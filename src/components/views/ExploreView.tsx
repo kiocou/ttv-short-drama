@@ -73,6 +73,7 @@ export const ExploreView: React.FC = () => {
     isLoading,
     isLoadingMore,
     hasMore,
+    dedupedStop,
     error,
     activeSources,
     setChannel,
@@ -217,7 +218,28 @@ export const ExploreView: React.FC = () => {
    * 只剩一块时那一块独占整行——不为了对齐而留半屏空白。
    */
   const showContinueSlot = Boolean(continueWatching);
-  const showRandomSlot = hasRandomCandidates(visibleItems, historySeriesIds);
+  /**
+   * 「猜你喜欢」槽位是否占位。
+   *
+   * ## 为什么要把"还在加载"也算成占位（2026-10-18）
+   *
+   * 旧判定只有 `hasRandomCandidates(visibleItems)` —— 它看的是**已经到手**的
+   * 目录条目。而目录是异步来的（要等 worker 冷启动），于是首屏时序变成：
+   *
+   *   1. 「继续观看」先渲染，因为 `mergedTwoColumns` 为 false，它**独占整行**；
+   *   2. 目录数据到达 → `showRandomSlot` 翻成 true → 网格从一列变两列，
+   *      「猜你喜欢」整块插进来；
+   *   3. 用户看到的是「别的卡片都加载完了，这一块最后才弹出来」。
+   *
+   * 现在：只要**可能**会有候选（首屏还在 loading 时按"会有"处理），就先占位。
+   * 骨架高度与真实卡片一致，数据到达只是把骨架换成内容，布局不移动。
+   *
+   * 只有"确实不可能有候选"才彻底不占位：
+   *   - 首屏已加载完（`!isLoading`），且
+   *   - 现有条目里没有任何合格候选（全被 historySeriesIds 排除了）。
+   * 那种情况是永久的，留一个空槽没有意义。
+   */
+  const showRandomSlot = isLoading || hasRandomCandidates(visibleItems, historySeriesIds);
   const mergedTwoColumns = showContinueSlot && showRandomSlot;
 
   /**
@@ -580,6 +602,7 @@ if (!sentinel || !root || !hasMore) return;
               onWatch={handleRandomWatch}
               onDetail={handleCardClick}
               isMerged={mergedTwoColumns}
+              isLoading={isLoading}
             />
           )}
         </div>
@@ -614,11 +637,16 @@ if (!sentinel || !root || !hasMore) return;
         </>
       ) : (
         <>
-          {/* 神秘小窝：红果 App 接口没有 18+ 口径，仍从本机启用源聚合出来的目录切。 */}
+          {/* 神秘小窝：红果 App 接口没有 18+ 口径，仍从本机启用源聚合出来的目录切。
+              `loading` 必须传：`HomeShelf` 在 `!loading && items.length === 0`
+              时返回 null（不占位），而这里的数据是异步聚合来的 —— 不传 loading
+              的话，首屏会先没有这两栏、等目录到达才整块插入，把下方网格顶下去。
+              与「猜你喜欢」那次是同一类抖动（2026-10-18 一并修）。 */}
           <HomeShelf
             title="正在热播"
             subtitle={`当前专区热度靠前的${CHANNEL_COPY[channel].noun}`}
             items={hotItems}
+            loading={isLoading}
             onClick={handleCardClick}
             onUnavailable={markSeriesUnavailable}
             onMore={() => handleShelfMore('hot')}
@@ -628,6 +656,7 @@ if (!sentinel || !root || !hasMore) return;
             title="新剧"
             subtitle="最近加入的内容"
             items={newItems}
+            loading={isLoading}
             onClick={handleCardClick}
             onUnavailable={markSeriesUnavailable}
             onMore={() => handleShelfMore('new')}
@@ -729,6 +758,17 @@ if (!sentinel || !root || !hasMore) return;
                 className="px-3 py-1.5 rounded-xl bg-white/70 border border-slate-200/70 text-xs text-slate-500 shadow-xs hover:text-slate-700 hover:bg-white cursor-pointer"
               >
                 加载更多失败，点此重试
+              </button>
+            ) : dedupedStop ? (
+              // 站方说还有下一页，但整页卡片都被去重吃掉了（多源页码错位，或
+              // 站方对越界页码回退到同一页）。继续自动请求只会空转，所以停了；
+              // 但它**不是**"已加载全部"，给一条重试让用户能再推一次。
+              <button
+                type="button"
+                onClick={() => { void refreshCatalog(''); }}
+                className="px-3 py-1.5 rounded-xl bg-white/70 border border-slate-200/70 text-xs text-slate-500 shadow-xs hover:text-slate-700 hover:bg-white cursor-pointer"
+              >
+                没有更多新内容了，点此重新加载
               </button>
             ) : (
               <span className="text-[11px] text-slate-400">已加载全部公开内容</span>

@@ -44,9 +44,30 @@ fn buffer() -> &'static Mutex<VecDeque<Line>> {
 ///
 /// 用相对时间而不是墙上时间：排障时真正要读的是"attach 之后 380ms 才 canplay"，
 /// 绝对时间还得做减法。
+///
+/// ## 为什么不是 `OnceLock<Instant>` 惰性初始化（2026-10-18 改）
+///
+/// 旧实现是 `*ORIGIN.get_or_init(Instant::now)` —— 计时起点落在**第一次写日志
+/// 的那一刻**，而第一次写日志发生在 `setup()` 里两个 DLL 加载**之后**。于是
+/// 日志里的 `+0.000s` 并不是进程启动，而是"初始化已经做完、终于开始打点"。
+///
+/// 后果很实在：用户报「点图标后要卡一会儿」，而日志显示启动只花了 1.6 秒 ——
+/// 因为真正慢的那段（`GuoBridge::load` + `initialize` 跨 FFI、dmghg DLL 加载）
+/// **完全落在计时起点之前，一个字都没记下来**。排查被这个假象带偏过一轮。
+///
+/// 现在改成 `main()` 的第一行显式调用 `mark_process_start()`，把起点钉在
+/// 进程真正开始跑的那一刻。`origin()` 保留惰性兜底（测试、单测直接调 `log`
+/// 时没有 `main`）。
 fn origin() -> Instant {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     *ORIGIN.get_or_init(Instant::now)
+}
+
+/// 在 `main()` 的最开头调用一次，把相对时间戳的零点钉在进程启动。
+///
+/// 重复调用是空操作（`OnceLock` 语义），所以不用担心被调用两次。
+pub fn mark_process_start() {
+    origin();
 }
 
 fn log_path() -> PathBuf {

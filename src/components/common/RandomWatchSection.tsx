@@ -38,6 +38,14 @@ interface RandomWatchSectionProps {
    * 是否与「继续观看」并排处于半宽两列模式。
    */
   isMerged?: boolean;
+  /**
+   * 宿主是否仍在加载目录。
+   *
+   * 有它才能区分"暂时还没有候选（数据在路上）"与"永远不会有候选
+   * （全被历史记录排除）"：前者必须占位，否则数据到达时整块插入会把
+   * 下方内容顶下去（用户报的「最后才弹出来」就是这个）。
+   */
+  isLoading?: boolean;
   className?: string;
 }
 
@@ -64,6 +72,7 @@ export const RandomWatchSection: React.FC<RandomWatchSectionProps> = ({
   onDetail,
   excludeIds,
   isMerged = false,
+  isLoading: hostLoading = false,
   className = '',
 }) => {
   const candidates = useMemo(
@@ -110,8 +119,21 @@ export const RandomWatchSection: React.FC<RandomWatchSectionProps> = ({
         window.clearTimeout(refreshTimerRef.current);
       }
 
-      // 提供 350ms 的加载动效时间，让刷新具有视觉流动感与反馈
-      refreshTimerRef.current = window.setTimeout(() => {
+      /**
+       * 首次出卡**不给延迟**，只有用户主动「换一批」才走 350ms 动效。
+       *
+       * ## 为什么（2026-10-18 修「猜你喜欢」最后才弹出来）
+       *
+       * 旧实现无条件 `setTimeout(…, 350)`，于是首屏的时序是：
+       *   目录数据到达 → 再白等 350ms → 才把卡片插进来。
+       * 而用户看到的是「别的卡片都加载完了，这一块最后才突然弹出来」——
+       * 那个"最后"里有 350ms 是我们自己造出来的，不是网络慢。
+       *
+       * 刷新动效只在**已有内容 → 换一批**时才有意义：那时卡片是留在原地
+       * 渐变的，用户需要那 350ms 理解"在换"。首次加载时整块是空的，
+       * 没有任何东西需要过渡，延迟纯粹是在拖慢首屏。
+       */
+      const applyResult = () => {
         if (result.hero) {
           setHero(result.hero);
           selectedIdRef.current = result.hero.id;
@@ -120,9 +142,18 @@ export const RandomWatchSection: React.FC<RandomWatchSectionProps> = ({
         setIsRefreshing(false);
         setIsLoading(false);
         setError(false);
-      }, 350);
+      };
+
+      if (!hero && !retainHero) {
+        // 首次：同步落地，一帧都不等。
+        applyResult();
+        return;
+      }
+
+      // 已有内容：给 350ms 让骨架微光把"正在换"这件事表达清楚。
+      refreshTimerRef.current = window.setTimeout(applyResult, 350);
     },
-    [candidates, hero?.id, isMerged],
+    [candidates, hero, isMerged],
   );
 
   // 初始化与候选集变更时选取批次
@@ -188,7 +219,113 @@ export const RandomWatchSection: React.FC<RandomWatchSectionProps> = ({
     [hero, isLoading, onWatch],
   );
 
-  if (!hero) return null;
+  /**
+   * 还没有主推剧时**不返回 null**，而是渲染一块等高的骨架占位。
+   *
+   * ## 为什么（2026-10-18 修「猜你喜欢」最后才弹出来」
+   *
+   * 旧实现是 `if (!hero) return null` —— 组件在数据没到之前**完全不占位**。
+   * 而首屏的数据是异步的（目录聚合要等 worker），于是时序变成：
+   *
+   *   1. 「继续观看」先渲染出来，占掉这一行；
+   *   2. 它下方的内容（正在热播 / 新剧 / 目录网格）已经按"这一行只有一张卡"
+   *      的高度排好了；
+   *   3. 目录数据到达 → 「猜你喜欢」突然插进来 → **下方所有内容整体下移**。
+   *
+   * 用户看到的就是「别的卡片都加载完了，这一块最后才弹出来，还把我正在看的
+   * 位置顶走了」。
+   *
+   * 现在改成占位：高度与真实卡片对齐（并轨模式 `min-h-[156px]`，全宽模式
+   * 用同构骨架），数据到达后只是把骨架换成内容，**布局不再移动**。
+   *
+   * 只有当"确实没有任何候选"（`candidates.length === 0`，例如神秘小窝里
+   * 全是已看过的）时才返回 null —— 那种情况是永久的，占位没有意义。
+   */
+  if (!hero) {
+    // 只有"确定永远不会有候选"才彻底不占位：宿主已经加载完、且现有条目里
+    // 一条合格候选都没有（全被历史记录排除）。
+    // 数据还在路上（`hostLoading`）时必须占位 —— 否则数据到达时整块插入，
+    // 会把下方内容顶下去，那正是用户报的「最后才弹出来」。
+    if (candidates.length === 0 && !hostLoading) return null;
+    return isMerged ? (
+      <section
+        aria-label="猜你喜欢"
+        aria-busy="true"
+        className={`${PICK_CARD_SHELL} bg-gradient-to-r from-violet-50/80 via-white/92 to-purple-50/40 ${className}`}
+      >
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-3 left-0 w-[3px] rounded-r-full bg-violet-500"
+        />
+        <div className="h-32 w-24 shrink-0 rounded-xl border border-white/80 bg-violet-100/60 shimmer-loading" />
+        <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">
+          <div className="flex items-center gap-1.5">
+            <div className="h-4 w-16 rounded-full bg-violet-100/70 shimmer-loading" />
+            <div className="h-4 w-12 rounded bg-slate-100 shimmer-loading" />
+          </div>
+          <div className="h-5 w-40 rounded bg-slate-200/70 shimmer-loading" />
+          <div className="h-3.5 w-full rounded bg-slate-100 shimmer-loading" />
+          <div className="h-3 w-24 rounded bg-slate-100 shimmer-loading" />
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <div className="h-8 w-8 shrink-0 rounded-lg bg-violet-100/60 shimmer-loading" />
+          <div className="h-8 w-20 shrink-0 rounded-lg bg-violet-200/60 shimmer-loading" />
+        </div>
+      </section>
+    ) : (
+      <section
+        aria-label="猜你喜欢"
+        aria-busy="true"
+        className={`relative flex flex-col gap-3.5 overflow-hidden rounded-2xl border border-white/90 bg-gradient-to-br from-violet-50/70 via-white/95 to-purple-50/40 p-4 sm:p-5 shadow-fluent-lg fluent-raised-island ${className}`}
+      >
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-3.5 left-0 w-[3.5px] rounded-r-full bg-gradient-to-b from-violet-500 via-purple-500 to-indigo-500"
+        />
+        <div className="flex items-center justify-between gap-2.5 pl-2">
+          <div className="flex items-center gap-2">
+            <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-violet-500/10 text-violet-600">
+              <Sparkles className="h-3.5 w-3.5" />
+            </span>
+            <span className="text-sm font-extrabold tracking-tight text-slate-800 sm:text-base">
+              猜你喜欢
+            </span>
+          </div>
+          <div className="h-8 w-20 rounded-xl bg-violet-100/60 shimmer-loading" />
+        </div>
+        <div className="grid grid-cols-1 items-stretch gap-4.5 pt-1 pl-2 lg:grid-cols-12">
+          <div className="flex flex-col items-center gap-4 rounded-xl border border-white/80 bg-white/70 p-3.5 shadow-2xs sm:flex-row sm:items-stretch lg:col-span-7">
+            <div className="h-38 w-28 shrink-0 rounded-xl bg-violet-100/60 shimmer-loading sm:h-44 sm:w-32" />
+            <div className="flex w-full min-w-0 flex-1 flex-col justify-between py-1 gap-2.5">
+              <div className="flex flex-col gap-2">
+                <div className="h-4.5 w-18 rounded-full bg-violet-100/70 shimmer-loading" />
+                <div className="h-6 w-3/4 rounded-md bg-slate-200/70 shimmer-loading" />
+                <div className="h-3.5 w-full rounded bg-slate-100 shimmer-loading" />
+                <div className="h-3.5 w-4/5 rounded bg-slate-100 shimmer-loading" />
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <div className="h-8 w-24 rounded-lg bg-violet-200/60 shimmer-loading" />
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-col justify-between gap-2 rounded-xl border border-violet-100/60 bg-violet-50/30 p-3.5 lg:col-span-5">
+            <div className="h-4 w-28 rounded bg-violet-100/60 shimmer-loading" />
+            <div className="flex flex-col gap-2">
+              {[1, 2, 3].map(i => (
+                <div key={i} className="flex items-center gap-3 rounded-xl bg-white/70 p-2">
+                  <div className="h-13 w-10 shrink-0 rounded-lg bg-violet-100/50 shimmer-loading" />
+                  <div className="flex flex-1 flex-col gap-1.5">
+                    <div className="h-3.5 w-12 rounded bg-violet-100/60 shimmer-loading" />
+                    <div className="h-4 w-3/4 rounded bg-slate-200/70 shimmer-loading" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   const heroTeaser = getSeriesTeaser(hero);
   const heatLabel = formatHeatValue(hero.heat);

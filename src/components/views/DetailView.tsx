@@ -25,9 +25,11 @@ import {
 } from 'lucide-react';
 
 export const DetailView: React.FC = () => {
-  const { selectedSeriesId, navigateTo, goBack, showToast } = useAppStore();
+  const { selectedSeriesId, navigateTo, goBack, showToast, currentView } = useAppStore();
   // 详情页挂在常驻 DOM 上：走低频动作专线，整表订阅会让选集网格跟着播放进度重渲染。
-  const { openEpisode, prewarmEpisode } = usePlaybackActions();
+  // `currentEpisode` 只用于「别预转用户正在看的那一集」，它是低频字段（换集才变），
+  // 走动作专线不会引入高频重渲染。
+  const { openEpisode, prewarmEpisode, currentEpisode } = usePlaybackActions();
   const { open: openAnimeEpisode } = useAnimePlayer();
   const { markBySeriesId, setMark } = useFavorites();
   const detailCacheRef = useRef<Record<string, SeriesDetail>>({});
@@ -35,7 +37,6 @@ export const DetailView: React.FC = () => {
   const prewarmEpisodeRef = useRef(prewarmEpisode);
   prewarmEpisodeRef.current = prewarmEpisode;
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const prewarmedSeriesRef = useRef<Set<string>>(new Set());
 
   const [detail, setDetail] = useState<SeriesDetail | null>(null);
   const [isDescExpanded, setIsDescExpanded] = useState(false);
@@ -54,6 +55,69 @@ export const DetailView: React.FC = () => {
     const vids = detail.episodes.slice(start, start + 6).map(ep => ep.id);
     if (vids.length === 0) return;
     void ipcService.playback.prefetchStream(vids, detail.type === 'comic' ? 1004 : 1);
+  }, [detail]);
+
+  /**
+   * 详情页为「最可能被点开的那一集」**预转整集 HLS**。
+   *
+   * ## 为什么这条是首开提速的最大一块
+   *
+   * 实测（ttv-playback.log，同一份日志里两种情形并存）：
+   *   - 冷集首开：`整集 HLS 出画 耗时=9056ms`
+   *   - 命中预转：`流式开播 返回 耗时=132ms` → `出画 耗时=368ms`
+   * 差 25 倍。而在此之前，`prewarmStreamNative` 在整个前端**只有一处调用点**
+   * （`usePlaybackStore` 的 `warmAdjacentEpisodes`，且是"本集出画后延后 7 秒
+   * 转下一集"），也就是说**任何一集被首次打开时，它的转码一定是冷的**。
+   *
+   * 而转码本身只要 1.5~5.6 秒（实测首片中位 761ms、整集 5.6 秒），用户从
+   * 首页点卡片进详情、看简介、翻选集，停留时间通常远超这个数——这段窗口此前
+   * 完全没被利用。
+   *
+   * ## 三条硬约束
+   *
+   * 1. **只预转一集**。编码单元是串行的（见 `MAX_PREWARM_INFLIGHT` 的实测），
+   *    多转一集就是把正在播的那一路挤慢，收益为零、代价是卡顿。
+   * 2. **不预转"当前正在播的那一集"**。它已经在转（或已转好），重复发车只会
+   *    命中后端去重空跑一趟；更糟的是用户可能正看着它，抢资源就是直接卡顿。
+   * 3. **详情页常驻 DOM**（`display:none` 隐藏），所以这个 effect 在用户已经
+   *    在播放器里时同样可能因 `detail` 变化而触发 —— 必须用 `currentView` 挡掉，
+   *    否则会在播放期间凭空起一路转码。
+   */
+  const prewarmedStreamRef = useRef<Set<string>>(new Set());
+  // 供 effect 读取最新值而不进依赖数组：`currentEpisode` 每次换集都变，放进依赖
+  // 会让预转在换集时重跑一遍——那恰恰是约束 2 要禁止的事。
+  const playingEpisodeIdRef = useRef<string | null>(null);
+  playingEpisodeIdRef.current = currentEpisode?.id ?? null;
+  const currentViewRef = useRef(currentView);
+  currentViewRef.current = currentView;
+
+  useEffect(() => {
+    if (!detail || detail.episodes.length === 0) return;
+    // 动漫与 guo 源不走整集 HLS 预转：动漫是流式 m3u8（无产物可转），
+    // guo 走的是 guo-core 本地媒体服务，两者的预取在各自链路里另有安排。
+    if (detail.type === 'anime' || detail.id.startsWith('guo:')) return;
+    // 只在详情页可见时预热：播放器里不该有第二路转码。
+    if (currentViewRef.current !== 'detail') return;
+    const target =
+      detail.episodes.find(ep => (ep.watchedSeconds || 0) > 0 && !ep.isFinished) || detail.episodes[0];
+    if (!target) return;
+    if (playingEpisodeIdRef.current === target.id) return;
+    const key = `${detail.id}::${target.id}`;
+    if (prewarmedStreamRef.current.has(key)) return;
+    prewarmedStreamRef.current.add(key);
+    // 延后 1.2 秒：让上面那条 `prefetchStream` 先把签名跑完。预转内部会调
+    // `ensure_stream_cached`，与预签名命中同一条缓存，串行发起等于白等一轮
+    // 2.2 秒的 API 往返（后端有 leader/follower 去重，但前端没必要制造这次排队）。
+    const timer = setTimeout(() => {
+      // 定时器到点时用户可能已经离开详情页进了播放器：再复查一次。
+      if (currentViewRef.current !== 'detail') return;
+      void ipcService.playback.prewarmStreamNative(
+        detail.id,
+        target.id,
+        detail.type === 'comic' ? 1004 : 1,
+      );
+    }, 1200);
+    return () => clearTimeout(timer);
   }, [detail]);
   const [modalSearch, setModalSearch] = useState('');
 
@@ -99,17 +163,24 @@ export const DetailView: React.FC = () => {
   }, [selectedSeriesId, showToast]);
 
   // 详情到手就预热"最可能被点开"的那一集（断点续播集，没有则第一集）。
-  // 用户在详情页看简介、翻选集通常要停留数秒，这段时间足够把该集所需数据拉下来；
-  // 此前预热只在进入播放器之后才开始，等于白白丢掉这段可利用的窗口。
-  useEffect(() => {
-    if (!detail || detail.episodes.length === 0) return;
-    const seriesKey = detail.id;
-    if (prewarmedSeriesRef.current.has(seriesKey)) return;
-    prewarmedSeriesRef.current.add(seriesKey);
-    const target =
-      detail.episodes.find(ep => (ep.watchedSeconds || 0) > 0 && !ep.isFinished) || detail.episodes[0];
-    prewarmEpisodeRef.current(detail.id, target.id, detail.type === 'comic' ? 1004 : 1);
-  }, [detail]);
+  //
+  // ⚠️ 这里**曾经**调 `prewarmEpisode`（整集 mp4 的 worker 下载 + 解密 + 转存），
+  // 现已改为由下面的「整集 HLS 预转」承担。原因是实机日志证明两者会互相打架：
+  //
+  //   18.574s  resolve 请求开始        ← 本条 effect 抢跑，worker 开始下整集 mp4
+  //   19.912s  流式开播 请求开始        ← 用户点播放
+  //   24.189s  预转跳过（同一 vid 已在转码） ← HLS 预转被这条占位顶掉
+  //   39.912s  resolve 完成 耗时=21279ms 字节=35.7MB
+  //
+  // 整集 mp4 在方案 B 之后**已经不是播放源**（整集 HLS 才是），它只是「HLS 起不来」
+  // 时的退路；而它却要跑 21 秒、下 35MB，且占着「同一 vid 已在转码」的坑，把真正
+  // 有用的 HLS 预转挡在门外。用 21 秒的下载去抢 1.5 秒的转码，纯属倒挂。
+  //
+  // 现在这里只保留**预签名**（下面那条 effect 已负责），整集产物的预热交给
+  // HLS 预转 —— 它产出的正是播放要用的东西。
+  //
+  // 保留 `prewarmedSeriesRef` 与 `prewarmEpisode` 的引用：悬停预热（`schedulePrewarm`）
+  // 仍然在用它，那条路径有 420ms 防抖且是用户主动瞄准某集，语义不同。
 
   // 悬停预热必须防抖：鼠标扫过选集网格会在几百毫秒内触发几十次 hover，
   // 每次都起 worker 会把带宽抢空（store 侧另有并发上限兜底）。

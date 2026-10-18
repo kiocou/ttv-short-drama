@@ -278,23 +278,106 @@ fn build_client(use_proxy: bool) -> Result<Client, String> {
         .map_err(|error| error.to_string())
 }
 
+/// 用一次极短的 TCP 连接判断 `host:port` 是否真的有人监听。
+///
+/// 只做 connect、不发任何字节、立刻关闭：这里要回答的是"这个端口通不通"，
+/// 不是"代理好不好用"。真正的可用性由后续请求验证（失败仍会走兜底）。
+///
+/// 超时 400ms：本机回环上的 connect 要么立刻成功、要么立刻被拒（`10061`），
+/// 400ms 只是防止某个异常配置把启动拖住。
+fn tcp_reachable(address: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(addrs) = address.to_socket_addrs() else {
+        return false;
+    };
+    let timeout = std::time::Duration::from_millis(400);
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// 运行期切换代理模式（设置页保存时调用，即时生效、无需重启）。
+///
+/// ## 为什么需要"运行时"切换，而不是"下次启动才生效"
+///
+/// 这个开关的**主要使用场景**就是故障现场：用户看到「目录数据加载失败」，
+/// 去设置页选「直连」，期望马上能刷出内容。若要求重启才生效，那它对这个
+/// 场景毫无价值 —— 而重启一次要重新走一遍启动探测，等于什么都没省。
+///
+/// `direct` 直接把代理判死；`auto` / `proxy` 则**解除**判死，让请求重新
+/// 按各自策略走（`auto` 会在下一次失败时再判、`proxy` 则一路用代理）。
+/// 解除是安全的：真有问题时兜底链路仍在（`fetch_page_with_client`）。
+pub fn apply_proxy_mode(mode: &str) {
+    match mode {
+        "direct" => mark_proxy_dead("用户在设置里选择「直连」"),
+        _ => clear_proxy_dead(),
+    }
+}
+
+/// 解除"代理已判死"。给 `apply_proxy_mode` 用（用户改回 auto/proxy 时）。
+fn clear_proxy_dead() {
+    proxy_dead_flag().store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 给诊断命令用的公开包装（`tcp_reachable` 本身是私有的）。
+///
+/// 单独包一层而不是把原函数改成 `pub`：诊断是"旁路观察者"，它不该有能力
+/// 影响主链路的行为。这一层只转发，不改变语义。
+pub fn tcp_reachable_public(address: &str) -> bool {
+    tcp_reachable(address)
+}
+
+/// 代理当前是否已被判死（诊断命令展示用）。
+pub fn is_proxy_dead() -> bool {
+    proxy_dead()
+}
+
+/// 直连取一次最小目录页，返回是否成功。
+///
+/// 用 `/category`（不带频道段）而不是 `/category/comic-drama`：前者是站点里
+/// 最小的一页（实测 266KB vs 320KB），而这里只关心"通不通"，不关心内容。
+/// 走的是 `fallback_direct_client()` 那条**明确 no_proxy 的客户端**，
+/// 所以它的结果就是"绕开代理到底行不行"的答案。
+pub async fn probe_direct_catalog() -> bool {
+    let Some(direct) = fallback_direct_client() else {
+        return false;
+    };
+    fetch_page_once(direct, "/category").await.is_ok()
+}
+
 /// 直连兜底客户端（进程内单例、惰性创建）。
 ///
-/// 只在**确实挂着系统代理**时才需要它：没挂代理的机器上这条路径永远走不到，
-/// 白白多一个连接池。绝大多数请求也用不到它，所以等到真失败那一刻再建。
+/// ## 为什么**无条件**创建，而不是只在"检测到系统代理"时
+///
+/// 旧实现先问 `crate::update::has_system_proxy()`，没有代理就直接返回 `None`。
+/// 那个判断读的是**当下**的注册表，而主客户端 `self.client` 是在
+/// `DramaProvider::new()`（进程启动那一刻）用 `build_client(true)` 建好的 ——
+/// 两者的取样时刻不同，于是存在一个必然踩中的时序窗口：
+///
+///   1. 应用启动时 `ProxyEnable=1`、`ProxyServer=127.0.0.1:10808`
+///      → 主客户端把 `http://127.0.0.1:10808` 固化进连接器；
+///   2. 用户随后关掉代理（或代理软件退出），注册表变成 `ProxyEnable=0`；
+///   3. 主客户端**不会**重建，仍然往那个已经没人监听的端口发请求
+///      → `tcp connect error: 由于目标计算机积极拒绝 (os error 10061)`；
+///   4. 兜底那一刻去问 `has_system_proxy()`，答案却是 `false`
+///      → `None` → 没有直连可退 → 界面报"目录数据加载失败（1 个源均无响应）"。
+///
+/// 实测复现（本机 2026-10-18）：PowerShell 直连 `hongguoduanju.com` 返回 200，
+/// 而应用内目录请求恒为 10061 —— 差异只在于应用固化了启动时的代理配置。
+///
+/// 反过来，"没有代理的机器上多建一个连接池"的代价可以忽略：它是一个惰性单例，
+/// 只有在主客户端**确实失败过**之后才会被创建，健康路径上一辈子不会实例化。
 fn fallback_direct_client() -> Option<&'static Client> {
     static DIRECT_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
     DIRECT_CLIENT
-        .get_or_init(|| {
-            if !crate::update::has_system_proxy() {
-                return None;
-            }
-            match build_client(false) {
-                Ok(client) => Some(client),
-                Err(error) => {
-                    eprintln!("[ttv] 直连兜底客户端创建失败：{error}");
-                    None
-                }
+        .get_or_init(|| match build_client(false) {
+            Ok(client) => Some(client),
+            Err(error) => {
+                eprintln!("[ttv] 直连兜底客户端创建失败：{error}");
+                None
             }
         })
         .as_ref()
@@ -305,6 +388,51 @@ impl DramaProvider {
         Ok(Self {
             client: build_client(true)?,
         })
+    }
+
+    /// 启动时的代理自检：按用户在设置页选定的 `proxy_mode` 决定用不用代理。
+    ///
+    /// ## 为什么必须在启动时定，而不是等第一次请求失败
+    ///
+    /// 主客户端在 `new()` 里就把注册表里的代理固化了。若那个代理端口已经没人
+    /// 监听（Windows 上极常见：代理软件退出但注册表 `ProxyServer` 留着），
+    /// 每一次目录请求都会先撞一次 `os error 10061`，再走直连兜底重发 ——
+    /// 实测这一趟要 **约 15 秒**（两次连接尝试 + TLS 握手）。
+    ///
+    /// 而前端 `useCatalogStore` 对单个源只有 **6 秒**的等待上限。于是红果
+    /// （唯一启用的源）每一轮都被判超时 → 全部源失败 → 界面报
+    /// 「目录数据加载失败（1 个源均无响应）」。**兜底本身是好的，但它跑不到终点。**
+    ///
+    /// ## 三种模式
+    ///
+    /// - `direct`：用户明确说"别用代理"。直接判死，一次探测都不做 ——
+    ///   有些环境的代理是黑洞（连得上但不转发），探测会误判成可用。
+    /// - `proxy`：用户明确说"必须用代理"。**不探测、不判死** ——
+    ///   相信用户的判断，探测失败也照用（他们知道自己在配什么）。
+    /// - `auto`（默认）：TCP 探一次，通就用、不通就判死。
+    ///
+    /// 探测失败**不影响启动**：判死之后直连照常工作。
+    pub fn probe_proxy_on_startup(&self, mode: &str) {
+        match mode {
+            "direct" => {
+                mark_proxy_dead("用户在设置里选择「直连」");
+                return;
+            }
+            "proxy" => {
+                // 显式选择代理：不做任何判定，让请求自己去试。
+                // 失败时仍会走 `fetch_page_with_client` 的兜底，不至于整页打不开。
+                return;
+            }
+            _ => {}
+        }
+        // `auto`：没有配代理就没有可探的：主客户端本来就没挂。
+        let Some(proxy) = crate::update::system_proxy_address() else {
+            return;
+        };
+        if tcp_reachable(&proxy) {
+            return;
+        }
+        mark_proxy_dead(&format!("启动自检：{proxy} 无法建立连接"));
     }
 
     pub async fn catalog(&self, filter: &CatalogFilter) -> Result<CatalogPage, String> {
@@ -910,9 +1038,30 @@ async fn fetch_page_once(client: &Client, path: &str) -> Result<String, String> 
 ///
 /// ## 边界
 ///
-/// 兜底**只做一次**，且只在本机确实配了系统代理时才有对端（见
-/// `fallback_direct_client`），不会把失败请求翻倍打给站方。
+/// 兜底**只做一次**，不会把失败请求翻倍打给站方。
+///
+/// ## 一次性降级（2026-10-18 补）
+///
+/// 上面那条"先失败、再直连"的路径单次代价很小，但目录翻页是**每页一次**：
+/// 用户滚十屏就要多付十次连接被拒的往返（每次在 Windows 上是毫秒级，但
+/// 每页都要先撞一次墙纯属浪费）。更糟的是 `error 10061` 说明那个端口**根本
+/// 没人监听**，它不是抖动、不会自愈 —— 一旦确认失效，后续所有请求都该直接走直连。
+///
+/// 所以这里记一枚进程级标记：某次代理请求以"连接层失败"告终、而直连成功，
+/// 就把代理判死，之后不再尝试它。标记**不随请求清除** —— 代理配置若真的被
+/// 用户重新打开，重启应用即可恢复（那时 `DramaProvider::new()` 会用新配置重建
+/// 主客户端，本标记也随进程归零）。
+///
+/// 只认**连接层**失败：HTTP 4xx/5xx 是站方的问题，与代理是否可用无关，
+/// 那种情况不该把代理判死。
 async fn fetch_page_with_client(client: Client, path: String) -> Result<String, String> {
+    // 已判定代理失效：直接走直连，不再浪费一次往返。
+    if proxy_dead() {
+        let Some(direct) = fallback_direct_client() else {
+            return fetch_page_once(&client, &path).await;
+        };
+        return fetch_page_once(direct, &path).await;
+    }
     match fetch_page_once(&client, &path).await {
         Ok(body) => Ok(body),
         Err(proxied_error) => {
@@ -921,6 +1070,10 @@ async fn fetch_page_with_client(client: Client, path: String) -> Result<String, 
             };
             match fetch_page_once(direct, &path).await {
                 Ok(body) => {
+                    // 只有"连接层失败 + 直连成功"才判定代理已死。
+                    if is_connect_level_failure(&proxied_error) {
+                        mark_proxy_dead(&proxied_error);
+                    }
                     eprintln!("[ttv] 系统代理不可用，已直连取回目录：{path}");
                     Ok(body)
                 }
@@ -930,6 +1083,45 @@ async fn fetch_page_with_client(client: Client, path: String) -> Result<String, 
             }
         }
     }
+}
+
+/// 代理是否已被判定失效（进程级，见 `fetch_page_with_client` 的注释）。
+///
+/// 用 `OnceLock` 承载而不是各函数里各写一个 `static`：后者会得到**两个互不相干**
+/// 的变量，读的那个永远读不到写的那个（这个错误很容易在编译期完全静默）。
+fn proxy_dead_flag() -> &'static std::sync::atomic::AtomicBool {
+    static DEAD: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    DEAD.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
+fn proxy_dead() -> bool {
+    proxy_dead_flag().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn mark_proxy_dead(reason: &str) {
+    // 只报一次：这条日志的价值是"告诉排查者代理被绕过了"，不是刷屏。
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[ttv] 系统代理已判定失效，后续目录请求全部直连：{reason}");
+    }
+    proxy_dead_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 错误文本是否属于"连接层失败"（连不上 / 隧道建不起来 / 被拒）。
+///
+/// reqwest 的 `Display` 会把这些包成一句话，真正的分类在 source 链里；
+/// `describe_request_error` 已经把它们拼进同一个字符串，这里按关键字判定。
+/// 刻意**不**包含 `HTTP 4xx/5xx`：那是站方的响应，代理是通的。
+fn is_connect_level_failure(text: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "tcp connect error",
+        "proxy connect error",
+        "tunnel error",
+        "os error 10061",
+        "connection refused",
+        "Connection refused",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
 }
 
 /// 生成搜索关键词的候选形式：原词 + 阿拉伯数字转中文数字的变体。

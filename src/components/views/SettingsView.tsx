@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useSettingsStore } from '../../stores/useSettingsStore';
 import { useAppStore } from '../../stores/useAppStore';
+import type { UserSettings } from '../../types/settings';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
-import { FluentSlider } from '../common/FluentSlider';
 import {
   checkForUpdate,
   downloadUpdate,
@@ -27,7 +27,6 @@ import {
   Check,
   RefreshCw,
   FolderOpen,
-  Clock,
   Download,
   Server,
   Sparkles,
@@ -37,8 +36,15 @@ import {
   Palette,
   Sun,
   Moon,
+  MonitorSmartphone,
+  Wifi,
 } from 'lucide-react';
-import { readTheme, saveTheme, type ThemeMode } from '../../services/theme';
+import {
+  readThemePreference,
+  saveTheme,
+  systemPrefersDark,
+  type ThemePreference,
+} from '../../services/theme';
 
 /* ==========================================================================
    统一样式原语
@@ -53,15 +59,67 @@ import { readTheme, saveTheme, type ThemeMode } from '../../services/theme';
 const TITLE_CLS = 'text-xs font-semibold text-slate-800';
 const HINT_CLS = 'text-[11px] text-slate-400 leading-relaxed';
 
-/** 外观卡片的分段选项。 */
+/**
+ * 外观卡片的分段选项。
+ *
+ * 三项而不是两项：`system` 是**用户的选择**，不是一个主题——它必须和浅色/暗色
+ * 并列出现，因为对用户来说这三者是同一道单选题（"我要什么外观"），而不是
+ * "选主题 + 一个开关"。若做成"跟随系统"的开关，用户会遇到"开关开着但下面
+ * 还高亮着暗色"这种自相矛盾的画面。
+ */
 const THEME_OPTIONS: {
-  id: ThemeMode;
+  id: ThemePreference;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: 'light', label: '浅色', icon: Sun },
   { id: 'dark', label: '暗色', icon: Moon },
+  { id: 'system', label: '跟随系统', icon: MonitorSmartphone },
 ];
+
+/**
+ * 默认清晰度的分段选项。
+ *
+ * 只列 `auto` 与 1080P 两档，**刻意不给 4K/720P**：
+ * 源站实测最高就是 1080p（设置页旧注释与 `.learnings` 都记着"4K 实为 1080p"），
+ * 列一个源里根本不存在的档位等于让用户选一个必然回退的选项。类型里保留
+ * `'4k' | '720p'` 是为了兼容旧设置记录，不是鼓励新写入。
+ */
+const QUALITY_OPTIONS: { id: UserSettings['defaultQuality']; label: string; hint: string }[] = [
+  { id: 'auto', label: '自动', hint: '跟随源里最高的一档，绝大多数情况选它。' },
+  { id: '1080p', label: '1080P', hint: '强制请求 1080p。源里没有该档时后端自动回退。' },
+];
+
+/**
+ * 红果官网链路的代理选项。
+ *
+ * 三项对应用户能做出的三种判断，没有第四种：
+ * - `auto`：让程序探一下（默认，绝大多数人该选它）
+ * - `direct`：我知道我这台机器不该走代理
+ * - `proxy`：我知道必须走代理（企业网、非常规代理）
+ *
+ * 为什么不做成"自动探测 + 一个覆盖开关"：那样用户要先理解"自动探测是什么"，
+ * 才能判断自己该不该动它。三个并列的选项把这件事变成一次选择。
+ */
+const PROXY_OPTIONS: { id: UserSettings['proxyMode']; label: string; hint: string }[] = [
+  { id: 'auto', label: '自动', hint: '启动时探测系统代理，通就用、不通就直连。' },
+  { id: 'direct', label: '直连', hint: '永远不走代理。代理软件退出后仍报「目录加载失败」时选它。' },
+  { id: 'proxy', label: '总是代理', hint: '强制走系统代理。企业网或非常规代理环境用。' },
+];
+
+/**
+ * 分段选择控件的单项样式。
+ *
+ * 与「外观」那一组共用：同一个页面上两处分段控件长得一样，用户只需要学一次。
+ * 选中态用 `fluent-convex-tab`（凸起白片），未选中只留文字 + hover 底色——
+ * 与 `CategoryBar` 的交互语言一致，也不给每个选项套边框（那会让两个选项
+ * 看起来像两个独立按钮，而不是"二选一"）。
+ */
+function segmentedClass(selected: boolean): string {
+  return `flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors duration-150 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 ${
+    selected ? 'fluent-convex-tab text-slate-800' : 'text-slate-500 hover:text-slate-800'
+  }`;
+}
 
 /**
  * 分段选项（单选 chip）的状态样式。
@@ -81,7 +139,14 @@ function chipClass(selected: boolean, disabled: boolean): string {
   return `${base} text-slate-600 hover:bg-slate-100/80`;
 }
 
-/** 一行「标题 + 说明 + 右侧控件」。控件列固定宽度，避免每行各自靠右、参差不齐。 */
+/** 一行「标题 + 说明 + 右侧控件」。
+ *
+ * 右侧控件给一个**最小**宽度而不是定宽（`sm:min-w-[152px]` + 靠右）：
+ * 定宽 `w-[168px]` 试过，会把左侧说明文字压窄、「默认清晰度」那段 hint
+ * 被迫折成两行——说明文字才是这一行要读的东西，控件只是操作入口，
+ * 不该为了对齐去牺牲正文的行宽。最小宽度只解决"开关和下拉框起点乱跳"，
+ * 内容更宽时（比如分段控件）允许自己撑开。
+ */
 const SettingRow: React.FC<{
   title: string;
 /** 说明文字。允许传节点：有些说明要在中间嵌一个加粗片段（“不会自动安装”之类）。 */
@@ -93,7 +158,9 @@ const SettingRow: React.FC<{
       <h4 className={TITLE_CLS}>{title}</h4>
       {hint && <p className={`${HINT_CLS} mt-0.5`}>{hint}</p>}
     </div>
-    <div className="flex-shrink-0 self-start sm:self-center">{children}</div>
+    <div className="flex-shrink-0 self-start sm:self-center sm:min-w-[152px] flex sm:justify-end">
+      {children}
+    </div>
   </div>
 );
 
@@ -133,21 +200,17 @@ const Toggle: React.FC<{
 );
 
 /**
- * 数值徽章（缓存大小、版本号、倒计时秒数）。
+ * 数值徽章（缓存大小、版本号）。
  *
- * 之前这些徽章在卡片 3 和卡片 4 各写了一份完全相同的 className 字符串。
+ * 之前这些徽章在两张卡片里各写了一份完全相同的 className 字符串。
+ *
+ * 原本还有一个 `tone?: 'info' | 'neutral'` 参数，唯一传 `neutral` 的调用点是
+ * 「客户端信息」里那个写死的 `Mica Light` 徽章。那个徽章删掉之后，`tone`
+ * 只剩 `info` 一个取值 —— 一个永远走同一分支的参数不如没有，于是收成单一样式。
+ * 将来真需要第二种配色时再加，而不是留一个空壳让人以为有得选。
  */
-const ValueBadge: React.FC<{ children: React.ReactNode; tone?: 'info' | 'neutral' }> = ({
-  children,
-  tone = 'info',
-}) => (
-  <span
-    className={`text-[11px] font-bold font-mono px-2 py-0.5 rounded-md border ${
-      tone === 'info'
-        ? 'text-blue-600 bg-blue-50 border-blue-200/60'
-        : 'text-slate-500 bg-slate-50 border-slate-200'
-    }`}
-  >
+const ValueBadge: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <span className="text-[11px] font-bold font-mono px-2 py-0.5 rounded-md border text-blue-600 bg-blue-50 border-blue-200/60">
     {children}
   </span>
 );
@@ -160,13 +223,21 @@ const ValueBadge: React.FC<{ children: React.ReactNode; tone?: 'info' | 'neutral
  * 现在标题行只有这一处，字阶与图标色一起定死。
  */
 
-/** 卡片骨架： MicaCard + 统一标题行。 */
+/** 卡片骨架： MicaCard + 统一标题行。
+ *
+ * `gap-4`（16px）而不是原来的 `gap-5`（20px）：卡片内部各行的分隔线是
+ * `<div className="pt-4 border-t">`，它自带 16px 上边距。外层 gap 也是 20px 时，
+ * 分隔线上方是 20px、下方是 16px，每条线都歪一点点——单看一处不明显，但本页
+ * 有 6 张卡片、十几条分隔线，累积起来整页的纵向节奏是"每段都差一点"。
+ * 把外层 gap 对齐到 16px 后，分隔线上下等距，整页只靠**间距本身**分组，
+ * 不再需要靠加粗或换色来区分段落。
+ */
 const SectionCard: React.FC<{
   icon: React.ReactNode;
   title: string;
   children: React.ReactNode;
 }> = ({ icon, title, children }) => (
-  <MicaCard className="p-6 flex flex-col gap-5 shrink-0 animate-fluent-card-in">
+  <MicaCard className="p-6 flex flex-col gap-4 shrink-0 animate-fluent-card-in">
     <div className="flex items-center gap-2 text-[13px] font-semibold text-slate-800 pb-3 border-b border-black/[0.04]">
       {icon}
       <span>{title}</span>
@@ -197,6 +268,83 @@ hint?: React.ReactNode;
    ========================================================================== */
 
 /**
+ * 代理自检（「站源网络」那张卡里的测试按钮）。
+ *
+ * ## 为什么值得一块 UI
+ *
+ * 这个项目在代理上栽过三次，每次的症状都一样：**「目录加载失败」**，
+ * 而真实原因（代理端口没人监听）藏在几十行日志之外。用户的排查成本全部
+ * 花在"这到底是不是代理的问题"上。
+ *
+ * 这个按钮把那个推理一次做完并如实报告三件事：
+ *   ① 系统代理配的是什么（没有就明说没有）
+ *   ② 那个端口此刻通不通
+ *   ③ 绕开代理直连，能不能取到红果目录
+ *
+ * ③ 是最终判据：它成立就说明"关掉代理就能用"，用户据此改上面的开关即可。
+ */
+const ProxyDiagnose: React.FC = () => {
+  const [state, setState] = useState<
+    | { kind: 'idle' }
+    | { kind: 'running' }
+    | { kind: 'done'; result: { proxyAddress: string | null; proxyReachable: boolean; directCatalogOk: boolean; proxyDead: boolean } }
+    | { kind: 'error'; message: string }
+  >({ kind: 'idle' });
+
+  const run = async () => {
+    setState({ kind: 'running' });
+    try {
+      const result = await ipcService.diagnostics.proxyDiagnose();
+      setState({ kind: 'done', result });
+    } catch (error) {
+      setState({ kind: 'error', message: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <FluentButton
+          variant="secondary"
+          size="sm"
+          disabled={state.kind === 'running' || !isTauriEnvironment()}
+          icon={<Activity className={`w-3 h-3 ${state.kind === 'running' ? 'animate-pulse' : ''}`} />}
+          onClick={() => void run()}
+        >
+          {state.kind === 'running' ? '正在检测…' : '检测网络'}
+        </FluentButton>
+        <span className="text-[10px] text-slate-400">排查「目录加载失败」时先点它</span>
+      </div>
+
+      {state.kind === 'done' && (
+        <div className="flex flex-col gap-1 px-3 py-2 rounded-xl bg-slate-50/70 border border-slate-200/70 text-[11px]">
+          <span className="text-slate-600">
+            系统代理：{state.result.proxyAddress
+              ? <span className="font-mono">{state.result.proxyAddress}</span>
+              : <span className="text-slate-500">未配置</span>}
+          </span>
+          {state.result.proxyAddress && (
+            <span className={state.result.proxyReachable ? 'text-emerald-600' : 'text-rose-600'}>
+              {state.result.proxyReachable ? '✓ 代理端口可连接' : '✕ 代理端口连不上（这就是「目录加载失败」的常见原因）'}
+            </span>
+          )}
+          <span className={state.result.directCatalogOk ? 'text-emerald-600' : 'text-rose-600'}>
+            {state.result.directCatalogOk ? '✓ 直连可以取到目录' : '✕ 直连也取不到目录（可能是网络本身不通）'}
+          </span>
+          {state.result.proxyDead && (
+            <span className="text-amber-600">当前已判定代理不可用，所有请求走直连。</span>
+          )}
+        </div>
+      )}
+
+      {state.kind === 'error' && (
+        <p className="text-[11px] text-rose-600">检测失败：{state.message}</p>
+      )}
+    </div>
+  );
+};
+
+/**
  * 一组同类视频源的勾选列表。
  *
  * `locked` 是 18+ 总开关关闭时的状态：整组置灰不可点，而不是把已勾选的悄悄
@@ -225,10 +373,14 @@ const SourceGroup: React.FC<{
       title={title}
       hint={hint}
       aside={
-        <>
-          <span className="text-[10px] text-slate-400">{sources.length} 个源</span>
+        /* 必须给 gap：此前这两个元素直接相邻，`6 个源` 与 18+ 开关会贴在一起
+           （截图实测：开关左边缘压在文字右边缘上，读起来像"6 个源"是开关的一部分）。
+           顺序也调成「开关在前、计数在后」——开关是操作，计数是信息，
+           操作靠右是这一页所有行的统一朝向。 */
+        <span className="flex items-center gap-2.5">
           {header}
-        </>
+          <span className="text-[10px] text-slate-400">{sources.length} 个源</span>
+        </span>
       }
     >
       <div className="flex flex-wrap gap-1.5">
@@ -402,19 +554,20 @@ const SourceStatusPanel: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-3">
+      {/* 折叠标题统一成 `SubSection` 的写法：图标 + 标题 + 右侧箭头。
+          此前中间还塞了一句「展开后查询 guo-core 的 19 个站源」——它把
+          一个 12 字的标题行拉长到 30 多字，且「19 个源」与右侧「N 个源」
+          计数重复。那句话的信息已由下方展开后的说明段落完整覆盖。 */}
       <button
         type="button"
         onClick={toggle}
         aria-expanded={open}
-        className="flex items-center gap-2 text-left cursor-pointer group"
+        className="flex items-center gap-2 text-left cursor-pointer group py-0.5"
       >
         <Activity className="w-3.5 h-3.5 text-blue-600" />
         <span className={TITLE_CLS}>站源状态与链路体检</span>
-        <span className="text-[11px] text-slate-400 group-hover:text-slate-500 transition-colors">
-          展开后查询 guo-core 的 19 个站源
-        </span>
         <ChevronDown
-          className={`w-3.5 h-3.5 text-slate-400 ml-auto transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+          className={`w-3.5 h-3.5 text-slate-400 ml-auto transition-transform duration-200 group-hover:text-slate-600 ${open ? 'rotate-180' : ''}`}
         />
       </button>
 
@@ -570,10 +723,14 @@ const GuoNetworkRow: React.FC = () => {
   return (
     <SubSection
       title="站源网络"
-      hint="这些站源的请求全部走本地 guo-core。站方 CDN 会拒绝代理（机场）出口 IP——挂着系统代理时目录能看（吃缓存）、点开就报「获取剧集详情失败」，就是它。默认直连；只有直连到不了站点的境外网络才选代理。"
+      hint="这些站点会拒绝代理出口 IP：挂着系统代理时目录能看，点开却报「获取剧集详情失败」。默认直连；只有身处境外、直连到不了站点时才选代理。"
       aside={mode === null ? <span className="text-[11px] text-slate-400">读取中…</span> : undefined}
     >
-      <div className="grid grid-cols-2 gap-1.5">
+      {/* `inline-flex` + 自适应宽度，而不是 `grid grid-cols-2`。
+          两列网格会让每个选项各占半行（约 380px），而「直连」「跟随系统代理」
+          加起来才 12 个字——中间全是空白，看着像两个被拉长的空盒子。
+          自适应后两个 chip 紧挨着，视觉密度与上面「浅色/暗色」那组一致。 */}
+      <div className="inline-flex items-center gap-1.5 p-1 rounded-xl bg-slate-100/80">
         {options.map(option => (
           <button
             key={option.id}
@@ -603,8 +760,44 @@ export const SettingsView: React.FC = () => {
 
   const [isCleaning, setIsCleaning] = useState(false);
   // 主题不进 UserSettings（那是 Rust 契约，见 services/theme.ts 的说明）。
-  const [theme, setTheme] = useState<ThemeMode>(readTheme);
+  //
+  // 这里存的是**用户的选择**（可能为 `'system'`），不是实际生效的模式。
+  // 单选按钮必须反映"用户选了什么"，否则选了「跟随系统」之后按钮会跳到
+  // 「暗色」上去，看起来像是自己改了主意。
+  const [themePreference, setThemePreference] = useState<ThemePreference>(readThemePreference);
+  /**
+   * 「跟随系统」时，系统当前是暗是浅。
+   *
+   * 这个 state 唯一的用途是：在「跟随系统」选项旁边标出此刻实际落到哪一档
+   * （`跟随系统 · 暗色`）。没有它，用户选了跟随之后无从知道当前生效的是什么
+   * ——尤其当系统就是浅色、界面看起来"没变化"时，会怀疑按钮没生效。
+   *
+   * 它由下面的 effect 跟随系统事件更新；固定主题下不参与任何判断。
+   */
+  const [systemIsDark, setSystemIsDark] = useState<boolean>(systemPrefersDark);
   const enabledSources = settings.enabledSources;
+
+  /**
+   * 系统配色变化的本地订阅。
+   *
+   * `main.tsx` 里已经挂了一个进程级的监听器负责**真正切换主题**；这里这一个
+   * 只负责把"系统现在是暗还是浅"同步到组件 state，好让「跟随系统」旁边那行
+   * 小字准确。两处订阅同一事件，职责不同，都不重。
+   *
+   * 必须用 `addEventListener('change')` 而不是轮询：Windows 改应用模式时
+   * 这个事件是即时的，轮询既费电又会有一拍延迟。
+   */
+  useEffect(() => {
+    let media: MediaQueryList;
+    try {
+      media = window.matchMedia('(prefers-color-scheme: dark)');
+    } catch {
+      return;
+    }
+    const onChange = (event: MediaQueryListEvent) => setSystemIsDark(event.matches);
+    media.addEventListener('change', onChange);
+    return () => media.removeEventListener('change', onChange);
+  }, []);
 
   /**
    * 勾选/取消一个源。
@@ -793,18 +986,29 @@ export const SettingsView: React.FC = () => {
   };
 
   return (
-    <div className="w-full h-full overflow-y-auto select-none p-6 sm:p-8">
-      <div className="max-w-4xl mx-auto flex flex-col gap-4 pb-24">
-        {/* 页面主标题 */}
-        <div className="pb-4 mb-2 border-b border-black/[0.05] shrink-0">
-          <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center border border-blue-200/50">
-              <Settings className="w-4 h-4" />
-            </div>
+    /* 滚动容器**撑满整个面板**，内容限宽交给内层。
+       此前 `max-w-5xl mx-auto` 直接挂在滚动容器上：那个容器的宽度就成了
+       1024px 并居中，于是**滚动条出现在容器右边缘**（面板内部约 3/4 处），
+       右侧留出一条与内容同宽的空白——看起来像"页面没铺满"，而实际是
+       滚动条被限宽框住了。把限宽下移一层，滚动条回到面板右边缘，
+       内容仍然居中、行宽仍然可控。 */
+    <div className="w-full h-full overflow-y-auto select-none">
+      <div className="w-full max-w-5xl mx-auto p-8 flex flex-col gap-6 pb-24">
+        {/* 页面主标题
+            —— 与「我的追剧」「观看历史」对齐到同一套标题语言：`text-xl font-bold`
+            + 一个 20px 的彩色 lucide 图标 + 一行 `text-xs` 说明。
+            这里此前是「蓝底圆角方框包着 16px 图标」——那是**卡片标题**的语汇
+            （本页每张卡的标题行正是这个写法），放在页面级标题上会让设置页的
+            第一屏比其他页面重一个层级，用户从发现页切过来会觉得"换了一套设计"。
+            图标色选 `text-blue-600`：设置页在本应用里属于"工具"类页面，
+            与收藏页的玫瑰色、历史页的中性色一样，只用一处语义色点出身份。 */}
+        <div className="pb-4 border-b border-black/[0.05] shrink-0">
+          <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+            <Settings className="w-5 h-5 text-blue-600" />
             <span>设置</span>
           </h1>
           <p className="text-xs text-slate-400 mt-1">
-            自动连播、本地缓存与视频源
+            外观、播放体验、视频源与本地缓存
           </p>
         </div>
 
@@ -812,27 +1016,35 @@ export const SettingsView: React.FC = () => {
         <SectionCard icon={<Palette className="w-4 h-4 text-blue-600" />} title="外观">
           <SettingRow
             title="界面主题"
-            hint="暗色模式是黑红配色：黑底 + 红色强调，界面与播放器控制条一起变。选择会记住，重启后仍生效。"
+            hint={
+              themePreference === 'system'
+                // 「跟随系统」时必须告诉用户此刻落到哪一档：否则系统本身就是浅色时，
+                // 点了"跟随系统"界面毫无变化，看起来像没生效。
+                ? `正在跟随 Windows 的应用模式，当前为${systemIsDark ? '暗色' : '浅色'}。在系统设置里切换，这里会立即跟随。`
+                : '暗色模式是黑红配色：黑底 + 红色强调，界面与播放器控制条一起变。选择会记住，重启后仍生效。'
+            }
           >
-            {/* 分段选择沿用 CategoryBar 那套：选中项凸起、未选中只留文字。 */}
+            {/* 分段选择沿用 CategoryBar 那套：选中项凸起、未选中只留文字。
+                样式与「默认清晰度」共用 `segmentedClass`，全页只长一个样。 */}
             <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100/80">
               {THEME_OPTIONS.map(option => {
                 const Icon = option.icon;
-                const selected = theme === option.id;
+                const selected = themePreference === option.id;
                 return (
                   <button
                     key={option.id}
                     type="button"
                     aria-pressed={selected}
                     onClick={() => {
+                      // `saveTheme` 内部会 `resolveTheme`：选「跟随系统」时写进
+                      // `data-theme` 的是系统此刻的值，不是字符串 "system"。
                       saveTheme(option.id);
-                      setTheme(option.id);
+                      setThemePreference(option.id);
+                      // 切到跟随系统时，顺手同步一次当前系统状态，避免 hint 里
+                      // 还留着上一次的旧值（系统事件只在**变化**时才会来）。
+                      if (option.id === 'system') setSystemIsDark(systemPrefersDark());
                     }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors duration-150 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 ${
-                      selected
-                        ? 'fluent-convex-tab text-slate-800'
-                        : 'text-slate-500 hover:text-slate-800'
-                    }`}
+                    className={segmentedClass(selected)}
                   >
                     <Icon className="w-3.5 h-3.5" />
                     {option.label}
@@ -846,10 +1058,27 @@ export const SettingsView: React.FC = () => {
         {/* 2. 播放体验 */}
         <SectionCard icon={<Tv className="w-4 h-4 text-blue-600" />} title="播放体验">
           <SettingRow
-            title="视频清晰度"
-            hint="由播放源实测决定：源里真的带多档时才显示切换，探测不到就只显示单档「自动」，不会虚构档位。"
+            title="默认清晰度"
+            hint="只决定「第一次打开某部剧」时请求哪一档。之后在播放器里切过的档位优先，不会每次都被这里覆盖。源里没有该档时后端自动回退到最接近的一档。"
           >
-            <ValueBadge>自动</ValueBadge>
+            {/* 这里此前是一个**只读的**「自动」徽章：字段 `defaultQuality` 在
+                `usePlaybackStore` 里是真的被读去起播的，但用户没有任何入口改它 ——
+                设置页展示了一个自己无权决定的设置。现在改成与「外观」同款分段控件，
+                两项共用 `segmentedClass`，全页的分段选择只长一个样。 */}
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100/80">
+              {QUALITY_OPTIONS.map(option => (
+                <button
+                  key={option.id}
+                  type="button"
+                  aria-pressed={settings.defaultQuality === option.id}
+                  onClick={() => updateSettings({ defaultQuality: option.id })}
+                  title={option.hint}
+                  className={segmentedClass(settings.defaultQuality === option.id)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
           </SettingRow>
 
           <div className="pt-4 border-t border-black/[0.04]">
@@ -899,14 +1128,46 @@ export const SettingsView: React.FC = () => {
           </div>
         </SectionCard>
 
-        {/* 3. 视频源（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
+        {/* 3. 网络与代理
+            单独成卡而不是塞进「视频源」：这张卡管的是**红果官网链路**
+            （provider.rs 抓 /category），而「视频源」管的是 guo 那 19 个站。
+            两条链路用的是完全不同的网络栈，混在一张卡里会让用户以为
+            改一处就能同时影响两边 —— 而它们互不相干。 */}
+        <SectionCard icon={<Wifi className="w-4 h-4 text-blue-600" />} title="网络与代理">
+          <SettingRow
+            title="红果目录网络"
+            hint="决定拉取红果短剧/漫剧目录时走不走系统代理。程序会在启动时探测一次；代理软件退出后仍报「目录加载失败」时，手动选「直连」。"
+          >
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100/80">
+              {PROXY_OPTIONS.map(option => (
+                <button
+                  key={option.id}
+                  type="button"
+                  aria-pressed={settings.proxyMode === option.id}
+                  title={option.hint}
+                  onClick={() => updateSettings({ proxyMode: option.id })}
+                  className={segmentedClass(settings.proxyMode === option.id)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </SettingRow>
+
+          <div className="pt-4 border-t border-black/[0.04]">
+            <ProxyDiagnose />
+          </div>
+        </SectionCard>
+
+        {/* 4. 视频源（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
         <SectionCard icon={<Server className="w-4 h-4 text-blue-600" />} title="视频源">
+          {/* 这段说明此前混着实现细节（"2026-09-29 拉每个源的前 12 条看标题"），
+              那是给维护者看的溯源信息，不是用户决策需要的东西。用户只需知道
+              三件事：勾了会去哪、开多了会怎样、默认为什么这么少。
+              长度从 4 行压到 2 行，卡片首屏就能看到第一个可点的源。 */}
           <p className={HINT_CLS}>
-            勾选后这些源会一起汇入发现页——前两组进「短剧专区」与「漫剧次元」，
-            18+ 那组只在打开开关后进「神秘小窝」独占。
-            归类是逐源实测目录内容得出的（2026-09-29 拉每个源的前 12 条看标题/分类/集数），不是按站名猜的。
-            <span className="text-slate-500">勾得越多，首屏要并发等待的站点也越多</span>
-            ——实测 19 个源全开会打 19 个站点，最慢的那个决定首屏时间。
+            勾选的源会一起汇入发现页：前两组进「短剧专区」与「漫剧次元」，18+ 那组在打开开关后独占「神秘小窝」。
+            <span className="text-slate-500">勾得越多，首屏要并发等待的站点也越多</span>，最慢的那个决定首屏时间。
           </p>
 
           <GuoNetworkRow />
@@ -931,7 +1192,10 @@ export const SettingsView: React.FC = () => {
           />
           <SourceGroup
             title="18+ 成人内容"
-            hint="实测逐源确认含成人条目（母子同欢 / 同学妈妈无删减版 / 无码中字番号 等）。只汇入发现页的「神秘小窝」专区，不进短剧专区与漫剧次元。"
+            /* 不再列举具体片名：那是维护期逐源核对的产物，对用户没有决策价值，
+               而且把几个露骨片名直接印在设置页上，也超出了这一行的用途。
+               用户只需要知道「它归哪个专区、受哪个开关管辖」。 */
+            hint="逐源确认含成人条目。只汇入发现页的「神秘小窝」专区，不进短剧专区与漫剧次元。"
             sources={GUO_SOURCES.filter(item => item.adult)}
             enabled={enabledSources}
             locked={!settings.showAdultSources}
@@ -964,13 +1228,7 @@ export const SettingsView: React.FC = () => {
         <SectionCard icon={<HardDrive className="w-4 h-4 text-blue-600" />} title="存储空间与本地缓存">
           <SettingRow
             title="剧集缓存"
-            hint={
-              <>
-                播放过的剧集会缓存到本地，以便回看与换集时秒开。
-                <span className="text-slate-600 font-medium">已开启全自动清理</span>
-                ：超过 7 天未播放的剧集、以及总量超过下方上限时最旧的剧集，都会自动移除，无需手动操作。
-              </>
-            }
+            hint="播放过的剧集会缓存到本地，回看与换集时秒开。清理全自动，无需手动操作。"
           >
             <div className="flex items-center gap-2">
               <ValueBadge>{cacheLabel}</ValueBadge>
@@ -985,30 +1243,37 @@ export const SettingsView: React.FC = () => {
               title="自动清理上限"
               hint="短剧与漫剧缓存合计达到上限后，自动保留最近使用的剧集并淘汰最旧内容。默认 1 GB。"
             >
-              <select
-                value={settings.playbackCacheMb}
-                onChange={event => updateSettings({ playbackCacheMb: Number(event.target.value) })}
-                className="h-9 rounded-xl border border-slate-200/80 bg-white px-3 text-xs font-semibold text-slate-700 shadow-xs outline-none focus:ring-2 focus:ring-blue-400/40 cursor-pointer"
-                aria-label="剧集缓存自动清理上限"
-              >
-                <option value="512">512 MB</option>
-                <option value="1024">1 GB</option>
-                <option value="2048">2 GB</option>
-                <option value="4096">4 GB</option>
-              </select>
+              <div className="flex items-center gap-2">
+                <select
+                  value={settings.playbackCacheMb}
+                  onChange={event => updateSettings({ playbackCacheMb: Number(event.target.value) })}
+                  className="h-8 rounded-lg border border-slate-200/80 bg-white px-2.5 text-xs font-semibold text-slate-700 shadow-xs outline-none focus:ring-2 focus:ring-blue-400/40 cursor-pointer"
+                  aria-label="剧集缓存自动清理上限"
+                >
+                  <option value="512">512 MB</option>
+                  <option value="1024">1 GB</option>
+                  <option value="2048">2 GB</option>
+                  <option value="4096">4 GB</option>
+                </select>
+                {/* 清理按钮从"卡片底部孤零零靠右"移进这一行。
+                    理由有二：
+                    ① 它清的就是这一行在配置的那份缓存，放一起才看得出因果关系；
+                    ② 原来那颗按钮是页面上唯一 `size="md"` 的（其余全是 `sm`），
+                       在卡片底部独占一行、比同卡所有控件都大一号，视觉重心被一个
+                       破坏性操作抢走——那正好是最不该被强调的东西。
+                    文案也从「立即全部清空」收敛成「清空缓存」：前者像一句警告，
+                    而这是一个可随时重建的缓存，不是不可逆的数据删除。 */}
+                <FluentButton
+                  variant="secondary"
+                  size="sm"
+                  disabled={isCleaning}
+                  icon={<RefreshCw className={`w-3 h-3 ${isCleaning ? 'animate-spin' : ''}`} />}
+                  onClick={handleClearCache}
+                >
+                  {isCleaning ? '正在清理…' : '清空缓存'}
+                </FluentButton>
+              </div>
             </SettingRow>
-          </div>
-
-          <div className="flex justify-end">
-            <FluentButton
-              variant="secondary"
-              size="md"
-              disabled={isCleaning}
-              icon={<RefreshCw className={`w-3.5 h-3.5 ${isCleaning ? 'animate-spin' : ''}`} />}
-              onClick={handleClearCache}
-            >
-              {isCleaning ? '正在清理…' : '立即全部清空'}
-            </FluentButton>
           </div>
         </SectionCard>
 
@@ -1138,17 +1403,19 @@ export const SettingsView: React.FC = () => {
             title="TTV Short Drama 独立桌面客户端"
             hint="基于 Tauri + React 19 + TypeScript 构建 · 硬件加速渲染已启用"
           >
-            <div className="flex items-center gap-2">
-              <ValueBadge tone="neutral">Mica Light</ValueBadge>
-              <FluentButton
-                variant="secondary"
-                size="sm"
-                icon={<FolderOpen className="w-3.5 h-3.5" />}
-                onClick={handleExportLogs}
-              >
-                导出匿名运行日志
-              </FluentButton>
-            </div>
+            {/* 这里曾有一个写死的「Mica Light」徽章。删掉的理由不是它占地方，
+                而是它**恒为 Light**：暗色主题下界面已经变成黑红配色，这个徽章
+                仍宣称 "Mica Light"，是一句当场就能被用户证伪的陈述。
+                它也不携带任何可操作信息——真正的构建信息在下面那行 hint 里，
+                导出日志里也有完整快照（`os` 字段）。 */}
+            <FluentButton
+              variant="secondary"
+              size="sm"
+              icon={<FolderOpen className="w-3.5 h-3.5" />}
+              onClick={handleExportLogs}
+            >
+              导出匿名运行日志
+            </FluentButton>
           </SettingRow>
 
           <PlaybackLogPanel />

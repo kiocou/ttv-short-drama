@@ -50,4 +50,13 @@ export interface UserSettings {
    * 保持「默认开」——现状默认就走 VSR 链路，默认关等于让老用户行为突变。
    */
   vsrEnabled: boolean;
+  /**
+   * 红果官网链路走不走系统代理。
+   *
+   * 自动判断在代理软件退出后必然判错（启动时固化的代理与运行时读到的注册表
+   * 对不上），所以最终决定权交回用户。详见 Rust 侧 `models.rs` 的同名字段。
+   *
+   * 旧设置记录没有这个字段，读取时按 `'auto'` 处理。
+   */
+  proxyMode: 'auto' | 'direct' | 'proxy';
 }

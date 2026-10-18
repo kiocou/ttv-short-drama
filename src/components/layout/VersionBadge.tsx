@@ -112,10 +112,36 @@ export const VersionBadge: React.FC = () => {
             ? `发现新版本 v${pendingVersion}，点击查看`
             : `当前版本 v${version || '—'}，点击检查更新`
         }
+        /**
+         * 两种状态的配色必须**各自成立**，不能靠"深色下会被变量重映射"来兜底。
+         *
+         * ## 旧配色在浅色下几乎是隐形的（2026-10-18）
+         *
+         * 平时态是 `text-blue-600 bg-blue-50/90 border-blue-200/60`：
+         *   - 底色 `blue-50`（#eff6ff）与标题栏的 `bg-white/80` 几乎同色；
+         *   - 边框 `blue-200/60` 再淡一档；
+         *   - 结果整块徽章在浅色下只剩几个蓝字浮在白底上，**没有边界**，
+         *     用户看到的是一行"不知道该不该点"的小字。
+         *
+         * 而暗色下同一套类名被 `dark.css` 重映射（`--c-blue-600` → 红），
+         * 深红底 + 亮红字在黑标题栏上边界清晰，反而很醒目 ——
+         * 于是同一个元素在两个主题下**可辨识度差了一倍**。
+         *
+         * ## 现在
+         *
+         * 平时态改成"实边框 + 略深的底"（`border-blue-300/80` + `bg-blue-50`），
+         * 让它在白底标题栏上有一条明确的轮廓；文字保持 `blue-600`。
+         * 暗色下这些类名照旧被重映射成红色系，语义（"这是一枚可点的版本徽章"）
+         * 在两个主题下一致。
+         *
+         * 有新版本时用 `bg-red-500`：那是**硬红**，暗色下也被映射成
+         * `--c-red-500`（240 90 90），两个主题都是"该注意"的信号色，
+         * 与平时态的区分不依赖主题。
+         */
         className={`text-[9px] font-bold px-1.5 py-0.5 rounded-md border shadow-2xs cursor-pointer transition-colors active:scale-95 ${
           pendingVersion
             ? 'text-white bg-red-500 border-red-400/70 hover:bg-red-600'
-            : 'text-blue-600 bg-blue-50/90 border-blue-200/60 hover:bg-blue-100'
+            : 'text-blue-600 bg-blue-50 border-blue-300/80 hover:bg-blue-100 hover:border-blue-400'
         }`}
       >
         {pendingVersion ? `有新版本 v${pendingVersion}` : `v${version || '—'}`}

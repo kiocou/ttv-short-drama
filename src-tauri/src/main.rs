@@ -1155,6 +1155,22 @@ fn normalize_enabled_sources(input: &[String]) -> Vec<String> {
     known
 }
 
+/// 代理模式白名单归一。
+///
+/// 只认三个值：`auto` / `direct` / `proxy`。其余（含空串、旧版遗留值、
+/// 前端拼错）一律回落到 `auto` —— 那是"探测决定"的安全默认，绝不会让
+/// 一个脏值把用户锁死在"永不走代理"或"永远走一个坏代理"上。
+///
+/// 为什么不报错：设置页保存是一个高频、幂等的动作，因为一个脏字符串就
+/// 整体拒绝保存，会让其它真实设置（缓存上限、VSR）一起丢失。
+fn normalize_proxy_mode(value: &str) -> String {
+    match value.trim() {
+        "direct" => "direct".into(),
+        "proxy" => "proxy".into(),
+        _ => "auto".into(),
+    }
+}
+
 /// 总开关关闭时，把 18+ 源从启用列表里剔除。
 ///
 /// 为什么必须在**写入**时剔除，而不只靠运行期守卫：`enabledSources` 是持久化
@@ -1201,12 +1217,46 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
     // 注意这里**不做任何强制改写**：它是真实可用的用户设置，不是不变量 8
     // 里那批「能力受限、如实归零」的字段。
     set_vsr_enabled(settings.vsr_enabled);
+    // 代理模式：运行期即时生效。用户切到「直连」时立刻把代理判死，不必重启 ——
+    // 这正是这个开关存在的意义：出现"目录加载失败"时，用户能自己一步绕过去。
+    settings.proxy_mode = normalize_proxy_mode(&settings.proxy_mode);
+    crate::provider::apply_proxy_mode(&settings.proxy_mode);
     let saved = state.database.settings_save(&settings);
     if saved.is_ok() {
         // 文件删除不能拖住设置保存的 IPC 返回，放到独立线程立即收敛。
         std::thread::spawn(short_drama_app::enforce_cache_budget_now);
     }
     saved
+}
+
+/// 代理连通性自检（设置页「测试」按钮）。
+///
+/// ## 为什么值得单独开一条命令
+///
+/// 这个项目在代理上栽过三次（`10061` 目录全灭、更新检查失败、guo 源 403），
+/// 每次的共同点是：**用户看到的只是一句"加载失败"，而真实原因在几十行之外**。
+/// 排查成本全花在"从症状倒推是不是代理"上。
+///
+/// 这条命令把那个推理过程一次做完并如实报告：系统代理配了什么、端口通不通、
+/// 直连能不能取到红果目录。用户点一下就能知道该不该动设置页的代理开关，
+/// 而不是等下次再遇到"目录加载失败"。
+#[tauri::command]
+async fn proxy_diagnose() -> Result<serde_json::Value, String> {
+    let address = crate::update::system_proxy_address();
+    // 探一次端口：与启动自检用的是同一个函数，结论不会互相矛盾。
+    let reachable = address
+        .as_deref()
+        .map(crate::provider::tcp_reachable_public)
+        .unwrap_or(false);
+    // 直连取一次目录：这是"绕开代理到底行不行"的最终判据。
+    // 用 `/category`（最小的一页）而不是整站首页，避免把 300KB 拖进这次诊断。
+    let direct_ok = crate::provider::probe_direct_catalog().await;
+    Ok(serde_json::json!({
+        "proxyAddress": address,
+        "proxyReachable": reachable,
+        "directCatalogOk": direct_ok,
+        "proxyDead": crate::provider::is_proxy_dead(),
+    }))
 }
 
 /// 清空缓存（设置页按钮）。
@@ -1425,6 +1475,13 @@ fn apply_windows_gpu_preference() {
 fn apply_windows_gpu_preference() {}
 
 fn main() {
+    // ⚠️ 必须是**第一行**：把日志的相对时间零点钉在进程启动。
+    //
+    // 放在这里之前曾经出过一个大坑：旧实现的计时起点是"第一次写日志那一刻"，
+    // 而第一次写日志发生在 setup() 里两个 DLL 加载之后。于是日志永远显示
+    // `+0.000s` 起步，用户报的"点图标卡一会儿"在日志里**根本看不到** ——
+    // 那段耗时全落在零点之前。详见 `trace::mark_process_start` 的注释。
+    crate::trace::mark_process_start();
     // 历史背景：系统盘写满时，WebView2 写不了 GPU/着色器缓存 → 合成管线初始化失败
     // → 窗口内容区整片纯黑。当时用 `--disable-gpu-compositing` 兜底，但那会让全部
     // 渲染退回 CPU 软件光栅；而界面大量使用 `backdrop-blur`（30 处），软件高斯模糊
@@ -1449,6 +1506,24 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
+            // ===== 启动阶段打点 =====
+            //
+            // 用户报「点图标后要卡一会儿才开始加载」。窗口出现之前的耗时全在这
+            // 个 setup 里，而它是**同步**的 —— 每一项都在推迟第一帧。
+            // 之前没有任何分段计时，只能靠猜；这里把每个阻塞点单独记一行，
+            // 下次再有人报"启动慢"，日志里直接能看到是谁。
+            let setup_started = std::time::Instant::now();
+            let mut last_mark = setup_started;
+            // 记一段并推进基准。`label` 写英文短名，便于 grep。
+            let mut mark = |label: &str| {
+                let now = std::time::Instant::now();
+                crate::trace::log(format!(
+                    "[boot] {label} +{}ms（累计 {}ms）",
+                    now.duration_since(last_mark).as_millis(),
+                    now.duration_since(setup_started).as_millis()
+                ));
+                last_mark = now;
+            };
             // AppState 的 SQLite 与剧集缓存也落在同一个可写根目录下。
             let app_dir = app_storage_root().unwrap_or_else(|| {
                 app.path()
@@ -1458,16 +1533,23 @@ fn main() {
             fs::create_dir_all(&app_dir).map_err(|error| error.to_string())?;
             let cache_dir = app_dir.join("cache");
             fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
+            mark("创建目录");
             let provider = DramaProvider::new()?;
+            mark("DramaProvider::new（HTTP 客户端 + 代理探测）");
+            // ⚠️ 这一行会**同步加载外部 DLL**（动漫共和国桥接），是启动期
+            // 最重的单个阻塞点之一。详见 `AnimeProvider::new` 的注释。
             let anime_provider = crate::anime_provider::AnimeProvider::new()?;
+            mark("AnimeProvider::new（dmghg DLL 加载）");
             let resource_dir = app
                 .path()
                 .resource_dir()
                 .unwrap_or_else(|_| app_dir.join("resources"));
+            // ⚠️ 同样跨 FFI：`GuoBridge::load` + 一次 `initialize` 调用。
             let guo_provider = Arc::new(crate::guo_provider::GuoProvider::new(
                 &resource_dir,
                 &app_dir,
             )?);
+            mark("GuoProvider::new（guo-core DLL 加载 + initialize）");
             // guo 源的封面由 guo-core 下载到 `<app_dir>/guo-core/covers-v1` 后经
             // asset 协议呈现：dev 态这个目录在项目内（.app-data），不在默认的
             // `$APPLOCALDATA` scope 里，不显式放行生产/dev 两端都会 403。
@@ -1475,6 +1557,7 @@ fn main() {
                 .asset_protocol_scope()
                 .allow_directory(app_dir.join("guo-core"), true);
             let database = Database::open(&app_dir.join("short-drama.sqlite3"))?;
+            mark("Database::open（SQLite 建表/迁移）");
             // 自动清理必须按用户上限启动，不能在后台线程里写死 1GB。
             let saved_cache_mb = database
                 .settings_get()
@@ -1490,6 +1573,22 @@ fn main() {
                     .map(|settings| settings.vsr_enabled)
                     .unwrap_or(true),
             );
+            // 代理模式：按落库值决定红果官网链路用不用系统代理。
+            //
+            // 这一步必须在 `database` 就绪**之后**（它读的是用户设置），
+            // 又必须在**任何目录请求之前** —— 它决定的是"代理是否被判死"，
+            // 一旦第一条请求先跑，就要白等一次 15 秒的失败 + 兜底重发，
+            // 而前端单源只等 6 秒，那一轮必然报"目录加载失败"。
+            //
+            // 旧设置记录缺这个字段时 `settings_get` 会走 `default_proxy_mode`
+            // 给 `auto`，与修复前的行为一致（探测决定）。
+            let saved_proxy_mode = normalize_proxy_mode(
+                &database
+                    .settings_get()
+                    .map(|settings| settings.proxy_mode)
+                    .unwrap_or_else(|_| "auto".to_string()),
+            );
+            provider.probe_proxy_on_startup(&saved_proxy_mode);
             app.manage(AppState {
                 provider,
                 anime_provider,
@@ -1600,6 +1699,7 @@ fn main() {
             window_finish_fullscreen,
             settings_get,
             settings_save,
+            proxy_diagnose,
             cache_clear,
             pip_open,
             pip_handoff,
