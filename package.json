@@ -1,7 +1,7 @@
 {
   "name": "ttv-short-drama-frontend",
   "private": true,
-  "version": "0.2.26",
+  "version": "0.2.27",
   "description": "TTV Short Drama — Windows 11 Mica 风格短剧/漫剧桌面播放器前端（React + TypeScript + Vite，配套 Tauri/Rust 后端位于 src-tauri/）",
   "type": "module",
   "scripts": {
@@ -11,6 +11,11 @@
     "verify:boost": "node --experimental-strip-types scripts/verify-boost.mjs",
     "verify:tail": "node --experimental-strip-types scripts/verify-playback-tail.mjs",
     "verify:random-pick": "node --experimental-strip-types scripts/verify-random-pick.mjs",
+    "verify:launch-overlay": "node --experimental-strip-types scripts/verify-launch-overlay.ts",
+    "verify:keyrepeat": "node --experimental-strip-types scripts/verify-keyrepeat.ts",
+    "verify:player-toast-dom": "node --experimental-strip-types scripts/verify-player-toast-dom.ts",
+    "verify:player-toast": "node --experimental-strip-types scripts/verify-player-toast.ts",
+    "verify:resume": "node --experimental-strip-types scripts/verify-resume.ts",
     "verify:season-label": "node --experimental-strip-types scripts/verify-season-label.mjs",
     "verify:related-section": "node scripts/verify-related-section.mjs",
     "verify:related-pick": "node scripts/verify-related-pick.mjs",

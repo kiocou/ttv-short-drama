@@ -759,11 +759,18 @@ export const LaunchAnimation: React.FC = () => {
       ref={rootRef}
       className="ttv-launch"
       aria-hidden="true"
-      onPointerDown={(event) => {
-        // 只认左键：右键在项目里是全局被禁用的，不该顺手把启动动画关掉。
-        if (event.button !== 0) return;
-        skip();
-      }}
+      /*
+        ⚠️ 这里**不能**再挂 `onPointerDown` 跳过（2026-10-19 改）。
+
+        整层现在是 `pointer-events: none`（见 launch.css 的注释）——它铺满
+        全屏、z-index 70，若继续吃指针事件，启动那 1.7–3.2 秒里首页的滚轮
+        和点击全都失效，用户看到的就是"刚打开时滚轮没反应，过一会儿又好了"。
+
+        跳过动画的入口保留三个，都在**明确的、不遮挡应用的**目标上：
+          1. 底部提示条（下面那个 `<button>`，自身 pointer-events: auto）
+          2. Esc / 空格 / 回车（本组件的 keydown 监听）
+          3. 等它自己跑完（最长 3.2 秒）
+      */
     >
       <div className="ttv-launch-orbit">
         <div className="ttv-launch-glow" />
@@ -787,9 +794,20 @@ export const LaunchAnimation: React.FC = () => {
         <span className="ttv-launch-ring" />
         <span className="ttv-launch-ring" />
       </div>
-      <span className="ttv-launch-hint">
+      {/*
+        跳过按钮：整层已 pointer-events: none，所以"点任意处跳过"没有了，
+        必须给鼠标留一个**真实可点**的目标。用 <button> 而不是 <span>：
+        它自带键盘可达性与无障碍语义，也不必再手写 role/tabIndex。
+        `type="button"` 是必须的——否则在表单上下文里会被当成提交按钮。
+      */}
+      <button
+        type="button"
+        className="ttv-launch-hint"
+        onClick={() => skip()}
+        aria-label="跳过启动动画"
+      >
         {holding ? '正在准备首页内容…（点击跳过）' : '点击跳过'}
-      </span>
+      </button>
     </div>
   );
 };

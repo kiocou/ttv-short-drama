@@ -210,6 +210,23 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
     const percent = safeDuration > 0
       ? Math.min(100, Math.max(0, Math.round((safePosition / safeDuration) * 100)))
       : 0;
+    /**
+     * 「算看完了吗」——与短剧播放器**同一套判定**（2026-10-19）。
+     *
+     * 旧规则 `percent >= 95` 对短内容太宽松：短剧/泡面番一集只有几十秒，
+     * 看到 95% 就被置位，而所有续播入口都排除 `isFinished`，用户重进播放器
+     * 会发现"位置没了"。
+     *
+     * 现在以**剩余秒数**为准（剩余 ≤3 秒且百分比 ≥90）。不用"百分比 ≥98"
+     * 是因为 20 秒的集看到 19 秒只剩 1 秒、确实看完了，却只有 95% ——
+     * 百分比对短内容会误杀。
+     *
+     * 两处播放器必须用同一条规则：各写一份迟早漂移成"短剧能续播、动漫不能"。
+     */
+    const remainingSeconds = safeDuration > 0
+      ? Math.max(0, safeDuration - safePosition)
+      : Number.POSITIVE_INFINITY;
+    const isFinished = safeDuration > 0 && remainingSeconds <= 2 && percent >= 95;
     void ipcService.history.save({
       seriesId: currentSeries.id,
       episodeId: currentEpisode.id,
@@ -221,7 +238,7 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
       durationSeconds: Math.floor(safeDuration),
       progressPercent: percent,
       updatedAt: now,
-      isFinished: percent >= 95,
+      isFinished,
       channel: 'anime',
     }).catch(() => {
       // 历史写入失败不影响播放，静默即可（后端已记录日志）。

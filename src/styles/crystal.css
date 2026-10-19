@@ -267,6 +267,192 @@
 }
 
 /* ==========================================================================
+   3.6 操作提示（空格 / 方向键 / 全屏 / 切集）
+   ========================================================================== */
+
+/*
+  形态对齐 B 站播放器：操作发生的那一刻，画面**正中央**闪一个
+  「圆形半透明底 + 图标 + 主文案 + 副文案」，停留约 0.76 秒后自己淡出。
+
+  为什么放正中央而不是角落：角落已经有音量、倍速、缓冲这些常驻信息了，
+  再往里塞会让边缘变成一块信息垃圾场；而中央本来就空着，且用户的视线
+  天然落在画面中间——提示放在那里，"我刚才那下生效了没有"一眼就能确认。
+
+  ## 为什么是圆形而不是方块（2026-10-19 重设计）
+
+  旧版是「黑色圆角方块 + 竖排图标文字」。实测的问题是**黑块太重**：
+  72% 不透明度的方块压在画面中央，看剧时像贴了一块膏药；
+  而且竖排让视线要上下扫，一瞥之间读不完。
+
+  圆底在同样面积下视觉重量更小（圆角让边缘退到背景里），
+  横排则符合"从左往右读"的习惯。副文案只在有数值时出现
+  （音量%、落点时间、集号），不堆信息。
+
+  ## 四个必须遵守的约束
+
+  1. **只做 opacity + scale，不做位移**。
+     播放器里任何常驻的 transform/filter 都会把 video 祖先钉成合成层，
+     让 RTX VSR 失效（不变量 26）。这层虽然只存在 0.76 秒、也不是 video 祖先，
+     但既然淡入就够表达"出现"，就不引入第二个变量。
+  2. **不用 backdrop-filter**。本舞台内所有背景模糊都会把视频拉进合成器，
+     同样会打掉 VSR（见本文件第 2 节的长注释）。圆底用纯色半透明。
+  3. **pointer-events: none**。它盖在画面中央，绝不能挡住"点画面暂停"。
+  4. **文字带描边阴影**。亮画面（雪景、白墙）上白字会糊，
+     `text-shadow` 是唯一不引入额外 DOM 就能保证可读的办法。
+
+  尺寸：圆底 68px、图标 30px、主文案 13px、副文案 11px。
+*/
+.ttv-player-toast {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color: #fff;
+  pointer-events: none;
+
+  /* 默认隐藏：靠 .is-visible 点亮 */
+  opacity: 0;
+  transform: scale(0.92);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+/*
+  点亮：快速到位 + 轻微过冲。
+
+  `cubic-bezier(.22, 1.4, .42, 1)` 里的 1.4 是**过冲**——图标会稍微"弹"过
+  目标尺寸再回落，比线性缩放有生命感。这是这一版动效的核心手感。
+
+  起点 scale 取 .92 而不是 1：起点更小，弹回来的位移才看得出来。
+  0.92 也是刻意的——再小会像"从远处飞来"，而这一层是反馈不是表演。
+
+  `will-change` 只写在点亮态、不写在基础类上：
+  它是**常驻**提示吗？不是——这一层只在操作发生后的 0.76 秒里存在。
+  若把 `will-change` 挂在基础类上，元素虽然 opacity: 0 却仍然常驻 DOM
+  （组件在 payload 非空后就一直渲染），会白白占着一个合成层。
+  只在真正要动画时才提升，动画结束随 `is-visible` 一起撤掉。
+*/
+.ttv-player-toast.is-visible {
+  opacity: 1;
+  transform: scale(1);
+  will-change: opacity, transform;
+  transition:
+    opacity 0.1s ease-out,
+    transform 0.22s cubic-bezier(0.22, 1.4, 0.42, 1);
+}
+
+/* 圆底：深色半透明，不模糊（保护 VSR） */
+.ttv-player-toast-disc {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  background: rgba(8, 10, 14, 0.56);
+  box-shadow:
+    0 6px 22px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  flex-shrink: 0;
+}
+
+/*
+  音量进度弧：圆底外圈一道弧，直观表达"现在多大音量"。
+
+  用 `conic-gradient` + `mask` 画环，而不是叠一个 SVG 或额外 DOM：
+   - 纯 CSS，零额外节点；
+   - 改一个 CSS 变量就能更新，不需要重渲染 React 树；
+   - 不涉及 filter/backdrop-filter，不影响 VSR。
+
+  `--ttv-toast-volume` 由组件按当前音量写入（0%–100%）。
+  没传 volume 时整圈不渲染（`.has-volume` 才显示）。
+*/
+.ttv-player-toast-ring {
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
+  background: conic-gradient(
+    rgba(255, 255, 255, 0.55) var(--ttv-toast-volume, 0%),
+    rgba(255, 255, 255, 0.1) 0
+  );
+  -webkit-mask: radial-gradient(circle, transparent 60%, #000 61%);
+  mask: radial-gradient(circle, transparent 60%, #000 61%);
+}
+
+.ttv-player-toast-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  /* 图标投影：亮画面上白图标不糊 */
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
+  /*
+    图标脉冲：换图标时做一次「缩小 → 略放大 → 归位」，像按下去又弹回。
+
+    这是最关键的细节——旧版换图标是硬切，看起来机械。组件每次点亮会给
+    这个节点换一个 key 触发重挂，从而重播这段动画（只重挂图标，不是整个提示，
+    所以 `visible` 状态不受影响）。
+  */
+  animation: ttv-player-toast-pulse 0.22s ease-out;
+}
+
+@keyframes ttv-player-toast-pulse {
+  0% {
+    transform: scale(0.82);
+  }
+  55% {
+    transform: scale(1.06);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/* 主文案：贴在圆底下方 */
+.ttv-player-toast-label {
+  margin-top: 9px;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.4px;
+  line-height: 1.2;
+  color: rgba(255, 255, 255, 0.95);
+  /* 双层阴影：近处实、远处晕，亮暗画面上都能读 */
+  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.85), 0 0 14px rgba(0, 0, 0, 0.5);
+  /* 数字（音量%、时间）用等宽数字，连按时不会左右抖 */
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 副文案：数值（音量% / 落点时间 / 集号），只在有内容时出现 */
+.ttv-player-toast-detail {
+  margin-top: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: rgba(255, 255, 255, 0.6);
+  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.85);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 空副文案不占位（避免圆底下方多出一段空白） */
+.ttv-player-toast-detail:empty {
+  display: none;
+}
+
+/* 用户开了"减少动态效果"：去掉缩放与脉冲，只保留淡入淡出 */
+@media (prefers-reduced-motion: reduce) {
+  .ttv-player-toast,
+  .ttv-player-toast.is-visible {
+    transform: none;
+    transition: opacity 0.12s ease;
+  }
+
+  .ttv-player-toast-icon {
+    animation: none;
+  }
+}
+
+/* ==========================================================================
    3.5 长按加速提示
    ========================================================================== */
 

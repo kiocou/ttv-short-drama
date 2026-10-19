@@ -6,7 +6,27 @@ import { isTauriEnvironment } from '../../services/ipc';
 import { PlayerHud } from './PlayerHud';
 import { useBoostKeys } from './useBoostKeys';
 import { BoostToast } from './BoostToast';
-import { Loader2, AlertCircle, AlertTriangle, RefreshCw, SkipForward, Copy, X, Layers } from 'lucide-react';
+import { PlayerToast } from './PlayerToast';
+import { usePlayerToast, formatClock } from './usePlayerToast';
+import {
+  Loader2,
+  AlertCircle,
+  AlertTriangle,
+  RefreshCw,
+  SkipForward,
+  SkipBack,
+  Copy,
+  X,
+  Layers,
+  Play,
+  Pause,
+  Volume2,
+  VolumeX,
+  Maximize,
+  Minimize,
+  RotateCcw,
+  RotateCw,
+} from 'lucide-react';
 
 /**
  * 动漫专区播放器界面。
@@ -146,13 +166,76 @@ export const AnimeVideoSurface: React.FC = () => {
     bindVideo(element);
   }, [bindVideo]);
 
+  /**
+   * 画面中央的操作提示（与短剧播放器同一套，形态照 B 站）。
+   *
+   * 两个播放器共用键位，提示也必须共用：同一个空格键在短剧里闪「播放」、
+   * 在动漫里什么都不显示，就是最该消灭的那种不一致。
+   */
+  const {
+    toast: playerToast,
+    tick: playerToastTick,
+    show: showPlayerToast,
+  } = usePlayerToast();
+
+  /** 快进 / 快退 + 提示（普通跳转；加速期间的跳转由 BoostToast 负责）。 */
+  const seekWithToast = useCallback(
+    (delta: number) => {
+      const video = videoRef.current;
+      const duration = video?.duration ?? 0;
+      const hasDuration = Number.isFinite(duration) && duration > 0;
+      const target = Math.min(
+        hasDuration ? duration : Number.POSITIVE_INFINITY,
+        Math.max(0, (video?.currentTime ?? 0) + delta),
+      );
+      showPlayerToast({
+        key: delta >= 0 ? 'seek-forward' : 'seek-back',
+        icon: delta >= 0 ? <RotateCw className="w-10 h-10" /> : <RotateCcw className="w-10 h-10" />,
+        label: delta >= 0 ? `快进 ${Math.abs(delta)} 秒` : `快退 ${Math.abs(delta)} 秒`,
+        detail: hasDuration
+          ? `${formatClock(target)} / ${formatClock(duration)}`
+          : formatClock(target),
+      });
+      seekRelative(delta);
+    },
+    [seekRelative, showPlayerToast, videoRef],
+  );
+
+  /**
+   * 音量步进 + 提示（含"已到顶/已静音"的边界反馈）。
+   *
+   * 基准值读**媒体元素的真实音量**而不是闭包里的 `volume`：
+   * 按住 ↑↓ 时系统连续派发 keydown，而 React 的 state 提交是异步的 ——
+   * 同一帧内几条事件都会读到同一个旧值，导致"按住只加一格"。
+   * 详见 `VideoSurface.stepVolumeWithToast` 的注释（两处同一个修复）。
+   */
+  const stepVolumeWithToast = useCallback(
+    (delta: number) => {
+      const video = videoRef.current;
+      const base = video && Number.isFinite(video.volume) ? video.volume : volume;
+      const next = Math.min(1, Math.max(0, base + delta));
+      const atEdge = Math.abs(next - base) < 0.001;
+      const silent = next <= 0.001;
+      if (!atEdge) setVolume(next);
+      showPlayerToast({
+        key: atEdge ? 'volume-edge' : 'volume',
+        icon: silent ? <VolumeX className="w-10 h-10" /> : <Volume2 className="w-10 h-10" />,
+        label: silent ? '静音' : atEdge ? (delta > 0 ? '音量已满' : '音量已静音') : '音量',
+        detail: `${Math.round(next * 100)}%`,
+        // 传当前音量：圆底外圈会画一道进度弧，直观表达"现在多大音量"。
+        volume: next,
+      });
+    },
+    [volume, setVolume, showPlayerToast, videoRef],
+  );
+
   const boost = useBoostKeys({
     enabled: true,
     isLocked,
     getVideo: () => videoRef.current,
     getBaseRate: () => playbackRate,
-    seekRelative,
-    stepVolume: (delta) => setVolume(Math.min(1, Math.max(0, volume + delta))),
+    seekRelative: seekWithToast,
+    stepVolume: stepVolumeWithToast,
     onUserActivity: handleUserActivity,
     // 换集即结束加速：新一集会由 store 把 playbackRate 重置成基准倍速，
     // 而加速控制器若不自知，提示条会留在画面上、与实际倍速脱钩。
@@ -276,18 +359,39 @@ export const AnimeVideoSurface: React.FC = () => {
       switch (event.code) {
         case 'Space':
           event.preventDefault();
+          // 提示反映**切换后**的状态：`isPlaying` 是切换前的值，所以取反。
+          showPlayerToast({
+            key: 'playback',
+            icon: isPlaying ? <Pause className="w-10 h-10" /> : <Play className="w-10 h-10" />,
+            label: isPlaying ? '暂停' : '播放',
+          });
           togglePlay();
           break;
         case 'KeyF':
           event.preventDefault();
+          showPlayerToast({
+            key: 'fullscreen',
+            icon: isFullscreen ? <Minimize className="w-10 h-10" /> : <Maximize className="w-10 h-10" />,
+            label: isFullscreen ? '退出全屏' : '全屏播放',
+          });
           void toggleFullscreen();
           break;
         case 'BracketLeft':
           event.preventDefault();
+          showPlayerToast({
+            key: 'episode-prev',
+            icon: <SkipBack className="w-10 h-10" />,
+            label: '上一集',
+          });
           playPrev();
           break;
         case 'BracketRight':
           event.preventDefault();
+          showPlayerToast({
+            key: 'episode-next',
+            icon: <SkipForward className="w-10 h-10" />,
+            label: '下一集',
+          });
           playNext();
           break;
         case 'Escape':
@@ -332,10 +436,23 @@ export const AnimeVideoSurface: React.FC = () => {
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
+      // 双击进/退全屏：与键盘 F 同一套提示。
+      // 短剧播放器早就有这一条，动漫此前漏了 —— 同一款控制条两种手感。
+      showPlayerToast({
+        key: 'fullscreen',
+        icon: isFullscreen ? <Minimize className="w-10 h-10" /> : <Maximize className="w-10 h-10" />,
+        label: isFullscreen ? '退出全屏' : '全屏播放',
+      });
       void toggleFullscreen();
       return;
     }
     clickTimerRef.current = setTimeout(() => {
+      // 单击暂停/播放：提示要反映**切换后**的状态，所以按 isPlaying 取反。
+      showPlayerToast({
+        key: 'playback',
+        icon: isPlaying ? <Pause className="w-10 h-10" /> : <Play className="w-10 h-10" />,
+        label: isPlaying ? '暂停' : '播放',
+      });
       togglePlay();
       handleUserActivity();
       clickTimerRef.current = null;
@@ -391,6 +508,24 @@ export const AnimeVideoSurface: React.FC = () => {
       {boost && (
         <div className="absolute top-16 inset-x-0 z-50 pointer-events-none flex justify-center">
           <BoostToast level={boost.level} direction={boost.direction} />
+        </div>
+      )}
+
+      {/*
+        操作提示（空格 / ← → / ↑ ↓ / F / [ ]）：画面正中央闪一下就淡出。
+        与短剧播放器同一套组件与样式，保证两个播放器手感一致。
+
+        视觉重心略高于几何中心（padding-bottom: 40），用 padding 而非 translateY：
+        位移会引入额外合成层，可能影响 RTX VSR（不变量 26）。
+
+        外层容器条件渲染：没有提示时整块不挂载，不常留透明层。
+      */}
+      {playerToast && (
+        <div
+          className="absolute inset-0 z-50 pointer-events-none flex items-center justify-center"
+          style={{ paddingBottom: 40 }}
+        >
+          <PlayerToast payload={playerToast} tick={playerToastTick} />
         </div>
       )}
 

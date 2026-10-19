@@ -92,14 +92,18 @@ const label = parseSeasonLabel(`${BASE}第十四季`)!;
   const b0 = ids(sliceRelatedBatch(pool, 0));
   const b1 = ids(sliceRelatedBatch(pool, 1));
   const b2 = ids(sliceRelatedBatch(pool, 2));
-  // 2 季不足以铺满一屏 → 每屏 2 季 + 4 条兜底，兜底接着往后走。
+  // 2 季不足以铺满一屏 → 第 0 批 2 季 + 4 条兜底。
+  // 季卡**只展示一轮**：第 1 批起季卡已经全部展示完，整屏交给兜底。
   check('第0批 = 2季 + 兜底前4条', b0, ['sea1', 'sea2', 'o0', 'o1', 'o2', 'o3']);
-  check('第1批 = 2季 + 兜底次4条', b1, ['sea1', 'sea2', 'o4', 'o5', 'o6', 'o7']);
-  check('第2批 = 2季 + 兜底再次4条', b2, ['sea1', 'sea2', 'o8', 'o9', 'o10', 'o11']);
+  check('第1批 = 季卡已展示完，整屏兜底', b1, ['o4', 'o5', 'o6', 'o7', 'o8', 'o9']);
+  check('第2批 = 继续整屏兜底', b2, ['o10', 'o11', 'o0', 'o1', 'o2', 'o3']);
   check('第0批与第1批不同', JSON.stringify(b0) !== JSON.stringify(b1), true);
   check('第1批与第2批不同', JSON.stringify(b1) !== JSON.stringify(b2), true);
+  // 季卡铺 1 屏 + 12 条兜底被第 0 批用掉 4 条、剩 8 条 → 还能再撑 2 屏（6+2，最后一屏回绕）。
   check('可翻批数 = 3', relatedBatchCount(pool), 3);
   check('每批都恰好一屏', [b0, b1, b2].every(batch => batch.length === SLOT_COUNT), true);
+  // 季卡只出现一次，不在后续批次里重复。
+  check('季卡不会在后续批次重复', b1.some(id => id.startsWith('sea')), false);
 }
 
 // ── 3. 同系列超过一屏：季卡优先铺满，按批往后翻 ───────────────────
@@ -133,9 +137,9 @@ const label = parseSeasonLabel(`${BASE}第十四季`)!;
     others: [],
   };
   check('刚好一屏时只有 1 批', relatedBatchCount(pool), 1);
-  // 超出一屏时季卡钳制在最后一页（不塌成空屏，兜底为空则整屏仍是那 6 季）。
-  check('超出一屏时季卡停在最后一页', ids(sliceRelatedBatch(pool, 1)),
-    ['sea1', 'sea2', 'sea3', 'sea4', 'sea5', 'sea6']);
+  // 季卡只够一屏、没有兜底：第 1 批起已经没有内容可出（不是重复季卡）。
+  // 这条守着"季卡是优先展示、不是固定占位"的语义。
+  check('季卡展示完后不再重复', ids(sliceRelatedBatch(pool, 1)), []);
 }
 
 // ── 5. 端到端：池子要装得下不止一屏（首屏就拉满兜底） ──────────────

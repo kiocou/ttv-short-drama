@@ -834,6 +834,10 @@ def fetch_stream(session: requests.Session, vid: str, device_id: str,
 
     # duration 用于直连解密的进度换算（out_time_us / 总时长）。字段名按形状
     # 防御性取，取不到就退回"只有阶段提示"的进度，不影响任何功能。
+    #
+    # ⚠️ 这里只做"上游值"的收集，**不是最终时长**：`stream_cmd` 会再用
+    # `probe_duration_ms` 实测覆盖它（那才是给前端当进度条总长的值）。
+    # 别在这里再做一次探测——那会让每集多付一次 6 秒级的同步等待。
     duration_ms = 0
     for probe in (video_data.get("duration"), video_data.get("video_duration"),
                   video_data.get("video_time"), best.get("duration")):

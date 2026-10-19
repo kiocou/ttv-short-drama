@@ -363,7 +363,20 @@ function usableDuration(video: HTMLVideoElement): number {
     // 同上。
   }
   const candidates = ends.filter(value => Number.isFinite(value) && value > 0);
-  return candidates.length > 0 ? Math.max(...candidates) : 0;
+  if (candidates.length === 0) return 0;
+  const fallback = Math.max(...candidates);
+  /**
+   * ## 兜底值的下限保护（2026-10-19 修「断点续播时有时无」）
+   *
+   * `seekable` / `buffered` 的末端在**转码刚开始**时可能只有零点几秒
+   * （实测日志里出现过 `0.1s`）。把这个值当总时长会让 `percent` 直接爆到 100%，
+   * 于是 `isFinished` 被误置位、这一集从续播候选里消失。
+   *
+   * 1 秒以下一律视为"还没准备好"，返回 0 让调用方走 `duration=0` 分支
+   * （后端对 duration=0 只更新元数据、保留旧进度，不会把已有进度冲掉）。
+   * 这个阈值不设更高：真的只有 0.5 秒的源不存在，而"刚起播还没缓冲"极常见。
+   */
+  return fallback >= 1 ? fallback : 0;
 }
 
 /** 当前媒体元素最后一个连续缓冲区间的末端；没有可读区间时返回 0。 */
@@ -1911,7 +1924,41 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const safeDur = Number.isFinite(dur) && dur > 0 ? dur : 0;
     const safePos = Number.isFinite(pos) && pos > 0 ? Math.min(pos, safeDur > 0 ? safeDur : pos) : 0;
     const percent = safeDur > 0 ? Math.min(100, Math.max(0, Math.round((safePos / safeDur) * 100))) : 0;
-    const isFinished = percent >= 95;
+    /**
+     * 「这一集算看完了吗」——**剩余秒数是主判据，百分比只是辅助**。
+     *
+     * ## 为什么单看 95% 不行（2026-10-19 修「断点续播时有时无」）
+     *
+     * 短剧一集实测只有 33–68 秒。旧规则 `percent >= 95` 意味着：
+     *   - 60 秒的一集，看到 **57 秒**就被判「已看完」——还有 3 秒内容没看；
+     *   - 而所有续播入口都是 `watchedSeconds > 0 && !isFinished`（见 DetailView /
+     *     ExploreView），一旦置位，这一集就被跳过，用户重进播放器会从**别的集**
+     *     或第 1 集开始，表现就是"我明明看到一半，回来位置没了"。
+     *   - 更糟的是它**时有时无**：取决于退出那一刻是否刚好越过 95% 这条线。
+     *
+     * ## 为什么不能只看百分比（第一版修法踩到的坑）
+     *
+     * 第一版写成「percent >= 98 且剩余 <= 3」。但 20 秒的一集看到 19 秒时
+     * 剩余只有 1 秒、**确实看完了**，而 `Math.round(19/20*100)` = 95，
+     * 被 98% 挡在门外 —— 越短的集越难判完，方向正好反了。
+     *
+     * 现在用**剩余秒数 + 百分比双条件**，两者各自挡住一类误判：
+     *   - `剩余 <= 2 秒`  → 挡住"还有好几秒内容没看就算完"（旧 95% 的核心问题）
+     *   - `百分比 >= 95%` → 挡住"短集里剩余 2 秒其实占比很大"
+     *     （20 秒的集看到 18 秒还剩 2 秒 = 10%，不该算完）
+     *
+     * 这两个值是**一起调出来的**，见 `scripts/verify-resume.ts` 的 17 条边界用例：
+     *   - 60s 看到 57s（95%、剩 3s）→ 不算完 ✓
+     *   - 60s 看到 58s（97%、剩 2s）→ 算完   ✓
+     *   - 20s 看到 18s（90%、剩 2s）→ 不算完 ✓
+     *   - 20s 看到 19s（95%、剩 1s）→ 算完   ✓
+     * 单用秒数会把 20s/18s 误判成看完，单用百分比会把 20s/19s 误判成未完，都不行。
+     *
+     * 真正的"播到结尾"由 `ended` 事件走 `saveProgressThrottled(dur, dur, true)`
+     * 兜底（见 handleEnded），那条路径 position == duration，必然成立。
+     */
+    const remainingSeconds = safeDur > 0 ? Math.max(0, safeDur - safePos) : Number.POSITIVE_INFINITY;
+    const isFinished = safeDur > 0 && remainingSeconds <= 2 && percent >= 95;
 
     ipcService.history.save({
       seriesId: currentSeries.id,
@@ -2444,7 +2491,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           const syncTimeline = () => {
             if (activeSessionRef.current !== newSessionId) return;
             const dur = usableDuration(video);
-            if (dur > 0) setDuration(dur);
+            if (dur > 0) {
+              setDuration(dur);
+              // 打点：这条路径（guo 源 / 非红果链路）此前改时长不留痕，
+              // 排查"时长显示不对"时无法判断界面上的值来自哪条分支。
+              tracePlayback(
+                `时长同步（浏览器侧）= ${dur.toFixed(1)}s 来源=${
+                  Number.isFinite(video.duration) && video.duration > 0 ? 'video.duration' : 'seekable/buffered'
+                }`,
+              );
+            }
             const cur = Number.isFinite(video.currentTime) ? video.currentTime : 0;
             if (cur >= 0) setPosition(cur);
           };

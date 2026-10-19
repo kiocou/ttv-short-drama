@@ -1015,74 +1015,40 @@ async fn fetch_page_once(client: &Client, path: &str) -> Result<String, String> 
     String::from_utf8(bytes.to_vec()).map_err(|_| "目录响应不是 UTF-8。".into())
 }
 
-/// 抓一页；**系统代理不通时自动直连兜底**。
+/// 抓一页目录。**红果目录永远走直连，不经过系统代理。**
 ///
-/// ## 为什么必须有这条兜底
+/// ## 为什么红果必须直连（2026-10-19 实测定论）
 ///
-/// `update::with_system_proxy()` 会把注册表里的系统代理**无条件**挂到客户端上
-/// （`system_proxy()` 连 `ProxyOverride` 绕过表都没读）。而
-/// "Windows 系统代理开着、但那个端口其实已经不通"是极常见的状态——实测本机
-/// （2026-10-07）：
+/// 之前的策略是"先试代理，失败再直连兜底"。那个策略能救「代理端口已关」，
+/// 但救不了**代理能通却极慢**——而后者正是当前的真实状态。同一台机器、
+/// 同一个 URL、同一时刻的三轮实测：
 ///
 /// ```text
-/// 注册表 ProxyEnable=1 / ProxyServer=127.0.0.1:10808
-/// curl -x http://127.0.0.1:10808 https://hongguoduanju.com/category/comic-drama
-///   → exit 7（连接被拒）
-/// curl --noproxy '*' 同一个 URL
-///   → 200 / 317 KB / 1.1 s
+/// curl --noproxy '*'  https://hongguoduanju.com/category/comic-drama
+///   → 200 / 383 KB / 0.26 s、0.31 s、0.32 s     ← 稳定且快
+/// curl -x http://127.0.0.1:10808  同一个 URL
+///   → 000 / 20.0 s（超时，一个字节都没拿到）
+///   → 200 / 9.9 s
+///   → 000 / 20.0 s（超时）
 /// ```
 ///
-/// 没有兜底时，用户看到的是"浏览器打得开、应用报目录加载失败（1 个源均无响应）"，
-/// 而错误里只有一句 `error sending request`，完全指不到代理头上——那一轮排查
-/// 就是这么耗掉的。
+/// 代理（xray）把红果这条链路拖到 10–20 秒，而应用对目录请求的等待上限只有
+/// 6 秒 —— 于是用户看到的就是「目录加载失败（1 个源均无响应）」，并且**每次
+/// 翻页都要再赌一次**。这不是抖动，是稳定复现的劣化。
 ///
-/// ## 边界
+/// 红果是国内站点，直连本就是最优路径；系统代理通常是为了访问境外资源
+/// （本项目里真正需要它的是 GitHub 更新下载、以及部分境外图床），
+/// 把国内站也塞进代理纯属绕远路。所以这里直接定死：**目录请求不挂代理**。
 ///
-/// 兜底**只做一次**，不会把失败请求翻倍打给站方。
-///
-/// ## 一次性降级（2026-10-18 补）
-///
-/// 上面那条"先失败、再直连"的路径单次代价很小，但目录翻页是**每页一次**：
-/// 用户滚十屏就要多付十次连接被拒的往返（每次在 Windows 上是毫秒级，但
-/// 每页都要先撞一次墙纯属浪费）。更糟的是 `error 10061` 说明那个端口**根本
-/// 没人监听**，它不是抖动、不会自愈 —— 一旦确认失效，后续所有请求都该直接走直连。
-///
-/// 所以这里记一枚进程级标记：某次代理请求以"连接层失败"告终、而直连成功，
-/// 就把代理判死，之后不再尝试它。标记**不随请求清除** —— 代理配置若真的被
-/// 用户重新打开，重启应用即可恢复（那时 `DramaProvider::new()` 会用新配置重建
-/// 主客户端，本标记也随进程归零）。
-///
-/// 只认**连接层**失败：HTTP 4xx/5xx 是站方的问题，与代理是否可用无关，
-/// 那种情况不该把代理判死。
-async fn fetch_page_with_client(client: Client, path: String) -> Result<String, String> {
-    // 已判定代理失效：直接走直连，不再浪费一次往返。
-    if proxy_dead() {
-        let Some(direct) = fallback_direct_client() else {
-            return fetch_page_once(&client, &path).await;
-        };
-        return fetch_page_once(direct, &path).await;
-    }
-    match fetch_page_once(&client, &path).await {
-        Ok(body) => Ok(body),
-        Err(proxied_error) => {
-            let Some(direct) = fallback_direct_client() else {
-                return Err(proxied_error);
-            };
-            match fetch_page_once(direct, &path).await {
-                Ok(body) => {
-                    // 只有"连接层失败 + 直连成功"才判定代理已死。
-                    if is_connect_level_failure(&proxied_error) {
-                        mark_proxy_dead(&proxied_error);
-                    }
-                    eprintln!("[ttv] 系统代理不可用，已直连取回目录：{path}");
-                    Ok(body)
-                }
-                Err(direct_error) => {
-                    Err(format!("{proxied_error}；直连兜底同样失败：{direct_error}"))
-                }
-            }
-        }
-    }
+/// 保留 `client` 参数是为了调用方（以及将来可能出现的其它来源）不必改签名；
+/// 红果这一路不使用它。
+async fn fetch_page_with_client(_client: Client, path: String) -> Result<String, String> {
+    // 直连客户端是进程级复用的；拿不到才退回调用方给的那个（此时它可能挂了代理，
+    // 属于极端降级，但至少不会让整条链路直接失败）。
+    let Some(direct) = fallback_direct_client() else {
+        return Err("无法创建直连客户端。".to_string());
+    };
+    fetch_page_once(direct, &path).await
 }
 
 /// 代理是否已被判定失效（进程级，见 `fetch_page_with_client` 的注释）。
@@ -1112,6 +1078,17 @@ fn mark_proxy_dead(reason: &str) {
 /// reqwest 的 `Display` 会把这些包成一句话，真正的分类在 source 链里；
 /// `describe_request_error` 已经把它们拼进同一个字符串，这里按关键字判定。
 /// 刻意**不**包含 `HTTP 4xx/5xx`：那是站方的响应，代理是通的。
+///
+/// ## 当前没有调用点（2026-10-19）
+///
+/// 红果目录改成**无条件直连**后，不再需要"代理失败 → 判死 → 换直连"这条判定链
+/// （见 `fetch_page_with_client` 的注释）。保留它是为了两件事：
+///   1. `apply_proxy_mode` / `probe_proxy_on_startup` 仍靠 `mark_proxy_dead`
+///      维护"用户主动选直连"与"启动自检失败"这两个语义；
+///   2. 将来若有境外来源需要"先试代理再兜底"，这套判定可以直接复用。
+///
+/// 加 `allow(dead_code)` 而不是删掉：删了等于把这份踩坑结论一起丢掉。
+#[allow(dead_code)]
 fn is_connect_level_failure(text: &str) -> bool {
     const MARKERS: [&str; 6] = [
         "tcp connect error",

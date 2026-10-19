@@ -181,10 +181,11 @@ function seasonNumbers(slice: { seasons: { season: number }[] }): number[] {
   const afterSeasons = sliceRelatedBatch(pool, pages);
   const lastPage = sliceRelatedBatch(pool, pages - 1);
 
-  // 季卡只有 2 页，之后钳制在最后一页（不塌成空屏、不把主线换没）。
-  check('季卡页翻完后停在最后一页', seasonNumbers(afterSeasons),
-    seasonNumbers(lastPage));
-  check('季卡没被清空', afterSeasons.seasons.length > 0, true);
+  // 季卡只展示一轮：2 页铺完之后不再重复出季卡，整屏交给兜底。
+  // （旧语义是"钳制在最后一页"，会让季卡永远占着主卡位不动 ——
+  //  已按用户要求改为"优先展示但不固定"。）
+  check('季卡页翻完后不再重复出季卡', afterSeasons.seasons.length, 0);
+  check('季卡确实已经在前面展示过', lastPage.seasons.length > 0, true);
   check('仍是完整一屏', afterSeasons.seasons.length + afterSeasons.others.length, SLOT_COUNT);
 
   // 兜底内容必须接着往后走，不能每屏重复同一批。
@@ -196,8 +197,9 @@ function seasonNumbers(slice: { seasons: { season: number }[] }): number[] {
 
 // ── 7. 可翻批数：季卡页 + 兜底还能撑几屏 ─────────────────────────
 {
-  // 10 季 → 2 屏季卡：第一屏 6 季，第二屏 4 季 + 2 兜底。
-  // 第二屏只消耗 2 条兜底，之后每屏钳制在 4 季、固定消耗 2 条 → 20 条兜底能撑 9 屏。
+  // 10 季 → 2 屏季卡：第一屏 6 季，第二屏 4 季 + 2 条兜底。
+  // 季卡铺完之后不再占座，每屏满额消耗 6 条 → 20-2=18 条兜底撑 3 屏。
+  // 合计 2 + 3 = 5 屏。
   const pool: RelatedSeries = {
     seasons: Array.from({ length: 10 }, (_, index) => ({
       item: item(`s${index + 1}`, `${BASE}第${index + 1}季`),
@@ -206,7 +208,7 @@ function seasonNumbers(slice: { seasons: { season: number }[] }): number[] {
     })),
     others: Array.from({ length: 20 }, (_, index) => item(`o${index}`, `别的剧${index}`)),
   };
-  check('可翻批数 = 2 屏季卡 + 9 屏兜底 = 11', relatedBatchCount(pool), 11);
+  check('可翻批数 = 2 屏季卡 + 3 屏兜底 = 5', relatedBatchCount(pool), 5);
 }
 
 // ── 8. 每屏都不超过一屏，且季卡排完后仍能翻 ─────────────────────

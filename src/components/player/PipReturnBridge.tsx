@@ -56,6 +56,10 @@ async function saveHistory(
   const rawPosition = Number.isFinite(progress.position) && progress.position > 0 ? progress.position : 0;
   const position = duration > 0 ? Math.min(rawPosition, duration) : rawPosition;
   const percent = duration > 0 ? Math.min(100, Math.max(0, Math.round((position / duration) * 100))) : 0;
+  // 「算看完了吗」与两个播放器同一套判定（2026-10-19）：剩余 ≤3 秒且百分比 ≥90。
+  // 以秒数为主判据 —— 短集（20 秒看到 19 秒）只有 95%，用 98% 会误杀。
+  const remainingSeconds = duration > 0 ? Math.max(0, duration - position) : Number.POSITIVE_INFINITY;
+  const isFinished = duration > 0 && remainingSeconds <= 2 && percent >= 95;
   // 集号按"小窗最后在播的那一集"取：它可能已经自动连播到下一集了。
   const episodeNumber = handoff.episodes.find(item => item.id === episodeId)?.episodeNumber
     ?? handoff.episodeNumber;
@@ -72,7 +76,7 @@ async function saveHistory(
       durationSeconds: Math.floor(duration),
       progressPercent: percent,
       updatedAt: Date.now(),
-      isFinished: percent >= 95,
+      isFinished,
       channel: handoff.channel,
     });
   } catch (error) {

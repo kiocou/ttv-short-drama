@@ -321,8 +321,19 @@ export const ExploreView: React.FC = () => {
   }, [currentView, continueWatching]);
 
   const handleRandomWatch = useCallback((series: SeriesItem, detail: SeriesDetail) => {
-    const episode = detail.episodes.find(item => (item.watchedSeconds || 0) > 0 && !item.isFinished)
-      || detail.episodes[0];
+    /**
+     * 选哪一集：**有进度就回到那一集，不再排除 `isFinished`**。
+     *
+     * 与 DetailView 的 `lastWatchedEp` 同一语义（2026-10-19 修「断点续播时有时无」）：
+     * 旧写法排除 `isFinished`，而短剧一集只有 33–68 秒、看到 95% 就置位，
+     * 于是"随机看"会把人带去第一集，而不是上次看到的地方。
+     * 按集号取最大者 = 看得最远的那一集。
+     */
+    const episode =
+      [...detail.episodes]
+        .filter(item => (item.watchedSeconds || 0) > 0)
+        .sort((left, right) => right.episodeNumber - left.episodeNumber)[0] ||
+      detail.episodes[0];
     if (!episode) return;
     if (detail.type === 'anime') {
       void openAnimeEpisode(detail.id, episode.id, episode.watchedSeconds || 0);

@@ -10,9 +10,27 @@ import { tracePlayback } from '../../services/playbackTrace';
 import { PlayerControls } from './PlayerControls';
 import { useBoostKeys } from './useBoostKeys';
 import { BoostToast } from './BoostToast';
+import { PlayerToast } from './PlayerToast';
+import { usePlayerToast, formatClock } from './usePlayerToast';
 import { EpisodeDrawer } from './EpisodeDrawer';
 import { DiagnosticsModal } from './DiagnosticsModal';
-import { Loader2, AlertCircle, RefreshCw, Copy, X } from 'lucide-react';
+import {
+  Loader2,
+  AlertCircle,
+  RefreshCw,
+  Copy,
+  X,
+  Play,
+  Pause,
+  Volume2,
+  VolumeX,
+  Maximize,
+  Minimize,
+  SkipBack,
+  SkipForward,
+  RotateCcw,
+  RotateCw,
+} from 'lucide-react';
 
 export const VideoSurface: React.FC = () => {
   const {
@@ -37,6 +55,19 @@ export const VideoSurface: React.FC = () => {
     finishedAll,
     sessionId,
   } = usePlaybackStore();
+
+  /**
+   * 画面中央的操作提示（形态照 B 站播放器）。
+   *
+   * 每个快捷键都要有反馈：按了空格画面停了，用户得能分清"暂停了"还是"卡住了"；
+   * 按 ↑↓ 调音量，得看见具体数值；按 [ ] 切集，得知道切到了第几集。
+   * 提示内容由下面的各个处理函数在**动作发生时**调 `showPlayerToast` 决定。
+   */
+  const {
+    toast: playerToast,
+    tick: playerToastTick,
+    show: showPlayerToast,
+  } = usePlayerToast();
 
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
   // 返回详情页也在这里发起（而非 store 内部）：导航权归组件层，store 只出信号。
@@ -213,9 +244,21 @@ export const VideoSurface: React.FC = () => {
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
+      // 双击进/退全屏：与键盘 F 同一套提示，用户不必猜刚才那下是什么。
+      showPlayerToast({
+        key: 'fullscreen',
+        icon: isFullscreen ? <Minimize className="w-10 h-10" /> : <Maximize className="w-10 h-10" />,
+        label: isFullscreen ? '退出全屏' : '全屏播放',
+      });
       toggleFullscreen();
     } else {
       clickTimerRef.current = setTimeout(() => {
+        // 单击暂停/播放：提示要反映**切换后**的状态，所以按 isPlaying 取反。
+        showPlayerToast({
+          key: 'playback',
+          icon: isPlaying ? <Pause className="w-10 h-10" /> : <Play className="w-10 h-10" />,
+          label: isPlaying ? '暂停' : '播放',
+        });
         togglePlay();
         handleUserActivity();
         clickTimerRef.current = null;
@@ -236,13 +279,85 @@ export const VideoSurface: React.FC = () => {
    * **同一份**。此前只有这里接了长按加速，动漫按 ← / → 永远只是跳转 —— 同一款控制条
    * 两种手感，正是要消灭的不一致。
    */
+  /**
+   * 快进 / 快退 + 中央提示。
+   *
+   * 只在**普通跳转**时弹（长按进入加速由 BoostToast 负责，两者不会同时出现：
+   * `useBoostKeys` 在加速起效后会吞掉这次跳转，根本不会走到这里）。
+   *
+   * 提示里带「目标时间 / 总时长」：只写"快进 5 秒"用户还得自己算跳到哪了；
+   * 直接给出目标位置，一眼就知道落点对不对。
+   */
+  const seekWithToast = useCallback(
+    (delta: number) => {
+      const video = videoRef.current;
+      const duration = video?.duration ?? 0;
+      const target = Math.min(
+        Number.isFinite(duration) && duration > 0 ? duration : Number.POSITIVE_INFINITY,
+        Math.max(0, position + delta),
+      );
+      showPlayerToast({
+        key: delta >= 0 ? 'seek-forward' : 'seek-back',
+        icon: delta >= 0 ? <RotateCw className="w-10 h-10" /> : <RotateCcw className="w-10 h-10" />,
+        label: delta >= 0 ? `快进 ${Math.abs(delta)} 秒` : `快退 ${Math.abs(delta)} 秒`,
+        detail:
+          Number.isFinite(duration) && duration > 0
+            ? `${formatClock(target)} / ${formatClock(duration)}`
+            : formatClock(target),
+      });
+      seekRelative(delta);
+    },
+    [position, seekRelative, showPlayerToast, videoRef],
+  );
+
+  /**
+   * 音量步进 + 中央提示。
+   *
+   * 单独抽出来是因为它有**两个调用方**：`useBoostKeys` 的 ↑/↓（非加速时调音量），
+   * 以及键盘处理里的其它入口。提示只在真正发生音量变化时才弹——
+   * 已经 100% 时再按 ↑ 不该闪一个"音量 100%"让人以为又调大了，
+   * 但也得给一次反馈，否则用户会以为按键没生效。
+   *
+   * ## 基准值必须读"当下真实音量"，不能用闭包里的 `volume`（2026-10-19 修）
+   *
+   * 按住 ↑ / ↓ 时系统会连续派发 keydown（每秒十几条）。旧实现用闭包捕获的
+   * `volume` 算 `next = volume + delta`，而 React 的 state 提交是异步的 ——
+   * 同一帧内连续几条事件读到的都是**同一个旧值**，于是：
+   *   - 第一次按 0.5 → 0.6（生效）
+   *   - 紧接着的第二条仍读到 0.5 → 又算成 0.6（等于没动）
+   * 表现就是"按住只加一格，之后不涨了"。
+   *
+   * 现在以 `video.volume`（媒体元素的真实值，`setVolume` 里是同步写的）为基准，
+   * 保证每一档都在上一档的基础上累加。元素不存在时才退回 state。
+   */
+  const stepVolumeWithToast = useCallback(
+    (delta: number) => {
+      const video = videoRef.current;
+      // 优先读媒体元素的真实音量：它是同步写入的，不受 React 提交时机影响。
+      const base = video && Number.isFinite(video.volume) ? video.volume : volume;
+      const next = Math.min(1, Math.max(0, base + delta));
+      const atEdge = Math.abs(next - base) < 0.001;
+      const silent = next <= 0.001;
+      if (!atEdge) setVolume(next);
+      showPlayerToast({
+        key: atEdge ? 'volume-edge' : 'volume',
+        icon: silent ? <VolumeX className="w-10 h-10" /> : <Volume2 className="w-10 h-10" />,
+        label: silent ? '静音' : atEdge ? (delta > 0 ? '音量已满' : '音量已静音') : '音量',
+        detail: `${Math.round(next * 100)}%`,
+        // 传当前音量：圆底外圈会画一道进度弧，直观表达"现在多大音量"。
+        volume: next,
+      });
+    },
+    [volume, setVolume, showPlayerToast, videoRef],
+  );
+
   const boost = useBoostKeys({
     enabled: currentView === 'player',
     isLocked,
     getVideo: () => videoRef.current,
     getBaseRate: () => playbackRate,
-    seekRelative,
-    stepVolume: (delta) => setVolume(Math.min(1, Math.max(0, volume + delta))),
+    seekRelative: seekWithToast,
+    stepVolume: stepVolumeWithToast,
     onUserActivity: handleUserActivity,
     // 换集即结束加速：新一集由 store 把 playbackRate 重置成基准倍速，
     // 而加速控制器若不自知，提示条会留在画面上、与实际倍速脱钩。
@@ -264,19 +379,41 @@ export const VideoSurface: React.FC = () => {
       switch (e.code) {
         case 'Space':
           e.preventDefault();
+          // 提示要反映**切换后**的状态：`isPlaying` 是切换前的值，所以取反。
+          // 直接读切换后的值需要等 store 更新，这里用取反更即时也更稳。
+          showPlayerToast({
+            key: 'playback',
+            icon: isPlaying ? <Pause className="w-10 h-10" /> : <Play className="w-10 h-10" />,
+            label: isPlaying ? '暂停' : '播放',
+          });
           togglePlay();
           handleUserActivity();
           break;
         case 'KeyF':
           e.preventDefault();
+          showPlayerToast({
+            key: 'fullscreen',
+            icon: isFullscreen ? <Minimize className="w-10 h-10" /> : <Maximize className="w-10 h-10" />,
+            label: isFullscreen ? '退出全屏' : '全屏播放',
+          });
           toggleFullscreen();
           break;
         case 'BracketLeft': // [
           e.preventDefault();
+          showPlayerToast({
+            key: 'episode-prev',
+            icon: <SkipBack className="w-10 h-10" />,
+            label: '上一集',
+          });
           playPrevEpisode();
           break;
         case 'BracketRight': // ]
           e.preventDefault();
+          showPlayerToast({
+            key: 'episode-next',
+            icon: <SkipForward className="w-10 h-10" />,
+            label: '下一集',
+          });
           playNextEpisode();
           break;
         case 'Escape':
@@ -293,7 +430,7 @@ export const VideoSurface: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlay, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity, currentView, isLocked]);
+  }, [togglePlay, playPrevEpisode, playNextEpisode, toggleFullscreen, exitFullscreen, isFullscreen, handleUserActivity, currentView, isLocked, isPlaying, showPlayerToast]);
 
   // 全屏时给一个短暂的退出提示：纯原生全屏没有浏览器自带的全屏提示条，
   // 用户不一定会想到 Esc。
@@ -348,6 +485,30 @@ export const VideoSurface: React.FC = () => {
       {boost && (
         <div className="absolute top-6 inset-x-0 z-40 pointer-events-none flex justify-center">
           <BoostToast level={boost.level} direction={boost.direction} />
+        </div>
+      )}
+
+      {/*
+        操作提示（空格 / ← → / ↑ ↓ / F / [ ]）：画面正中央闪一下就淡出。
+
+        层级 z-40 与加速提示同级、但两者不会同时出现——加速期间 ← → 被
+        `useBoostKeys` 吞掉、↑ ↓ 改去换档，都不会走到这里的提示。
+        不挂在控制条里：控制条会自动隐藏，而提示需要在任何时刻都能看见。
+
+        视觉重心比几何中心略高（padding-bottom: 40）：纯居中时提示显得偏低。
+        用 padding 而不是 translateY —— 位移会引入额外合成层，而本舞台内任何
+        常驻 transform 都可能影响 RTX VSR（不变量 26）。padding 只改变 flex
+        的可用空间，把内容自然推上去，不产生新层。
+
+        **外层容器也条件渲染**：没有提示时整块不挂载，避免在播放器舞台上
+        常留一个 `absolute inset-0` 的透明层（它会参与命中测试与合成树遍历）。
+      */}
+      {playerToast && (
+        <div
+          className="absolute inset-0 z-40 pointer-events-none flex items-center justify-center"
+          style={{ paddingBottom: 40 }}
+        >
+          <PlayerToast payload={playerToast} tick={playerToastTick} />
         </div>
       )}
 

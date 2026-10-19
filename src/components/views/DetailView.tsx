@@ -282,8 +282,29 @@ export const DetailView: React.FC = () => {
       )
     : episodes;
 
-  // 检查是否有观看历史或从第一集开始
-  const lastWatchedEp = episodes.find(e => (e.watchedSeconds || 0) > 0 && !e.isFinished) || episodes[0] || null;
+  /**
+   * 「继续观看」锚点：**只要有进度就认，不再排除 `isFinished`**。
+   *
+   * ## 为什么去掉 `!e.isFinished`（2026-10-19 修「断点续播时有时无」）
+   *
+   * 旧写法是 `watchedSeconds > 0 && !isFinished`。而 `isFinished` 由前端
+   * `percent >= 95` 算出——短剧一集只有 33–68 秒，看到 95% 就置位，
+   * 于是这一集被**从续播候选中剔除**，用户重进播放器被带去看别的集。
+   *
+   * 现在 `isFinished` 的判定已收紧（98% 且剩余 ≤3 秒），但这里再兜一层：
+   * 就算某一集真的被标成看完，只要它有进度，仍然应该作为锚点——
+   * 用户点「继续观看」时的预期是"回到我上次看到的地方"，
+   * 而不是"因为我看完了，所以给你从第一集重来"。
+   *
+   * 排序按**集号最大**取（`EpisodeItem` 没有时间戳字段）：短剧是顺看，
+   * 看得最远的那一集就是最近看的那一集，这与"最近观看优先"等价。
+   */
+  const lastWatchedEp =
+    [...episodes]
+      .filter(e => (e.watchedSeconds || 0) > 0)
+      .sort((left, right) => right.episodeNumber - left.episodeNumber)[0] ||
+    episodes[0] ||
+    null;
 
   const handleStartPlay = (ep: EpisodeItem) => {
     setShowAllEpisodesModal(false);

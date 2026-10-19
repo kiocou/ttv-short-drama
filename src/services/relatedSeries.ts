@@ -252,32 +252,46 @@ function seasonsOnPage(totalSeasons: number, page: number): number {
   return Math.max(0, Math.min(SLOT_COUNT, totalSeasons - page * SLOT_COUNT));
 }
 
-/** 季卡一共铺满几屏。没有季卡时也算 1 屏（那 1 屏全给兜底内容）。 */
+/**
+ * 季卡一共铺满几屏。
+ *
+ * ## 没有季卡时是 0 屏，不是 1 屏（2026-10-19 修正）
+ *
+ * 旧实现返回 `max(1, ...)`，把"没有季卡"也算成 1 屏。那是为了兼容"第 0 批必须
+ * 有内容"的写法，但它带来一个副作用：`sliceRelatedBatch` 里的 `pages - 1` 会
+ * 变成 0，于是**季卡永远被钳制在第 0 页**，翻批时反复显示同一批季卡。
+ *
+ * 现在返回真实的屏数：0 表示"这一栏没有季卡，全部走兜底"。
+ */
 function seasonPageCount(totalSeasons: number): number {
-  return Math.max(1, Math.ceil(totalSeasons / SLOT_COUNT));
+  return Math.ceil(totalSeasons / SLOT_COUNT);
 }
 
 /**
  * 第 `batch` 屏开始前，兜底池已经被用掉了多少条。
  *
- * 为什么要精确算：兜底段要**接着往下走**而不是每屏从头开始，否则「换一批」翻到
- * 后半段会重复前面的内容。每屏消耗的条数等于"这一屏剩下的座位数"，而座位数又取决于
- * 这一屏有几张季卡——所以必须逐屏累加，不能用 `batch * 固定值` 近似。
+ * ## 为什么要精确算
  *
- * 季卡页走完之后，每屏的季卡数固定为最后一页的量（见 `sliceRelatedBatch` 的钳制），
- * 所以后续每屏消耗的兜底条数也固定。
+ * 兜底段要**接着往下走**而不是每屏从头开始，否则「换一批」翻到后半段会重复前面的
+ * 内容。每屏消耗的条数等于"这一屏剩下的座位数"，而座位数又取决于这一屏有几张季卡
+ * ——所以必须逐屏累加，不能用 `batch * 固定值` 近似。
+ *
+ * ## 季卡全部展示完之后（2026-10-19 修正）
+ *
+ * 旧实现假设"季卡页走完后每屏季卡数固定在最后一页的量"，也就是季卡会一直占座。
+ * 现在的规则是**季卡按接续顺序全部展示完，之后整屏交给兜底内容**，所以季卡页
+ * 走完之后每屏消耗的兜底条数就是 `SLOT_COUNT`（满屏），不再有季卡占座。
  */
 function othersConsumedBefore(totalSeasons: number, batch: number): number {
   const pages = seasonPageCount(totalSeasons);
-  const lastPageSeasons = seasonsOnPage(totalSeasons, pages - 1);
-  const settledPerPage = SLOT_COUNT - lastPageSeasons;
 
   let consumed = 0;
+  // 季卡还在铺的这几屏：每屏消耗「6 - 这一屏的季卡数」条兜底。
   for (let page = 0; page < Math.min(batch, pages); page += 1) {
     consumed += SLOT_COUNT - seasonsOnPage(totalSeasons, page);
   }
-  // 季卡页走完后，每屏的季卡数固定，兜底每屏固定消耗 `settledPerPage` 条。
-  if (batch > pages) consumed += (batch - pages) * settledPerPage;
+  // 季卡已经全部展示完：之后每屏都是满屏兜底。
+  if (batch > pages) consumed += (batch - pages) * SLOT_COUNT;
   return consumed;
 }
 
@@ -286,16 +300,17 @@ function othersConsumedBefore(totalSeasons: number, batch: number): number {
  *
  * = 季卡铺满的屏数 + 兜底内容还能再撑几屏。兜底池被季卡页"顺带消耗"掉的那部分
  * 要先扣掉，否则批数会虚高，翻到后面全是重复。
+ *
+ * 季卡全部展示完之后，每屏是满屏兜底（`SLOT_COUNT` 条），所以剩余屏数按它算。
  */
 export function relatedBatchCount(pool: RelatedSeries): number {
   const pages = seasonPageCount(pool.seasons.length);
   const consumedBySeasons = othersConsumedBefore(pool.seasons.length, pages);
   const restOthers = Math.max(0, pool.others.length - consumedBySeasons);
-  // 季卡页走完之后，每屏只消耗 `settledPerPage` 条兜底（季卡钳制在最后一页，仍占座）。
-  const lastPageSeasons = seasonsOnPage(pool.seasons.length, pages - 1);
-  const settledPerPage = Math.max(1, SLOT_COUNT - lastPageSeasons);
-  const extra = Math.ceil(restOthers / settledPerPage);
-  return pages + extra;
+  // 季卡走完后不再占座，每屏满额消耗兜底。
+  const extra = Math.ceil(restOthers / SLOT_COUNT);
+  // 没有任何内容时至少 1 屏（否则「换一批」会被判定为"没得翻"而卡住）。
+  return Math.max(1, pages + extra);
 }
 
 /**
@@ -307,14 +322,24 @@ export function relatedBatchCount(pool: RelatedSeries): number {
  * 搜同样的词、过同样的筛选排序，重拉必然得到同一批，点了完全没反应（用户报的 bug）。
  * 真正的"换"只能来自**在更大的池子里换一个起点**，这就是 `batch` 的作用。
  *
- * ## 排布规则：季卡优先占满整屏
+ * ## 排布规则：季卡优先，但按顺序全部展示完
  *
  * 每屏先放季卡，放不满才用兜底内容补位。正在看第 5 季、池子里有第 6~10 季时，
  * 第一屏就是「第6、第7、第8、第9、第10季」——**后续季优先**（`seasonOrder` 已按
  * "往后接、越近越前"排好），剩下的座位才轮到前作和同频道其它剧。
  *
- * 季卡翻完之后（`batch >= seasonPageCount`），这一屏不再出季卡，整屏给兜底内容，
- * 并继续往后推进。
+ * ## 季卡展示完就轮到兜底（2026-10-19 修正）
+ *
+ * 旧实现把季卡**钳制在最后一页**：翻批时季卡永远重复同一批，只有右侧兜底在变。
+ * 那让"季卡优先"退化成了"季卡固定"——用户看到的是一栏永远不动的主卡。
+ *
+ * 现在的规则是：
+ *   - 第 0 屏起按 `seasonOrder` 顺序把季卡**逐屏铺开**（后续季在前、越近越前）；
+ *   - 季卡全部展示完之后（`batch >= seasonPageCount`），**不再重复出季卡**，
+ *     整屏交给兜底内容；
+ *   - 排序始终由 `seasonOrder` 决定，不因翻批而打乱接续顺序。
+ *
+ * 也就是说：季卡是"优先展示"，不是"固定占位"。
  *
  * ## 回绕而不是留空
  *
@@ -326,20 +351,15 @@ export function relatedBatchCount(pool: RelatedSeries): number {
  */
 export function sliceRelatedBatch(pool: RelatedSeries, batch: number): RelatedSlice {
   const index = Math.max(0, Math.trunc(batch));
-  const pages = seasonPageCount(pool.seasons.length);
 
   /**
-   * 季卡段：前 `pages` 屏按页往后铺；**之后钳制在最后一页**，不再往下取空。
+   * 季卡段：按页往后铺，**铺完就停**（不钳制、不重复）。
    *
-   * 钳制而不是清空：季卡是这一栏的主体（"接着看下一季"），兜底只是补位。若在
-   * 兜底翻页时把季卡清空，用户连点几次「换一批」会看到季卡突然全消失、只剩别的剧
-   * ——那不是"换一批"，是"把主线换没了"（实测：2 季的池子第 2 批季卡全空）。
+   * `pool.seasons` 已由 `pickSeasons` 按 `seasonOrder` 排好序（后续季在前、
+   * 越近越前），这里只做切片，不重新排序——排序规则必须只有一处，
+   * 否则两处各写一份就会漂移成"角标按 A 排、卡面按 B 排"的错位。
    */
-  const seasonPage = Math.min(index, pages - 1);
-  const pickedSeasons = pool.seasons.slice(
-    seasonPage * SLOT_COUNT,
-    seasonPage * SLOT_COUNT + SLOT_COUNT,
-  );
+  const pickedSeasons = pool.seasons.slice(index * SLOT_COUNT, index * SLOT_COUNT + SLOT_COUNT);
 
   const remaining = SLOT_COUNT - pickedSeasons.length;
   if (remaining <= 0 || pool.others.length === 0) {

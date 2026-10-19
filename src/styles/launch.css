@@ -51,7 +51,27 @@
   display: grid;
   place-items: center;
   overflow: hidden;
-  cursor: pointer;
+  /*
+    ## 滚轮必须能穿透到下面的首页（2026-10-19 修「刚打开时滚轮没效果」）
+
+    这一层是 `position: absolute; inset: 0` 铺满全屏、z-index 70 —— 在它
+    存活的这 1.7–3.2 秒里，**所有指针与滚轮事件都被它接住**。而用户打开
+    应用的第一件事往往就是滚一下看看有什么剧，于是表现为
+    「刚打开时滚轮没反应，过一会儿又好了」——"过一会儿"正是它卸载的时刻。
+
+    置 `pointer-events: none` 之后，滚轮直接落到下面首页的
+    `overflow-y-auto` 容器上，启动动画期间也能正常滚动。
+
+    代价是"点画面任意处跳过动画"这条交互失效了。这是**有意的取舍**：
+      - 跳过还有三个入口：底部的显式提示按钮（下面单独恢复它的点击）、
+        Esc / 空格 / 回车（见 LaunchAnimation 的 keydown 监听）；
+      - 而"启动期间能不能滚首页"是打开应用时的**第一条**真实交互，
+        它比"点任意处跳过一段装饰动画"重要得多。
+
+    ⚠️ 不要给这一层加回 `pointer-events: auto`：它盖住的是**整个应用**，
+    不只是一块装饰区。
+  */
+  pointer-events: none;
   /* 与 .mica-backdrop 共用同一个变量，见 mica.css 的 --theme-backdrop */
   background: var(--theme-backdrop);
 }
@@ -61,6 +81,14 @@
    实现在 LaunchAnimation.tsx 的 skip() —— 先把壳层 cancel 回终态，
    再从那**一刻的真实不透明度**补一段新动画到 0，所以无论第几毫秒跳过都不闪回。 */
 
+/*
+  ⚠️ 这一层已经 `pointer-events: none`，所以"点任意处跳过"不再生效。
+  底部提示条要单独恢复可点，否则用户用鼠标就跳不过动画了。
+
+  注意：`opacity: 0` 只是视觉上淡出，元素仍然可点——这里靠父层的
+  `pointer-events: none` 保证它不吃掉首页的点击（提示条自身区域除外，
+  那是刻意的：它就是"跳过"按钮）。
+*/
 .ttv-launch-hint {
   position: absolute;
   right: 22px;
@@ -69,8 +97,43 @@
   font-weight: 600;
   letter-spacing: 0.06em;
   color: #94a3b8;
+  /*
+    按钮复位：它现在是 <button>（跳过动画的唯一鼠标入口），
+    要抹掉浏览器默认的边框/底色/字体，否则会出现一块系统灰按钮。
+  */
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 6px 10px;
+  margin: 0;
+  border-radius: 8px;
+  font-family: inherit;
+  cursor: pointer;
+  /*
+    ⚠️ 必须显式 auto：父层 `.ttv-launch` 是 pointer-events: none，
+    不恢复的话这个按钮同样点不到，鼠标用户就没有跳过入口了。
+  */
+  pointer-events: auto;
+  transition: color 0.15s ease, background 0.15s ease;
+  /*
+    opacity: 0 —— 这一条的显隐由 WAAPI 在时间线里驱动（见 startIdle / buildPhaseA），
+    这里给 0 只是"尚未被动画点亮"的初值。
+    注意：opacity: 0 的元素**仍然可点**，所以它不会因为"看不见"而变成隐形热区
+    ——时间线会在合适的时候把它淡进来。
+  */
   opacity: 0;
-  pointer-events: none;
+}
+
+/* 悬停：给一点"这确实能点"的反馈 */
+.ttv-launch-hint:hover {
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* 键盘聚焦时要有可见轮廓：这是唯一的跳过入口，不能只有鼠标能用 */
+.ttv-launch-hint:focus-visible {
+  outline: 2px solid rgba(148, 163, 184, 0.7);
+  outline-offset: 2px;
 }
 
 /* ── 轨道组：132×132 的居中盒，子元素全部绝对定位，靠 grid 对齐居中 ── */

@@ -185,13 +185,30 @@ export function useBoostKeys({
       const target = event.target as HTMLElement | null;
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
       if (!enabled || isLocked) return;
-      // 系统的按键重复每秒会再发十几条 keydown：不挡掉的话长按定时器会被不停重置，
-      // 永远到不了阈值；换档也会一次按住连跳好几档。
-      if (event.repeat) return;
+
+      /**
+       * ## 按键重复（长按）必须**按方向分别处理**（2026-10-19 修「长按 ↑↓ 不连续调音量」）
+       *
+       * 旧实现在 switch 之前一刀切 `if (event.repeat) return;`，把所有重复事件都挡掉了。
+       * 那条规则原本是为 ← / → 写的 —— 它们有"按住计时进加速"的状态机，
+       * 重复事件会把长按定时器不停重置，永远到不了阈值；换档也会一次按住连跳好几档。
+       *
+       * 但 ↑ / ↓ 是**离散步进**语义（音量 ±10%），用户按住时**本来就该连续调节**。
+       * 一刀切的结果是：按住 ↑↓ 只动一格就停，用户得一下下地敲 —— 这就是
+       * 「长按上下方向键没有连续添加音量」的直接原因。
+       *
+       * 现在把判定下沉到各分支：
+       *   - ← / →：仍然挡重复（加速状态机的需要）
+       *   - ↑ / ↓：放行重复（音量连续调节）
+       *   - Esc：挡重复（避免重复 cancel）
+       */
+      const isRepeat = event.repeat;
 
       switch (event.code) {
         case 'ArrowLeft':
         case 'ArrowRight':
+          // 长按加速的按下只认一次：重复事件会重置长按定时器，让加速永远起不来。
+          if (isRepeat) return;
           event.preventDefault();
           activityRef.current();
           heldArrowRef.current = event.code;
@@ -205,11 +222,18 @@ export function useBoostKeys({
           activityRef.current();
           const step = event.code === 'ArrowUp' ? -1 : 1;
           // 加速中换档，否则维持音量调节。
-          if (controller.isBoosting()) controller.cycleLevel(step);
-          else volumeRef.current(step === -1 ? 0.1 : -0.1);
+          // 加速期间**挡重复**：换档是离散动作，重复事件会让它一次连跳好几档。
+          // 非加速时**放行重复**：按住 ↑↓ 就该连续调音量。
+          if (controller.isBoosting()) {
+            if (isRepeat) return;
+            controller.cycleLevel(step);
+          } else {
+            volumeRef.current(step === -1 ? 0.1 : -0.1);
+          }
           break;
         }
         case 'Escape':
+          if (isRepeat) return;
           // 方向键卡在按住状态又按了 Esc 时，避免倍速留在加速值上。
           controller.cancel();
           break;
