@@ -582,6 +582,39 @@ const MAX_STREAM_RECOVER = 2;
 const STREAM_RECOVER_DELAY_MS = 1200;
 
 /**
+ * 一次播放生命周期内，流式源恢复的**总预算**（次数 + 时间）。
+ *
+ * ## 为什么需要总预算（2026-10-20）
+ *
+ * 恢复有三层，原本各自独立计数，叠加起来没有上界：
+ *
+ *   1. hls.js 内层：`MAX_IN_PLACE_RECOVERY`（2 次），每次自动重来；
+ *   2. 本层：`MAX_STREAM_RECOVER`（2 次），每次 1.2 秒后重新 open_stream；
+ *   3. 看门狗：10 秒停滞 → 原地重试 2 秒 → 重装载整集。
+ *
+ * 实测叠加结果（ttv-playback.log 会话 104）：100.8s 首次失败 → 247.2s 才把
+ * 内层额度耗尽 → 256.6s 才把本层额度耗尽，期间约 180 条 `fragLoadError`，
+ * 界面在缓冲态锁了 **158 秒**。用户看到的只有"卡住不动"，没有任何提示，
+ * 也没有出口。
+ *
+ * 现在给"同一集的同一份源"一个总账：次数与时间任一超限即进入终态，
+ * 如实报错而不是继续无声重试。终态必须让用户看见、并且可退出。
+ */
+const STREAM_RECOVERY_TOTAL_BUDGET = 4;
+const STREAM_RECOVERY_DEADLINE_MS = 25_000;
+
+/**
+ * 单次流式源恢复的总账。
+ *
+ * `episodeKey` 换了（换集）或 `resetStreamingSource()` 被调用时清零 ——
+ * 预算属于"这一集的这一份源"，不该跨集继承。
+ */
+interface StreamRecoveryLedger {
+  attempts: number;
+  startedAt: number;
+}
+
+/**
  * 出帧停滞看门狗（短剧链路）。
  *
  * 判定："本该在播"（非 paused、非 seeking）却连续 `PLAYBACK_STALL_MS` 既没有
@@ -846,6 +879,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 地址与自愈额度都属于"这一集的这一个源"，换源即失效。
     streamUrlRef.current = '';
     streamRecoverRef.current = 0;
+    // 恢复总账同理：次数与起点都属于"这一集的这一份源"。
+    streamRecoveryLedgerRef.current = null;
     // 挂起的那次自愈同理：它绑的是旧源的位置与旧会话，换源之后落地就是错的。
     cancelStreamRecover();
     // 时长权威值属于"这一集的这一个源"，换源即失效。
@@ -901,6 +936,39 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       streamRecoverTimerRef.current = null;
     }
   }, []);
+
+  /**
+   * 流式源恢复的总账（见 `STREAM_RECOVERY_TOTAL_BUDGET`）。
+   *
+   * 与 `streamRecoverRef` 的区别：那个是"还允许再重开几次"的**额度**，成功后
+   * 会回血；这个是"这一集的这一份源到底折腾了多久几次"的**总账**，只增不减，
+   * 因为它是"该不该放弃"的判据 —— 回血的话就又会变成无界重试。
+   */
+  const streamRecoveryLedgerRef = useRef<StreamRecoveryLedger | null>(null);
+
+  /**
+   * 申请一次恢复机会。返回 `null` 表示预算充足，否则返回"为什么耗尽"。
+   *
+   * 调用点必须在真正发起恢复**之前**调用它，这样超限时不会再多排一个定时器。
+   */
+  const claimStreamRecovery = (): { reason: string } | null => {
+    const now = performance.now();
+    const ledger = streamRecoveryLedgerRef.current
+      ?? { attempts: 0, startedAt: now };
+    streamRecoveryLedgerRef.current = ledger;
+    if (ledger.attempts >= STREAM_RECOVERY_TOTAL_BUDGET) {
+      return {
+        reason: `恢复次数已达上限（${ledger.attempts}/${STREAM_RECOVERY_TOTAL_BUDGET}）`,
+      };
+    }
+    if (now - ledger.startedAt >= STREAM_RECOVERY_DEADLINE_MS) {
+      return {
+        reason: `恢复总时长已超限（${Math.round(now - ledger.startedAt)}ms / ${STREAM_RECOVERY_DEADLINE_MS}ms）`,
+      };
+    }
+    ledger.attempts += 1;
+    return null;
+  };
 
 
   /**
@@ -2889,13 +2957,80 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
   };
 
-  const seek = (seconds: number) => {
+  const seek = (seconds: number, previewing = false) => {
     if (!videoRef.current) return;
-    // 用户手动拖进度 = 接管播放：撤销"全剧播完自动返回详情"的安排（若有）。
+    // 用户手动拖进度 = 接管播放：撤销"全剧播完自动返回首页"的安排（若有）。
     setFinishedAll(false);
     finishedAllEpisodeRef.current = null;
+    const video = videoRef.current;
     const clamped = Math.max(0, Math.min(seconds, duration || 0));
-    videoRef.current.currentTime = clamped;
+    /**
+     * 拖到「还没转好的位置」时，必须显式让后端续转 —— 否则会被浏览器夹回。
+     *
+     * ## 用户报的现象（2026-10-21）
+     *
+     * 「转码在 20 秒，我切到 30 秒，进度条会跳到 20 秒这里，不会跳到 30 秒；
+     *   如果在 25，我点开始还会跳到 25，并不会跳到 30 秒」
+     *
+     * ## 为什么会夹回
+     *
+     * 播放源是「边转边播」的整集 HLS：清单里此刻只有已切好的分片，于是
+     * `video.seekable.end()` 只到已转位置（20 秒）。MSE 规范要求 seek 目标落在
+     * **可寻址范围**内，超出范围时浏览器会把 `currentTime` 夹到范围末端 ——
+     * 于是赋值 30 秒后立刻回弹到 20 秒。用户看到的就是"拖不过去"。
+     *
+     * 而进度条显示用的 `duration` 是**源片真实时长**（权威值），所以滑块本身
+     * 允许拖到 30 秒 —— 两套时间基不一致，矛盾就暴露在这里。
+     *
+     * ## 处置
+     *
+     * 目标位置超出可寻址末端时，走「从该位置重新开播」：后端 `open_stream`
+     * 会按新位置续转（`start_video_cache` 会从 ENDLIST 判定继续写后续分片），
+     * 重新挂载后 seek 落在合法范围内。这与用户手动重开这一集的等价，
+     * 只是不用他手动。
+     */
+    let seekableEnd = 0;
+    try {
+      if (video.seekable && video.seekable.length > 0) {
+        seekableEnd = video.seekable.end(video.seekable.length - 1);
+      }
+    } catch {
+      // 尚未就绪的媒体元素访问 seekable 可能抛错：按"不可寻址"处理。
+    }
+    /**
+     * 只有「流式源 + 目标明显超出已转范围」才走续转。
+     *
+     * 留 0.5 秒容差：`seekable.end` 与用户拖的落点之间本就有几十毫秒误差，
+     * 卡死在等号上会让每次正常拖动都触发一次重开。
+     */
+    const beyondTranscoded = streamingSourceRef.current
+      && Number.isFinite(seekableEnd)
+      && seekableEnd > 0
+      && clamped > seekableEnd + 0.5;
+    // 拖动过程中只更新界面读数，不触发续转 —— 见 `onSeek` 的签名说明。
+    // 不这样的话，拖 3 秒会经过几十个像素，每个都发一次 open_stream。
+    if (beyondTranscoded && previewing) {
+      setPosition(clamped);
+      return;
+    }
+    if (beyondTranscoded) {
+      tracePlayback(
+        `拖动到未转码区域 目标=${clamped.toFixed(1)}s 可寻址末端=${seekableEnd.toFixed(1)}s 会话=${activeSessionRef.current}（从该位置续转）`,
+      );
+      // 先记下位置：即便后面重开失败，续播点也不至于丢。
+      setPosition(clamped);
+      saveProgressThrottled(clamped, duration, true);
+      const ctx = handlerCtxRef.current;
+      if (ctx.currentSeries && ctx.currentEpisode) {
+        void openEpisodeRef.current(
+          ctx.currentSeries.id,
+          ctx.currentEpisode.id,
+          clamped,
+        );
+      }
+      return;
+    }
+    video.currentTime = clamped;
     setPosition(clamped);
     saveProgressThrottled(clamped, duration, true);
   };
@@ -3631,7 +3766,28 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // 末尾复核也要收：它采样的是"出错前"的元素状态，自愈换源之后
         // 那次采样对新源毫无意义，落地只会把界面按在 buffering 上。
         cancelTailProbe();
-        if ((streamUrl || (ctx.currentSeries && ctx.currentEpisode)) && streamRecoverRef.current < MAX_STREAM_RECOVER) {
+        /**
+         * 先问总账要不要继续（2026-10-20）。
+         *
+         * 这一层与 hls.js 内层（`MAX_IN_PLACE_RECOVERY`）原本各管各的计数，
+         * 叠起来没有上界：实测一次卡顿里两层轮流重试，界面锁在缓冲态 158 秒，
+         * 用户既看不到原因也没有出口。现在次数或总时长任一超限就进入终态。
+         */
+        const canRecover = (streamUrl || (ctx.currentSeries && ctx.currentEpisode))
+          && streamRecoverRef.current < MAX_STREAM_RECOVER;
+        const budgetDenied = canRecover ? claimStreamRecovery() : null;
+        if (budgetDenied) {
+          tracePlayback(`流式源恢复预算耗尽，停止重试：${budgetDenied.reason}`);
+          setIsPlaying(false);
+          setUiState({
+            kind: 'error',
+            sessionId: activeSessionRef.current,
+            code: 'MEDIA_LOAD_FAILED',
+            recoverable: true,
+          });
+          return;
+        }
+        if (canRecover) {
           streamRecoverRef.current += 1;
           const attempt = streamRecoverRef.current;
           const sessionAtRecover = activeSessionRef.current;

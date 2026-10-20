@@ -4,7 +4,14 @@ interface ProgressBarProps {
   position: number;
   duration: number;
   buffered: number;
-  onSeek: (seconds: number) => void;
+  /**
+   * 落点变更。第二个参数表示"这次只是拖动过程中的预览，还没松手"。
+   *
+   * 为什么需要它（2026-10-21）：拖到未转码区域时，上层要向后端请求续转
+   * （`open_stream`）。如果不区分预览与落定，一次拖动经过的每个像素都会发一次
+   * 续转请求 —— 拖 3 秒能发几十次，每次都重建会话。
+   */
+  onSeek: (seconds: number, previewing?: boolean) => void;
 }
 
 /**
@@ -60,15 +67,25 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const ratio = ratioFromClientX(e.clientX);
     setHoverRatio(ratio);
-    if (isScrubbing && ratio !== null) onSeek(ratio * duration);
+    // 拖动过程中只做**预览**：真正落定交给 pointerup。
+    //
+    // 理由见 `onSeek` 的签名说明：未转码区的落定会触发一次后端续转，
+    // 拖动过程中每个像素都落定的话，拖 3 秒能发出几十次重建请求。
+    if (isScrubbing && ratio !== null) onSeek(ratio * duration, true);
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const wasScrubbing = isScrubbing;
     setIsScrubbing(false);
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch {
       // 指针已被释放时忽略
+    }
+    // 松手这一刻才真正落定：补一次最终落点，续转只发这一次。
+    if (wasScrubbing) {
+      const ratio = ratioFromClientX(e.clientX);
+      if (ratio !== null) onSeek(ratio * duration);
     }
   };
 

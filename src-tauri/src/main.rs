@@ -1383,14 +1383,48 @@ fn app_storage_root() -> Option<PathBuf> {
 
 /// 配置 WebView2 启动参数。
 ///
-/// 两件事：
+/// 三件事：
 /// 1. 确保开启 `PlatformHEVCDecoderSupport` —— 没有它，HEVC 源流无法播放。
 /// 2. 剔除 `--disable-gpu-compositing` —— 那是当年 C 盘写满导致黑屏时的兜底，
 ///    如今 user-data 已迁到可写盘、根因消除；而它会把渲染与解码压回软件路径，
 ///    既让 30 处 backdrop-blur 异常昂贵，也会让平台 HEVC 硬解走不通。
-///    保留用户/脚本传入的其他参数，只做追加与剔除，不整体覆盖。
+/// 3. 关闭后台节流（2026-10-21）—— 见下面 `ANTI_THROTTLE_ARGS` 的说明。
+///
+/// 保留用户/脚本传入的其他参数，只做追加与剔除，不整体覆盖。
 fn configure_webview_browser_arguments() {
     const HEVC_FEATURE: &str = "PlatformHEVCDecoderSupport";
+    /**
+     * 禁止 WebView2 在窗口失焦/被遮挡/最小化时冻结或降频渲染进程。
+     *
+     * ## 为什么必须显式写在这里，而不是只写进 `tauri.conf.json`
+     *
+     * `tauri.conf.json` 的 `additionalBrowserArgs` 由 Tauri **在 Builder 启动时**
+     * 写进 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`，而本函数在那之前就执行了
+     * （见调用点：它排在 `tauri::Builder::default()` 前面）。所以从这里读到的
+     * 环境变量是空串，`set_var` 反而会把 conf 里的配置**整个盖掉**。
+     *
+     * 实测（ttv-playback.log，2026-10-21）：
+     *   日志打出「WebView2 启动参数：--enable-features=PlatformHEVCDecoderSupport」
+     *   —— conf 里那三条 anti-throttle 参数一条都没进去。
+     * 于是播放时"收起窗口"会触发 Chromium 的后台节流：JS 定时器被降到 1 秒/次
+     * 甚至整个渲染进程被冻结，表现为**画面停住、日志空白 12~32 秒**，
+     * 恢复后播放位置一次性追上。用户侧的感受就是"卡了一下，缓冲一下"。
+     *
+     * ## 为什么这三条是必需的（缺一不可）
+     *
+     *   - `--disable-background-timer-throttling`
+     *     不让后台页面的 setTimeout/setInterval 降频。播放器的进度心跳、
+     *     末尾复核、看门狗全靠定时器 —— 被降频就等于全部失灵。
+     *   - `--disable-backgrounding-occluded-windows`
+     *     窗口被其它窗口遮住时不降级。用户"收起播放器去看别的"正是这个场景。
+     *   - `--disable-renderer-backgrounding`
+     *     不让渲染进程进入后台优先级，避免整个 JS 线程被挂起。
+     */
+    const ANTI_THROTTLE_ARGS: [&str; 3] = [
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+    ];
     let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
 
     // 保留有效参数，丢弃已过时的软件光栅开关。
@@ -1412,6 +1446,13 @@ fn configure_webview_browser_arguments() {
             }
         }
         None => kept.push(format!("--enable-features={HEVC_FEATURE}")),
+    }
+
+    // 补齐反节流参数（幂等：已存在的不重复追加）。
+    for arg in ANTI_THROTTLE_ARGS {
+        if !kept.iter().any(|existing| existing == arg) {
+            kept.push(arg.to_string());
+        }
     }
 
     let merged = kept.join(" ");

@@ -61,6 +61,90 @@ fn media_root() -> PathBuf {
     crate::short_drama_app::cache_dir().join("rtx-vsr")
 }
 
+/// 产物身份（ArtifactId）—— **一份 HLS 产物目录的不可变名字**。
+///
+/// ## 为什么需要它（2026-10-20）
+///
+/// 旧 URL 形态是 `/rtx/{session_id}/index.m3u8`：唯一的身份是**播放会话号**，
+/// 而会话号会被反复复用。实测日志里同一个会话号 104 先后指向两份完全不同的
+/// 产物：
+///
+/// ```text
+/// [+ 54.6s] 流式开播 vid=7696136695548234777 会话=104
+/// [+200.9s] 流式开播 vid=7679731146971696152 会话=104   ← 换集，同一会话号
+/// ```
+///
+/// 后端 `register_reused(104, 新目录)` 会把 104 从旧目录摘走、挂到新目录上。
+/// 于是任何仍持有旧 URL 的请求（旧 hls 实例、画中画窗口、自愈续体）在换集后
+/// 都会**静默读到另一集的内容**，或者命中一个不存在的分片。
+///
+/// 目录名本身就是天然不可变的身份（`vid-{vid}` 按内容建、`{session}-{uuid}`
+/// 带随机后缀），所以直接把它放回 URL 即可：
+///
+/// ```text
+/// /rtx/{session_id}/{artifact}/index.m3u8
+///             ^^^^^^^^^^ 不可变：一旦生成，永远指向同一份产物
+/// ```
+///
+/// `session_id` 保留在路径里只为兼容既有日志与旧地址，**不再参与目录解析**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactId(String);
+
+impl ArtifactId {
+    /// 从目录名构造。只接受 `[A-Za-z0-9._-]` 且非空、不以点开头。
+    ///
+    /// 这条校验是**安全边界**，不是格式洁癖：`artifact` 直接来自 HTTP 路径，
+    /// 若不校验就能用 `..%2f` 之类跳出 `media_root()` 读到任意文件。
+    fn parse(raw: &str) -> Option<Self> {
+        if raw.is_empty() || raw.len() > 128 {
+            return None;
+        }
+        // 不允许 `.` / `..`，也不允许以点开头（隐藏文件、相对路径跳转）。
+        if raw.starts_with('.') {
+            return None;
+        }
+        let ok = raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        // 连续的点同样要挡：`a..b` 在 Windows 上会被折叠。
+        if !ok || raw.contains("..") {
+            return None;
+        }
+        Some(Self(raw.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// 解析成绝对目录。**只做拼接，不做存在性判断**（调用方按需检查）。
+    fn directory(&self) -> PathBuf {
+        media_root().join(&self.0)
+    }
+
+    /// 由目录反推身份：只接受直接位于 `media_root()` 下的一级子目录。
+    fn from_directory(directory: &std::path::Path) -> Option<Self> {
+        let name = directory.file_name()?.to_str()?;
+        let candidate = Self::parse(name)?;
+        // 必须是 media_root 的直接子目录，避免把深层路径当身份。
+        let expected = media_root().join(&candidate.0);
+        (expected == directory).then_some(candidate)
+    }
+}
+
+/// 本地 HLS 播放地址。
+///
+/// 形态为 `/rtx/{session_id}/{artifact}/index.m3u8`：`artifact` 决定读哪份产物，
+/// `session_id` 只是日志与兼容用途。清单里 `init.mp4` 与 `seg-*.m4s` 由
+/// `rewrite_local_playlist` 补成**同一目录下的相对路径**，因此它们天然共用同一个
+/// ArtifactId —— 不会出现"清单来自 A、分片来自 B"的串线。
+fn artifact_url(port: u16, session_id: u64, artifact: &ArtifactId, token: &str) -> String {
+    format!(
+        "http://127.0.0.1:{port}/rtx/{session_id}/{}/index.m3u8?token={token}",
+        artifact.as_str()
+    )
+}
+
 /// 只处理确实能由 ffmpeg 输入的 http(s) 源。asset/本地文件由红果 worker
 /// 直接产出 H.264，不需要在这里二次转码。
 pub fn needs_enhancement(url: &str) -> bool {
@@ -699,15 +783,18 @@ pub async fn start_video_cache(
     if let Ok(body) = std::fs::read_to_string(&playlist) {
         if body.contains("#EXT-X-ENDLIST") && directory.join("init.mp4").is_file() {
             let info = ensure_server().await?;
-            let url = format!(
-                "http://127.0.0.1:{}/rtx/{}/index.m3u8?token={}",
-                info.port, session_id, info.token
-            );
-            // 复用目录必须重新挂进 jobs 表：本地服务是按 session 找目录的，
-            // 而这次会话是新的（新的 session_id），表里没有它的映射。
+            // 地址里钉死产物身份（目录名），会话号只作兼容：换集后旧 URL 仍指向
+            // 原来那份产物，不会串到新目录。
+            let artifact = ArtifactId::from_directory(&directory)
+                .ok_or_else(|| "产物目录名无法作为 ArtifactId。".to_string())?;
+            let url = artifact_url(info.port, session_id, &artifact, &info.token);
+            // 复用目录必须重新挂进 jobs 表：会话号是这次新的，表里还没有映射。
+            // ⚠️ 但**它只用于进程生命周期管理**（stop / 取消 / 淘汰），
+            // 读文件时按 ArtifactId 定位，不看这张表。
             register_reused(session_id, directory.clone());
             crate::trace::log(format!(
-                "[vsr] 复用已转好的整集 HLS 会话={session_id} vid={vid}（未起转码）"
+                "[vsr] 复用已转好的整集 HLS 会话={session_id} vid={vid} 产物={}（未起转码）",
+                artifact.as_str()
             ));
             return Ok(url);
         }
@@ -722,13 +809,15 @@ pub async fn start_video_cache(
     // 处置：把正在转的那条会话的目录**挂到本次会话号上**，共用同一次转码。
     if let Some(existing) = directory_of_inflight_vid(&directory) {
         let info = ensure_server().await?;
-        let url = format!(
-            "http://127.0.0.1:{}/rtx/{}/index.m3u8?token={}",
-            info.port, session_id, info.token
-        );
+        // 共用产物时同样钉住**那份产物**的身份（可能是别的会话目录），
+        // 而不是本次会话号 —— 否则本会话的自愈重挂会指向一个空目录。
+        let artifact = ArtifactId::from_directory(&existing)
+            .ok_or_else(|| "共用产物目录名无法作为 ArtifactId。".to_string())?;
+        let url = artifact_url(info.port, session_id, &artifact, &info.token);
         register_reused(session_id, existing);
         crate::trace::log(format!(
-            "[vsr] 同一 vid 正在转码，共用产物 会话={session_id} vid={vid}"
+            "[vsr] 同一 vid 正在转码，共用产物 会话={session_id} vid={vid} 产物={}",
+            artifact.as_str()
         ));
         return Ok(url);
     }
@@ -1182,10 +1271,12 @@ async fn start_in_directory(
     // 而它之所以要按住，正是因为当时前端没有重试，早返回必然判死。
     //
     // 只有 ffmpeg 进程真的退出且没留下任何产物，才算起不来，回退原始 URL。
-    let url = format!(
-        "http://127.0.0.1:{}/rtx/{}/index.m3u8?token={}",
-        info.port, session_id, info.token
-    );
+    //
+    // 地址钉住**产物身份**（目录名）而不是会话号：会话号会被后续换集复用，
+    // 而目录名一旦确定就不再变（见 `ArtifactId` 的说明）。
+    let artifact = ArtifactId::from_directory(&directory)
+        .ok_or_else(|| "产物目录名无法作为 ArtifactId。".to_string())?;
+    let url = artifact_url(info.port, session_id, &artifact, &info.token);
     // 就绪条件同时要求 `init.mp4` 存在。它是 fMP4 的首片（播放列表里的
     // `#EXT-X-MAP`），缺了它 hls.js 连解封装都起不来；只等 playlist 会在
     // "列表已写、init 还没落"的那一瞬把一个必然失败的地址交出去。
@@ -1479,11 +1570,63 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
         write_plain(&mut socket, "404 Not Found", "增强播放资源不存在").await?;
         return Ok(());
     };
-    let Some(session_text) = path.split('/').nth(2) else {
-        write_plain(&mut socket, "404 Not Found", "增强播放资源不存在").await?;
-        return Ok(());
-    };
-    let Ok(session_id) = session_text.parse::<u64>() else {
+    // 路径形态：/rtx/{session_id}/{artifact}/{file}
+    //
+    // ⚠️ 读文件时**按 artifact 定位**，session_id 不参与解析（2026-10-20）。
+    //
+    // 旧实现只认 session_id，去任务表里查目录 —— 而任务表是可变的：
+    // `register_reused` 会把同一个会话号从旧目录摘走挂到新目录。于是换集之后，
+    // 任何仍持有旧 URL 的请求（旧 hls 实例、画中画窗口、自愈续体）都会静默
+    // 读到**另一集的内容**，或者命中一个不存在的分片。
+    //
+    // artifact 是目录名，天然不可变：`vid-{vid}` 按内容建、`{session}-{uuid}`
+    // 带随机后缀。所以它可以直接当身份用，不需要任何查找表。
+    //
+    // 形态判定**必须按段数**，不能看 `nth(3)` 是否存在 ——
+    // `/rtx/104/index.m3u8` 的 `nth(3)` 恰好是文件名 `index.m3u8`，
+    // 拿它当 artifact 会让旧地址走进新分支、把文件名当目录名。
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // 新形态：["rtx", session, artifact, file]；旧形态：["rtx", session, file]
+    let is_new_shape = segments.len() >= 4;
+    if !is_new_shape {
+        // 旧形态 /rtx/{session_id}/{file}：兼容一个版本。
+        //
+        // 这类地址只可能来自升级前已经打开的播放器。它按会话表解析，
+        // 因此**保留旧的串线风险**，但会打一条日志便于确认何时可以删除。
+        let Ok(session_id) = segments.get(1).copied().unwrap_or_default().parse::<u64>() else {
+            write_plain(&mut socket, "404 Not Found", "增强播放资源不存在").await?;
+            return Ok(());
+        };
+        if !matches!(file_name, "index.m3u8" | "init.mp4") && !is_segment(file_name) {
+            write_plain(&mut socket, "404 Not Found", "增强播放资源不存在").await?;
+            return Ok(());
+        }
+        crate::trace::log(format!(
+            "[vsr] 本地服务：收到旧形态地址（按会话表解析）会话={session_id} 文件={file_name}"
+        ));
+        let Some(directory) = jobs()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&session_id).map(|job| job.directory.clone()))
+        else {
+            write_plain(&mut socket, "410 Gone", "增强播放会话已结束").await?;
+            return Ok(());
+        };
+        return serve_artifact_file(
+            &mut socket,
+            &directory,
+            session_id,
+            file_name,
+            &server.token,
+            &method,
+            &request,
+        )
+        .await;
+    }
+    let artifact_raw = segments[2];
+    // session_id 仍然解析一遍：只用于日志与旧任务状态判断，**不决定目录**。
+    let session_id = segments[1].parse::<u64>().unwrap_or(0);
+    let Some(artifact) = ArtifactId::parse(artifact_raw) else {
         write_plain(&mut socket, "404 Not Found", "增强播放资源不存在").await?;
         return Ok(());
     };
@@ -1491,21 +1634,48 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
         write_plain(&mut socket, "404 Not Found", "增强播放资源不存在").await?;
         return Ok(());
     }
-    let Some(directory) = jobs()
-        .lock()
-        .ok()
-        .and_then(|guard| guard.get(&session_id).map(|job| job.directory.clone()))
-    else {
-        // 会话已经不在任务表里（被 stop / 正常结束 / 切集）——这块产物不会再有新分片。
-        // 返 410 而不是 404：4xx 让 hls.js 立刻 fatal，前端随即重新 open_stream；
-        // 404 会让它把 24 次重试预算全花在一个永远不会出现的文件上。
-        write_plain(&mut socket, "410 Gone", "增强播放会话已结束").await?;
+    let directory = artifact.directory();
+    if !directory.is_dir() {
+        // 产物目录真的不在了（被缓存预算淘汰 / 从未存在）。这是永久失效，
+        // 与"会话被换掉"是两回事，410 在这里是诚实的。
+        crate::trace::log(format!(
+            "[vsr] 本地服务：产物不存在 产物={} 会话={session_id} 文件={file_name}",
+            artifact.as_str()
+        ));
+        write_plain(&mut socket, "410 Gone", "增强播放产物不存在").await?;
         return Ok(());
-    };
+    }
+    return serve_artifact_file(
+        &mut socket,
+        &directory,
+        session_id,
+        file_name,
+        &server.token,
+        &method,
+        &request,
+    )
+    .await;
+}
+
+/// 按目录提供清单/分片。`directory` 已由调用方按 **ArtifactId** 解析完毕。
+///
+/// `method` 与 `request` 从外层 handler 传进来：清单分支要判 HEAD，分片分支要读
+/// Range 头。它们属于**这一次 HTTP 请求**，与"读哪份产物"无关，所以不该由本函数
+/// 重新解析。
+#[allow(clippy::too_many_lines)]
+async fn serve_artifact_file(
+    socket: &mut TcpStream,
+    directory: &std::path::Path,
+    session_id: u64,
+    file_name: &str,
+    token: &str,
+    method: &str,
+    request: &str,
+) -> std::io::Result<()> {
     let file_path = directory.join(file_name);
     if file_name == "index.m3u8" {
         let body = std::fs::read_to_string(&file_path).unwrap_or_default();
-        let rewritten = rewrite_local_playlist(&body, &server.token);
+        let rewritten = rewrite_local_playlist(&body, token);
         // ⚠️ 清单还没写出有效内容时**必须返 5xx**，绝不能返 200 空清单。
         //
         // 为什么：hls.js 对"拿到了完整响应但内容是空的"的解读只有一个 ——
@@ -1516,8 +1686,12 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
         // 而"暂时还没准备好"应当用 **503** 表达：hls.js 的 `manifestLoadError` 会走
         // `shouldRetry` → `retryForHttpStatus`，**对 5xx 重试、对 4xx 不重试**，因此
         // 配上调用方的 `manifestLoadingMaxRetry: 4` 正好让它自己等到 ffmpeg 吐出首片。
-        // （返 404 是错的：4xx 不重试。分片路径上的 404 之所以没事，是因为 hls.js 对
-        //  分片另有 `fragLoadingMaxRetry` 那条不同的重试路径。）
+        //
+        // ⚠️ 2026-10-20 更正：这里原本写着"分片路径上的 404 之所以没事，是因为
+        // hls.js 对分片另有 `fragLoadingMaxRetry` 那条不同的重试路径"——**那句是错的**。
+        // `fragLoadingMaxRetry` 只管"重试几次"，而"要不要重试"由同一个
+        // `retryForHttpStatus()` 决定，它对所有 4xx 一律返回 false。也就是说
+        // 分片路径上的 404 与 410 一样，第一次就 fatal，重试预算一次都用不上。
         //
         // 空清单只有一种成因：ffmpeg 刚起、还没来得及 prime 出播放列表。实测从起进程
         // 到清单首次含 `#EXTINF` 是 1011ms，这段窗口踩中的概率不低——用户那次 15.7 秒
@@ -1539,12 +1713,7 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
             crate::trace::log(format!(
                 "[vsr] 本地服务：清单尚未就绪 会话={session_id}（返 503 让播放器重试）"
             ));
-            write_plain(
-                &mut socket,
-                "503 Service Unavailable",
-                "增强播放清单尚未就绪",
-            )
-            .await?;
+            write_plain(socket, "503 Service Unavailable", "增强播放清单尚未就绪").await?;
             return Ok(());
         }
         // 播放器每次重新拉清单都会打一行：清单已经被拉了几次，直接反映"卡了多久"。
@@ -1557,7 +1726,7 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
             cors_headers()
         );
         write_head(
-            &mut socket,
+            socket,
             "200 OK",
             &headers,
             rewritten.len() as u64,
@@ -1574,14 +1743,15 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
     let Ok(metadata) = std::fs::metadata(&file_path) else {
         // 分片还没落盘、播放器却在要它——这就是"一直加载等待"最直接的一行证据。
         //
-        // ⚠️ 但要分两种情形（2026-10-20 修「播着播着卡住」）：
-        //   - 转码进程还活着：确实是"还没写到"，返 404 让 hls.js 按
+        // ⚠️ 但要分两种情形：
+        //   - 转码进程还活着：确实是"还没写到"，返 503 让 hls.js 按
         //     `fragLoadingMaxRetry`（24 次 × 300ms）继续等 —— 它多半马上就会写出来；
         //   - 转码进程**已经退出**：这个分片永远不会出现了（源断连 / 5XX 导致 ffmpeg
-        //     中途退出）。继续返 404 只会让播放器白等满 7 秒重试预算才 fatal，
+        //     中途退出）。继续返 5xx 只会让播放器白等满 7 秒重试预算才 fatal，
         //     用户看到的就是"卡住不动"。
         //     410 是 4xx，hls.js 对 4xx 不重试、立刻 fatal → 前端马上进入
         //     「重新 open_stream 续转」的自愈，中断时间从 7 秒降到 1 秒内。
+        //
         // ⚠️ 判据必须是**产物是否完整**（清单里有 `#EXT-X-ENDLIST`），
         // 不能用 `job.done`。
         //
@@ -1595,40 +1765,42 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
         let artifact_complete = std::fs::read_to_string(directory.join("index.m3u8"))
             .map(|body| body.contains("#EXT-X-ENDLIST"))
             .unwrap_or(false);
-        if artifact_complete {
-            crate::trace::log(format!(
-                "[vsr] 本地服务：分片缺失且产物已完整 会话={session_id} 文件={file_name}（返 410，确实没有这一片）"
-            ));
-            write_plain(&mut socket, "410 Gone", "增强播放分片缺失（产物已完整）").await?;
-            return Ok(());
-        }
-        crate::trace::log(format!(
-            "[vsr] 本地服务：分片尚未就绪 会话={session_id} 文件={file_name}"
-        ));
-        // 进程还活着，但这个目录已经很久没有新产出了 —— 说明 ffmpeg 卡在了某处
-        // （源不回包、NVENC 挂起、关键帧解不出来）。
-        //
-        // 实测现场（ttv-playback.log，会话 103，同一个分片被反复请求 40 秒）：
-        //   2561.1s / 2561.7s / 2562.8s / 2564.9s / 2569.0s / 2577.1s …
-        // 播放器按退避一直等，而转码那边一片都没再写出来——用户看到的就是
-        // 「播到一半停住不动」。
+        // 转码是否停滞：目录超过 STALL_SECONDS 没有新文件。
         //
         // 判据用**目录内最新文件时间**而不是分片序号：正常转码每 2 秒写一片，
-        // 超过 STALL_SECONDS 无新文件就是停滞。这时主动杀掉这一路转码并返 410，
-        // 让前端立刻重新 open_stream 续转（而不是继续等一个永远不会出现的分片）。
-        if transcode_started_writing(&directory)
-            && directory_idle_seconds(&directory)
+        // 长时间无新文件就是停滞。只在"已经开始写过分片"时才有意义 ——
+        // 连第一片都没落时该由"还没写到"处理，不能套停滞判据。
+        let stalled = transcode_started_writing(directory)
+            && directory_idle_seconds(directory)
                 .map(|idle| idle >= STALL_SECONDS)
-                .unwrap_or(false)
-        {
-            crate::trace::log(format!(
-                "[vsr] 转码停滞超过 {STALL_SECONDS}s（分片缺失且无新产出），停掉并返 410 触发续转 会话={session_id} 文件={file_name}"
-            ));
+                .unwrap_or(false);
+        // 停滞时先停掉这一路转码，再复查它是否真的已从任务表移除。
+        //
+        // `stop()` 内的 `task.abort()` 只取消 tokio 任务、靠 `kill_on_drop` 连带
+        // 终止子进程，**并不等待进程退出**。若 abort 后会话仍在表里（拿锁失败、
+        // 或目录被别的会话重新挂上），产物还可能继续产出，此时返 410 就是谎报
+        // "永久失效"，会把用户正常播放的一集打断。
+        let still_registered = if stalled {
             stop(session_id);
-            write_plain(&mut socket, "410 Gone", "增强播放转码停滞").await?;
-            return Ok(());
-        }
-        write_plain(&mut socket, "404 Not Found", "增强播放分片尚未就绪").await?;
+            jobs()
+                .lock()
+                .map(|guard| guard.contains_key(&session_id))
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        let decision = segment_status(artifact_complete, stalled, still_registered);
+        crate::trace::log(format!(
+            "[vsr] 本地服务：分片缺失 会话={session_id} 文件={file_name} 产物完整={artifact_complete} 停滞={stalled} 会话仍在表={still_registered} → {}",
+            decision.http_status()
+        ));
+        let body = match decision {
+            SegmentStatus::MissingForever => "增强播放分片缺失（产物已完整）",
+            SegmentStatus::TranscodeStalled => "增强播放转码停滞",
+            SegmentStatus::StalledButStillRunning => "增强播放转码停滞待重试",
+            SegmentStatus::NotReadyYet => "增强播放分片尚未就绪",
+        };
+        write_plain(socket, decision.http_status(), body).await?;
         return Ok(());
     };
     let size = metadata.len();
@@ -1646,12 +1818,7 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
         crate::trace::log(format!(
             "[vsr] 本地服务：分片长度为 0（正在写入） 会话={session_id} 文件={file_name}（返 503 让播放器重试）"
         ));
-        write_plain(
-            &mut socket,
-            "503 Service Unavailable",
-            "增强播放分片正在写入",
-        )
-        .await?;
+        write_plain(socket, "503 Service Unavailable", "增强播放分片正在写入").await?;
         return Ok(());
     }
     let range = request.lines().find_map(|line| {
@@ -1668,7 +1835,7 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
             "[vsr] 本地服务：Range 不满足 会话={session_id} 文件={file_name} start={start} end={end} size={size}"
         ));
         write_head(
-            &mut socket,
+            socket,
             "416 Range Not Satisfiable",
             &cors_headers(),
             0,
@@ -1692,7 +1859,7 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
         "200 OK"
     };
     write_head(
-        &mut socket,
+        socket,
         status,
         &headers,
         end - start + 1,
@@ -1774,6 +1941,75 @@ fn cors_headers() -> String {
      Access-Control-Expose-Headers: Content-Length,Content-Range,Accept-Ranges\r\n\
      X-Content-Type-Options: nosniff\r\n"
         .to_owned()
+}
+
+/// 整集 HLS 产物缺失时该回哪个 HTTP 状态。
+///
+/// 抽成纯函数是为了能被单测钉住：这一处判断直接决定播放器是"继续等"还是
+/// "立刻判死"，而两者在 hls.js 里由同一个开关控制 —— `retryForHttpStatus()`
+/// 只对 5xx（与超时）重试，对**所有** 4xx 一律不重试。
+///
+/// 四个分支的语义严格分开：
+///
+/// | 情形 | 状态 | 理由 |
+/// |---|---|---|
+/// | 产物已完整（含 `#EXT-X-ENDLIST`），这一片确实不存在 | 410 | 永久失效，重试无意义，前端应重新开播 |
+/// | 转码停滞超时，且会话已确认从任务表移除 | 410 | 进程已死、产物不会再增长，只能续转 |
+/// | 转码停滞超时，但会话仍在任务表里 | 503 | stop 未生效，产物**仍可能**继续产出 |
+/// | 其余（还没写到） | 503 | 常态，让 hls.js 用自己的重试预算等 |
+#[derive(Debug, PartialEq, Eq)]
+enum SegmentStatus {
+    /// 产物完整但缺这一片：永久失效。
+    MissingForever,
+    /// 转码停滞且已确认停止：需要前端重新开播续转。
+    TranscodeStalled,
+    /// 会话还在跑、分片只是还没写到：让播放器继续等。
+    NotReadyYet,
+    /// 停滞但 stop 未生效：仍按"等着"处理，不能谎报永久失效。
+    StalledButStillRunning,
+}
+
+impl SegmentStatus {
+    fn http_status(&self) -> &'static str {
+        match self {
+            // 4xx：hls.js 不重试，立刻 fatal → 前端进入「重新 open_stream 续转」。
+            Self::MissingForever => "410 Gone",
+            Self::TranscodeStalled => "410 Gone",
+            // 5xx：hls.js 按 fragLoadingMaxRetry（24 次 × 300ms）继续等。
+            Self::NotReadyYet => "503 Service Unavailable",
+            Self::StalledButStillRunning => "503 Service Unavailable",
+        }
+    }
+
+    /// 这个状态是否会让 hls.js 重试。
+    ///
+    /// 只在测试里用：它是对"4xx 不重试、5xx 重试"这条外部约定的**双向断言**，
+    /// 生产代码不需要（生产只关心发哪个状态码）。
+    #[cfg(test)]
+    fn retried_by_hls(&self) -> bool {
+        // hls.js 1.7.3：retryForHttpStatus 对 4xx 返回 false、对 5xx 返回 true。
+        self.http_status().starts_with('5')
+    }
+}
+
+/// 判定分片缺失时的响应语义。
+///
+/// * `artifact_complete` — 清单里已有 `#EXT-X-ENDLIST`（产物转完了）
+/// * `stalled` — 目录超过 `STALL_SECONDS` 没有新产出
+/// * `still_registered` — 会话是否仍在任务表里（`stop()` 之后复查）
+fn segment_status(artifact_complete: bool, stalled: bool, still_registered: bool) -> SegmentStatus {
+    if artifact_complete {
+        // 产物完整却没有这一片：重试永远等不到，如实报永久失效。
+        return SegmentStatus::MissingForever;
+    }
+    if stalled {
+        return if still_registered {
+            SegmentStatus::StalledButStillRunning
+        } else {
+            SegmentStatus::TranscodeStalled
+        };
+    }
+    SegmentStatus::NotReadyYet
 }
 
 async fn write_plain(socket: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
@@ -2059,6 +2295,155 @@ mod tests {
                 "{python_name} 与 Rust 侧同名档位的参数漂移了（两边必须同一套）"
             );
         }
+    }
+
+    /// 分片缺失的四种情形必须映射到正确的 HTTP 语义。
+    ///
+    /// 这条测试守的是一个**曾经真实存在的缺陷**：分片"还没写到"时返 404，
+    /// 而注释声称"404 让 hls.js 按 fragLoadingMaxRetry 继续等"。hls.js 1.7.3 的
+    /// `retryForHttpStatus()`（`src/utils/error-helper.ts:86`）对**所有 4xx**
+    /// 返回 false —— 404 与 410 效果完全相同：首次请求就 fatal，24 次重试预算
+    /// 一次都不会用到。于是"分片晚两秒落地"这种常态被升级成致命错误。
+    ///
+    /// 实测代价（ttv-playback.log，会话 104）：100.8s → 247.2s 累计约 150 条
+    /// `fragLoadError`，界面锁在缓冲态 158 秒。
+    #[test]
+    fn segment_missing_status_semantics() {
+        use SegmentStatus::*;
+
+        // 产物已完整、这一片确实没有 → 永久失效，不该重试。
+        assert_eq!(segment_status(true, false, true), MissingForever);
+        assert_eq!(segment_status(true, false, true).http_status(), "410 Gone");
+        assert!(!segment_status(true, false, true).retried_by_hls());
+
+        // 产物完整但不完整的清单也判永久失效（artifact_complete 优先）。
+        assert_eq!(segment_status(true, true, true), MissingForever);
+
+        // 停滞且已确认停止 → 只能续转，410 正确。
+        assert_eq!(segment_status(false, true, false), TranscodeStalled);
+        assert_eq!(segment_status(false, true, false).http_status(), "410 Gone");
+
+        // 停滞但 stop 未生效 → 产物还可能产出，不能谎报永久失效。
+        assert_eq!(segment_status(false, true, true), StalledButStillRunning);
+        assert_eq!(
+            segment_status(false, true, true).http_status(),
+            "503 Service Unavailable"
+        );
+        assert!(segment_status(false, true, true).retried_by_hls());
+
+        // 常态：分片还没写到 → 必须让 hls.js 继续等（5xx 才会重试）。
+        assert_eq!(segment_status(false, false, true), NotReadyYet);
+        assert_eq!(
+            segment_status(false, false, true).http_status(),
+            "503 Service Unavailable"
+        );
+        assert!(segment_status(false, false, true).retried_by_hls());
+    }
+
+    /// "还没写到"的分片必须让 hls.js 重试，否则一切退避都形同虚设。
+    ///
+    /// 单独钉一条：这条一旦回归，用户看到的正是「画面停住、进度条不动、
+    /// 日志里每 400ms 一条 fragLoadError」那种卡死。
+    #[test]
+    fn not_ready_segment_is_retried_by_hls() {
+        assert!(
+            SegmentStatus::NotReadyYet.retried_by_hls(),
+            "分片未就绪必须返 5xx —— hls.js 对 4xx 不重试，重试预算完全用不上"
+        );
+        assert!(
+            !SegmentStatus::MissingForever.retried_by_hls(),
+            "产物完整后仍缺片属于永久失效，不该让播放器空转重试"
+        );
+    }
+
+    /// ArtifactId 必须拒绝一切能跳出 `media_root()` 的输入。
+    ///
+    /// 这条是**安全边界**：`artifact` 直接来自 HTTP 路径。若不校验，就能用
+    /// `..` / 绝对路径 / 交替分隔符读到任意文件（播放器是个本地服务，
+    /// 但同机的其它程序可以扫 127.0.0.1 的端口）。
+    #[test]
+    fn artifact_id_rejects_path_escape() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../etc",
+            "..\\windows",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "a..b",
+            "C:\\Windows",
+            "/abs/path",
+            "with space",
+            "with*star",
+            "中文目录",
+        ] {
+            assert!(
+                ArtifactId::parse(bad).is_none(),
+                "ArtifactId 不该接受 {bad:?}（越界风险）"
+            );
+        }
+        // 长度上限：128 是为了挡住超长名导致的路径拼接异常。
+        assert!(ArtifactId::parse(&"a".repeat(129)).is_none());
+    }
+
+    /// 真实产物目录名必须能被原样接受。
+    ///
+    /// 两种命名都来自生产代码：`vid-{vid}`（按内容建、跨会话复用）与
+    /// `{session_id}-{uuid}`（临时目录）。它们就是"不可变身份"本身。
+    #[test]
+    fn artifact_id_accepts_real_directory_names() {
+        for good in [
+            "vid-7679731146971696152",
+            "vid-guo-0123456789abcdef",
+            "104-3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c",
+        ] {
+            let id = ArtifactId::parse(good).unwrap_or_else(|| panic!("应接受 {good:?}"));
+            assert_eq!(id.as_str(), good);
+        }
+    }
+
+    /// **本次修复的核心回归**：URL 里必须能唯一确定产物，且与会话号解耦。
+    ///
+    /// 旧形态 `/rtx/{session}/index.m3u8` 的身份只有会话号，而会话号会被
+    /// `register_reused` 复用 —— 实测同一个 104 先后指向两份不同 vid 的产物。
+    /// 新形态把目录名放进路径，会话号只是兼容字段。
+    #[test]
+    fn artifact_url_pins_content_not_session() {
+        let a = ArtifactId::parse("vid-1111111111111111111").unwrap();
+        let b = ArtifactId::parse("vid-2222222222222222222").unwrap();
+        // 同一个会话号、不同产物 → 必须是两个不同的 URL。
+        let url_a = artifact_url(49701, 104, &a, "tok");
+        let url_b = artifact_url(49701, 104, &b, "tok");
+        assert_ne!(
+            url_a, url_b,
+            "同一会话号必须能区分不同产物，否则换集后旧 URL 会读到新内容"
+        );
+        assert!(url_a.contains("vid-1111111111111111111"));
+        assert!(url_a.contains("/rtx/104/"));
+        assert!(url_a.ends_with("/index.m3u8?token=tok"));
+        // 不同会话号、同一产物 → 指向同一份内容（会话号不参与定位）。
+        let url_a2 = artifact_url(49701, 999, &a, "tok");
+        assert!(url_a2.contains("vid-1111111111111111111"));
+    }
+
+    /// 清单重写必须让 `init.mp4` 与分片保持**相对路径**。
+    ///
+    /// 这是身份绑定能被分片继承的前提：相对 URI 由播放器按清单自己的目录解析，
+    /// 于是清单来自哪个 artifact、分片就一定来自同一个 artifact —— 不会出现
+    /// "清单是 A 的、分片是 B 的"那种串线。
+    #[test]
+    fn playlist_rewrite_keeps_segments_relative_to_artifact() {
+        let body = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:3.2,\nseg-00000.m4s\n";
+        let rewritten = rewrite_local_playlist(body, "tok");
+        // init 与分片都只补 token，**不补任何目录前缀**。
+        assert!(rewritten.contains("#EXT-X-MAP:URI=\"init.mp4?token=tok\""));
+        assert!(rewritten.contains("seg-00000.m4s?token=tok"));
+        assert!(
+            !rewritten.contains("/rtx/"),
+            "清单里不该出现绝对路径 —— 那会让分片脱离当前 artifact"
+        );
     }
 
     /// 取出 Python 源码里 `<name> = [ ... ]` 这一段之间所有字符串字面量的值。

@@ -32,6 +32,14 @@ interface HlsInstance {
 const HLS_KEY = '__ttv_hls__';
 
 /**
+ * 元素上登记的「按倍速调整缓冲目标」回调。
+ *
+ * 播放器只有一块常驻 `<video>`，换集不换元素。不登记回调就没法在
+ * `detachSource` 时摘掉 `ratechange` 监听器，几十集下来会累积几十个。
+ */
+const RATE_TARGET_KEY = '__ttvRateTarget';
+
+/**
  * 判死前允许 hls.js 自己重来的次数。
  *
  * hls.js 把分片/缓冲类错误升级成 `fatal` 时，源往往**仍然可用**：本地转码是
@@ -151,8 +159,25 @@ export async function attachSource(video: HTMLVideoElement, url: string): Promis
     }
     const hls = new Hls({
       // 本地代理分片很小（0.6-2s），默认 30 分片缓冲对动漫分片粒度太保守。
-      maxBufferLength: 45,
-      maxMaxBufferLength: 90,
+      //
+      // ⚠️ 这两个值必须按**倍速**放大，不能只看媒体时长（2026-10-21）。
+      //
+      // hls.js 的 `maxBufferLength` 单位是**媒体时间**，它完全不感知
+      // `video.playbackRate`（见 `stream-controller.ts:1579` 的取值实现）。
+      // 于是同一份 45 秒缓冲：
+      //   1x → 够播 45 秒真实时间，绰绰有余；
+      //   3x → 只够播 15 秒，而分片还在等着转码 —— 播放头立刻追平缓冲末端。
+      //
+      // 实测（ttv-playback.log，2026-10-21，6674 行）：
+      //   缓冲 >0.5 秒的事件共 20 次，其中 **18 次发生在 2.6x~3.0x**
+      //   （1.0x 只有 1 次且仅 0.84 秒）。1.50 秒这个值反复出现是因为
+      //   一个 3.2 秒的分片在 3x 下只需 1.07 秒就播完 —— 播放器每拿一片就断一次。
+      //
+      // 所以最大值按最高倍速（3x）设定，实际目标由运行期按当前倍速收紧
+      // （见下面 `applyBufferTarget`）。本地回环拿分片的成本是亚毫秒级，
+      // 多缓冲几乎没有代价；而缓冲不足的代价是用户每几秒看到一次转圈。
+      maxBufferLength: 60,
+      maxMaxBufferLength: 120,
       // 本地代理不走网络限速，开最大加载并发让起播更快。
       maxBufferHole: 0.5,
       // 增强转码是"边转边播"：后端可能在首个分片落地前就把 m3u8 地址交回来，
@@ -180,7 +205,22 @@ export async function attachSource(video: HTMLVideoElement, url: string): Promis
       //
       // 本地代理是 127.0.0.1 回环：一次 503 的往返成本是**亚毫秒级**，任何秒级
       // 退避在这里都毫无意义。线性 250ms 让 4 次重试的总等待从 15s 降到 1s。
-      manifestLoadingMaxRetry: 4,
+      //
+      // ⚠️ 但 4 次 × 250ms ≈ 1 秒对「边转边播」仍然太短（2026-10-21 实测）。
+      //
+      // 现场（ttv-playback.log，会话 104，26.367s 起）：
+      //   26.367 / 26.623 / 26.880 / 27.133 / 27.386  连吃五次 503
+      //   27.394  manifestLoadError fatal=true          ← 1.03 秒后判死
+      //   27.394  整集 HLS 播放失败 → 回退整集 mp4（用户白等一次 7~10 秒下载）
+      //
+      // 而这次转码其实**正常在跑**（后端在同一秒还打出了「首段尚未落地，先交地址」）。
+      // 也就是说：一个本可以再等 0.5 秒就好的地址，被 1 秒的重试预算判了死刑，
+      // 代价是退回到整集 mp4 那条慢链路。
+      //
+      // 现在给到 20 次 × 250ms ≈ 5 秒：覆盖"ffmpeg 已起、首片还没 prime 出来"
+      // 的常见窗口（实测 876~1521ms，个别源到 4 秒）。回环重试成本可忽略，
+      // 而误判的代价是一整集重下。
+      manifestLoadingMaxRetry: 20,
       // 与下面的 `playlistLoadPolicy` 对齐取 6（2026-10-20 复查修正）。
       // 原先这里写 4、policy 写 6，正好破了下面那条"必须保持一致"的规矩。
       levelLoadingMaxRetry: 6,
@@ -200,8 +240,9 @@ export async function attachSource(video: HTMLVideoElement, url: string): Promis
         default: {
           maxTimeToFirstByteMs: 10000,
           maxLoadTimeMs: 20000,
-          timeoutRetry: { maxNumRetry: 4, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
-          errorRetry: { maxNumRetry: 4, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+          // 与上面 `manifestLoadingMaxRetry: 20` 保持一致（见那条"必须一致"的说明）。
+          timeoutRetry: { maxNumRetry: 20, retryDelayMs: 250, maxRetryDelayMs: 1500, backoff: 'linear' },
+          errorRetry: { maxNumRetry: 20, retryDelayMs: 250, maxRetryDelayMs: 1500, backoff: 'linear' },
         },
       },
       playlistLoadPolicy: {
@@ -245,6 +286,39 @@ export async function attachSource(video: HTMLVideoElement, url: string): Promis
     hls.on(Hls.Events.FRAG_BUFFERED, () => {
       if (recoverAttempts > 0) recoverAttempts = 0;
     });
+    /**
+     * 按当前倍速把缓冲目标调大（2026-10-21）。
+     *
+     * `maxBufferLength` 的单位是**媒体时间**，而长按加速把真实时间压缩了 3 倍。
+     * 60 秒媒体缓冲在 1x 下够播 60 秒、在 3x 下只够 20 秒 —— 后者在"边转边播"
+     * 的本地源上也足够，但如果实测仍不够，这条会把目标按倍速线性放大。
+     *
+     * 上限用 `maxMaxBufferLength`（120 秒媒体时间）兜住，避免 3x 长时间后
+     * 缓冲堆到几百秒、把整集产物全锁在内存里。
+     *
+     * 为什么监听 `ratechange` 而不是每次 timeupdate 都算：倍速只在用户长按/松手
+     * 时改变，是个低频事件，重算成本可以忽略。
+     */
+    const applyBufferTarget = () => {
+      const rate = Number.isFinite(video.playbackRate) && video.playbackRate > 0
+        ? video.playbackRate
+        : 1;
+      // 目标 = 基准 20 秒 × 倍速，钳在 [20, 120] 秒媒体时间。
+      //
+      // 基准取 20 而不是 45：本地回环上分片是按需拉的，缓冲太深只会让"拖动后
+      // 起播"变慢（要先丢掉多余数据）；而 20 秒 × 3x = 60 秒媒体时间 ≈ 20 秒
+      // 真实播放，足够覆盖一次转码抖动。
+      const target = Math.min(120, Math.max(20, Math.round(20 * rate)));
+      hls.config.maxBufferLength = target;
+      tracePlayback(`hls.js 缓冲目标=${target}s（倍速 ${rate}x）`);
+    };
+    video.addEventListener('ratechange', applyBufferTarget);
+    // 登记到元素上，`detachSource` 换源时一并摘掉。
+    //
+    // 播放器只有一块常驻 `<video>`，换集不换元素；不登记就意味着每换一集
+    // 就多挂一个 ratechange 监听器，几十集之后一次长按会触发几十次重算。
+    (video as unknown as Record<string, unknown>)[RATE_TARGET_KEY] = applyBufferTarget;
+    applyBufferTarget();
     hls.on(Hls.Events.ERROR, (_event, data) => {
       // 打点带 type/details：manifest 拉不到、分片 404、解码失败在这条日志里
       // 是可区分的——[vsr] 转码链路的"卡在加载"多数是清单还没落地时的分片 404。
@@ -325,6 +399,12 @@ export function detachSource(video: HTMLVideoElement): void {
       // 销毁失败不影响主流程
     }
     delete (video as unknown as Record<string, unknown>)[HLS_KEY];
+  }
+  // 摘掉按倍速调整缓冲目标的监听器：换源即换实例，旧的那个不该再被调用。
+  const rateTarget = (video as unknown as Record<string, unknown>)[RATE_TARGET_KEY];
+  if (typeof rateTarget === 'function') {
+    video.removeEventListener('ratechange', rateTarget as EventListener);
+    delete (video as unknown as Record<string, unknown>)[RATE_TARGET_KEY];
   }
   // 换源即作废旧标记：留着会让下一次判死读到上一次的明细。
   clearHlsFatal(video);
