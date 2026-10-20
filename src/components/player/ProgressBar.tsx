@@ -73,8 +73,17 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({
   };
 
   // 未播放时不显示"已播放"层之外的信息：duration 为 0 的进度条只会误导。
-  const playedRatio = duration > 0 ? Math.max(0, Math.min(1, position / duration)) : 0;
-  const bufferedRatio = duration > 0 ? Math.max(0, Math.min(1, buffered / duration)) : 0;
+  //
+  // ⚠️ 三个值都必须**有限**：`video.currentTime` / `buffered.end()` 在 MSE 重新
+  // 挂载或换源的那一瞬间可能读成 `NaN`，而 `Math.min(1, NaN)` 还是 `NaN` ——
+  // `scaleX(NaN)` 是无效值，已播段会整个不渲染。用户看到的是"进度条消失了"
+  // （2026-10-19 现场：长按倍速 + 切集后必现）。所以统一在下面这个收口里过滤。
+  const clampRatio = (value: number): number => {
+    if (duration <= 0 || !Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(1, value / duration));
+  };
+  const playedRatio = clampRatio(position);
+  const bufferedRatio = clampRatio(buffered);
   const shownRatio = hoverRatio !== null ? hoverRatio : playedRatio;
 
   return (

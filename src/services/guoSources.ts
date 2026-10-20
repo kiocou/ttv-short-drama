@@ -43,6 +43,19 @@ export interface GuoSource {
    * - 黄果视频：series/video 混合条目，真人
    */
   adult?: boolean;
+  /**
+   * 已下线的源：从选择器、目录聚合与体检面板里移除。
+   *
+   * 判据是 2026-10-19 的全链路体检（catalog → detail → resolve，直连）：
+   * 观果详情接口返回空、牛果 resolve 57s 超时、发果目录 24s 超时、皮果域名
+   * 无法解析。四条都是“点开必挂”的死链，留着只会让用户以为是自己网络坏了。
+   *
+   * 为什么用标记而不是从清单里删掉：① 历史/收藏里可能还留着这些源的剧 id，
+   * 物理删除会让它们连“来源名”都解析不出来；② 后端 `GUO_SOURCES` 同时承担
+   * 18+ 门闩的登记职责（`source_is_adult`），删掉 18+ 源等于给旧 id 开后门。
+   * 标记停用只影响“能不能被选到、会不会进聚合”，不影响按 id 直连。
+   */
+  retired?: boolean;
 }
 
 /**
@@ -62,7 +75,9 @@ export const GUO_SOURCES: GuoSource[] = [
   // 实测 20 条：分类恒为"短剧"，标题为成人真人条目。
   { id: 'huangju', name: '剧果', kind: 'live', adult: true },
   // 实测 20 条：分类恒为"短剧"，标签为成人题材；集数全部为 0。
-  { id: 'yeguo', name: '野果', kind: 'live', adult: true },
+  // 2026-10-19 两轮体检：直连 25s 超时，挂代理（127.0.0.1:10808）仍 25s 超时，
+  // 站方线路侧不可用；留成可选只会让用户在「神秘小窝」里点一排必挂的卡。
+  { id: 'yeguo', name: '野果', kind: 'live', adult: true, retired: true },
   // 实测 72 条：真人成人向内容（无码中字 / 无码破解）。
   { id: 'dsd', name: '帝果', kind: 'live', adult: true },
   // 实测 96 条：分类恒为 "AI 短剧"（AI 生成、真人外形），有集数。
@@ -76,7 +91,7 @@ export const GUO_SOURCES: GuoSource[] = [
   // 实测 10 条：分类恒为"都市"，真人，30~90 集。
   { id: 'fanguo', name: '饭果', kind: 'live' },
   // 实测 30 条：玄幻仙侠/都市爱情/逆袭/甜宠，真人。
-  { id: 'guanguo', name: '观果', kind: 'live' },
+  { id: 'guanguo', name: '观果', kind: 'live', retired: true },
   // 实测 63 条：都市/古风/复仇真人短剧，部分条目集数为 0。
   { id: 'heguo', name: '河果', kind: 'live' },
   // 实测 10 条：真人短剧，20~91 集。
@@ -84,13 +99,13 @@ export const GUO_SOURCES: GuoSource[] = [
   // 实测 36 条：标题带题材后缀的真人短剧，但含《工资真相-动漫合集》这一漫剧条目。
   { id: 'huaguo', name: '花果', kind: 'both' },
   // 实测 12 条：穿越/修仙/剑仙，集数全为 0；无简介，按真人登记。
-  { id: 'niuguo', name: '牛果', kind: 'live' },
+  { id: 'niuguo', name: '牛果', kind: 'live', retired: true },
   // 实测 403（站点要求浏览器验证）。
   { id: 'wangguo', name: '网果', kind: 'live' },
   // 实测 444。
-  { id: 'faguo', name: '发果', kind: 'live' },
+  { id: 'faguo', name: '发果', kind: 'live', retired: true },
   // 实测 492，且两次探测结果不一致（一次 10 条、一次报错），链路不稳。
-  { id: 'piguo', name: '皮果', kind: 'live' },
+  { id: 'piguo', name: '皮果', kind: 'live', retired: true },
   // 实测 30 条：古代宅斗/宫斗真人短剧，集数恒为 1。
   { id: 'wuguo', name: '伍果', kind: 'live' },
 ];
@@ -127,7 +142,7 @@ export function sourceMatchesTab(source: GuoSource, tab: 'drama' | 'comic'): boo
 export function adultTabSources(enabled: string[], showAdult: boolean): GuoSource[] {
   if (!showAdult) return [];
   const chosen = new Set(enabled);
-  return GUO_SOURCES.filter(item => item.adult && chosen.has(item.id));
+  return GUO_SOURCES.filter(item => item.adult && !item.retired && chosen.has(item.id));
 }
 
 /**
@@ -140,6 +155,7 @@ export function adultTabSources(enabled: string[], showAdult: boolean): GuoSourc
 export function enabledSourceIds(enabled: string[], showAdult: boolean): string[] {
   const chosen = new Set(enabled);
   return GUO_SOURCES
+    .filter(item => !item.retired)
     .filter(item => chosen.has(item.id))
     .filter(item => showAdult || !item.adult)
     .map(item => item.id);

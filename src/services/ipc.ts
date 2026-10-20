@@ -99,6 +99,27 @@ let currentGlobalSessionId = 100;
 const channelBySeriesId = new Map<string, string>();
 
 /**
+ * 把会话号的下一个值抬到 `base` 之上。
+ *
+ * ## 为什么需要它（2026-10-19，小窗改用整集 HLS 之后）
+ *
+ * 会话号不是"前端自己的计数器"，它是**后端播放会话的标识**：
+ * `short_drama_app_open_stream` 的 `sessionId`、VSR 本地服务的 `/rtx/{session}/`
+ * 路径、`playback_command(sessionId, "stop")` 的键，全都用它。
+ *
+ * 主窗口与画中画小窗是两个独立 WebView，各有自己的模块实例 —— 两边都从 100
+ * 开始递增，号段必然重叠。后果不是"偶尔慢一下"而是实打实的互相拆台：
+ * 小窗开播会把主窗口正在转码的会话顶掉（同一号段被共用产物），主窗口离开
+ * 播放器时那一次 `stop` 也会顺手掐断小窗的转码。
+ *
+ * 所以小窗在挂载前用这个函数把自己的号段挪到高位（见 `bootPip.tsx`），
+ * 两边从此不会撞号。
+ */
+export function reserveSessionIds(base: number): void {
+  if (Number.isFinite(base) && base > currentGlobalSessionId) currentGlobalSessionId = base;
+}
+
+/**
  * guo 封面解析结果的会话内缓存。
  *
  * key 是 seriesId，值是后端返回的**本地缓存文件路径**（或 `null` 表示该剧确实没有封面）。

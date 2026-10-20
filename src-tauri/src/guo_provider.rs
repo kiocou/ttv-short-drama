@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub const GUO_ID_PREFIX: &str = "guo:";
 
@@ -599,7 +600,53 @@ pub struct GuoProvider {
     catalog_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     /// 正在后台刷新的 `"源|分类"` 集合（SWR 去重），见 [`GuoProvider::catalog`]。
     revalidating: Mutex<HashSet<String>>,
+    /// 详情缓存（`"源:裸剧 id"` → 详情 + 分集表），见 [`GuoProvider::detail_raw`]。
+    ///
+    /// 起播链路上 `detail` 是**重复调用**的重灾区：前端进详情页拉一次、点集时
+    /// `open_episode` 再拉一次、换集时 `qualities()` 又拉一次。同一部剧的分集表在
+    /// 几分钟内不会变，短 TTL 缓存把这两次重复往返直接消掉。
+    detail_cache: Mutex<HashMap<String, DetailEntry>>,
+    /// 最近一次 `resolve` 带回的清晰度档位（`"剧|集"` → 档位）。
+    ///
+    /// guo 的档位只在 resolve 结果里，前端起播时会**另发一次** `qualities()`
+    /// 探测（那次会再跑一遍 detail + resolve）。开放时顺手把档位记下来，探测直接
+    /// 命中，省掉一次站源往返，也少一次对同一站源的并发挤占。
+    resolve_qualities: Mutex<HashMap<String, (Instant, Vec<VideoQualityOption>)>>,
 }
+
+/// 详情缓存的一条记录。
+///
+/// `drama` / `chapters` 是 guo-core 原样返回的 JSON：缓存的是**站源当时的快照**，
+/// 所以带 `fetched` 做 TTL，并在分集查不到时强制刷新一次（见 `detail_with_chapter`）。
+struct DetailEntry {
+    fetched: Instant,
+    drama: Value,
+    chapters: Vec<Value>,
+}
+
+/// 详情缓存 TTL：3 分钟。
+///
+/// 选它是因为短剧更新以「天」为单位，而一次追剧从详情页到连播几集通常几分钟内完成。
+/// 再长会把「刚上新的集」挡在缓存外，用户体验反而变差。
+const DETAIL_TTL: Duration = Duration::from_secs(180);
+
+/// 详情缓存条目上限。
+///
+/// 一部剧的 `chapters` 最多几百条小 JSON，24 部约几 MB —— 相对 1GB 的播放缓存
+/// 可以忽略，但必须设上界：用户翻目录时每点一部剧就会写一条。
+const DETAIL_CACHE_LIMIT: usize = 24;
+
+/// 档位缓存条目上限。
+///
+/// 每条只有一个「剧|集」键与几个档位，几十 KB 量级；满了直接清空重填即可，
+/// 不必做 LRU——它是起播时的顺带产物，丢了也只是回到“再探测一次”。
+const QUALITY_CACHE_LIMIT: usize = 64;
+
+/// 档位缓存 TTL：2 分钟。
+///
+/// 只服务「起播与档位探测几乎同时发生」这一个场景，短 TTL 足够，且不会让用户
+/// 换清晰度后看到旧档位。
+const QUALITY_TTL: Duration = Duration::from_secs(120);
 
 impl GuoProvider {
     pub fn new(resource_dir: &Path, data_dir: &Path) -> Result<Self, String> {
@@ -613,6 +660,8 @@ impl GuoProvider {
             category_index: Mutex::new(HashMap::new()),
             catalog_cooldowns: Mutex::new(HashMap::new()),
             revalidating: Mutex::new(HashSet::new()),
+            detail_cache: Mutex::new(HashMap::new()),
+            resolve_qualities: Mutex::new(HashMap::new()),
         };
         provider.bridge.request(&json!({
             "action": "initialize",
@@ -1021,11 +1070,8 @@ impl GuoProvider {
         let ids = parse_guo_series_id(series_id).ok_or_else(|| "剧集 ID 无效。".to_string())?;
         let episode_raw =
             guo_episode_raw(series_id, episode_id).ok_or_else(|| "分集 ID 无效。".to_string())?;
-        let (drama, chapters) = self.detail_raw(ids.source, ids.raw_series_id)?;
-        let chapter_index = chapters
-            .iter()
-            .position(|chapter| text(chapter, &["id"]) == episode_raw)
-            .ok_or_else(|| "分集不存在或已失效。".to_string())?;
+        let (drama, chapters, chapter_index) =
+            self.detail_with_chapter(ids.source, ids.raw_series_id, episode_raw)?;
         let chapter = chapters[chapter_index].clone();
         // resolve 的 index 是"第几集"：黄豆等源在章节自身没带集数时靠它推导播放
         // 序号，硬编码 1 会让这些源的所有分集都去请求第 1 集。
@@ -1039,6 +1085,20 @@ impl GuoProvider {
         let url = text(&data, &["url"]);
         if url.is_empty() {
             return Err("站源未返回播放地址。".to_string());
+        }
+        // 顺手把这次 resolve 带回的档位记下：前端起播时会并发探测档位，
+        // 那次 `qualities()` 命中这条缓存就不必再跑一遍 detail + resolve。
+        let qualities = data_qualities(&data);
+        if !qualities.is_empty() {
+            if let Ok(mut cache) = self.resolve_qualities.lock() {
+                if cache.len() >= QUALITY_CACHE_LIMIT {
+                    cache.clear();
+                }
+                cache.insert(
+                    format!("{series_id}|{episode_id}"),
+                    (Instant::now(), qualities),
+                );
+            }
         }
         self.sessions
             .lock()
@@ -1072,11 +1132,17 @@ impl GuoProvider {
         let ids = parse_guo_series_id(series_id).ok_or_else(|| "剧集 ID 无效。".to_string())?;
         let episode_raw =
             guo_episode_raw(series_id, episode_id).ok_or_else(|| "分集 ID 无效。".to_string())?;
-        let (drama, chapters) = self.detail_raw(ids.source, ids.raw_series_id)?;
-        let chapter_index = chapters
-            .iter()
-            .position(|chapter| text(chapter, &["id"]) == episode_raw)
-            .ok_or_else(|| "分集不存在或已失效。".to_string())?;
+        // 起播时已经 resolve 过同一集：档位就在那次结果里，直接回，
+        // 不再白跑一次 detail + resolve（那两次往返会与正在起播的 ffmpeg 抢源站）。
+        if let Ok(cache) = self.resolve_qualities.lock() {
+            if let Some((at, options)) = cache.get(&format!("{series_id}|{episode_id}")) {
+                if at.elapsed() < QUALITY_TTL {
+                    return Ok(options.clone());
+                }
+            }
+        }
+        let (drama, chapters, chapter_index) =
+            self.detail_with_chapter(ids.source, ids.raw_series_id, episode_raw)?;
         let chapter = chapters[chapter_index].clone();
         // 画质探测和起播共用同一个全局序号：写死 1（原来的写法）会被 guo-core
         // 当成"比高水位旧"直接 Cancel——第一次起播就把水位抬到了 ≥100，于是
@@ -1093,7 +1159,19 @@ impl GuoProvider {
                 .bridge
                 .request(&json!({ "action": "release", "session": session }));
         }
-        Ok(data_qualities(&data))
+        let options = data_qualities(&data);
+        if !options.is_empty() {
+            if let Ok(mut cache) = self.resolve_qualities.lock() {
+                if cache.len() >= QUALITY_CACHE_LIMIT {
+                    cache.clear();
+                }
+                cache.insert(
+                    format!("{series_id}|{episode_id}"),
+                    (Instant::now(), options.clone()),
+                );
+            }
+        }
+        Ok(options)
     }
 
     pub fn release(&self, session_id: u64) {
@@ -1162,7 +1240,35 @@ impl GuoProvider {
         }))
     }
 
+    /// 拉详情（带 3 分钟缓存，见 `DETAIL_TTL`）。
+    ///
+    /// 缓存键是「源:裸剧 id」，**不含渠道/清晰度**——同一部剧的分集表与这些无关。
+    /// 命中即返回克隆：GUI 点击路径上这点克隆开销远小于一次站源往返。
     fn detail_raw(&self, source: &str, raw_series_id: &str) -> Result<(Value, Vec<Value>), String> {
+        self.detail_inner(source, raw_series_id, false)
+    }
+
+    /// `force = true` 跳过缓存并重写它。
+    ///
+    /// 只在「缓存里的分集表找不到用户点的那一集」时使用：站源刚补更、或缓存写入后
+    /// 源侧换了线路，都会让缓存暂时落后。没有这条兜底，一次错误快照会让该剧在
+    /// TTL 内**每一集**都报“分集不存在”。
+    fn detail_inner(
+        &self,
+        source: &str,
+        raw_series_id: &str,
+        force: bool,
+    ) -> Result<(Value, Vec<Value>), String> {
+        let key = format!("{source}:{raw_series_id}");
+        if !force {
+            if let Ok(cache) = self.detail_cache.lock() {
+                if let Some(entry) = cache.get(&key) {
+                    if entry.fetched.elapsed() < DETAIL_TTL {
+                        return Ok((entry.drama.clone(), entry.chapters.clone()));
+                    }
+                }
+            }
+        }
         let data = self.bridge.request(&json!({
             "action": "detail",
             "drama": { "id": format!("{source}:{raw_series_id}"), "source": source },
@@ -1176,7 +1282,51 @@ impl GuoProvider {
         if drama.is_null() || chapters.is_empty() {
             return Err("该剧暂时没有可播放的分集。".to_string());
         }
+        if let Ok(mut cache) = self.detail_cache.lock() {
+            // 上界：超过就丢掉最早写入的那几条。条目少，线性扫描即可。
+            while cache.len() >= DETAIL_CACHE_LIMIT {
+                let oldest = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.fetched)
+                    .map(|(key, _)| key.clone());
+                match oldest {
+                    Some(oldest) => {
+                        cache.remove(&oldest);
+                    }
+                    None => break,
+                }
+            }
+            cache.insert(
+                key,
+                DetailEntry {
+                    fetched: Instant::now(),
+                    drama: drama.clone(),
+                    chapters: chapters.clone(),
+                },
+            );
+        }
         Ok((drama, chapters))
+    }
+
+    /// 取详情并定位某一集的下标；缓存里没有这一集时强制刷新一次。
+    ///
+    /// 抽出来是因为 `open_episode` 与 `qualities` 原本各写了一遍“拉详情 + 找下标”，
+    /// 两处的失败语义也必须一致，否则换集与画质探测会给出不同的结论。
+    fn detail_with_chapter(
+        &self,
+        source: &str,
+        raw_series_id: &str,
+        episode_raw: &str,
+    ) -> Result<(Value, Vec<Value>, usize), String> {
+        let (drama, chapters) = self.detail_raw(source, raw_series_id)?;
+        if let Some(index) = chapter_index_of(&chapters, episode_raw) {
+            return Ok((drama, chapters, index));
+        }
+        // 缓存落后：强制重拉一次再找。仍找不到才把“分集不存在”报给用户。
+        let (drama, chapters) = self.detail_inner(source, raw_series_id, true)?;
+        let index = chapter_index_of(&chapters, episode_raw)
+            .ok_or_else(|| "分集不存在或已失效。".to_string())?;
+        Ok((drama, chapters, index))
     }
 
     fn map_item(&self, source: &str, item: &Value) -> SeriesItem {
@@ -1286,6 +1436,16 @@ fn parse_rating(item: &Value) -> Option<f64> {
     }
     let value: f64 = cleaned.parse().ok()?;
     (value.is_finite() && value > 0.0 && value <= 10.0).then_some(value)
+}
+
+/// 在分集表里找某一集的下标。
+///
+/// `open_episode` / `qualities` / `detail_with_chapter` 三处共用，判据只允许有一份：
+/// 分集 id 的字段名在各源并不统一，少认一个键就会让换集与画质探测得出不同结果。
+fn chapter_index_of(chapters: &[Value], episode_raw: &str) -> Option<usize> {
+    chapters
+        .iter()
+        .position(|chapter| text(chapter, &["id"]) == episode_raw)
 }
 
 fn data_qualities(value: &Value) -> Vec<VideoQualityOption> {

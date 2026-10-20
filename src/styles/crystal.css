@@ -26,13 +26,19 @@
   --fluent-sky: #38bdf8;
 
   /*
-   * 进度条语义色跟随主题：浅色用蓝色已播放段 + 白色轨道，
-   * 暗色在 dark.css 里换成红色已播放段 + 白色轨道。
+   * 进度条语义色跟随主题（浅色 = 品牌蓝，暗色 = 黑红），但**三条进度条共用同
+   * 一组变量**：完整条、收起态贴边细条、小窗进度条。旧实现里前两者用变量、
+   * 小窗写死 `bg-blue-500`，于是同一时刻"主窗口红、小窗蓝"。
+   *
+   * 底轨为什么是中性灰而不是白色：这条细条叠在视频画面上，纯白半透明
+   * （旧值 rgba(255,255,255,0.22)）在白墙 / 白西装 / 雪景上叠合后亮度差为 0，
+   * 3.5px 的线等于完全不存在 —— 这正是「收起后进度条有时候不见了」的成因。
+   * 中性灰叠白约 185、叠黑约 70，与两种极端背景都拉开约 70 的亮度差。
    */
   --progress-played-from: #4da3ff;
   --progress-played-to: #0078d4;
-  --progress-buffer: rgba(255, 255, 255, 0.38);
-  --progress-track: rgba(255, 255, 255, 0.22);
+  --progress-buffer: rgba(213, 213, 213, 0.6);
+  --progress-track: rgba(128, 128, 128, 0.55);
   --progress-glow: rgba(0, 120, 212, 0.58);
 
   /* 平缓动效曲线 */
@@ -611,6 +617,9 @@
   background: var(--progress-track);
   box-shadow:
     0 -1px 0 rgba(255, 255, 255, 0.3),
+    /* 中性灰细描边：白色底轨在上缘高光之外再给一条不依赖背景色的轮廓，
+       极亮画面上也能看出"这里有一条线"（纯白描边在白底上等于没有）。 */
+    0 0 0 0.5px rgba(128, 128, 128, 0.45),
     0 0 5px rgba(0, 0, 0, 0.32);
   z-index: 35;
   opacity: 0;
@@ -667,7 +676,8 @@
   background: linear-gradient(180deg, var(--progress-played-from), var(--progress-played-to));
   box-shadow:
     0 0 8px var(--progress-glow),
-    0 0 0 0.5px rgba(255, 255, 255, 0.52);
+    /* 描边用中性灰而不是纯白：这条线要在白西装 / 雪景这类亮画面上也有轮廓。 */
+    0 0 0 0.5px rgba(128, 128, 128, 0.55);
   /* 用 scaleX 而非 width：进度每帧更新时避免触发布局重排 */
   transform-origin: left center;
   will-change: transform;
@@ -681,10 +691,15 @@
 .ttv-mini-played.is-unknown {
   width: 28%;
   transform: none;
-  /* 与已播段同族但更亮、并带白色外描边：时长未知时它独自出现在底轨上，
-     必须在极亮画面上也有轮廓（纯色版本实测只有 41 的亮度差，在白西装上会糊掉）。 */
-  background: linear-gradient(180deg, #ff8b9c, #d92543);
-  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.6);
+  /*
+    与已播段**同一组变量**（2026-10-19 修「进度条偶尔变色」）。
+    这里曾经是写死的红色渐变：浅色主题下时长未就绪的头一两秒，细条是红的，
+    时长一解析出来立刻变成蓝色 —— 用户看到的就是"进度条有时候会变色"。
+    改成变量后，占位与已播永远同色系，只靠不透明度区分"还没开始"。
+  */
+  background: linear-gradient(180deg, var(--progress-played-from), var(--progress-played-to));
+  opacity: 0.72;
+  box-shadow: 0 0 0 0.5px rgba(128, 128, 128, 0.55);
   /*
     刻意**不做**无限循环动画。原设想是加一段 opacity 呼吸提示"还在加载"，
     但任何持续动画都会被提升为常驻合成层，而这条播放器的合成约束极其昂贵：

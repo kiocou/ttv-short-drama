@@ -102,11 +102,12 @@ html[data-theme='dark'] {
   --fluent-blue-hover: #c31e38;
   --fluent-sky: #ff8296;
 
-  /* 播放器进度条：暗色主题使用红色已播放段 + 白色轨道。 */
+  /* 播放器进度条：暗色主题用黑红已播放段 + 中性灰底轨
+     （底轨与 crystal.css 相同 —— 它叠在视频画面上，可读性与界面主题无关）。 */
   --progress-played-from: #ff7184;
   --progress-played-to: #e02a45;
-  --progress-buffer: rgba(255, 255, 255, 0.38);
-  --progress-track: rgba(255, 255, 255, 0.22);
+  --progress-buffer: rgba(213, 213, 213, 0.6);
+  --progress-track: rgba(128, 128, 128, 0.55);
   --progress-glow: rgba(224, 42, 69, 0.72);
 
   /* 启动动画的强调色（导轨 / 光晕 / 冲击环 / 品牌投影）与品牌图标的着色。

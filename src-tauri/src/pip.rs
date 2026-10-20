@@ -74,6 +74,11 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 pub const EVENT_RETURNED: &str = "pip://returned";
 /// 主窗口 → 小窗：复用已存在的小窗时下发新的交接包。
 pub const EVENT_HANDOFF: &str = "pip://handoff";
+/// 小窗 → 主窗口：小窗已经出画并可见，主窗口现在可以隐藏自己了。
+///
+/// 前端侧的广播点见 `bootPip` / `MiniPlayer` 的 revealWindow；这里的复用分支
+/// 也要补一条：复用意味着窗口早就加载好了，不会再走一次"首帧后 show"。
+pub const EVENT_SHOWN: &str = "pip://shown";
 
 /// 小窗默认尺寸（逻辑像素，16:9）。再小就看不清人脸，再大就不叫"小窗"了。
 const DEFAULT_WIDTH: f64 = 420.0;
@@ -204,6 +209,9 @@ fn ensure_window(app: &AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
         let _ = window.show();
         let _ = window.set_focus();
+        // 复用分支不会走前端的"首帧后 show"，所以那一拍的通知必须由这里补：
+        // 主窗口在等 `pip://shown` 才隐藏自己，漏发就会两个窗口同时可见。
+        let _ = app.emit_to(MAIN_WINDOW_LABEL, EVENT_SHOWN, ());
         return Ok(());
     }
 
@@ -220,9 +228,35 @@ fn ensure_window(app: &AppHandle) -> Result<(), String> {
         .skip_taskbar(true)
         .shadow(true)
         .resizable(true)
-        .focused(true)
+        // **先不可见，由前端在首帧渲染完成后 show()**。
+        //
+        // WebView2 创建窗口到页面出画之间有一段"白底空窗"：窗口一 build 就可见的话，
+        // 用户点"画中画"看到的是先闪一块白的、再刷出播放界面 —— 观感上就是"卡一下"。
+        // 这段空窗正是页面加载 + JS 执行的时间，让它在不可见状态下发生，
+        // 用户只在界面已就绪时才看到窗口。
+        //
+        // 兜底见下方 spawn：前端若因加载失败没能 show，1.5 秒后强制显示，
+        // 绝不允许出现"点了画中画却什么都没有"。
+        .visible(false)
         .build()
         .map_err(|error| format!("创建画中画窗口失败：{error}"))?;
+
+    // 可见性兜底：前端首帧渲染后会自己 show（见 MiniPlayer 的 showWindow effect）。
+    // 这一步只在天窗（前端异常）时生效。
+    {
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let Some(window) = handle.get_webview_window(WINDOW_LABEL) else {
+                return;
+            };
+            // 已被销毁/已被重新启用时 `is_visible` 为 true，不重复处理。
+            if !window.is_visible().unwrap_or(true) {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        });
+    }
 
     // 两条与窗口生命周期相关的事项：
     //   1. Alt+F4 / 任务栏结束等系统路径不会走 pip_close。不在 Destroyed 里补一手，

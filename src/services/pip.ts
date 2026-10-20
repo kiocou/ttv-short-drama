@@ -32,6 +32,14 @@ export const PIP_WINDOW_LABEL = 'mini';
 export const PIP_HANDOFF_EVENT = 'pip://handoff';
 /** 小窗 → 主窗口：小窗已关闭，附带最终进度。 */
 export const PIP_RETURNED_EVENT = 'pip://returned';
+/**
+ * 小窗 → 主窗口：小窗**已经出画并显示**。
+ *
+ * 存在的理由只有一个：主窗口必须等到这一刻才隐藏自己。提前隐藏会出现用户报的
+ * 那个空档——播放界面先消失、小窗还在加载，屏幕上剩一块主界面（或桌面），
+ * 看起来像"切过去卡了一下"。顺序反过来就没有空档：小窗先接管画面，主窗口再退场。
+ */
+export const PIP_SHOWN_EVENT = 'pip://shown';
 
 /** 小窗用哪条解析链路：短剧/漫剧，或动漫专区。 */
 export type PipKind = 'drama' | 'anime';

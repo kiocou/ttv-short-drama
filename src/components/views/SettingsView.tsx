@@ -589,7 +589,7 @@ const SourceStatusPanel: React.FC = () => {
             </p>
           )}
 
-          {GUO_SOURCES.map(source => {
+          {GUO_SOURCES.filter(source => !source.retired).map(source => {
             const row = byId.get(source.id);
             const check = checks[source.id];
             const badge = healthBadge(row, check);
@@ -1197,7 +1197,7 @@ export const SettingsView: React.FC = () => {
           <SourceGroup
             title="真人短剧"
             hint="实拍短剧，条目有剧情简介、几十至上百集。汇入发现页的「短剧专区」。"
-            sources={GUO_SOURCES.filter(item => item.kind === 'live' && !item.adult)}
+            sources={GUO_SOURCES.filter(item => item.kind === 'live' && !item.adult && !item.retired)}
             enabled={enabledSources}
             locked={false}
             onToggle={toggleSource}
@@ -1205,7 +1205,7 @@ export const SettingsView: React.FC = () => {
           <SourceGroup
             title="真人 + 漫剧"
             hint="同一个源里两种内容都有。汇入「短剧专区」与「漫剧次元」。"
-            sources={GUO_SOURCES.filter(item => item.kind === 'both' && !item.adult)}
+            sources={GUO_SOURCES.filter(item => item.kind === 'both' && !item.adult && !item.retired)}
             enabled={enabledSources}
             locked={false}
             onToggle={toggleSource}
@@ -1216,7 +1216,7 @@ export const SettingsView: React.FC = () => {
                而且把几个露骨片名直接印在设置页上，也超出了这一行的用途。
                用户只需要知道「它归哪个专区、受哪个开关管辖」。 */
             hint="逐源确认含成人条目。只汇入发现页的「神秘小窝」专区，不进短剧专区与漫剧次元。"
-            sources={GUO_SOURCES.filter(item => item.adult)}
+            sources={GUO_SOURCES.filter(item => item.adult && !item.retired)}
             enabled={enabledSources}
             locked={!settings.showAdultSources}
             onToggle={toggleSource}

@@ -312,6 +312,49 @@ fn hls_packaging_args(ffmpeg: &std::path::Path) -> &'static [&'static str] {
     }
 }
 
+/// 网络源的断流重连参数（输入选项，必须排在 `-i` 之前）。
+///
+/// ## 为什么需要（2026-10-19，「播着播着转码失败」）
+///
+/// 日志里的真实退出样本：
+///
+/// ```text
+/// [vsr] 转码进程退出 会话=1000188 状态=exit code: 0xffffff76
+///       stderr=[tcp @ ...] Connection to tcp://v5-se-bjtc-reading-video-a.qznovelvod.com
+/// [vsr] 起转失败 会话=111 状态=exit code: 0xa7a7ca08
+///       stderr=[in#0] Error opening input: Server returned 5XX Server Error
+/// ```
+///
+/// 红果源是 CDN 直链，中途断连 / 5XX 是常态。ffmpeg 默认把"连接断了"直接当成
+/// **输入结束** —— 进程退出、产物停在半截且没有 `#EXT-X-ENDLIST`，播放器于是播到
+/// 已写出的最后一个分片就停住。用户的处置只能是重新打开这一集：那会重新走
+/// `start_video_cache`，发现产物不完整 → 整集重转。所以现象被描述成
+/// 「要重新从头播放才能加载完后面」。
+///
+/// `-reconnect_streamed 1` 让它在**流式输入**（mp4/HLS 直链都属于）断流时重连，
+/// 而不是当作 EOF；`-reconnect_delay_max 5` 把重试间隔封顶在 5 秒 ——
+/// CDN 切节点通常在这个量级内恢复，再久就该如实判失败（交给上层重转一次）。
+///
+/// 只对 http(s) 追加：本地文件输入没有这套协议选项，传了只会增加无意义参数。
+fn reconnect_args(source_url: &str) -> &'static [&'static str] {
+    if source_url.starts_with("http://") || source_url.starts_with("https://") {
+        RECONNECT_ARGS
+    } else {
+        &[]
+    }
+}
+
+const RECONNECT_ARGS: &[&str] = &[
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_at_eof",
+    "0",
+    "-reconnect_delay_max",
+    "5",
+];
+
 fn video_encoder_args(ffmpeg: &std::path::Path, source_kbps: Option<u32>) -> Vec<String> {
     let tier = detect_encoder_tier(ffmpeg);
     let args = match tier {
@@ -701,6 +744,40 @@ pub async fn start_video_cache(
     .await
 }
 
+/// 按**稳定键**建持久产物目录（guo 外部站源的整集 HLS）。
+///
+/// 与红果 [`start_video_cache`] 的区别只是“键从哪来”：红果有官方 vid，而 guo 源
+/// 只有「源:剧:集」，且它的播放地址每次 resolve 都带新的本地 token（不能当键）。
+/// 所以这里把调用方给的 `key` 哈希成目录名，其余复用同一套「ENDLIST 即复用 +
+/// 编码指纹校验 + 任务表重挂」逻辑。
+///
+/// 为什么值得持久：guo 链路原来每集都建 `session-<uuid>` 临时目录、换集即删，
+/// 同一集回看 / 画中画交接 / 连播预取都没法命中，每次都要重新起 ffmpeg 等首片。
+/// 红果早就是「转一次、之后秒开」，这条改动把 guo 拉到同一水平。
+pub async fn start_keyed_cache(
+    session_id: u64,
+    key: &str,
+    source_url: &str,
+    source_kbps: Option<u32>,
+) -> Result<String, String> {
+    let vid = format!("guo-{}", stable_key_hash(key));
+    crate::trace::log(format!(
+        "[vsr] guo 整集缓存键会话={session_id} 目录=vid-{vid}"
+    ));
+    start_video_cache(session_id, &vid, source_url, None, source_kbps).await
+}
+
+/// 把「源:剧:集:档位」折成一个稳定的目录名片段。
+///
+/// `DefaultHasher` 在标准库里是固定种子的 SipHash——同一进程内、跳进程都稳定，
+/// 正好够当缓存键；不保证跳 Rust 版本一致，但那种情况只需重转一次（编码指纹会兜住）。
+fn stable_key_hash(key: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// 若某个**正在转码**的任务用的正是这个目录，返回那份目录。
 ///
 /// `done == false` 说明它的 ffmpeg 还没退出（也就是还在写分片）。
@@ -816,14 +893,22 @@ async fn start_in_directory(
     // 就地 abort 旧任务并删掉旧目录。
     let info = ensure_server().await?;
     stop(session_id);
+    // 先回收**已经跑完**的任务记录：ffmpeg 退出后 Job 仍留在表里（`done` 只置位
+    // 不移除），不清就会把「8 路」名额虚占满，逼着下面的循环去杀进程。
+    if let Ok(mut guard) = jobs().lock() {
+        guard.retain(|id, job| *id == session_id || !job.done.load(Ordering::Acquire));
+    }
     // 预取可能同时准备多条 guo 会话；限制任务数，避免用户连续点选后留下十几路 ffmpeg。
+    //
+    // 淘汰**必须排除本次会话**：`min(id)` 优先挑的是播放器会话号（前端从 100 起），
+    // 而预取会话号是独立的大数——不排除时会先杀掉正在播的那一路，表现为“换集后
+    // 画面卡死、要再点一次”。持久任务（红果 vid-* / guo 整集缓存）也不杀：
+    // 掐掉正在转的那一路会连同产物一起失效。
     while jobs().lock().map(|guard| guard.len()).unwrap_or(0) >= 8 {
-        // 淘汰只能挑**非持久**任务：持久目录是可复用缓存，掐掉正在转的那一路
-        // 会连同它的产物一起失效（下次还得重转）。
         let victim = jobs().lock().ok().and_then(|guard| {
             guard
                 .iter()
-                .filter(|(_, job)| !job.persist)
+                .filter(|(id, job)| **id != session_id && !job.persist)
                 .map(|(id, _)| *id)
                 .min()
         });
@@ -924,7 +1009,29 @@ async fn start_in_directory(
         .arg("-tls_verify")
         .arg("0")
         .arg("-rw_timeout")
-        .arg("60000000")
+        // 15 秒（ffmpeg 的单位是微秒）。原来是 60 秒 —— 源 CDN 一旦卡住不回包，
+        // ffmpeg 就干等整整一分钟、一个分片都写不出来；播放器那边只看得到
+        // "这一片一直不存在"，用户感知就是"播到一半卡住不动"。
+        // 15 秒足够覆盖正常网络抖动，超过它就该判失败：进程退出 → 分片请求拿到
+        // 410 → 前端重新开播续转（比干等一分钟好得多）。
+        .arg("15000000")
+        // 网络源断流自动重连（**输入选项，必须在 `-i` 之前**）。
+        //
+        // 实测现场（ttv-playback.log，2026-10-19 多次）：
+        //   [vsr] 转码进程退出 会话=1000188 状态=exit code: 0xffffff76
+        //        stderr=[tcp @ ...] Connection to tcp://v5-se-bjtc-reading-video-a...
+        //   [vsr] 起转失败 会话=111 状态=exit code: 0xa7a7ca08
+        //        stderr=Error opening input: Server returned 5XX Server Error
+        //
+        // 也就是说：转码中途源 CDN 一断，ffmpeg 直接退出、产物停在半截（没有
+        // `#EXT-X-ENDLIST`）。播放器只能播到已写出的分片末尾就停住，用户看到的就是
+        // "播着播着转码失败，必须重新打开从头播才能加载完后面"——重新开播会重新走
+        // `start_video_cache`，发现产物不完整于是整集重转一次。
+        //
+        // 这三条让 ffmpeg 自己在断流处重连而不是立刻退出：对它而言这是"数据来得慢"，
+        // 不是"流结束"。5 秒上限覆盖 CDN 切节点 / 短时拥塞，再长就该判失败了。
+        // 只对 http(s) 源追加：本地文件输入没有这套协议选项。
+        .args(reconnect_args(source_url))
         .arg("-i")
         .arg(source_url)
         .arg("-map")
@@ -994,18 +1101,25 @@ async fn start_in_directory(
     let child = command
         .spawn()
         .map_err(|error| format!("启动增强转码失败：{error}"))?;
+    // 转码耗时基准：用户反复反馈「播放到一半还在转码」，而此前日志里只有
+    // "首片就绪"（start → 预转已就绪 0.7~1.3s），**整集到底转多久从来没记过**。
+    // 没有这个数，就分不清是"转码慢"还是"转码卡住"——两者的处置完全相反。
+    let transcode_started = std::time::Instant::now();
     let done = Arc::new(AtomicBool::new(false));
     let task_done = Arc::clone(&done);
     let task = tokio::spawn(async move {
         let output = child.wait_with_output().await;
+        let elapsed = transcode_started.elapsed().as_millis();
         if let Ok(output) = output {
-            if !output.status.success() {
+            if output.status.success() {
+                crate::trace::log(format!("[vsr] 转码完成 会话={session_id} 耗时={elapsed}ms"));
+            } else {
                 // 原来这里只 eprintln!：双击启动（windows 子系统）时是黑洞，
                 // 转码到底为什么退出没人看得到。改走日志通道。
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let trimmed = stderr.trim();
                 crate::trace::log(format!(
-                    "[vsr] 转码进程退出 会话={session_id} 状态={} stderr={}",
+                    "[vsr] 转码进程退出 会话={session_id} 耗时={elapsed}ms 状态={} stderr={}",
                     output.status,
                     trimmed.chars().take(300).collect::<String>()
                 ));
@@ -1149,6 +1263,42 @@ fn job_alive(session_id: u64) -> bool {
 /// **`persist` 的产物不删目录**：换集时 `playback_command("stop")` 会走到这里，
 /// 而对红果的整集 HLS 来说那时转码早已结束、产物是一份可复用的缓存 —— 删掉意味着
 /// 用户下一次打开同一集又要重转 5.6 秒。回收改由缓存预算统一负责。
+/// 判定"转码停滞"的阈值（秒）。
+///
+/// 正常转码每 2 秒写一个分片（`-hls_time 2`），所以连续 8 秒没有任何新文件
+/// 就意味着至少四个分片的产出被卡住了。取 8 秒而不是更大：用户对"停住"的
+/// 容忍度很短；也不取更小，要排除磁盘抖动与 NVENC 的偶发长帧。
+const STALL_SECONDS: u64 = 8;
+
+/// 目录内最新文件的"距今多少秒"；读不到目录时返回 `None`。
+///
+/// 用于判断转码是否还在产出：ffmpeg 每写完一个分片都会重写 `index.m3u8`，
+/// 所以"最新 mtime"就是"最后一次真的写出东西"的时刻。
+fn directory_idle_seconds(directory: &std::path::Path) -> Option<u64> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in std::fs::read_dir(directory).ok()? {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        newest = Some(match newest {
+            Some(prev) if prev >= modified => prev,
+            _ => modified,
+        });
+    }
+    newest?.elapsed().ok().map(|elapsed| elapsed.as_secs())
+}
+
+/// 转码是否**已经开始写出分片**（至少落了第一片）。
+///
+/// 停滞判据必须带上这个前提：全新会话在首片落地前本来就要等 2~4 秒（源越远越久），
+/// 那段时间目录里一个文件都没有，把它当"停滞"会误杀一次正常的起转。
+/// 只有已经开始写、却突然停住，才是真的要处置的那种卡死。
+fn transcode_started_writing(directory: &std::path::Path) -> bool {
+    directory.join("seg-00000.m4s").is_file()
+}
+
 pub fn stop(session_id: u64) {
     let job = jobs()
         .lock()
@@ -1346,7 +1496,10 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
         .ok()
         .and_then(|guard| guard.get(&session_id).map(|job| job.directory.clone()))
     else {
-        write_plain(&mut socket, "404 Not Found", "增强播放会话已结束").await?;
+        // 会话已经不在任务表里（被 stop / 正常结束 / 切集）——这块产物不会再有新分片。
+        // 返 410 而不是 404：4xx 让 hls.js 立刻 fatal，前端随即重新 open_stream；
+        // 404 会让它把 24 次重试预算全花在一个永远不会出现的文件上。
+        write_plain(&mut socket, "410 Gone", "增强播放会话已结束").await?;
         return Ok(());
     };
     let file_path = directory.join(file_name);
@@ -1376,6 +1529,13 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
         // （无 ENDLIST 被判成 live 流）→ 落到 `levelLoadingMaxRetry`，重试预算被花在
         // 另一条路径上；返 503 才回到注释上面写的那条 `manifestLoadingMaxRetry`。
         if !rewritten.contains("#EXTINF") {
+            // 清单里一条分片都没有：只能是"刚起转、还没写出来"。
+            //
+            // 这里刻意**不套停滞判据**：连第一片都没落时 `transcode_started_writing`
+            // 恒为假，套上去只会让判断永远不成立、代码读起来自相矛盾。
+            // 这种状态的出口交给播放器：503 会让 hls.js 按 `manifestLoadingMaxRetry`
+            // 重试；重试耗尽就 fatal → 前端重新 open_stream（重新签名、可能换到更快的
+            // CDN 节点），比在后端猜"是不是卡了"更准确。
             crate::trace::log(format!(
                 "[vsr] 本地服务：清单尚未就绪 会话={session_id}（返 503 让播放器重试）"
             ));
@@ -1413,13 +1573,87 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
     }
     let Ok(metadata) = std::fs::metadata(&file_path) else {
         // 分片还没落盘、播放器却在要它——这就是"一直加载等待"最直接的一行证据。
+        //
+        // ⚠️ 但要分两种情形（2026-10-20 修「播着播着卡住」）：
+        //   - 转码进程还活着：确实是"还没写到"，返 404 让 hls.js 按
+        //     `fragLoadingMaxRetry`（24 次 × 300ms）继续等 —— 它多半马上就会写出来；
+        //   - 转码进程**已经退出**：这个分片永远不会出现了（源断连 / 5XX 导致 ffmpeg
+        //     中途退出）。继续返 404 只会让播放器白等满 7 秒重试预算才 fatal，
+        //     用户看到的就是"卡住不动"。
+        //     410 是 4xx，hls.js 对 4xx 不重试、立刻 fatal → 前端马上进入
+        //     「重新 open_stream 续转」的自愈，中断时间从 7 秒降到 1 秒内。
+        // ⚠️ 判据必须是**产物是否完整**（清单里有 `#EXT-X-ENDLIST`），
+        // 不能用 `job.done`。
+        //
+        // 2026-10-20 现场：正在播放的会话 106 走的是「同一 vid 正在转码 → 共用产物」
+        // 分支（`register_reused` 把它挂到真正在转的 1001935 的目录上），而
+        // `register_reused` 会把 `done` 直接置 true —— 它只表示"这个会话号没有
+        // 自己的 ffmpeg"，**不表示产物转完了**。拿 done 当"转码已结束"，就会把
+        // 一份正在写的产物判成结束：播放器要下一片 → 文件还没写出来 → 410 →
+        // hls.js 对 4xx 不重试、立刻 fatal → 自愈重开又是同一个 410，于是
+        // 每 0.4 秒刷一条 fragLoadError、最后彻底卡住。
+        let artifact_complete = std::fs::read_to_string(directory.join("index.m3u8"))
+            .map(|body| body.contains("#EXT-X-ENDLIST"))
+            .unwrap_or(false);
+        if artifact_complete {
+            crate::trace::log(format!(
+                "[vsr] 本地服务：分片缺失且产物已完整 会话={session_id} 文件={file_name}（返 410，确实没有这一片）"
+            ));
+            write_plain(&mut socket, "410 Gone", "增强播放分片缺失（产物已完整）").await?;
+            return Ok(());
+        }
         crate::trace::log(format!(
             "[vsr] 本地服务：分片尚未就绪 会话={session_id} 文件={file_name}"
         ));
+        // 进程还活着，但这个目录已经很久没有新产出了 —— 说明 ffmpeg 卡在了某处
+        // （源不回包、NVENC 挂起、关键帧解不出来）。
+        //
+        // 实测现场（ttv-playback.log，会话 103，同一个分片被反复请求 40 秒）：
+        //   2561.1s / 2561.7s / 2562.8s / 2564.9s / 2569.0s / 2577.1s …
+        // 播放器按退避一直等，而转码那边一片都没再写出来——用户看到的就是
+        // 「播到一半停住不动」。
+        //
+        // 判据用**目录内最新文件时间**而不是分片序号：正常转码每 2 秒写一片，
+        // 超过 STALL_SECONDS 无新文件就是停滞。这时主动杀掉这一路转码并返 410，
+        // 让前端立刻重新 open_stream 续转（而不是继续等一个永远不会出现的分片）。
+        if transcode_started_writing(&directory)
+            && directory_idle_seconds(&directory)
+                .map(|idle| idle >= STALL_SECONDS)
+                .unwrap_or(false)
+        {
+            crate::trace::log(format!(
+                "[vsr] 转码停滞超过 {STALL_SECONDS}s（分片缺失且无新产出），停掉并返 410 触发续转 会话={session_id} 文件={file_name}"
+            ));
+            stop(session_id);
+            write_plain(&mut socket, "410 Gone", "增强播放转码停滞").await?;
+            return Ok(());
+        }
         write_plain(&mut socket, "404 Not Found", "增强播放分片尚未就绪").await?;
         return Ok(());
     };
     let size = metadata.len();
+    // ⚠️ 文件存在但**长度为 0**：ffmpeg 刚创建分片、还没写进数据。
+    //
+    // 2026-10-20 现场（用户第 7 集，画面正常播但日志每 0.4 秒一条 fragLoadError，
+    // 本地服务一条日志都没有）：这种"半成品文件"会一路走到下面的 Range 判断，
+    // `parse_range` 得到 `(0, 0-1)` → `start > end` → **416 Range Not Satisfiable**，
+    // 而 416 是 4xx，hls.js 不重试内容、直接算 fragLoadError，24 次后 fatal。
+    // 播放器那边看到的就是"转码跟不上/卡一下"。
+    //
+    // 正确语义是"还没好、请稍等"——返 503（5xx 会让 hls.js 重试），并且打点留痕
+    // （这个分支此前完全静默，正是这次排查卡住的原因）。
+    if size == 0 {
+        crate::trace::log(format!(
+            "[vsr] 本地服务：分片长度为 0（正在写入） 会话={session_id} 文件={file_name}（返 503 让播放器重试）"
+        ));
+        write_plain(
+            &mut socket,
+            "503 Service Unavailable",
+            "增强播放分片正在写入",
+        )
+        .await?;
+        return Ok(());
+    }
     let range = request.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("range")
@@ -1427,6 +1661,12 @@ async fn handle(mut socket: TcpStream, server: ServerInfo) -> std::io::Result<()
     });
     let (start, end) = parse_range(range.as_deref(), size).unwrap_or((0, size.saturating_sub(1)));
     if start > end || start >= size {
+        // 这个分支以前是静默的：播放器那边只看到 fragLoadError，后端一行日志都没有，
+        // 排查时完全不知道请求到底卡在哪。416 说明 Range 与文件长度对不上
+        // （典型是文件正在被追加写），如实记一条。
+        crate::trace::log(format!(
+            "[vsr] 本地服务：Range 不满足 会话={session_id} 文件={file_name} start={start} end={end} size={size}"
+        ));
         write_head(
             &mut socket,
             "416 Range Not Satisfiable",

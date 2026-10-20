@@ -4,8 +4,8 @@ import { SeriesDetail, EpisodeItem } from '../types/series';
 import { ipcService, isTauriEnvironment } from '../services/ipc';
 import { attachSource, isHlsUrl, detachSource, takeHlsFatal } from '../services/hlsAttach';
 import { dismissPip, openPip } from '../services/pip';
-import { tracePlayback } from '../services/playbackTrace';
-import { shouldFinishAtBufferedTail } from '../services/playbackTail';
+import { redactUrl, tracePlayback } from '../services/playbackTrace';
+import { isPlayheadAtPlayableTail } from '../services/playbackTail';
 import { useSettingsStore } from './useSettingsStore';
 
 /**
@@ -379,6 +379,28 @@ function usableDuration(video: HTMLVideoElement): number {
   return fallback >= 1 ? fallback : 0;
 }
 
+/**
+ * 元素上记录的事件是否属于**已经作废**的会话（迟到事件）。
+ *
+ * ## 为什么必须允许"没有标记"通过（2026-10-19 / 10-20 两次踩同一个坑）
+ *
+ * `dataset.sessionId` 只在赋 `src` / 挂 hls 的那一刻写入。首帧真正落地之前，
+ * 它可能是空串 —— `Number('') === 0`、`Number(undefined) === NaN`，而会话号
+ * 从 100 起（小窗从 9e8 起），于是"不相等就丢弃"会在**这段窗口里把所有事件
+ * 全部丢掉**：
+ *
+ *   - `timeupdate`：画面在播（媒体元素与 React 无关），进度条与历史进度全不动；
+ *   - `playing`：界面永远停在 opening/buffering；
+ *   - `error`：hls.js 的 fatal 被整个吞掉，不弹卡、不自愈、也不留日志。
+ *
+ * 三次都是同一个判据写错。所以判据只留这一份，且只在**标记确实存在且为正数**
+ * 时才比对——"没有标记"是未知状态，放行由各调用点自身的其它守卫兜底。
+ */
+function isStaleElementSession(video: HTMLVideoElement, activeSessionId: number): boolean {
+  const tagged = Number(video.dataset.sessionId);
+  return Number.isFinite(tagged) && tagged > 0 && tagged !== activeSessionId;
+}
+
 /** 当前媒体元素最后一个连续缓冲区间的末端；没有可读区间时返回 0。 */
 function bufferedEndSeconds(video: HTMLVideoElement): number {
   try {
@@ -390,6 +412,38 @@ function bufferedEndSeconds(video: HTMLVideoElement): number {
   }
   return 0;
 }
+
+/**
+ * 把"这一集该从哪开始"真正落到媒体元素上。
+ *
+ * ## 为什么需要显式做这件事（2026-10-19）
+ *
+ * 播放器只有一块常驻 `<video>`，换集时**不换元素**：靠设置新 `src`（或 hls.js 重建
+ * MSE）让浏览器重置 `currentTime`。规范上那会把位置清 0，但 `hls.js` 的
+ * `startPosition` 默认值是 **-1**，语义是"拿 `media.currentTime` 当起点"——
+ * 也就是说新一集的起播点取决于这一刻元素上残留的值。一旦换源时序上出现
+ * "先 attach、后重置"的窗口，新一集就会从**上一集的位置**开始播，
+ * 用户看到的就是"进度条不在 0、从某个莫名其妙的时间点继续"。
+ *
+ * 所以这里不再假设"设了 src 就一定是 0"：目标位置由调用方给定（连播/点下一集
+ * 一律是 0，续播是保存的进度），偏移超过 0.5 秒时打点——这是该症状唯一的现场证据。
+ */
+function alignPlayhead(video: HTMLVideoElement, startPosition: number, sessionId: number): void {
+  const target = Number.isFinite(startPosition) && startPosition > 0 ? startPosition : 0;
+  const before = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+  if (Math.abs(before - target) > 0.5) {
+    tracePlayback(
+      `起播点收敛 期望=${target.toFixed(2)}s 元素现值=${before.toFixed(2)}s 会话=${sessionId}（换源没有重置位置，强制归位）`,
+    );
+  }
+  try {
+    video.currentTime = target;
+  } catch {
+    // `readyState === HAVE_NOTHING` 时给 currentTime 赋值会抛 InvalidStateError。
+    // 那种状态下位置天然是 0，随后的 `loadedmetadata` 会再次校准，不必在这里补救。
+  }
+}
+
 
 /**
  * `startPlayback` 的结果分类。三种失败的处理方式不同，不能压成一个 false。
@@ -493,6 +547,41 @@ const STALL_REWIND_SECONDS = 3;
 const STALL_RETRY_NOTICE = '画面卡住了，正在尝试恢复…';
 
 /**
+ * 看门狗判"停滞点就在可播末端"的窗口。
+ *
+ * 比 `handleWaiting` 的 2.5 秒更宽：走到这里说明时钟、解码帧、缓冲三者
+ * 已经连续 `PLAYBACK_STALL_MS`（10 秒）没有任何推进 —— 不可能还有数据在路上，
+ * 再把窗口收窄只会让"最后 3~5 秒分片永远没落地"的那类样本漏掉。
+ */
+const TAIL_END_STALL_WINDOW_SECONDS = 5;
+
+/**
+ * 末尾复核窗口（`waiting` 命中"停在可播末端"之后的确认时间）。
+ *
+ * 为什么是 1.2 秒：本机回环上 hls.js 拉一片只需亚毫秒级，真还有数据在路上，
+ * 这段时间里 `buffered.end` 必然已经前进；而倍速切换 / 解码抖动造成的瞬时
+ * `waiting` 也会在下一个 `timeupdate` 自行恢复（那会直接撤销这次复核）。
+ * 再短会让慢盘上的正常追加被误判成播完，再长则用户要盯 1 秒多的转圈。
+ */
+const TAIL_PROBE_DELAY_MS = 1200;
+
+/**
+ * 流式源就地重挂的额度与等待时间。
+ *
+ * 与 `hlsAttach` 的内层自愈（`MAX_IN_PLACE_RECOVERY`，针对 MSE/网络明细）构成两级：
+ * 内层处理"hls.js 自己能修的"，这里处理"要重新问后端点名才能续转的"。
+ * 两级都成功即回血，都失败才判死。
+ */
+const MAX_STREAM_RECOVER = 2;
+
+/**
+ * 重挂前的等待：给后端一拍时间去发现产物不完整并重新起 ffmpeg。
+ *
+ * 取 1200ms 与末尾复核同一个量级——短到用户还在看最后一帧，长到后端已经有反应。
+ */
+const STREAM_RECOVER_DELAY_MS = 1200;
+
+/**
  * 出帧停滞看门狗（短剧链路）。
  *
  * 判定："本该在播"（非 paused、非 seeking）却连续 `PLAYBACK_STALL_MS` 既没有
@@ -527,6 +616,18 @@ function startDramaStallWatchdog(
     onEscalate: () => void;
     /** 画面重新推进了（恢复成功）：用来收回卡死提示。 */
     onHealthy: () => void;
+    /**
+     * 停住的其实是"可播末端"：这一集已经播完了，别再 seek / 重装载。
+     *
+     * 末尾卡住时时钟/帧/缓冲三个信号与"解码线程卡死"完全一致，但处置相反：
+     * 那里没有下一帧可救，seek 回原处与重装载同一集都只会原地重演。
+     * 判据交给 `isPlayheadAtPlayableTail`（放宽到 5 秒窗口：此时已经确认
+     * 10 秒没有新数据进来），由它回落到 `handleEnded` 的完整语义。
+     *
+     * @returns 是否真的接手处理。返回 `false` 表示"这一拍没处理，下一拍再来"——
+     *          看门狗据此决定 `stalled` 是否置位，否则它会永久停摆（见调用点）。
+     */
+    onTailEnd: () => boolean;
   },
 ): () => void {
   const bufferedEnd = (): number => (video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0);
@@ -569,6 +670,37 @@ function startDramaStallWatchdog(
     // 10 秒后都会被误判成卡死，末帧被 seek 倒带闪回一次，再触发一次假重装载。
     if (video.paused || video.ended || video.seeking || stalled) return;
     if (now - lastAdvancedAt < PLAYBACK_STALL_MS) return;
+    // 停住的地方是可播末端 → 这一集其实已经播完了（见 `onTailEnd` 的说明）。
+    // 必须先于 onRetry 判定：末尾没有下一帧可救，seek 回原处会把末帧倒带闪回，
+    // 重装载同一集也只是把同一段结尾再卡一次。
+    if (
+      isPlayheadAtPlayableTail(
+        {
+          currentTime: video.currentTime,
+          duration: usableDuration(video),
+          bufferedEnd: bufferedEnd(),
+          paused: video.paused,
+          seeking: video.seeking,
+          ended: video.ended,
+        },
+        TAIL_END_STALL_WINDOW_SECONDS,
+      )
+    ) {
+      tracePlayback(
+        `看门狗：停滞点在可播末端，按本集播完处理 current=${video.currentTime.toFixed(2)}s duration=${usableDuration(video).toFixed(2)}s buffered=${bufferedEnd().toFixed(2)}s`,
+      );
+      // ⚠️ `stalled` 只在回调**真的处理了**才置位（2026-10-20 复查修正）。
+      //
+      // 原先无条件先置 true 再调回调：而回调里有两处早退（会话已作废 / 用户暂停、
+      // 拖进度、已 ended）。一旦早退，本函数此后每一拍都会被 `stalled` 挡在门口，
+      // 既不重试、也不升级、也不再判末尾 —— 看门狗就此静默死亡，用户对着屏幕
+      // 没有任何出口，直到手动点一下触发 `handlePlaying` 重新武装。
+      //
+      // 回调返回 false 时把 `stalled` 放回 false，下一拍（700ms 后）重新判断：
+      // 末尾判定是幂等的，重复进入没有副作用，而"静默死亡"没有第二次机会。
+      stalled = callbacks.onTailEnd() !== false;
+      return;
+    }
     stalled = true;
     callbacks.onRetry();
     escalateTimer = window.setTimeout(() => {
@@ -711,6 +843,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    */
   const resetStreamingSource = () => {
     streamingSourceRef.current = false;
+    // 地址与自愈额度都属于"这一集的这一个源"，换源即失效。
+    streamUrlRef.current = '';
+    streamRecoverRef.current = 0;
+    // 挂起的那次自愈同理：它绑的是旧源的位置与旧会话，换源之后落地就是错的。
+    cancelStreamRecover();
     // 时长权威值属于"这一集的这一个源"，换源即失效。
     streamingSourceTotalSeconds = 0;
   };
@@ -728,6 +865,42 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 加密直链，WebView 解不了 CENC）。正确动作只有一个：让整集链路接管。
    */
   const streamingSourceRef = useRef<boolean>(false);
+
+  /**
+   * 当前这一集流式 HLS 的原始地址（`http://127.0.0.1:.../rtx/{session}/index.m3u8`）。
+   *
+   * 为什么要单独记：`video.currentSrc` 在 hls.js 接管后是 `blob:`（MSE 句柄），
+   * 拿它重挂没有任何意义；而分片临时失败时的正确动作就是"用同一个 m3u8 再挂一次"。
+   */
+  const streamUrlRef = useRef<string>('');
+
+  /**
+   * 本集已经用掉几次"流式源就地重挂"。
+   *
+   * 上限见 `MAX_STREAM_RECOVER`：第一次覆盖"分片还没生成"，第二次覆盖"hls.js
+   * 已经把 MSE 状态搞乱"。用尽仍失败才判死——那时才是真的播不了，弹错误卡不算冤。
+   * 换集 / 换源时由 `resetStreamingSource` 清零；**自愈成功后也会清零回血**，
+   * 否则一集里攒够两次互不相关的瞬时故障就永久判死。
+   */
+  const streamRecoverRef = useRef<number>(0);
+
+  /**
+   * 挂起中的"流式源就地重挂"定时器。
+   *
+   * 必须登记（2026-10-20 复查修正）：原先是裸 `window.setTimeout`，回调体会
+   * `openStreamNative` → `attachSource` → `playBounded`，而它只靠会话号守卫。
+   * `stopPlayback` 会让守卫成立，但 **HMR / StrictMode 重挂载不会改会话号** ——
+   * 那时定时器照样落地，把新源挂到一块已经卸载的元素上。
+   */
+  const streamRecoverTimerRef = useRef<{ timer: number; sessionId: number } | null>(null);
+
+  /** 收掉挂起中的自愈定时器（没有就什么都不做）。 */
+  const cancelStreamRecover = useCallback(() => {
+    if (streamRecoverTimerRef.current) {
+      window.clearTimeout(streamRecoverTimerRef.current.timer);
+      streamRecoverTimerRef.current = null;
+    }
+  }, []);
 
 
   /**
@@ -786,6 +959,34 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const stallRecoveredRef = useRef<Set<string>>(new Set());
   /** 本次 `openEpisode` 由看门狗发起（用户手动切集要清空重装载额度，它不能）。 */
   const stallReloadingRef = useRef<boolean>(false);
+
+  /** 已经打过"timeupdate 丢弃"日志的会话号：同一会话只打一次，避免刷屏。 */
+  const staleTickNotedRef = useRef<Set<number>>(new Set());
+
+  /**
+   * 末尾停滞复核的挂起任务。
+   *
+   * `waiting` 是**一次性事件**：播到末尾卡住时它只来一次（或来几次后彻底沉没），
+   * 没有第二次机会重新判定。所以命中的那一帧只能"预约一次复核"，
+   * 1.2 秒后再看：时钟没动、缓冲没长、仍在末尾 → 这才算这一集播完了。
+   *
+   * 这个窗口是 0.2.20 那版回归的分界线：它把"数据已完整缓冲"直接当成
+   * "不能判播完"，于是末段全部进缓冲、播放头却差几十毫秒走不到 `duration`
+   * 的那一类（实测 `buffered.end` 与 `duration` 只差 0.00~0.07 秒）永远没有出口。
+   */
+  const tailProbeRef = useRef<{
+    timer: number;
+    /** 预约时的播放位置：`timeupdate` 用它判断"画面其实还在走"，是复核的反证。 */
+    position: number;
+  } | null>(null);
+
+  const cancelTailProbe = useCallback(() => {
+    if (tailProbeRef.current) {
+      window.clearTimeout(tailProbeRef.current.timer);
+      tailProbeRef.current = null;
+    }
+  }, []);
+
 
   /** 用户手动关掉卡死提示。 */
   const dismissStallNotice = useCallback(() => setStallNotice(null), []);
@@ -1172,13 +1373,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 而这一行必须放在新源就绪之后，才能保证下一集仍按用户选择的速度播放。
       video.playbackRate = playbackRateRef.current;
 
-      if (startPosition > 0) {
-        try {
-          video.currentTime = startPosition;
-        } catch {
-          // metadata 未就绪则从 0 播
-        }
-      }
+      // 起播点收敛（见 `alignPlayhead`）：目标是 0 也要显式写一次，
+      // 不能依赖"设了 src 浏览器就会把位置清 0"。
+      alignPlayhead(video, startPosition, sessionId);
       const started = await startPlayback(video);
       if (started !== 'ok') return started;
       if (pauseIfStale(sessionId, video)) return 'stale';
@@ -1248,13 +1445,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
       // 同上：`src`/`load()` 之后再恢复倍速，避免换集后回到 1x。
       video.playbackRate = playbackRateRef.current;
-      if (startPosition > 0) {
-        try {
-          video.currentTime = startPosition;
-        } catch {
-          // metadata 未就绪则从 0 播
-        }
-      }
+      alignPlayhead(video, startPosition, sessionId);
       const started = await startPlayback(video);
       if (started !== 'ok') return started;
       if (pauseIfStale(sessionId, video)) return 'stale';
@@ -1332,13 +1523,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         return 'error';
       }
       video.playbackRate = playbackRateRef.current;
-      if (startPosition > 0) {
-        try {
-          video.currentTime = startPosition;
-        } catch {
-          // metadata 未就绪则从 0 播。
-        }
-      }
+      alignPlayhead(video, startPosition, sessionId);
       const started = await startPlayback(video);
       if (started !== 'ok') return started;
       if (pauseIfStale(sessionId, video)) return 'stale';
@@ -1506,6 +1691,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       if (streamingOutcome === `ok`) {
         tracePlayback(`整集 HLS 出画 耗时=${Math.round(performance.now() - streamingStarted)}ms（单源到底，不再切源）`);
         streamingSourceRef.current = true;
+        // 记下这一集的流式地址：分片临时失败时 `handleError` 要靠它就地重挂，
+        // 而不是退回"整集 mp4 解析"那条 7~10 秒的旧链路。
+        streamUrlRef.current = streaming.playUrl;
+        streamRecoverRef.current = 0;
         // **钉住这一集的真实时长**：后端从 worker 拿到源片 `duration_ms`，
         // 它是文件的客观属性，不随转码进度变化。`usableDuration` 以它为最高
         // 优先级，进度条与时间读数从此不再"一路往上跳"。
@@ -2101,17 +2290,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 结果回来时若会话已被更新的切换作废则丢弃。
       // （不能改用详情里的 availableQualities 直填：那里对 guo 源恒为空，
       // 每次换集都会把已探测到的档位清掉，清晰度按钮就永远是禁用的。）
-      if (isGuoSeries) {
-        const guoQualityKey = `${seriesId}::${ep.id}`;
-        if (guoProbedRef.current !== guoQualityKey) {
-          guoProbedRef.current = guoQualityKey;
-          void ipcService.playback.animeQualities(seriesId, ep.id)
-            .then(options => {
-              if (activeSessionRef.current !== newSessionId) return;
-              setAvailableQualities(options);
-            });
-        }
-      }
+      // 档位探测已改到 open 之后（见下方 preload 块后的调用）：guo-core 的 resolve
+      // 用全局单调序号，后发者 cancel 前发者，并发探测会把正在起播的那次掐掉。
 
       const selectedQuality = qualityOverride || currentQuality;
 
@@ -2400,6 +2580,24 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
       if (activeSessionRef.current !== newSessionId) return;
 
+      // guo 档位探测：排在 open 完成后，命中后端刚写回的档位缓存（零 resolve）。
+      // 失败时返回空数组——宁可退回单档，绝不虚构源里没有的档位。
+      if (isGuoSeries) {
+        const guoQualityKey = `${seriesId}::${ep.id}`;
+        if (guoProbedRef.current !== guoQualityKey) {
+          guoProbedRef.current = guoQualityKey;
+          void ipcService.playback.animeQualities(seriesId, ep.id)
+            .then(options => {
+              if (activeSessionRef.current !== newSessionId) return;
+              setAvailableQualities(options);
+            })
+            .catch(() => {
+              if (activeSessionRef.current !== newSessionId) return;
+              setAvailableQualities([]);
+            });
+        }
+      }
+
       // 走到这里只剩公开网页直链兜底（本地解析失败的罕见场景）。
       // 清晰度切换预热保留：旧画面继续播，预热完成才切，避免黑屏。
 
@@ -2449,20 +2647,15 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         if (pauseIfStale(newSessionId, video)) return;
         video.playbackRate = playbackRateRef.current;
 
-        if (startPosition > 0) {
-          const handleMetadata = () => {
-            try {
-              video.currentTime = startPosition;
-            } catch {
-              // ignore
-            }
-            video.removeEventListener('loadedmetadata', handleMetadata);
-          };
-          if (video.readyState >= 1) {
-            video.currentTime = startPosition;
-          } else {
-            video.addEventListener('loadedmetadata', handleMetadata);
-          }
+        // 起播点收敛：公开直链这条路的 `loadedmetadata` 可能还没到，
+        // 不能只判 startPosition > 0（连播时它恒为 0，旧实现于是完全不管位置）。
+        const alignWhenReady = () => {
+          alignPlayhead(video, startPosition, newSessionId);
+        };
+        if (video.readyState >= 1) {
+          alignWhenReady();
+        } else {
+          video.addEventListener('loadedmetadata', alignWhenReady, { once: true });
         }
 
         // 公开直链是"吊死连接"最高发的一条路（远端不回包也不断开），play()
@@ -2617,10 +2810,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const resolveRetriedRef = useRef<Set<string>>(new Set());
   const openInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
   const openEpisode = (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string): Promise<void> => {
+    // 新的一集从哪开始，必须在日志里留一条：用户报"下一集不是从头播"时，
+    // 只有这行能和随后的「首帧-宿主 首次 timeupdate 位置=」对上——否则
+    // 分不清是起播点传错了，还是换源没重置元素位置。
+    tracePlayback(
+      `打开集 ${episodeId || '(默认首集)'} 期望起点=${Math.round(startPosition)}s 清晰度=${qualityOverride || '默认'}`,
+    );
     // 新的播放意图即刻撤销"全剧播完自动返回详情"的安排：用户可能在 2 秒返回窗口
     // 内从选集抽屉点了下一部/另一集，不撤销的话返回会把正在打开的播放打断。
     setFinishedAll(false);
     finishedAllEpisodeRef.current = null;
+    // 换集瞬间撤销上一次结尾留下的复核：它绑的是旧会话的播放位置，
+    // 落到新一集上就是"刚开始播就被推进下一集"。
+    cancelTailProbe();
     const key = `${seriesId}|${episodeId || ''}|${Math.round(startPosition)}|${qualityOverride || ''}`;
     const inflight = openInFlightRef.current.get(key);
     if (inflight) return inflight;
@@ -2820,6 +3022,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 看门狗必须一起收掉：它的续体会重起播、甚至重装载整集，留着就是"人已退出
     // 却仍被后台定时器拉起播放"。提示同时收回，播放器下次进来是干净的。
     stopStallWatchdog();
+    // 末尾复核同理：人已经离开播放器，之后那次复核若能落地，会把下一集隐形拉起。
+    cancelTailProbe();
     // 兜底链的分支判定同样作废：下次进播放器时新一集还没决定走哪条源，
     // 留着旧标记会让那一次的错误被静默跳过（审查 F3）。
     resetStreamingSource();
@@ -3021,6 +3225,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // 恢复成功：提示必须回到 null，否则它会一直挂在画面上（死 UI）。
         setStallNotice(null);
       },
+      onTailEnd: () => {
+        // 会话已作废：这次判定属于已经被切走的那一集，不能拉起任何播放。
+        // 返回 false：让看门狗保持未置位，下一拍重新判断（否则它会静默死亡）。
+        if (activeSessionRef.current !== sessionId) return false;
+        // 用户主动暂停优先：暂停在末尾的人是在逐帧看结尾，不该被推进下一集。
+        // 同样返回 false：用户随时可能继续播放，看门狗要能继续跟踪。
+        if (video.paused || video.seeking || video.ended) return false;
+        setStallNotice(null);
+        // 与 `waiting` 那条路同一个出口：`handleEnded` 自带落盘、连播闸门、
+        // 迟到旧源过滤与"全剧播完"收尾，不需要另写一套。
+        handleEndedRef.current?.();
+        return true;
+      },
     });
   }, [stopStallWatchdog]);
 
@@ -3035,24 +3252,136 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 一次的监听器还挂在被丢弃的旧元素上。
     const mountedAt = performance.now();
     let firstTickAt: number | null = null;
+    /** 心跳打点节流：每 5 秒记一条位置，用于定位"画面在走、进度条不动"。 */
+    let lastTickTraceAt = 0;
     tracePlayback('首帧-宿主 监听器已绑定 video');
 
     const handleTimeUpdate = () => {
+      /**
+       * 旧源的事件绝不能喂给新一集。
+       *
+       * 换集是"同一块 `<video>` 换源"，两条时序并不重合：`currentEpisode` 状态
+       * 先变成新集，而元素上的旧源还会再派发一两次 `timeupdate`。旧实现照单全收，
+       * 于是把**上一集的位置**写进新一集的历史（`saveProgressThrottled` 用的是
+       * 最新闭包里的 `currentEpisode`）——表现就是"这一集下次打开时进度条不在 0、
+       * 从一个莫名其妙的时间点继续播"。
+       *
+       * `dataset.sessionId` 是每次换源时写入的会话号（所有赋 src / 挂 hls 的落点
+       * 都会写），拿它和当前活动会话比对，就能把迟到事件按源头挡掉。
+       *
+       * ⚠️ **只在"标记确实存在且不等于当前会话"时才丢弃**（2026-10-19 修
+       * 「画面在播、进度条不动」）。
+       *
+       * 原因：`dataset.sessionId` 在首帧真正落地之前是空串/undefined，
+       * `Number('') === 0`、`Number(undefined) === NaN` —— 而 `activeSessionRef`
+       * 从 100 起。写成"不相等就 return"，会在**还没写标记的那段时间**把每一帧
+       * `timeupdate` 全部丢掉：画面自己照常播（媒体元素与 React 无关），
+       * 但 `position` / `duration` / 历史进度一个都不更新，界面上的进度条于是
+       * 停在原地。判据必须允许"没有标记"这种未知状态通过。
+       */
+      const taggedSession = Number(video.dataset.sessionId);
+      if (isStaleElementSession(video, activeSessionRef.current)) {
+        if (!staleTickNotedRef.current.has(taggedSession)) {
+          staleTickNotedRef.current.add(taggedSession);
+          tracePlayback(
+            `timeupdate 丢弃：元素标记会话=${taggedSession} 当前会话=${activeSessionRef.current}（迟到事件）`,
+          );
+        }
+        return;
+      }
       if (firstTickAt === null) {
         firstTickAt = performance.now();
-        tracePlayback(`首帧-宿主 首次 timeupdate 距装载=${Math.round(firstTickAt - mountedAt)}ms 时长=${usableDuration(video).toFixed(1)}s`);
+        tracePlayback(`首帧-宿主 首次 timeupdate 距装载=${Math.round(firstTickAt - mountedAt)}ms 位置=${video.currentTime.toFixed(2)}s 时长=${usableDuration(video).toFixed(1)}s`);
       }
-      const cur = video.currentTime;
+      const cur = Number.isFinite(video.currentTime) ? video.currentTime : 0;
       const dur = usableDuration(video);
+      // 时钟真的往前走了：这是末尾复核唯一的"反证"。只要这里推进，之前预约的
+      // 那次复核就作废——倍速切换/短暂抖动同样会派发 `waiting`，而它在下一个
+      // timeupdate 就自己恢复了，绝不能因此把这一集判成播完。
+      //
+      // 比较基准就用复核自己记下的 `position`，不另设一个"上次推进时刻"的 ref：
+      // 那个 ref 在全文件里只写不读（曾经写过一个，2026-10-20 复查时删掉）。
+      const probe = tailProbeRef.current;
+      if (probe && cur > probe.position + 0.06) {
+        window.clearTimeout(probe.timer);
+        tailProbeRef.current = null;
+      }
       setPosition(cur);
       setDuration(dur);
       saveProgressThrottledRef.current(cur, dur);
+      // 心跳：5 秒一条，带齐"界面读数到底该是多少"的三个输入。
+      // 用户报"画面在播、进度条不动"时，只有这行能分清是事件没来、被守卫挡掉，
+      // 还是时长算成了 0 —— 三种情况的处置完全不同。
+      const tickNow = performance.now();
+      if (tickNow - lastTickTraceAt >= 5000) {
+        lastTickTraceAt = tickNow;
+        tracePlayback(
+          `timeupdate 心跳 位置=${cur.toFixed(2)}s 时长=${dur.toFixed(1)}s 标记会话=${video.dataset.sessionId || '(空)'} 当前会话=${activeSessionRef.current}`,
+        );
+      }
     };
 
     const handleProgress = () => {
       if (video.buffered.length > 0) {
-        setBuffered(video.buffered.end(video.buffered.length - 1));
+        const end = video.buffered.end(video.buffered.length - 1);
+        // 同 `handleTimeUpdate`：换源瞬间这里的读数可能是 NaN。
+        if (Number.isFinite(end)) setBuffered(end);
       }
+    };
+
+    /**
+     * 预约一次末尾复核（1.2 秒后回收）。
+     *
+     * 只允许一次在途：末尾卡住时 `waiting` 可能连着来好几发（hls.js 在每次
+     * `bufferStalledError` 后都会重新触发一次），不去重就会排出一串定时器，
+     * 每个都去调 `handleEnded`。
+     */
+    const scheduleTailProbe = () => {
+      if (tailProbeRef.current) return;
+      const sessionId = activeSessionRef.current;
+      const position = video.currentTime;
+      const bufferedAt = bufferedEndSeconds(video);
+      const timer = window.setTimeout(() => {
+        tailProbeRef.current = null;
+        // 会话已作废 / 用户离开播放器：这次复核属于旧会话，静默丢弃。
+        if (activeSessionRef.current !== sessionId) return;
+        // 用户主动暂停或拖进度：那是在看结尾，不是卡住。
+        if (video.paused || video.seeking || video.ended) return;
+        if (!isPlayheadAtPlayableTail({
+          currentTime: video.currentTime,
+          duration: usableDuration(video),
+          bufferedEnd: bufferedEndSeconds(video),
+          paused: video.paused,
+          seeking: video.seeking,
+          ended: video.ended,
+        })) {
+          // 复核期间播放头已经离开末尾（例如用户拖回去）：按实际是否还有画面
+          // 决定要不要显示"缓冲中"。
+          //
+          // 不能无条件下 buffering（2026-10-20 复查修正）：自愈成功之后画面其实
+          // 在播，这时把界面按到 buffering 上会**永久转圈**——probe 已经置 null
+          // 不再重排，再没有事件来纠正它。
+          if (video.readyState < 3) {
+            setUiState({ kind: 'buffering', sessionId });
+          }
+          return;
+        }
+        const clockIdle = Math.abs(video.currentTime - position) <= 0.06;
+        const dataIdle = bufferedEndSeconds(video) <= bufferedAt + 0.06;
+        if (!clockIdle || !dataIdle) {
+          // 时钟还在走 / 缓冲还在长：这不是末尾停滞，是正常播放或慢网缓冲。
+          // 同上：只有真的没有可播画面时才显示 buffering。
+          if (video.readyState < 3) {
+            setUiState({ kind: 'buffering', sessionId });
+          }
+          return;
+        }
+        tracePlayback(
+          `末尾停滞复核命中：按本集播完处理 current=${video.currentTime.toFixed(2)}s duration=${usableDuration(video).toFixed(2)}s buffered=${bufferedEndSeconds(video).toFixed(2)}s readyState=${video.readyState}`,
+        );
+        handleEndedRef.current?.();
+      }, TAIL_PROBE_DELAY_MS);
+      tailProbeRef.current = { timer, position };
     };
 
     const handleWaiting = () => {
@@ -3060,7 +3389,15 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 旧实现无条件播报，换集时 video.load() 触发的空源 waiting 会让
       // 转圈图标闪一下，加重"卡顿"的观感。
       if (!video.currentSrc && !video.src) return;
-      if (video.readyState >= 3) return;
+      /**
+       * 换源交接期旧源补发的 `waiting` 不属于当前这一集（2026-10-20 复查修正）。
+       *
+       * 这是四个媒体事件里**唯一**漏了这道守卫的（`timeupdate` / `playing` /
+       * `error` 都有）。伤害在于：它会用**当前**会话号预约一次末尾复核，
+       * 而 `position` / `bufferedAt` 采样自**旧源**；1.2 秒后那次复核拿旧源的
+       * 快照去判新集，会话号却对得上，所有下游守卫都拦不住。
+       */
+      if (isStaleElementSession(video, activeSessionRef.current)) return;
       /**
        * 已经播到结尾附近却还在等数据 → **这不是缓冲，是播完了**。
        *
@@ -3079,21 +3416,37 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
        * 时长末尾，差半秒停在缓冲上就不算。用户看到的就是"最后一直在转圈，
        * 切下一集才恢复正常"。
        *
-       * 判据用「离结尾不到 1.5 秒」而不是严格相等：不同源的时长权威值有几十
-       * 毫秒误差，HLS 最后一片也可能只有 0.5–1 秒。1.5 秒足够覆盖，又不会把
-       * "网络慢卡在中段"误判成播完（中段离结尾远得多）。
+       * ## 2026-10-19：判定改成"位置 + 1.2 秒复核"
+       *
+       * 0.2.20 那版用单帧快照 + `bufferedEnd >= duration - 0.15 → return false`
+       * 排除"数据已完整缓冲"的瞬时抖动，结果把**唯一能救的那一类**也排掉了：
+       * 逐集核对 120 集产物，`buffered.end` 与 `duration` 只差 **0.00~0.07 秒**
+       * —— 也就是"末段全部进缓冲、播放头却再也走不到末尾"的现场必然落进那条
+       * 排除条件里，判定恒 false，`waiting` 之后只剩 `buffering`，永远不结束。
+       *
+       * 现在单帧只负责回答"是不是停在可播末端"，是否真的播完由 1.2 秒后的
+       * 复核回答：那时时钟没推进、缓冲没增长，才算这一集播完。倍速切换那种
+       * 瞬时抖动会在下一个 `timeupdate` 自行前进，复核随之作废。
        */
       const total = usableDuration(video);
-      if (shouldFinishAtBufferedTail({
+      const atTail = isPlayheadAtPlayableTail({
         currentTime: video.currentTime,
         duration: total,
         bufferedEnd: bufferedEndSeconds(video),
         paused: video.paused,
         seeking: video.seeking,
-      })) {
-        // 复用 handleEnded 的完整语义（落盘进度、连播、全剧播完）——
-        // 它已经处理了"这次结束属不属于当前集""要不要自动跳下一集"这些闸门。
-        handleEndedRef.current?.();
+        ended: video.ended,
+      });
+      // ⚠️ 末尾复核必须放在 `readyState >= 3` 早退**之前**：末段全部进缓冲时
+      // readyState 恰好是 4，而卡死就发生在这一刻。旧实现把它早退掉，
+      // 判定连执行的机会都没有（这也解释了为什么打点里只剩 waiting 没有下文）。
+      if (atTail) {
+        scheduleTailProbe();
+      }
+      if (video.readyState >= 3) return;
+      if (atTail) {
+        // 位置已经判定在末尾：等复核结果，不再显示"缓冲中"误导用户
+        // （这里不改 uiState，`playing` 会在复核命中时被 `handleEnded` 覆盖）。
         return;
       }
       // 缓冲**不**卸看门狗：解码线程卡死时 `waiting` 照样会派发且再也不回来，
@@ -3103,8 +3456,23 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     };
 
     const handlePlaying = () => {
+      // 换源交接期旧源可能补发一次 playing：它不属于当前这一集，
+      // 让它继续走会把 UI 与实际画面绑错，也会用旧位置写一条新集的历史。
+      //
+      // ⚠️ 同样只在"标记存在且不匹配"时丢弃。写成无脑不等判断，会在首帧落地前
+      // 把每一次 playing 都丢掉 —— 界面于是永远停在 opening/buffering，
+      // 而视频其实已经在播（与 `handleTimeUpdate` 那条是同一个坑）。
+      if (isStaleElementSession(video, activeSessionRef.current)) {
+        tracePlayback(
+          `playing 丢弃：元素标记会话=${video.dataset.sessionId} 当前会话=${activeSessionRef.current}（迟到事件）`,
+        );
+        return;
+      }
       // 播完后又重新开播（用户把进度拖回再播）即撤销"全剧播完自动返回详情"的安排。
       setFinishedAll(false);
+      // 之前预约的末尾复核属于"上一次停下"的现场：画面已经重新推进，
+      // 那次复核若能落地，就会在正常播放中把人推进下一集。
+      cancelTailProbe();
       // 真正开播这一刻才武装看门狗（装载等待期里没有帧是正常的）。
       armStallWatchdog();
       // 画面真的回来了就收回卡死提示。第 1 级原地重试恢复时由看门狗的 onHealthy
@@ -3112,7 +3480,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // onHealthy 永远不会来），只能由这里兜底——否则横幅会一直挂在正常播放上。
       setStallNotice(null);
       setIsPlaying(true);
-      setUiState({ kind: 'playing', sessionId: activeSessionRef.current, position: video.currentTime });
+      setUiState({
+        kind: 'playing',
+        sessionId: activeSessionRef.current,
+        // 换源瞬间 `currentTime` 可能是 NaN，直接塞进 uiState 会污染下游进度显示。
+        position: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+      });
       // 真正出画就立刻落一条历史，而不是等第一次 timeupdate 的 4 秒节流窗口。
       //
       // 这样"打开一集看两眼就退出"也会留下"看到第 N 集"；时长此刻可能还没就绪，
@@ -3129,6 +3502,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 不停掉的话，播完静置 10 秒它会照着 ended 状态（paused 仍为 false）
       // 误判成卡死并拉起恢复流程。下一集真正开播时 handlePlaying 会重新武装。
       stopStallWatchdog();
+      // 末尾复核（`waiting` 那条路）与看门狗的 `onTailEnd` 可能先后都到：
+      // 这里把在途复核收掉，保证一集只结算一次。
+      cancelTailProbe();
       setIsPlaying(false);
       setUiState({ kind: 'ended', sessionId: activeSessionRef.current });
       // 落盘"这一集看完了"必须归属**真正放完的那一集**。
@@ -3211,7 +3587,19 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 会话已作废（用户已离开播放器 / 已有更新的切换接管）：整条兜底链
       // （备用直链 → Blob → 本地解析）都不再启动——它们的续体最终都会
       // play()，等于人已退出却隐形开播。
-      if (activeSessionRef.current !== Number(video.dataset.sessionId)) return;
+      //
+      // ⚠️ 与 `handleTimeUpdate` / `handlePlaying` 同一个坑（2026-10-20 修「播放中卡住
+      // 且无任何自愈」）：`dataset.sessionId` 在首帧落地前是空串（`Number('') === 0`），
+      // 而当前会话号从 100 起。写成"不相等就 return"，会在那段窗口把 hls.js 的 fatal
+      // **整个吞掉** —— 不弹错误卡、不进自愈、也不打一行日志，播放器就那样停在那里。
+      // 日志实证：新进程里两次 `fragLoadError fatal=true` 之后没有任何「流式源自愈」行。
+      const errorSession = Number(video.dataset.sessionId);
+      if (isStaleElementSession(video, activeSessionRef.current)) {
+        tracePlayback(
+          `handleError 丢弃：元素标记会话=${errorSession} 当前会话=${activeSessionRef.current}（迟到事件）`,
+        );
+        return;
+      }
       const ctx = handlerCtxRef.current;
       // 本地流式 HLS 出错时**不能走备用直链与 Blob 这两步**：
       //   - 备用直链是同一个源的 CENC 加密地址，WebView 根本解不开；
@@ -3221,12 +3609,150 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 错误卡片，而真实处置只有一个：让整集链路接管（它本来就在跑）。
       if (streamingSourceRef.current) {
         tracePlayback('流式源报错：跳过备用直链/Blob，交给整集链路接管');
+        /**
+         * 流式 HLS 出错时的**唯一**正确处置：用同一个 m3u8 就地重挂。
+         *
+         * ## 为什么不能继续往下走（2026-10-19 修「播放中偶发弹错误卡」）
+         *
+         * 旧实现只打了一行日志就继续往下，于是掉进"本地解析"那一级：
+         * `startNativeResolve` 会重新走签名 → 下载整集 13~27MB → 解密 → 重编码，
+         * 实测 7~10 秒，期间界面是全屏 `opening` 遮罩；失败就弹错误卡。
+         * 而实际发生的往往只是「ffmpeg 还没写好后一个分片」——画面本来是好的。
+         * 用户看到的就是"播放正常，突然卡住并提示后台还在转码"。
+         *
+         * 现在：重挂同一地址（命中已转好的产物时后端 10ms 级返回），最多两次。
+         * 两次都不行才判死，并且**不再退回整集 mp4**（那条链路与 HLS 产物的
+         * 会话/目录是同一份，重下只会更慢）。
+         */
+        const streamUrl = streamUrlRef.current;
+        // 自愈也有会话边界：先把挂起的那次自愈收掉，避免同一集并发自愈
+        // （两条 handleError 各自排一个 1.2 秒定时器，会各自 attachSource）。
+        cancelStreamRecover();
+        // 末尾复核也要收：它采样的是"出错前"的元素状态，自愈换源之后
+        // 那次采样对新源毫无意义，落地只会把界面按在 buffering 上。
+        cancelTailProbe();
+        if ((streamUrl || (ctx.currentSeries && ctx.currentEpisode)) && streamRecoverRef.current < MAX_STREAM_RECOVER) {
+          streamRecoverRef.current += 1;
+          const attempt = streamRecoverRef.current;
+          const sessionAtRecover = activeSessionRef.current;
+          const resumeAt = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+          tracePlayback(
+            `流式源自愈 第 ${attempt} 次：1.2 秒后重新开播这一集（位置 ${Math.round(resumeAt)}s，触发后端续转）`,
+          );
+          // 轻提示，不遮画面：用户此刻还能看到最后一帧。
+          setUiState({ kind: 'buffering', sessionId: sessionAtRecover });
+          const timer = window.setTimeout(() => {
+            streamRecoverTimerRef.current = null;
+            if (activeSessionRef.current !== sessionAtRecover) return;
+            const el = videoRef.current;
+            const series = handlerCtxRef.current.currentSeries;
+            const episode = handlerCtxRef.current.currentEpisode;
+            if (!el || !series || !episode) return;
+            /**
+             * ⚠️ 关键：自愈必须**重新问后端要一次地址**，而不是把旧 m3u8 再挂一遍。
+             *
+             * 原因就是用户报的那条：「播着播着转码失败，要重新从头播放才能加载完后面」。
+             * ffmpeg 中途退出后，磁盘上的产物停在半截（没有 `#EXT-X-ENDLIST`），
+             * 旧地址指过去得到的永远是 404/503 —— 重挂多少次都没用。只有重新走一次
+             * `open_stream`，后端才会发现这个 vid 的产物不完整、重新起一路转码
+             * （`start_video_cache` 的 ENDLIST 判定），并把新地址交回来。
+             *
+             * 这正是"用户手动重开这一集"的等价动作，只是不用他手动、也不打断播放位置。
+             */
+            const contentType = series.type === 'comic' ? 1004 : 1;
+            void ipcService.playback
+              .openStreamNative(series.id, episode.id, sessionAtRecover, contentType)
+              .catch((error: unknown) => {
+                // 不能静默吞成 null（2026-10-20 复查修正）：VSR 开关关闭时后端是
+                // **确定性** Err，吞掉之后就只剩"拿旧地址再挂一次、必 404、再自愈"
+                // 的空转，日志里永远看不到真正的原因。
+                tracePlayback(`流式源自愈：重新申请地址失败 ${describeError(error)}`);
+                return null;
+              })
+              .then(fresh => {
+                if (activeSessionRef.current !== sessionAtRecover) return null;
+                const url = fresh && fresh.streamKind === 'hls' && fresh.playUrl
+                  ? fresh.playUrl
+                  : streamUrl;
+                if (!url) {
+                  // 地址彻底没了：这不是"能靠再挂一次恢复"的状态，直接抛出交给
+                  // 下面的 catch 判死，别用 `return null` 把界面留在 buffering。
+                  throw new Error('流式源自愈：没有可用的播放地址');
+                }
+                streamUrlRef.current = url;
+                return attachSource(el, url)
+                  .then(() => {
+                    // 恢复位置必须等 metadata（2026-10-20 复查修正）。
+                    //
+                    // `attachSource` 返回时只完成了 attachMedia + loadSource，
+                    // `readyState` 通常还是 0；此时给元素赋 `currentTime` 抛
+                    // InvalidStateError 被旧代码的空 catch 吞掉，位置静默回 0 ——
+                    // 用户看到的就是"自愈之后从头播"，正是本条修复要治的症状。
+                    // 仓库里 `useAnimePlayerStore` 早就是对的（先判 readyState 再挂
+                    // loadedmetadata），这里照抄，并补 `{ once: true }`。
+                    if (resumeAt > 0.5) {
+                      const applySeek = () => {
+                        try {
+                          el.currentTime = resumeAt;
+                        } catch {
+                          // 仍不可 seek：让用户自己拖，至少不是静默从头播。
+                        }
+                      };
+                      if (el.readyState >= 1) applySeek();
+                      else el.addEventListener('loadedmetadata', applySeek, { once: true });
+                    }
+                    return playBounded(el);
+                  });
+              })
+              .then(result => {
+                if (result === null || activeSessionRef.current !== sessionAtRecover) return;
+                setIsPlaying(true);
+                setUiState({ kind: 'playing', sessionId: sessionAtRecover, position: el.currentTime });
+                // 成功后回血（2026-10-20 复查修正）：恢复成功说明这个源是好的，
+                // 额度必须还回去。否则一集里攒够 MAX_STREAM_RECOVER 次**互不相关**
+                // 的瞬时故障就永久判死，用户得手动重开这一集。
+                streamRecoverRef.current = 0;
+                tracePlayback(`流式源自愈成功（第 ${attempt} 次）`);
+              })
+              .catch((error: unknown) => {
+                if (activeSessionRef.current !== sessionAtRecover) return;
+                tracePlayback(`流式源自愈失败（第 ${attempt} 次）${describeError(error)}`);
+                // ⚠️ 用**本次调用的局部** `attempt` 判死，不读 `streamRecoverRef`。
+                //
+                // 那个计数器会被 `resetStreamingSource` 归零（换集、预载快路径都会
+                // 调到它），读它就会出现"第 2 次明明失败了、却因为别人刚清零而不报错"，
+                // 界面永远停在 buffering。
+                if (attempt >= MAX_STREAM_RECOVER) {
+                  setIsPlaying(false);
+                  setUiState({
+                    kind: 'error',
+                    sessionId: sessionAtRecover,
+                    code: 'MEDIA_LOAD_FAILED',
+                    recoverable: true,
+                  });
+                }
+              });
+          }, STREAM_RECOVER_DELAY_MS);
+          streamRecoverTimerRef.current = { timer, sessionId: sessionAtRecover };
+          return;
+        }
+        // 地址丢了或额度用尽：如实报错，绝不退回整集 mp4。
+        setIsPlaying(false);
+        setUiState({
+          kind: 'error',
+          sessionId: activeSessionRef.current,
+          code: 'MEDIA_LOAD_FAILED',
+          recoverable: true,
+        });
+        return;
       } else {
       const backupUrl = backupUrlRef.current;
       if (backupUrl && !hasTriedBackupRef.current) {
         hasTriedBackupRef.current = true;
         // 用户已离开播放器（会话已作废）：不再补播备用直链，避免隐形出声。
-        if (activeSessionRef.current !== Number(video.dataset.sessionId)) return;
+        // 判据走 `isStaleElementSession`：首帧落地前元素上还没有标记，
+        // 旧写法（不相等即 return）会把这条路整条跳过。
+        if (isStaleElementSession(video, activeSessionRef.current)) return;
         const sessionAtBackup = activeSessionRef.current;
         setUiState({ kind: 'opening', sessionId: activeSessionRef.current, episodeId: ctx.currentEpisode?.id || '' });
         video.pause();
@@ -3258,27 +3784,37 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       const sourceUrl = video.currentSrc || video.src;
       if (sourceUrl && !sourceUrl.startsWith('blob:') && !hasTriedBlobRef.current) {
         hasTriedBlobRef.current = true;
+        /**
+         * 发起这次 Blob 兜底的会话号，与上面 `sessionAtBackup` 同一个用意。
+         *
+         * 旧写法拿 `Number(video.dataset.sessionId)` 当凭证：元素上标记为空时
+         * 它是 0（或 NaN），与从 100 起的会话号必然不等 → `pauseIfStale` 直接
+         * 判成"已换集"，把刚挂好的 Blob 播放掐掉；`isStaleElementSession` 则
+         * 反过来放行一切。两边的错法不同，根子都是"用元素标记代表发起者"。
+         * 发起者只有调用点自己知道，就记在这里。
+         */
+        const sessionAtBlob = activeSessionRef.current;
         void fetch(sourceUrl, { cache: 'no-store', referrerPolicy: 'no-referrer' })
           .then(response => {
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             return response.blob();
           })
           .then(blob => {
-            if (activeSessionRef.current !== Number(video.dataset.sessionId)) return;
+            if (pauseIfStale(sessionAtBlob, video)) return;
             objectUrlRef.current = URL.createObjectURL(blob);
             detachSource(video);
             video.src = objectUrlRef.current;
             const blobCtx = handlerCtxRef.current;
-            if (blobCtx.currentEpisode) markSourceCommitted(activeSessionRef.current, blobCtx.currentEpisode.id);
+            if (blobCtx.currentEpisode) markSourceCommitted(sessionAtBlob, blobCtx.currentEpisode.id);
             video.load();
             // Blob 直播的 play() 同样要设保底：挂死时这条 .then 永不落地，
             // 下面的本地解析兜底就永远轮不到。
             return playBounded(video);
           })
           .then(() => {
-            if (pauseIfStale(Number(video.dataset.sessionId), video)) return;
+            if (pauseIfStale(sessionAtBlob, video)) return;
             setIsPlaying(true);
-            setUiState({ kind: 'playing', sessionId: activeSessionRef.current, position: video.currentTime });
+            setUiState({ kind: 'playing', sessionId: sessionAtBlob, position: video.currentTime });
           })
           .catch(() => {
             // 走到这里说明 CDN 直链与 Blob 代理都被挡了。唯一可行路径就是
@@ -3393,6 +3929,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       video.removeEventListener('playing', clearResolveOverlay);
       video.removeEventListener('ended', handleEnded);
       video.removeEventListener('error', handleError);
+      // 宿主卸载（HMR / 严格模式重挂载）时把末尾复核与挂起的自愈一并收掉，
+      // 不留孤儿定时器。自愈那条尤其重要：它的回调会 openStreamNative +
+      // attachSource + play，落到已卸载的元素上就是"人走了画面还在动"。
+      cancelTailProbe();
+      cancelStreamRecover();
     };
     // 有意留空依赖：监听器只绑定一次。
     // 旧版把 currentSeries / currentEpisode / currentQuality / 播放进度这类状态 /

@@ -527,7 +527,13 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
       // 必须复查会话：换集时旧源的 error 可能**迟到**到新源已经接管之后才派发，
       // 不复查就会把新一集直接刷成错误页（本文件其它每个异步续体都有这道复查，
       // 唯独这个 DOM 回调漏了）。以元素上记录的会话号为准，与接管处同源。
-      if (video.dataset.sessionId !== String(sessionRef.current)) return;
+      //
+      // ⚠️ 只在"标记确实存在"时才比对（2026-10-20）：接管处先写 `dataset` 再挂源，
+      // 但源挂载失败 / 快速换集时标记可能还没写。旧写法 `!== String(current)` 在
+      // 标记为空时恒成立（`undefined !== "100"`），会把这次真实的解码失败静默丢成
+      // "迟到事件"，界面就停在原地没有任何提示。
+      const tagged = Number(video.dataset.sessionId);
+      if (Number.isFinite(tagged) && tagged > 0 && tagged !== sessionRef.current) return;
       setIsPlaying(false);
       setUiState({
         kind: 'error',

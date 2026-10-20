@@ -23,9 +23,57 @@ interface HlsInstance {
   destroy(): void;
   loadSource(url: string): void;
   attachMedia(video: HTMLVideoElement): void;
+  /** 重新开始拉流（用于分片/清单的临时失败）。 */
+  startLoad(startPosition?: number): void;
+  /** 重建解码器与 SourceBuffer（用于缓冲类错误）。 */
+  recoverMediaError(): void;
 }
 
 const HLS_KEY = '__ttv_hls__';
+
+/**
+ * 判死前允许 hls.js 自己重来的次数。
+ *
+ * hls.js 把分片/缓冲类错误升级成 `fatal` 时，源往往**仍然可用**：本地转码是
+ * "边转边播"，某个分片还没生成、或者 SourceBuffer 追不上，几秒后自己就好了。
+ * 旧实现一看到 fatal 就把错误抛给上层（上层再弹错误卡），等于把一次临时失败
+ * 定死成故障。
+ */
+const MAX_IN_PLACE_RECOVERY = 2;
+
+/** 网络类致命错误：重新拉一次分片/清单即可，不需要重建解码器。 */
+const RECOVERABLE_NETWORK_DETAILS = new Set([
+  'fragLoadError',
+  'fragLoadTimeout',
+  'levelLoadError',
+  'levelLoadTimeout',
+]);
+
+/**
+ * 缓冲类致命错误：SourceBuffer 真的坏掉了，重建 MSE 后再继续。
+ *
+ * ⚠️ `bufferStalledError` **不在**这里（2026-10-20 复查修正）。
+ *
+ * hls.js 1.7.3 里它有两个发送点（`gap-controller.ts`）：
+ *   - `_reportStall`（:557）：`fatal: false`，只是提示"缓冲空了"；
+ *   - `_tryNudgeBuffer`（:712）：`fatal: true`，但它的触发条件恰恰是
+ *     **"缓冲里明明有足够的数据，播放头就是不往前走，nudge 了 nudgeMaxRetry 次仍不动"**。
+ *
+ * 也就是说这个 fatal 的语义是"**数据在、就是解不出下一帧**"——末尾末帧的现场
+ * 正是如此（容器时长比末帧 PTS 长几十毫秒，播放头走不到 `duration`）。
+ *
+ * 对它调 `recoverMediaError()` 的后果是清空 SourceBuffer、重建 MSE，把末尾已经
+ * 完整缓冲的那一段全部丢掉重下。而它同时是 `playbackTail` 里"停在可播末端"
+ * 判定的证据源：缓冲被清成 0.x 秒之后，那次判定就再也读不到 `buffered.end ≈ duration`。
+ * 两边互相拆台，末尾只会更晚才判出来。
+ *
+ * 正确归属是上层：末尾 → 当作播完信号（`usePlaybackStore` 的 `waiting` 复核与
+ * 看门狗）；中段 → 由看门狗的三信号停滞计时处理，它比"重建 MSE"克制得多。
+ */
+const RECOVERABLE_BUFFER_DETAILS = new Set([
+  'bufferAppendError',
+  'bufferAppendNoProgress',
+]);
 
 /**
  * hls.js 判死时留下的可读标记（错误明细字符串）。
@@ -133,9 +181,19 @@ export async function attachSource(video: HTMLVideoElement, url: string): Promis
       // 本地代理是 127.0.0.1 回环：一次 503 的往返成本是**亚毫秒级**，任何秒级
       // 退避在这里都毫无意义。线性 250ms 让 4 次重试的总等待从 15s 降到 1s。
       manifestLoadingMaxRetry: 4,
-      levelLoadingMaxRetry: 4,
-      fragLoadingMaxRetry: 8,
-      fragLoadingRetryDelay: 500,
+      // 与下面的 `playlistLoadPolicy` 对齐取 6（2026-10-20 复查修正）。
+      // 原先这里写 4、policy 写 6，正好破了下面那条"必须保持一致"的规矩。
+      levelLoadingMaxRetry: 6,
+      // 分片重试窗口从 8 次 × 250ms（约 2.4 秒）拉到 24 次 × 300ms（约 7 秒）。
+      //
+      // 实测（ttv-playback.log，2026-10-19，会话 116 前后）：
+      //   606.705 → 608.800  fragLoadError fatal=false × 8，间隔精确 250~300ms
+      //   609.145            fragLoadError fatal=true   ← 8 次重试在 2.44 秒内耗尽
+      //   609.145            流式源报错 → 上层弹「播放源连接受阻 / 后台还在转码」
+      // 而那一刻 ffmpeg 只是在写后面的分片，再等一两秒就有了 —— 2.4 秒的窗口
+      // 对"边转边播"来说太短。回环请求成本亚毫秒级，多给几次几乎没有代价。
+      fragLoadingMaxRetry: 24,
+      fragLoadingRetryDelay: 300,
       // 显式写 policy（一旦写了 policy，上面那批废弃键就不再参与映射，
       // 所以两者的 maxNumRetry 必须保持一致，否则等于悄悄改了重试次数）。
       manifestLoadPolicy: {
@@ -150,25 +208,88 @@ export async function attachSource(video: HTMLVideoElement, url: string): Promis
         default: {
           maxTimeToFirstByteMs: 10000,
           maxLoadTimeMs: 20000,
-          timeoutRetry: { maxNumRetry: 4, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
-          errorRetry: { maxNumRetry: 4, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+          timeoutRetry: { maxNumRetry: 6, retryDelayMs: 300, maxRetryDelayMs: 1500, backoff: 'linear' },
+          errorRetry: { maxNumRetry: 6, retryDelayMs: 300, maxRetryDelayMs: 1500, backoff: 'linear' },
         },
       },
       fragLoadPolicy: {
         default: {
           maxTimeToFirstByteMs: 10000,
-          maxLoadTimeMs: 120000,
-          timeoutRetry: { maxNumRetry: 8, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
-          errorRetry: { maxNumRetry: 8, retryDelayMs: 250, maxRetryDelayMs: 1000, backoff: 'linear' },
+          // 单次分片请求的挂死上限：15000ms（2026-10-20 复查修正，原为 120000）。
+          //
+          // 源是 127.0.0.1 上的本地转码产物：一次分片请求的合法耗时是毫秒级。
+          // 留 2 分钟只意味着"ffmpeg 早就不写了，播放器还在对着一条死连接空等两分钟"，
+          // 而外层的每一个超时都远小于它（末尾复核 1.2s、看门狗 10s、小窗起播 8s），
+          // 于是用户先看到界面卡死，两分钟后才收到一条本该立刻给出的错误。
+          // 15 秒对"ffmpeg 正忙、分片稍后落地"仍然绰绰有余。
+          maxLoadTimeMs: 15000,
+          timeoutRetry: { maxNumRetry: 24, retryDelayMs: 300, maxRetryDelayMs: 1500, backoff: 'linear' },
+          errorRetry: { maxNumRetry: 24, retryDelayMs: 300, maxRetryDelayMs: 1500, backoff: 'linear' },
         },
       },
     });
+    // 这一条 hls 实例已经用掉几次"判死前自愈"（见下面 ERROR 回调）。
+    let recoverAttempts = 0;
     (video as unknown as Record<string, unknown>)[HLS_KEY] = hls;
+    /**
+     * 播放真的推进了就回血。
+     *
+     * 额度必须能恢复（2026-10-20 复查修正）：原先 `recoverAttempts` 在实例整个
+     * 生命周期里只增不减，于是一集 90 秒的短剧里，两次**互不相关**的瞬时故障
+     * （一次清单抖动 + 一次追加无进展）就把额度耗尽，第三次直接判死——用户看到
+     * 的就是"播到一半突然报错，得手动重开这一集"，正是这次修复要消灭的症状。
+     *
+     * 恢复判据用"分片真的进缓冲了"，而不是"时间过去了多久"：后者在长时间缓冲中
+     * 会给账号白送额度，前者是播放确实健康的直接证据。
+     */
+    hls.on(Hls.Events.FRAG_BUFFERED, () => {
+      if (recoverAttempts > 0) recoverAttempts = 0;
+    });
     hls.on(Hls.Events.ERROR, (_event, data) => {
       // 打点带 type/details：manifest 拉不到、分片 404、解码失败在这条日志里
       // 是可区分的——[vsr] 转码链路的"卡在加载"多数是清单还没落地时的分片 404。
       tracePlayback(`hls.js 错误 type=${String(data.type)} details=${String(data.details)} fatal=${data.fatal === true}`);
       if (!data.fatal) return;
+      /**
+       * 判死之前先让 hls.js 自己重来两次。
+       *
+       * 关键前提：这里的源是**本地转码产物**（`127.0.0.1/rtx/...`），不是远端 CDN。
+       * 分片暂时没生成、SourceBuffer 追不上进度，都属于"几秒后自己就好"的常态，
+       * 而不是"这个媒体坏了"。旧实现一看到 fatal 就把 `error` 抛给上层，上层再
+       * （因为流式源跳过备用/Blob）落到错误卡 —— 用户看到的就是"画面明明在播，
+       * 突然弹出播放源连接受阻 / 后台还在转码"。
+       *
+       * 对症下药，两类分开：
+       *   - 网络类（分片/清单拉不到）：`startLoad()` 从当前位置重新拉；
+       *   - 缓冲类（`bufferAppend*`，MSE 真的坏了）：`recoverMediaError()` 重建解码器。
+       *     （`bufferStalledError` 不在此列，理由见 `RECOVERABLE_BUFFER_DETAILS` 的注释。）
+       * 各给 `MAX_IN_PLACE_RECOVERY` 次机会；用尽才向上抛，让上层去做"重挂源"
+       * 那一级恢复。播放恢复正常后由 `FRAG_BUFFERED` 把额度清零。
+       */
+      const details = String(data.details);
+      if (recoverAttempts < MAX_IN_PLACE_RECOVERY) {
+        if (RECOVERABLE_NETWORK_DETAILS.has(details)) {
+          recoverAttempts += 1;
+          tracePlayback(`hls.js fatal 可恢复（${details}），第 ${recoverAttempts} 次自愈：重新开始拉流`);
+          try {
+            hls.startLoad();
+            return;
+          } catch {
+            // 落到底下的判死路径：至少让上层知道这次没能自愈。
+          }
+        } else if (RECOVERABLE_BUFFER_DETAILS.has(details)) {
+          recoverAttempts += 1;
+          tracePlayback(`hls.js fatal 可恢复（${details}），第 ${recoverAttempts} 次自愈：重建解码器`);
+          try {
+            hls.recoverMediaError();
+            return;
+          } catch {
+            // 同上。
+          }
+        }
+      } else {
+        tracePlayback(`hls.js fatal（${details}）自愈额度已用尽，交给上层重挂源`);
+      }
       // ⚠️ 这里**不能只 dispatchEvent**。
       //
       // `new Event('error')` 能唤醒 `addEventListener('error', ...)` 的监听者，但它

@@ -103,13 +103,16 @@ export const AnimeVideoSurface: React.FC = () => {
    *
    * 顺序不能反：`enterPip` 要读 `video.currentTime` 交接进度，而 `close()` 会走
    * `haltCurrent` 清掉 src——清完再读就只剩 0 秒了。交接失败则什么都不动。
-   * 最后离开播放器视图，让用户在主界面继续浏览。
+   *
+   * 交接成功后**不再导航离开播放器**：主窗口会整窗隐藏（`PipReturnBridge` 收到
+   * `pip://shown` 后执行），"同一时刻只有一个窗口"。旧实现顺手 `navigateTo` 回
+   * 上一页，于是窗口隐藏前的那一帧已经变成主界面 —— 用户看到的就是
+   * "播放界面先没了、小窗过一会儿才出来"。
    */
   const handleEnterPip = async () => {
     const handed = await enterPip();
     if (!handed) return;
     close();
-    navigateTo(previousView === 'player' ? 'anime' : previousView);
   };
 
   const [isControlsVisible, setIsControlsVisible] = useState(true);

@@ -14,11 +14,13 @@ import {
 } from 'lucide-react';
 import { generateNextSessionId, ipcService } from '../../services/ipc';
 import { attachAnimeSource, detachAnimeSource, streamKindOf } from '../../services/animePlayback';
+import { attachSource, detachSource } from '../../services/hlsAttach';
 import { formatTime } from './ProgressBar';
 import {
   closePip,
   listenPip,
   PIP_HANDOFF_EVENT,
+  PIP_SHOWN_EVENT,
   readPipHandoff,
   reportPipProgress,
   type PipHandoff,
@@ -47,6 +49,45 @@ import {
 
 /** 进度上报间隔：太密会让 IPC 变成每秒十几次的噪音，太疏则系统关闭时丢进度。 */
 const REPORT_INTERVAL_MS = 2000;
+
+/**
+ * `play()` 的保底时限。
+ *
+ * 整集 HLS 是"边转边播"：清单还没落地时 `<video>` 上 `play()` 既不 resolve
+ * 也不 reject，小窗于是永久停在"加载中"，连错误都出不来（主播放器踩过同一个坑，
+ * 见 `usePlaybackStore` 的 `playBounded`）。这里只做小窗需要的那一点：
+ * 超时先看元素是否其实已经能播，否则按失败交给上层的错误提示。
+ */
+const PLAY_PENDING_TIMEOUT_MS = 8000;
+
+function playBounded(video: HTMLVideoElement): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      if (video.readyState >= 3 && !video.error) {
+        resolve();
+        return;
+      }
+      reject(new DOMException('播放超时：源没有数据也没有报错', 'TimeoutError'));
+    }, PLAY_PENDING_TIMEOUT_MS);
+    video.play().then(
+      () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve();
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 /** 无边框窗口没有系统边框，缩放方向必须由前端算好传给 `startResizeDragging`。 */
 type ResizeDir =
@@ -109,6 +150,30 @@ export const MiniPlayer: React.FC = () => {
    */
   const playIntentRef = useRef(false);
 
+  /**
+   * 这一集的**源片真实时长**（秒），来自后端的 `durationMs`。
+   *
+   * 整集 HLS 是边转边播：转码没结束时清单里还没有 `#EXT-X-ENDLIST`，浏览器的
+   * `video.duration` 要么是 `Infinity`、要么等于"已经转到的位置"，进度条于是
+   * 一路往上跳。后端在开播时就把源片时长交下来了，以它为权威，读数为准。
+   */
+  const streamingTotalRef = useRef(0);
+
+  /**
+   * 当前这一集在**后端**的播放会话号。
+   *
+   * 与 `sessionRef`（前端用来作废异步续体的计数器）不是一回事：这个号交给后端
+   * 管 VSR 转码会话与本地服务路径，离开小窗时必须显式 `stop`，否则那一路 ffmpeg
+   * 会继续转、继续占磁盘与 CPU（主播放器在 `stopPlayback` 里做的就是这件事）。
+   */
+  const backendSessionRef = useRef(0);
+  /** 取"该信哪个时长"：权威值优先，拿不到才退回媒体元素。 */
+  const usableDuration = useCallback((video: HTMLVideoElement | null): number => {
+    if (streamingTotalRef.current > 0) return streamingTotalRef.current;
+    const native = video?.duration;
+    return Number.isFinite(native) && native && native > 0 ? native : 0;
+  }, []);
+
   const currentEpisode = handoff?.episodes.find(item => item.id === currentEpisodeId) ?? null;
   const currentIndex = handoff ? handoff.episodes.findIndex(item => item.id === currentEpisodeId) : -1;
   const hasPrev = currentIndex > 0;
@@ -123,26 +188,28 @@ export const MiniPlayer: React.FC = () => {
     lastReportRef.current = now;
     reportPipProgress({
       position: Number.isFinite(video.currentTime) ? video.currentTime : 0,
-      duration: Number.isFinite(video.duration) ? video.duration : 0,
+      // 时长优先用源片权威值：边转边播期间 `video.duration` 会一路往上跳，
+      // 拿它算出的百分比落进历史后，续播点会明显偏后。
+      duration: usableDuration(video),
       volume: video.volume,
       muted: video.muted,
       rate: video.playbackRate,
       episodeId: currentEpisodeIdRef.current || null,
     });
-  }, []);
+  }, [usableDuration]);
 
   /** 取最终进度：关闭窗口时用，必须与任何节流无关。 */
   const snapshotProgress = useCallback(() => {
     const video = videoRef.current;
     return {
       position: video && Number.isFinite(video.currentTime) ? video.currentTime : 0,
-      duration: video && Number.isFinite(video.duration) ? video.duration : 0,
+      duration: usableDuration(video),
       volume: video ? video.volume : volume,
       muted: video ? video.muted : muted,
       rate: video ? video.playbackRate : 1,
       episodeId: currentEpisodeIdRef.current || null,
     };
-  }, [muted, volume]);
+  }, [muted, usableDuration, volume]);
 
   /**
    * 解析并播放指定集。
@@ -161,35 +228,77 @@ export const MiniPlayer: React.FC = () => {
     setErrorText(null);
     setIsLoading(true);
 
-    // 只拆 hls.js 实例、不清 src：旧帧留到新源就绪，换集不黑屏（与动漫播放器同一手法）。
+    // 只拆 hls.js 实例、不清 src：旧帧留到新源就绪，换集不黑屏（动漫链路的手法）。
     detachAnimeSource(video);
+    // 上一集如果是短剧整集 HLS，那条 hls.js 实例挂在另一个键（`__ttv_hls__`）上，
+    // 必须单独拆：两套实例同时接管同一块元素，表现就是新一集起不来或声音串台。
+    // 它会顺带清掉 `src`，所以短剧换集会有极短一黑——整集 HLS 首片在本地回环上
+    // 通常 50~200ms 就绪，比留着一帧旧画面更划算（留着反而会掩盖起播失败）。
+    detachSource(video);
+    // 换集即作废旧时长权威值，否则进度条会沿用上一集的总长。
+    streamingTotalRef.current = 0;
 
     try {
       // guo 与动漫同走 playback_open（后端按 id 前缀路由到 guo-core / 动漫源）：
       // resolveNative 只认红果纯数字 vid，guo id 进去必报"缺少有效的集 vid"——
       // 此前 guo 剧的画中画整条链路就是坏的。
       if (plan.kind === 'anime' || plan.seriesId.startsWith('guo:')) {
+        const backendSession = generateNextSessionId();
+        backendSessionRef.current = backendSession;
         const opened = await ipcService.playback.open(
           plan.seriesId,
           episodeId,
           plan.quality || 'auto',
           startPosition,
-          generateNextSessionId(),
+          backendSession,
           true,
         );
         if (sessionRef.current !== session) return;
         await attachAnimeSource(video, opened.url, streamKindOf(opened.url, opened.streamKind));
       } else {
-        const resolved = await ipcService.playback.resolveNative(
-          plan.seriesId,
-          episodeId,
-          plan.contentType ?? 1,
-          plan.quality || 'auto',
-        );
+        /**
+         * 短剧/漫剧：**优先走整集 HLS**，与主播放器同一条链路。
+         *
+         * ## 为什么换掉原来的 `resolveNative`（2026-10-19）
+         *
+         * `resolveNative` 的产物是**整集 mp4**：签名 → 取直链 → 下载整集（实测
+         * 13~27MB）→ 解密 → 重编码，实测 7~10 秒才出画。而主播放器早在方案 B
+         * 之后就用整集 HLS 了：首片落地就能播（本机实测 132ms 返回 → 368ms 出画），
+         * 连播预取 `prewarmStreamNative` 转好的也正是这份产物。
+         *
+         * 也就是说小窗此前一直在走"已经废弃的慢链路"，而且和它自己的预取**不匹配**：
+         * 预取暖的是 HLS 产物，实际播放却在等整集 mp4 —— 用户看到的就是
+         * "主窗口切进小窗要等好几秒才有画面"，切集同理。
+         *
+         * 现在优先 `openStreamNative`：命中已转好的产物时后端 10ms 级返回，
+         * 小窗只负责把 m3u8 挂给 hls.js。只有后端明确回 `file`（VSR 关闭 /
+         * 盘上只有旧链路的 mp4）时才退回原来的整集解析。
+         */
+        const backendSession = generateNextSessionId();
+        backendSessionRef.current = backendSession;
+        const stream = await ipcService.playback
+          .openStreamNative(plan.seriesId, episodeId, backendSession, plan.contentType ?? 1)
+          .catch(() => null);
         if (sessionRef.current !== session) return;
-        const { convertFileSrc } = await import('@tauri-apps/api/core');
-        video.src = convertFileSrc(resolved.playUrl);
-        video.load();
+        if (stream && stream.streamKind === 'hls' && stream.playUrl) {
+          const totalMs = stream.durationMs ?? 0;
+          if (Number.isFinite(totalMs) && totalMs >= 1000) streamingTotalRef.current = totalMs / 1000;
+          await attachSource(video, stream.playUrl);
+        } else {
+          // 后端明确回 "file"（VSR 关闭 / 盘上只有旧链路的整集 mp4）：
+          // 那条会话不用再停，`open_stream` 自己不会留转码进程。
+          backendSessionRef.current = 0;
+          const resolved = await ipcService.playback.resolveNative(
+            plan.seriesId,
+            episodeId,
+            plan.contentType ?? 1,
+            plan.quality || 'auto',
+          );
+          if (sessionRef.current !== session) return;
+          const { convertFileSrc } = await import('@tauri-apps/api/core');
+          video.src = convertFileSrc(resolved.playUrl);
+          video.load();
+        }
       }
       if (sessionRef.current !== session) return;
 
@@ -205,7 +314,9 @@ export const MiniPlayer: React.FC = () => {
       }
 
       try {
-        await video.play();
+        // 有界起播：整集 HLS 的清单还没落地时，`play()` 会一直挂着不返回，
+        // 小窗就会永久停在"加载中"而没有错误可看（见 PLAY_PENDING_TIMEOUT_MS）。
+        await playBounded(video);
       } catch (error) {
         if (sessionRef.current !== session) return;
         const blocked = error instanceof DOMException && error.name === 'NotAllowedError';
@@ -331,6 +442,12 @@ export const MiniPlayer: React.FC = () => {
   // 定时器（否则小窗关了还会发 prefetch_native，白占一次整集解析）。
   useEffect(() => () => {
     sessionRef.current += 1;
+    // 窗口被系统销毁 / 页面被卸载时也要收掉后端会话：这是最后一道兜底，
+    // 正常路径由 `leave` 负责（那条能拿到返回值，这条只能尽力而为）。
+    if (backendSessionRef.current > 0) {
+      void ipcService.playback.command(backendSessionRef.current, 'stop').catch(() => undefined);
+      backendSessionRef.current = 0;
+    }
     if (prefetchTimerRef.current !== null) {
       window.clearTimeout(prefetchTimerRef.current);
       prefetchTimerRef.current = null;
@@ -343,7 +460,35 @@ export const MiniPlayer: React.FC = () => {
         // 忽略：元素可能已经在销毁流程里。
       }
       detachAnimeSource(video);
+      // 短剧整集 HLS 的实例挂在 `__ttv_hls__` 上（见 hlsAttach）：卸载时一并拆掉，
+      // 否则窗口销毁后那条 MSE 仍持有解码器与分片请求。
+      detachSource(video);
     }
+  }, []);
+
+  /**
+   * 把窗口显示出来，并告诉主窗口"小窗已经就绪"。
+   *
+   * 窗口由 Rust 侧以 `visible(false)` 创建：页面加载 + JS 执行那段"白底空窗"
+   * 不该被用户看到。这里在挂载后的第一帧过去再 show，用户看到的直接就是
+   * 带加载态的播放界面。
+   *
+   * 顺序是硬约束：`show()` 让这一帧真正可见，**之后**才广播 `pip://shown`。
+   * 主窗口收到它才隐藏自己；反过来做就会出现"播放界面先没了、小窗还没出来"
+   * 的空档。失败静默——Rust 侧还有 1.5 秒的强制显示兜底。
+   */
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
+        const current = getCurrentWindow();
+        void current.show().catch(() => {});
+        void current.setFocus().catch(() => {});
+        void import('@tauri-apps/api/event')
+          .then(({ emit }) => emit(PIP_SHOWN_EVENT))
+          .catch(() => {});
+      }).catch(() => {});
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   const togglePlay = useCallback(() => {
@@ -430,6 +575,13 @@ export const MiniPlayer: React.FC = () => {
     playIntentRef.current = false;
     const video = videoRef.current;
     if (video && !video.paused) video.pause();
+    // 停掉后端那一路转码会话：整集 HLS 是"边转边播"，小窗走了之后没人再读它的
+    // 分片，不停就会留下一个继续写磁盘、继续占 CPU 的 ffmpeg（返回值不 await：
+    // 关窗不该被一次 IPC 往返拖住）。
+    if (backendSessionRef.current > 0) {
+      void ipcService.playback.command(backendSessionRef.current, 'stop').catch(() => undefined);
+      backendSessionRef.current = 0;
+    }
     try {
       await closePip(mode, snapshotProgress());
     } catch {
@@ -524,10 +676,11 @@ export const MiniPlayer: React.FC = () => {
         onTimeUpdate={(event) => {
           const video = event.currentTarget;
           setPosition(video.currentTime);
+          setDuration(usableDuration(video));
           setBuffered(video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0);
           report();
         }}
-        onDurationChange={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)}
+        onDurationChange={(event) => setDuration(usableDuration(event.currentTarget))}
         onProgress={(event) => {
           const video = event.currentTarget;
           setBuffered(video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0);
@@ -658,9 +811,12 @@ export const MiniPlayer: React.FC = () => {
             if (duration > 0) seekTo(ratio * duration);
           }}
         >
-          <div className="relative w-full h-1 rounded-full bg-white/25 overflow-hidden">
-            <div className="absolute inset-y-0 left-0 bg-white/30" style={{ width: `${bufferedPercent}%` }} />
-            <div className="absolute inset-y-0 left-0 bg-blue-500" style={{ width: `${progressPercent}%` }} />
+          {/* 进度条三色与主播放器**同一组语义值**（见 crystal.css 的 --progress-*）：
+              底轨必须用中性灰 —— 纯白半透明叠在白墙/白西装/雪景上亮度差为 0，
+              细条等于不存在；已播放段与主播放器同为黑红，不再一块蓝一块红。 */}
+          <div className="relative w-full h-1 rounded-full bg-[rgba(128,128,128,0.55)] overflow-hidden">
+            <div className="absolute inset-y-0 left-0 bg-[rgba(213,213,213,0.6)]" style={{ width: `${bufferedPercent}%` }} />
+            <div className="absolute inset-y-0 left-0 bg-[var(--progress-played-to)]" style={{ width: `${progressPercent}%` }} />
           </div>
         </div>
 

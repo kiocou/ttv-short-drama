@@ -1,34 +1,119 @@
 /**
- * 播放到“已缓冲末端”的判定。
+ * 播放到"可播末端"的判定。
  *
- * 为什么不能只看“离总时长不到 1.5 秒”：用户在这段时间里切换倍速、seek
- * 或解码器短暂抖动都会派发 `waiting`，此时数据其实已经完整缓冲；把它当成
- * 播完会让界面进入 ended、播放键与实际 paused 状态脱钩，按一次反而先暂停。
+ * ## 为什么这里必须分成"位置判定"与"时间维度确认"两件事
  *
- * 真正的“最后一小段没落地”必须同时满足：
- *   - 已经接近总时长；
- *   - 缓冲末端还没有到总时长；
- *   - 播放头已经追上缓冲末端（前面没有可继续播的数据）。
+ * 用户报的症状：**一集播到最后 1~2 秒会卡住一直转圈，不自动进下一集，
+ * 只有手动点"下一集"才恢复**（2026-10-19 复现，`ttv-playback.log` 里
+ * `媒体 waiting` 之后紧跟 `hls.js 错误 details=bufferStalledError`）。
+ *
+ * 播放源是边转边播的整集 HLS。末尾停住有两种形态，**都不能靠单帧快照判**：
+ *
+ *   A. 最后一片还没落地：`buffered.end` 比总时长少 0~2 秒，播放头追上缓冲末端；
+ *   B. 末段已经全部进缓冲，但播放头再也走不到 `duration`：
+ *      容器时长（`#EXTINF` 累加）与末帧 PTS 差几十毫秒，Chromium 不会派发
+ *      `ended`（`ended` 要求播放位置真正到达时长末尾）。
+ *
+ * 旧实现（0.2.20）用一条 `bufferedEnd >= duration - 0.15 → return false`
+ * 把形态 B 排除掉了，本意是"数据都完整缓冲了，那只是倍速/解码抖动的瞬时
+ * waiting，不能当播完"。但实测该分支恰好把唯一的出口堵死：
+ *
+ *   * worker 上报的源片时长与 ffmpeg 产物时长只差 **0.00~0.07 秒**
+ *     （逐集核对 120 集：diff 中位数 0.00s，最大 0.07s）；
+ *   * 也就是说 `buffered.end` 几乎必然落在 `duration - 0.15` 之内；
+ *   * 于是形态 B 一发生，判定恒为 false，`waiting` 之后只剩 `buffering`
+ *     一条路 —— 看门狗 10 秒后把它当"卡死"：原地 seek（那里本来没下一帧）
+ *     → 2 秒后重装载同一集 → 播到同一位置再卡一次。
+ *
+ * 所以单帧快照只回答"播放头是不是已经停在可播末端"，**是否真的播完必须由
+ * 调用方再补一个时间维度**（这 1 秒里时钟有没有推进、缓冲有没有增长）。
+ * `usePlaybackStore` 的 `handleWaiting` 用 1.2 秒复核做这件事，看门狗用
+ * 它自己的三信号停滞计时兜底。
  */
 
-const NEAR_END_TOLERANCE_SECONDS = 1.5;
-const BUFFERED_END_TOLERANCE_SECONDS = 0.15;
-const PLAYHEAD_AT_BUFFER_END_TOLERANCE_SECONDS = 0.1;
+/** 播放头进入"末尾区域"的窗口。用户实测卡住位置是最后 1~2 秒。 */
+const NEAR_END_TOLERANCE_SECONDS = 2.5;
 
-export interface TailWaitSnapshot {
+/** 播放头贴住可播末端的容差（MSE 的时间基与容器时长本就有几十毫秒误差）。 */
+const PLAYHEAD_AT_TAIL_TOLERANCE_SECONDS = 0.3;
+
+/**
+ * 缓冲末端可以落后播放头多少秒，仍算"播放头贴住缓冲末端"。
+ *
+ * 与上面那个容差分开，是因为两者语义不同：上面那个容忍"播放头略微超前"，
+ * 这个容忍"缓冲略微落后"。都取 0.3 秒——正常停住时两者差在几十毫秒内，
+ * 而缓冲被清空 / 驱逐后差的是整段视频长度，判据要能一刀切开这两种情况。
+ */
+const TAIL_BUFFER_GAP_TOLERANCE_SECONDS = 0.3;
+
+export interface TailSnapshot {
   currentTime: number;
   duration: number;
   bufferedEnd: number;
   paused: boolean;
   seeking: boolean;
+  /** 已经派发过 `ended`：不再需要任何"补判播完"。 */
+  ended?: boolean;
 }
 
-export function shouldFinishAtBufferedTail(snapshot: TailWaitSnapshot): boolean {
-  const { currentTime, duration, bufferedEnd, paused, seeking } = snapshot;
+/**
+ * 位置判定：播放头是否已经停在"可播末端"。
+ *
+ * 只看位置，不看时间——同一帧快照无法区分"倍速切换抖一下"与"真的卡死"，
+ * 那件事必须交给调用方的时间维度确认。
+ *
+ * `nearEndSeconds` 允许调用方放宽窗口：看门狗已经在"时钟/帧/缓冲三信号都停滞"
+ * 上等了 10 秒，那时把窗口放宽到 5 秒是安全的（确实没有数据再进来了）。
+ */
+export function isPlayheadAtPlayableTail(
+  snapshot: TailSnapshot,
+  nearEndSeconds: number = NEAR_END_TOLERANCE_SECONDS,
+): boolean {
+  const { currentTime, duration, bufferedEnd, paused, seeking, ended } = snapshot;
+  if (ended === true) return false;
   if (paused || seeking) return false;
   if (!Number.isFinite(duration) || duration <= 0) return false;
-  if (!Number.isFinite(currentTime) || currentTime < duration - NEAR_END_TOLERANCE_SECONDS) return false;
-  if (!Number.isFinite(bufferedEnd) || bufferedEnd <= 0) return false;
-  if (bufferedEnd >= duration - BUFFERED_END_TOLERANCE_SECONDS) return false;
-  return currentTime >= bufferedEnd - PLAYHEAD_AT_BUFFER_END_TOLERANCE_SECONDS;
+  if (!Number.isFinite(currentTime) || currentTime < 0) return false;
+  // 1) 已进入末尾区域
+  if (currentTime < duration - nearEndSeconds) return false;
+  if (!Number.isFinite(bufferedEnd) || bufferedEnd <= 0) {
+    // 没有缓冲信息时无法判断"贴住末端"，单帧快照下按未命中的保守处理。
+    return false;
+  }
+  // 2) 没有可继续解码的数据：播放头追上缓冲末端，或缓冲本身已经覆盖到总时长。
+  //
+  // 第二条是形态 B 的关键：末段全部进缓冲时 `buffered.end ≈ duration`，
+  // 播放头却可能还差 1~2 秒走不到 —— 这正是要判成"该结束了"的那种停住。
+  //
+  // ⚠️ 第一条必须**双向**约束（2026-10-20 复查修正）。
+  //
+  // 只写 `currentTime >= bufferedEnd - TOL`，等于把"播放头在缓冲**之前**"也算成
+  // 命中：缓冲被 `recoverMediaError()` 清空、或被 MSE 驱逐之后 `bufferedEnd`
+  // 会退到 0.x 秒，而播放头还停在末尾 —— `97.6 >= 0.05 - 0.3` 为真。
+  // 那时真实状态是"末段数据没了、得等它重新进来"，判成播完就会提前跳集，
+  // 并把这一集按 100% 写进历史（看过的集会被续播入口跳过）。
+  //
+  // 所以补一条"缓冲末端离播放头不能太远"：正常播到末尾停住时两者几乎相等，
+  // 而缓冲被清空时差着整段时长，一眼可分。
+  const bufferReachesPlayhead =
+    currentTime >= bufferedEnd - PLAYHEAD_AT_TAIL_TOLERANCE_SECONDS &&
+    bufferedEnd >= currentTime - TAIL_BUFFER_GAP_TOLERANCE_SECONDS;
+  const bufferCoversEnd = bufferedEnd >= duration - PLAYHEAD_AT_TAIL_TOLERANCE_SECONDS;
+  return bufferReachesPlayhead || bufferCoversEnd;
+}
+
+/**
+ * 旧名兼容：位置判定。
+ *
+ * ⚠️ 返回值含义已从"确认播完"降级为"停在可播末端"。调用方**必须**再补一次
+ * 时间维度确认（见文件头）；直接把它当 `ended` 用会把倍速切换的瞬时 `waiting`
+ * 误判成播完，那正是 0.2.20 修过的回归。
+ *
+ * 当前仓库内已无调用点（短剧侧与用例都直接用 `isPlayheadAtPlayableTail`）。
+ * 保留只为不打断外部引用；下一个主版本删除。
+ *
+ * @deprecated 直接用 `isPlayheadAtPlayableTail`，语义更明确。
+ */
+export function shouldFinishAtBufferedTail(snapshot: TailSnapshot): boolean {
+  return isPlayheadAtPlayableTail(snapshot);
 }

@@ -676,7 +676,23 @@ fn set_vsr_enabled(enabled: bool) {
 }
 
 /// 非动漫链路统一转成 H.264 分片流。失败保留原 URL，由前端既有备份链路播放。
-async fn enhance_short_drama_session(mut session: PlaybackSession) -> PlaybackSession {
+async fn enhance_short_drama_session(session: PlaybackSession) -> PlaybackSession {
+    enhance_short_drama_session_keyed(session, None).await
+}
+
+/// 带缓存键的增强链路：guo 外部站源的起播走这条。
+///
+/// 键由「源|剧|集|档位」组成，由 `media_enhance::start_keyed_cache` 哈希成持久目录
+/// （`rtx-vsr/vid-guo-<hash>`）。不含播放地址：guo 的地址每次 resolve 都带新的本地
+/// token，拿地址当键永远命中不了；而同一集的内容在短时间内不会变，剧集 id 才是
+/// 稳定的身份。
+///
+/// 传 `None` 时行为与原来完全一致（红果另有自己的 `start_video_cache` 链路，
+/// 这里只服务 guo / 公开直链这类没有官方 vid 的源）。
+async fn enhance_short_drama_session_keyed(
+    mut session: PlaybackSession,
+    cache_key: Option<String>,
+) -> PlaybackSession {
     // 开关关闭：完全回到引入 `media_enhance` 之前的旧链路——原始源 URL 直接播，
     // 不做任何 HTTP(S) 转码。这条判定必须排在 `needs_enhancement` **之前**：
     // 后者只按 URL 形态决定「能不能转」，与用户开不开增强无关。
@@ -696,7 +712,13 @@ async fn enhance_short_drama_session(mut session: PlaybackSession) -> PlaybackSe
         ));
         return session;
     }
-    match media_enhance::start(session.session_id, &session.url).await {
+    let started = match cache_key.as_deref() {
+        Some(key) => {
+            media_enhance::start_keyed_cache(session.session_id, key, &session.url, None).await
+        }
+        None => media_enhance::start(session.session_id, &session.url).await,
+    };
+    match started {
         Ok(enhanced_url) => {
             session.backup_url = Some(session.backup_url.unwrap_or_else(|| session.url.clone()));
             session.url = enhanced_url;
@@ -719,14 +741,20 @@ async fn playback_open(
         // 它们全部——目录被挡住时用户手里仍然可能攥着一条旧 id（历史、收藏、
         // 复制来的链接），那正是这条命令存在的理由。
         ensure_series_source_allowed(&input.series_id, &state)?;
-        let session = enhance_short_drama_session(state.guo_provider.open_episode(
+        let opened = state.guo_provider.open_episode(
             input.session_id,
             &input.series_id,
             &input.episode_id,
             &input.quality,
             input.position,
-        )?)
-        .await;
+        )?;
+        // 同一部剧的同一集、同一档位共用一个产物目录：回看、画中画交接、连播预取
+        // 命中已转好的整集 HLS 就直接出画，与红果的 `vid-<vid>` 缓存同一套语义。
+        let cache_key = format!(
+            "guo|{}|{}|{}",
+            opened.series_id, opened.episode_id, opened.quality
+        );
+        let session = enhance_short_drama_session_keyed(opened, Some(cache_key)).await;
         let mut sessions = state
             .sessions
             .lock()
@@ -1611,6 +1639,24 @@ fn main() {
                 main_window.on_window_event(move |event| {
                     if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                         crate::pip::dismiss_on_main_close(&handle);
+                    }
+                    // 主窗口重新拿到焦点 = 用户把主界面叫回来了。
+                    //
+                    // 这时小窗必须立刻让位，否则就是用户报的那个严重故障：
+                    // 主界面与小窗同时在播、两块画面各出一路声音。
+                    // 「任何时刻只看见一个窗口」不能只靠进入小窗时 hide 一次 ——
+                    // 用户完全可以用任务栏 / Alt+Tab 把主窗口叫出来。
+                    //
+                    // ⚠️ 必须附加"主窗口此刻可见"这个条件：进入小窗的那一瞬，
+                    // 小窗的 `setFocus()` 会把焦点抢过去（Focused(false)），
+                    // 而主窗口要等到前端收到 `pip://shown` 才 hide。这段窗口期里
+                    // 若主窗口因为任何原因再拿到一次焦点，不加判据就会把小窗刚开就关掉。
+                    if let tauri::WindowEvent::Focused(true) = event {
+                        if let Some(main) = handle.get_webview_window("main") {
+                            if main.is_visible().unwrap_or(false) {
+                                let _ = crate::pip::pip_dismiss(handle.clone());
+                            }
+                        }
                     }
                     // 全屏进出会在几百毫秒内连发多次 Resized，「退出全屏回弹」的
                     // 真相就藏在这条时间线里：只看首尾矩形分不清中间弹了几次。

@@ -65,14 +65,17 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
   /**
    * 进入画中画。
    *
-   * 交接成功后主窗口离开播放器视图——App 的 effect 随即调 stopPlayback（作废会话
-   * + 落盘进度），主窗口这边就彻底停手了，用户可以在主界面继续浏览。交接失败
-   * （后端拒绝、非桌面环境）则留在原地：把用户扔到一个空页面上更糟。
+   * 交接成功后**主窗口不离开播放器视图**，而是整窗隐藏（由 `PipReturnBridge`
+   * 在收到 `pip://shown` 时执行）。这样"同一时刻只有一个窗口"：小窗先出画，
+   * 主窗口再退场。
+   *
+   * 旧实现交接成功后立刻 `goBack()` 回主界面 —— 那正是空档的来源：播放界面
+   * 先消失、主界面露出来，小窗还在加载，过一会儿才出现。
+   *
+   * 交接失败（后端拒绝、非桌面环境）则原地不动：把用户扔到一个空页面上更糟。
    */
   const handleEnterPip = async () => {
-    const handed = await enterPip();
-    if (!handed) return;
-    goBack();
+    await enterPip();
   };
 
   // 集数徽章文案。

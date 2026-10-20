@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ProgressBar } from './ProgressBar';
+import { tracePlayback } from '../../services/playbackTrace';
 import { RollingPercent, RollingTime } from './RollingNumber';
 import {
   Play,
@@ -196,14 +197,12 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
       }${!hudShown && !isLocked ? ' is-auto-hidden' : ''}`}
     >
       {/*
-        收起态的贴边迷你进度条。
-        放在 HUD 之外：HUD 整体淡出时它才登场，独立于那层透明度。
+        收起态的贴边迷你进度条已经**移到 VideoSurface 根部**（与 <video> 同级、
+        z-40）。原因：它原来挂在这里，而这一层在自动隐藏 / 锁定态会整体淡出 ——
+        子元素再怎么设 opacity 也救不回来；换集又恰好落在自动隐藏的时间窗里，
+        于是表现为"第一集正常、切下一集进度条不见了"。
+        现在由 VideoSurface 直接渲染 `<MiniProgress />`，位置与层叠都不受 HUD 影响。
       */}
-      <MiniProgress
-        position={position}
-        duration={duration}
-        buffered={buffered}
-      />
 
       {/*
         右侧居中小锁：展开 / 收起播放控制器。
@@ -648,6 +647,16 @@ interface MiniProgressProps {
   position: number;
   duration: number;
   buffered: number;
+  /**
+   * 是否露面（控制条收起 / 锁定时为 true）。
+   *
+   * 由组件自己内联控制，不再只依赖祖先的 `.is-locked` / `.is-auto-hidden`
+   * 类（2026-10-19 修「收起后进度条有几率消失」）：那两条类由 PlayerHud 挂在外
+   * 层容器上，任何一次类名抖动或判定分支漏挂，细条就会永久停在 `opacity: 0`
+   * —— 而它恰恰是收起态唯一的位置反馈，消失了用户就没有任何进度可看。
+   * 内联样式优先级高于类，判定与渲染在同一个表达式里，不可能对不上。
+   */
+  visible: boolean;
 }
 
 /**
@@ -669,16 +678,45 @@ export const MiniProgress: React.FC<MiniProgressProps> = ({
   position,
   duration,
   buffered,
+  visible,
 }) => {
+  /**
+   * 挂载与关键状态各留一条痕。
+   *
+   * 「进度条消失了」这个症状在代码层反复查不出来，是因为**渲染与否**和
+   * **看得见与否**是两件事：元素可能在，只是被父层透明度 / 裁剪 / 层叠吃掉。
+   * 有了这两行，下一次现场就能直接分辨：
+   *   - 完全没有这行 → 组件根本没挂载（上层条件渲染问题）；
+   *   - 有挂载行但看不见 → 纯视觉层问题（截图时对照 opacity/尺寸）。
+   */
+  useEffect(() => {
+    tracePlayback(
+      `贴边进度条挂载 visible=${visible} 位置=${Number.isFinite(position) ? position.toFixed(2) : 'NaN'} 时长=${Number.isFinite(duration) ? duration.toFixed(1) : 'NaN'}`,
+    );
+  }, []);
   // duration 未就绪时不算百分比（除零会得到 NaN，scaleX(NaN) 会让整条消失）。
   const hasDuration = Number.isFinite(duration) && duration > 0;
-  const percent = hasDuration ? Math.max(0, Math.min(100, (position / duration) * 100)) : 0;
-  const bufferPercent = hasDuration
-    ? Math.max(0, Math.min(100, (buffered / duration) * 100))
-    : 0;
+  /**
+   * 比例必须**有限**：`video.currentTime` 在 MSE 重新 attach 的那一瞬间会短暂读成
+   * `NaN`，一路传下来就是 `Math.min(1, NaN) = NaN` → `scaleX(NaN)` 让已播段
+   * 整个不渲染（不是变 0，是"这条线没了"）。所有比例统一在这里收口。
+   */
+  const safeRatio = (value: number): number => {
+    if (!hasDuration || !Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(100, (value / duration) * 100));
+  };
+  const percent = safeRatio(position);
+  const bufferPercent = safeRatio(buffered);
 
   return (
-    <div aria-hidden className="ttv-mini-progress">
+    <div
+      aria-hidden
+      className="ttv-mini-progress"
+      style={{
+        opacity: visible ? 1 : 0,
+        transform: visible ? 'translateY(0)' : 'translateY(100%)',
+      }}
+    >
       <div className="ttv-mini-buffer" style={{ width: `${bufferPercent}%` }} />
       {hasDuration ? (
         <div className="ttv-mini-played" style={{ transform: `scaleX(${percent / 100})` }} />

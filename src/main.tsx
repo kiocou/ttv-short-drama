@@ -1,7 +1,3 @@
-import React from 'react';
-import ReactDOM from 'react-dom/client';
-import App from './App';
-import { MiniPlayer } from './components/player/MiniPlayer';
 import { isPipWindow } from './services/pip';
 import { applyTheme, readTheme, watchSystemTheme } from './services/theme';
 import './index.css';
@@ -16,13 +12,21 @@ watchSystemTheme();
 
 const rootElement = document.getElementById('root');
 if (rootElement) {
-  // 同一个 index.html 承担两个入口：主界面与画中画小窗。分流依据是**窗口标签**
-  // （min 前缀的窗口由 Rust 侧 pip.rs 创建），而不是查询参数——生产环境前端走
-  // asset 协议，URL 参数的处理规则与 dev server 并不一致，标签才是唯一稳定的依据。
-  const pipWindow = isPipWindow();
-  ReactDOM.createRoot(rootElement).render(
-    <React.StrictMode>
-      {pipWindow ? <MiniPlayer /> : <App />}
-    </React.StrictMode>,
-  );
+  /**
+   * 同一个 index.html 承担两个入口：主界面与画中画小窗。分流依据是**窗口标签**
+   * （min 前缀的窗口由 Rust 侧 pip.rs 创建），而不是查询参数——生产环境前端走
+   * asset 协议，URL 参数的处理规则与 dev server 并不一致，标签才是唯一稳定的依据。
+   *
+   * ⚠️ 两个入口都用**动态 import**，不能静态 `import App`。
+   *
+   * 小窗是一块 380×214 的播放面，它只需要 MiniPlayer 那一小撮模块；静态引入 App
+   * 会把全部视图、store、服务一并加载并执行（冷启动下是几百毫秒级的解析与执行）。
+   * 用户感知就是"点画中画要卡一下才出来"，而画中画恰恰是最需要即时响应的动作。
+   * 拆成 `bootApp` / `bootPip` 两个文件后，Rollup 按 chunk 分开，小窗只付自己那份。
+   */
+  if (isPipWindow()) {
+    void import('./bootPip').then(({ mountPip }) => mountPip(rootElement));
+  } else {
+    void import('./bootApp').then(({ mountApp }) => mountApp(rootElement));
+  }
 }

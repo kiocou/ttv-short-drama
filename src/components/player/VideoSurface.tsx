@@ -8,6 +8,7 @@ import { enterFullscreen, leaveFullscreen, queryFullscreen } from '../../service
 // 且打点是 fire-and-forget，不影响渲染。
 import { tracePlayback } from '../../services/playbackTrace';
 import { PlayerControls } from './PlayerControls';
+import { MiniProgress } from './PlayerHud';
 import { useBoostKeys } from './useBoostKeys';
 import { BoostToast } from './BoostToast';
 import { PlayerToast } from './PlayerToast';
@@ -47,6 +48,8 @@ export const VideoSurface: React.FC = () => {
     currentSeries,
     currentEpisode,
     position,
+    duration,
+    buffered,
     isMuted,
     playbackRate,
     errorDetail,
@@ -451,6 +454,19 @@ export const VideoSurface: React.FC = () => {
   // 百分比与预计秒数属于排查信息，统一挪到设置页的播放诊断面板。
   const isLoadingVisible = uiState.kind === 'opening' || uiState.kind === 'buffering';
 
+  /**
+   * 错误提示的两种形态：**已经在播**和**还没开始播**。
+   *
+   * 2026-10-19 用户实测：画面明明在正常走，却因为一次分片重试失败被一张
+   * `bg-black/60` 的全屏卡片整个糊住，观感像"播放器坏了"。而这类失败大多是
+   * 边转边播的临时现象（分片还没写出来），画面本身没断。
+   *
+   * 所以：
+   *   - 播放位置已经推进（> 0.5s）→ 底部轻提示条，不遮画面、不挡控制条；
+   *   - 还没出画（首开就失败）→ 保留全屏卡片，那才是需要用户决策的时刻。
+   */
+  const compactError = position > 0.5;
+
   return (
     <div
       ref={containerRef}
@@ -480,6 +496,30 @@ export const VideoSurface: React.FC = () => {
         onWaiting={() => tracePlayback('媒体 waiting 缓冲等待（这是「一直在加载」的关键证据）')}
         onStalled={() => tracePlayback('媒体 stalled 拉流停滞')}
       />
+
+      {/*
+        贴边进度条：**独立于 HUD 层**挂在这里，不随控制坞淡出。
+        收起 / 锁定时它是唯一的位置反馈（2026-10-19 修「切换下一集后进度条消失」：
+        它此前渲染在 PlayerHud 的容器里，而那层在自动隐藏 / 锁定态整体淡出，
+        细条自己的 opacity 规则救不回来；换集后又正好落在自动隐藏的时间窗里，
+        于是表现为"第一集正常、切下一集就没了"）。
+        z-40 高过控制坞（z-30），避免被错误卡或控制条盖住。
+      */}
+      {/*
+        贴边进度条：**独立于 HUD 层**，`fixed` 贴在窗口底边。
+        它只在控制坞收起 / 锁定时出现 —— 展开时完整进度条已经在控制坞里，
+        再多一条就是重复（用户报的「不管收不收起它一直在上面」）。
+        用 `fixed` 而不是 `absolute`：绝对定位仍受父容器 overflow / 层叠上下文摆布，
+        这正是它此前"收起后消失"的根源。
+      */}
+      <div className="fixed inset-x-0 bottom-0 z-[999] pointer-events-none">
+        <MiniProgress
+          position={position}
+          duration={duration}
+          buffered={buffered}
+          visible={!isControlsVisible || isLocked}
+        />
+      </div>
 
       {/* 长按加速提示：按住方向键进入加速时出现，松开即消失。 */}
       {boost && (
@@ -563,9 +603,22 @@ export const VideoSurface: React.FC = () => {
 
       {/* 错误态覆盖 */}
       {uiState.kind === 'error' && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm z-30">
-          <div className="p-6 max-w-sm rounded-2xl bg-white/95 backdrop-blur-2xl shadow-fluent-lg flex flex-col items-center text-center gap-3 border border-white">
-            <AlertCircle className="w-10 h-10 text-rose-500" />
+        <div
+          className={
+            compactError
+              // 已开始播放：只占底部一条，画面与进度条都保持可见。
+              ? 'absolute inset-x-0 bottom-24 flex justify-center px-4 z-30 pointer-events-none'
+              : 'absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm z-30'
+          }
+        >
+          <div
+            className={
+              compactError
+                ? 'pointer-events-auto px-3.5 py-2.5 max-w-sm rounded-2xl bg-white/95 backdrop-blur-2xl shadow-fluent flex flex-col items-center text-center gap-1.5 border border-white'
+                : 'p-6 max-w-sm rounded-2xl bg-white/95 backdrop-blur-2xl shadow-fluent-lg flex flex-col items-center text-center gap-3 border border-white'
+            }
+          >
+            <AlertCircle className={compactError ? 'w-5 h-5 text-rose-500' : 'w-10 h-10 text-rose-500'} />
             {/* 卡死与解码失败是两回事：源是好的、是解码线程不再吐帧。原先它落进
                 默认分支显示"该媒体无法由 WebView 解码"，等于把这个结论错误地归因给
                 源与 WebView —— 与不变量 8「诚实报告边界」冲突。 */}
