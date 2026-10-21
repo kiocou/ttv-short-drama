@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/badge/下载-Windows%20x64-2563eb?style=for-the-badge" alt="下载 Windows x64" />
   </a>
   <img src="https://img.shields.io/badge/系统-Windows%2010%20%2F%2011-0f172a?style=for-the-badge" alt="Windows 10 / 11" />
-  <img src="https://img.shields.io/badge/版本-v0.2.29-64748b?style=for-the-badge" alt="v0.2.29" />
+  <img src="https://img.shields.io/badge/版本-v0.2.30-64748b?style=for-the-badge" alt="v0.2.30" />
 </p>
 
 <p align="center">
