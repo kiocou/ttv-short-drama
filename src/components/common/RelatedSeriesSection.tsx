@@ -9,7 +9,6 @@ import {
   type RelatedSeries,
   type RelatedSlice,
 } from '../../services/relatedSeries';
-import type { SeriesItem } from '../../types/catalog';
 import type { SeriesDetail } from '../../types/series';
 import { MicaCard } from './MicaCard';
 import { SeriesCard } from './SeriesCard';
@@ -46,26 +45,33 @@ function prefetchDetail(seriesId: string): void {
  * 打开集数时按需解析」。恒为占位文案的面板不是信息，是版面噪音，还占着详情页
  * 最后一屏最值钱的位置。
  *
- * ## 现在放什么
+ * ## 它现在**不**放什么（2026-10-21 用户要求）
  *
- * 用户在这里最想做的事是"接着看下一部"：刚看完《聚宝盆》第 1 季，下一部就该是
- * 第 2、3、4… 季。所以第一优先级是**同系列其它季**（「第N季」角标标出接续关系），
- * 凑不满一屏才用同频道其它剧补位。两路都拿不到时整块不渲染——不留空话占位置。
+ * 此前这里的第一优先级是**同系列其它季**（「第N季」角标标出接续关系），凑不满
+ * 一屏才用同频道其它剧补位。用户要求把系列短剧整块移出去：
+ *
+ * - 同一部剧的其它季已经在「选集播放」区有独立入口（「系列剧」按钮 → 弹窗），
+ *   在这一栏再铺一遍是同一份内容占两个版面；
+ * - 这一栏真正该回答的是"下一部看什么"，混进同一部剧的第 7、8 季反而答非所问。
+ *
+ * 所以现在**只出同频道的其它剧**，同系列条目在数据层（`fetchRelatedSeries`）就被
+ * 剔除了 —— 不靠组件里过滤，避免"换个入口又漏出来"。季号角标随之停用：这一栏
+ * 里已经不存在需要标注季号的卡片。
  *
  * ## 「换一批」为什么需要 batch 计数
  *
- * 早期实现里这个按钮只是"清缓存重拉"，而 `fetchRelatedSeries` 是**确定性函数**：
- * 同一部剧搜同样的词、过同样的筛选排序，重拉必然得到同一批 —— 点了完全没反应。
- * 现在数据层返回的是**候选池**（可达 4 屏），这个按钮推进 `batch`，由
- * `sliceRelatedBatch` 在池子里换一个起点；池子翻完还想要新的，就再去拉下一页兜底
- * 目录（`fallbackPage` 递增）。两者合起来才叫"换一批"。
+ * 早期实现里这个按钮只是"清缓存重拉"，而 `fetchRelatedSeries` 对同一页目录是
+ * 确定性的：重拉必然得到同一批 —— 点了完全没反应。现在数据层返回的是**候选池**
+ * （可达 4 屏），这个按钮推进 `batch`，由 `sliceRelatedBatch` 在池子里换一个起点；
+ * 池子翻完还想要新的，就再去拉下一页兜底目录（`fallbackPage` 递增）。两者合起来
+ * 才叫"换一批"。
  *
  * ## 四条时序约束
  *
- * 1. **详情到手才发请求**：`fetchRelatedSeries` 以剧名为关键词，标题还没到手时
+ * 1. **详情到手才发请求**：宿主只在拿到 `detail` 之后渲染本组件，标题还没到手时
  *    发出去等于搜一个空词。
  * 2. **换剧作废在途请求**：详情页常驻 DOM，用户点进另一部剧时上一部的推荐可能
- *    还在路上；按 requestId 复查，不复查就会把上一部的季卡画在这一部下面。
+ *    还在路上；按 requestId 复查，不复查就会把上一部的卡片画在这一部下面。
  * 3. **换剧先清屏并重置 batch**：换剧后从第 0 批重新开始，否则新剧会从"第 3 批"
  *    开始显示，看起来像漏了一半。
  * 4. **换剧要重置已翻页数**：`fallbackPage` 属于"这一部剧"的翻页进度，跨剧累加
@@ -119,7 +125,7 @@ export const RelatedSeriesSection: React.FC<RelatedSeriesSectionProps> = ({ deta
         if (requestId !== requestIdRef.current) return;
         // 失败与"确实没有推荐"都落到空结果：这一栏是增量信息，不值得弹错误提示。
         // **失败不入缓存**：下次进来应当重试，而不是把一次抖动记成"这部没有推荐"。
-        setPool({ seasons: [], others: [] });
+        setPool({ others: [] });
       })
       .finally(() => {
         if (requestId === requestIdRef.current) setIsLoading(false);
@@ -155,9 +161,8 @@ export const RelatedSeriesSection: React.FC<RelatedSeriesSectionProps> = ({ deta
     /**
      * 池子翻完一整轮：拉下一页兜底目录，把新剧并进池子再切。
      *
-     * 同系列季不重复拉（它们与页号无关），只追加新的兜底条目；已见过的 id 不重复
-     * 追加，否则池子会被重复条目灌满，`relatedBatchCount` 虚高，翻几批之后就全是
-     * 重复内容。
+     * 已见过的 id 不重复追加，否则池子会被重复条目灌满，`relatedBatchCount` 虚高，
+     * 翻几批之后就全是重复内容。
      */
     const nextPage = fallbackPageRef.current + 1;
     const requestId = ++requestIdRef.current;
@@ -175,10 +180,7 @@ export const RelatedSeriesSection: React.FC<RelatedSeriesSectionProps> = ({ deta
           setBatch(0);
           return;
         }
-        const merged: RelatedSeries = {
-          seasons: pool.seasons,
-          others: [...pool.others, ...fresh],
-        };
+        const merged: RelatedSeries = { others: [...pool.others, ...fresh] };
         fallbackPageRef.current = nextPage;
         poolCacheRef.current.set(detail.id, merged);
         setPool(merged);
@@ -198,18 +200,13 @@ export const RelatedSeriesSection: React.FC<RelatedSeriesSectionProps> = ({ deta
     [pool, batch],
   );
 
-  const seasonCount = slice?.seasons.length ?? 0;
-  const total = seasonCount + (slice?.others.length ?? 0);
+  const total = slice?.others.length ?? 0;
 
   const subtitle = useMemo(() => {
-    if (isLoading) return '正在按当前剧集找接续内容…';
+    if (isLoading) return '正在按当前剧集找同频道好剧…';
     if (isSwitching) return '正在换一批…';
-    if (seasonCount > 0 && (slice?.others.length ?? 0) === 0) {
-      return `同系列已收录 ${seasonCount} 季 · 按接续顺序排好`;
-    }
-    if (seasonCount > 0) return `同系列还有 ${seasonCount} 季，后面是同频道精选`;
-    return '同频道的其它热门';
-  }, [isLoading, isSwitching, seasonCount, slice]);
+    return '同频道的其它热门 · 已排除同系列';
+  }, [isLoading, isSwitching]);
 
   // 加载中：骨架占住版面（与真实卡片同构），数据到达时布局不跳。
   if (isLoading && !pool) {
@@ -221,7 +218,7 @@ export const RelatedSeriesSection: React.FC<RelatedSeriesSectionProps> = ({ deta
               <Sparkles className="h-3.5 w-3.5" />
             </span>
             <h2 className="text-sm font-bold text-slate-800">猜你喜欢</h2>
-            <span className="text-[11px] text-slate-400">正在匹配接续内容…</span>
+            <span className="text-[11px] text-slate-400">正在匹配同频道好剧…</span>
           </div>
         </div>
         <div className={RELATED_GRID_CLASS} aria-busy="true">
@@ -233,7 +230,7 @@ export const RelatedSeriesSection: React.FC<RelatedSeriesSectionProps> = ({ deta
     );
   }
 
-  // 两路都空：整块不渲染。写一句「暂无推荐」只是占着版面说废话。
+  // 池子空：整块不渲染。写一句「暂无推荐」只是占着版面说废话。
   if (!slice || total === 0) return null;
 
   return (
@@ -271,22 +268,11 @@ export const RelatedSeriesSection: React.FC<RelatedSeriesSectionProps> = ({ deta
         那正是"点了没反应"的观感来源之一（即便数据已经换了）。
       */}
       <div key={`batch-${batch}`} className={`${RELATED_GRID_CLASS} ttv-grid-in`}>
-        {slice.seasons.map((pick, index) => (
-          <SeriesCard
-            key={pick.item.id}
-            series={pick.item}
-            index={index}
-            seasonBadge={`第${pick.season}季`}
-            seasonBadgeTone={pick.relation}
-            onClick={onOpen}
-            onPrefetch={prefetchDetail}
-          />
-        ))}
         {slice.others.map((series, index) => (
           <SeriesCard
             key={series.id}
             series={series}
-            index={seasonCount + index}
+            index={index}
             onClick={onOpen}
             onPrefetch={prefetchDetail}
           />

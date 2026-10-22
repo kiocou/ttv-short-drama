@@ -43,6 +43,22 @@ export const HomeShelfSection: React.FC<HomeShelfSectionProps> = ({
 }) => {
   const feed = useShelfFeed(kind, channel);
 
+  // 诊断打点：货架封面全丢时最需要知道的就是"前端到底收到了什么地址"。
+  // `coverResolver` 只在地址像 heic 时才挂解析器，地址为空/被改写时它会静默
+  // 返回 undefined，界面表现与"代理失败"完全一样，光看 UI 分不出来。
+  React.useEffect(() => {
+    const preview = feed.items.slice(0, 3);
+    console.info(
+      `[shelf] ${kind}/${channel} 条目=${feed.items.length}`,
+      preview.map(item => ({
+        id: item.id,
+        title: (item.title || '').slice(0, 14),
+        coverLen: (item.cover || '').length,
+        coverHead: (item.cover || '').slice(0, 72),
+      })),
+    );
+  }, [feed.items, kind, channel]);
+
   return (
     <HomeShelf
       title={title}

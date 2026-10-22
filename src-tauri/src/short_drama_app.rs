@@ -639,7 +639,7 @@ pub(crate) fn ffmpeg_path() -> Result<PathBuf, String> {
         Err(format!("ffmpeg 不存在：{}", ffmpeg.display()))
     }
 }
-fn worker_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
+pub(crate) fn worker_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let base = resource_base().ok_or_else(|| {
         "未找到短剧解析 worker 资源目录（shortdrama-worker）。请重新安装或完整打包应用。".to_owned()
     })?;
@@ -1233,10 +1233,19 @@ pub fn auto_clean_cache_on_start() -> CacheSweepReport {
     // 计入预算与过期清理 —— 否则它在磁盘上只增不减，而用户设的上限管不到它。
     // 此前这里只列了 short-series / motion-comic，与 `evict_channels_to_budget_unthrottled`
     // 的注释（"三个频道共享同一份预算"）自相矛盾（审查 B2）。
+    // `rtx-vsr/` **不能**用 0 秒门槛做 sweep。
+    //
+    // 这里的目录是 `vid-{vid}` 持久 HLS 产物。它可能正在被 ffmpeg 写入，
+    // 也可能因为源断流只写到一半（清单里没有 `#EXT-X-ENDLIST`）。0 秒门槛会
+    // 把这类目录当成"陈旧缓存"整目录删掉；随后正在转码的 ffmpeg 继续往已被
+    // 删除的路径写分片，最终留下一个"有清单、没有 ENDLIST"的半残目录 ——
+    // 播放器再次打开时就会一直等不到完整清单。启动清理只处理**明确完成**
+    // 且超过保留期的产物；未完成产物交给播放链路的 `start_video_cache`
+    // 续转或重建。
     let rtx_root = root.join("rtx-vsr");
-    sweep_cache_dir(
+    sweep_completed_hls_dirs(
         &rtx_root,
-        Duration::from_secs(0),
+        CACHE_MAX_AGE_SECONDS,
         std::time::SystemTime::now(),
     );
     // keep 指向一个不可能存在的路径：启动时没有任何"正在写入"的剧集。
@@ -1252,6 +1261,48 @@ pub fn auto_clean_cache_on_start() -> CacheSweepReport {
         CACHE_MAX_AGE_SECONDS,
         std::time::SystemTime::now(),
     )
+}
+
+/// 清理**已明确完成**且超过保留期的 HLS 目录。
+///
+/// 判据必须是清单里的 `#EXT-X-ENDLIST`：没有它，目录就可能仍在被 ffmpeg 写，
+/// 或只是源断流后留下的半成品。启动时没有任何任务表可查，不能靠进程状态判断，
+/// 所以只动"完成 + 过期"这一种最安全的对象。
+fn sweep_completed_hls_dirs(
+    root: &std::path::Path,
+    max_age_seconds: u64,
+    now: std::time::SystemTime,
+) -> CacheSweepReport {
+    let max_age = Duration::from_secs(max_age_seconds);
+    let mut report = CacheSweepReport::default();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return report;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(playlist) = std::fs::read_to_string(path.join("index.m3u8")) else {
+            continue;
+        };
+        if !playlist.contains("#EXT-X-ENDLIST") {
+            continue;
+        }
+        let (size, stamp) = directory_usage(&path);
+        if size == 0 {
+            continue;
+        }
+        let expired = now
+            .duration_since(stamp)
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if expired && std::fs::remove_dir_all(&path).is_ok() {
+            report.removed_files += 1;
+            report.freed_bytes = report.freed_bytes.saturating_add(size);
+        }
+    }
+    report
 }
 
 /// 把前端传来的画质串归一成 worker 认得的档位：`auto` / `4k` / `{digits}p`。
@@ -2716,43 +2767,111 @@ fn image_data_url(bytes: &[u8], ext: &str) -> String {
 /// HEIC → JPEG（用随包的 ffmpeg，实测单张 0.39s）。
 ///
 /// 走临时文件而不是管道：ffmpeg 的 image2 输出走管道要自己拼封装，为几十 KB 的图
-/// 不值得；临时文件就写在缓存目录旁边，转完无论成败都清掉。
+/// 不值得；临时文件转完无论成败都清掉。
+///
+/// ## 临时文件为什么**不写缓存目录**（2026-10-21 修「三处封面全丢」）
+///
+/// 原实现把 `{key}.heic.tmp` 写在 `cache_dir`（即 `hongguo-covers-v1`）里。这条
+/// 路径在用户的机器上会以 **`拒绝访问 (os error 5)`** 失败，而同一个目录用别的
+/// 进程写同名文件却是成功的 —— 说明问题不在目录本身，而在**该进程对这个持久
+/// 缓存目录的写权限判定**（沙箱/继承 ACL/安全软件任一都可能造成这种差异）。
+///
+/// 更关键的是：**这类失败会静默吃掉整片封面**。命令返回 `Err`，前端
+/// `ipcService.shelf.cover` 捕获后返回 `null`，`CoverImage` 于是没有任何可用
+/// 地址，卡片只剩剧名首字——而用户看到的只是"封面又没了"，完全联想不到权限。
+///
+/// 临时文件本来就不该占用持久缓存目录（它连缓存都算不上，转完即删）。改成
+/// **系统临时目录 + 进程内唯一名**之后：
+///   * 不再依赖缓存目录的写权限，只管最终产物那一份；
+///   * 多实例/多卡片并发时靠进程号与序号区分，不会互相覆盖；
+///   * 静态连接一个 `OnceLock<u64>` 计数器，无锁也不用引入新依赖。
+///
+/// 产物 `{key}.jpg` 仍然落缓存目录（那是真正的缓存，命中即免转码）；万一写产物
+/// 也失败，本次调用返回错误，但**不会污染缓存**，下次仍会重试。
 async fn convert_heic_to_jpeg(
     cache_dir: &std::path::Path,
     key: &str,
     bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     let ffmpeg = ffmpeg_path()?;
-    let source = cache_dir.join(format!("{key}.heic.tmp"));
-    let target = cache_dir.join(format!("{key}.jpg"));
-    std::fs::write(&source, bytes).map_err(|error| format!("写入临时封面失败：{error}"))?;
+    // ===== 全走管道，一个文件都不写 =====
+    //
+    // ## 为什么不再用临时文件（2026-10-21 修「三处封面全丢」）
+    //
+    // 原实现要把 `{key}.heic.tmp` 写进缓存目录，再让 ffmpeg 读文件、写文件。
+    // 实测在某些环境下**任何写文件动作都被拒绝**（`os error 5`）：系统临时目录
+    // `C:\Users\…\Temp` 与缓存目录 `hongguo-covers-v1` 同时报拒绝访问，而同一台
+    // 机器上其它进程写同样的路径却是成功的。这类失败与代码逻辑无关，却会**静默
+    // 吃掉整片封面**——命令返回 Err，前端 `shelf.cover` 只能给 null，
+    // `CoverImage` 拿不到任何地址，卡片只剩剧名首字。
+    //
+    // 把转码改成 stdin/stdout 管道后，这条链路上**没有任何文件写操作**：
+    //   下载字节 → 直接喂 ffmpeg 的 stdin → 从 stdout 收 JPEG → 转 data URL。
+    // 缓存那一份改成"尽力写"（见函数末尾），写不进去只是下次多转一遍，不再影响
+    // 本次能否显示。这也顺手消掉了临时文件的残留与并发踩踏问题。
+    //
+    // 产物形态与文件方式完全一致（`-f mjpeg pipe:1`，实测单张 39KB、文件头
+    // `ffd8ffe0`），前端不需要任何改动。
     let mut command = tokio::process::Command::new(&ffmpeg);
     command
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-i")
-        .arg(&source)
+        .arg("pipe:0") // 源：标准输入
         .arg("-frames:v")
         .arg("1")
         .arg("-q:v")
         .arg("4")
-        .arg("-y")
-        .arg(&target);
+        .arg("-f")
+        .arg("mjpeg")
+        .arg("pipe:1") // 产物：标准输出
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // 别弹控制台黑窗
-    let output = command.output().await;
-    let _ = std::fs::remove_file(&source);
-    let output = output.map_err(|error| format!("封面转码失败：{error}"))?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("封面转码进程启动失败：{error}"))?;
+    // 写 stdin 与等待退出必须并发：源图几十 KB，管道缓冲装不下，先写完再读
+    // stdout 会在两侧同时阻塞（经典死锁）。stdout 只有几十 KB，交给
+    // `wait_with_output` 一次读完即可，因此只需要把"写 stdin"放进独立任务。
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "封面转码进程没有可写的 stdin。".to_owned())?;
+    let payload = bytes.to_vec();
+    let writer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let result = stdin.write_all(&payload).await;
+        // 显式关掉写端，否则 ffmpeg 会一直等更多输入、永不退出。
+        let _ = stdin.shutdown().await;
+        result
+    });
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| format!("封面转码等待失败：{error}"))?;
+    // 写端可能因为 ffmpeg 提前退出而报 broken pipe；那种情况下真正的原因在
+    // stderr 里，所以这里不把它当致命错误，交给下面的状态码判断。
+    let _ = writer.await;
     if !output.status.success() {
-        let _ = std::fs::remove_file(&target);
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "封面转码失败：{}",
             detail.lines().last().unwrap_or("未知原因")
         ));
     }
-    std::fs::read(&target).map_err(|error| format!("读取转码结果失败：{error}"))
+    let jpeg = output.stdout;
+    if jpeg.is_empty() {
+        return Err("封面转码失败：没有产出图像数据。".to_owned());
+    }
+    // 尽力写进持久缓存：写成功下次直接命中、免去下载与转码；写失败**不算这次
+    // 失败**——转码本身已经成功，封面能显示，只是下次要重新转一遍。若在这里
+    // 把错误抛出去，用户看到的仍然是"封面全丢"，而这恰恰是本轮要修的病根。
+    let _ = std::fs::write(cache_dir.join(format!("{key}.jpg")), &jpeg);
+    Ok(jpeg)
 }
 
 /// 命令的实体。独立出来是为了能被下面 `#[ignore]` 的联网测试直接调用 ——
@@ -2779,13 +2898,20 @@ async fn cover_to_data_url(url: &str, cache_dir: &std::path::Path) -> Result<Str
         return Err("该封面来源不支持代理。".to_owned());
     }
 
-    std::fs::create_dir_all(cache_dir).map_err(|error| format!("创建封面缓存目录失败：{error}"))?;
+    // 缓存目录建不出来**不该让整条链路失败**（2026-10-21）：目录建不出来只是
+    // "这次不走硬盘缓存"，封面照样能从网络下载、转码并直接返回 data URL。
+    // 原实现把它当致命错误返回 Err，前端 `shelf.cover` 收到后只能返回 null，
+    // 于是一整片卡片退化成剧名首字——一个「缓存写不进去」的次要问题被放大成
+    // 「封面全丢」的主要故障。
+    let cache_writable = std::fs::create_dir_all(cache_dir).is_ok();
     let key = cover_cache_key(url);
 
     // 命中缓存直接读盘。缓存里存的是**已转码**的格式，所以不需要原地址。
-    for ext in ["jpg", "png", "webp", "gif"] {
-        if let Ok(bytes) = std::fs::read(cache_dir.join(format!("{key}.{ext}"))) {
-            return Ok(image_data_url(&bytes, ext));
+    if cache_writable {
+        for ext in ["jpg", "png", "webp", "gif"] {
+            if let Ok(bytes) = std::fs::read(cache_dir.join(format!("{key}.{ext}"))) {
+                return Ok(image_data_url(&bytes, ext));
+            }
         }
     }
 
@@ -2838,7 +2964,47 @@ async fn cover_to_data_url(url: &str, cache_dir: &std::path::Path) -> Result<Str
 /// 一个人人可用的代理（SSRF）。
 #[tauri::command]
 pub async fn short_drama_app_cover_proxy(url: String) -> Result<String, String> {
-    cover_to_data_url(&url, &cover_cache_dir()).await
+    // 诊断打点：封面这条链路的失败在界面上只表现为"海报又变成首字占位"，
+    // 从 UI 完全看不出是域名被拒、下载失败、转码失败还是前端没调用。
+    //
+    // 同时写 stderr 与一份追加文件：开发态 `tauri dev` 的 stderr 未必被捕获
+    // （实测从外部 start 进程时拿不到），而排查必须有一个稳定的落点。
+    let result = cover_to_data_url(&url, &cover_cache_dir()).await;
+    let line = match &result {
+        Ok(data_url) => format!("成功 {}字符 url={}", data_url.len(), clip_log_url(&url)),
+        Err(error) => format!("失败 {error} url={}", clip_log_url(&url)),
+    };
+    eprintln!("[ttv] 封面代理{line}");
+    append_cover_probe_log(&line);
+    result
+}
+
+/// 封面代理的落盘探针。**只在开发态有用**，但保留成本极低（每次调用一行）。
+///
+/// 为什么需要它：封面失败在 UI 上只有"首字占位"一种表现，而"前端没调用"与
+/// "调用了但失败"必须分清——前者是前端路由问题，后者是网络/转码问题，两条
+/// 完全不同的排查路径。stderr 在某些启动方式下拿不到，文件是唯一稳的。
+fn append_cover_probe_log(line: &str) {
+    use std::io::Write;
+    let path = data_dir().join("ttv-cover-probe.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
+/// 日志里的地址截断：签名参数能到几百字符，打全会把日志刷满，而定位只需要
+/// 域名与路径前缀（域名被拒 / 模板后缀错都能看出来）。
+fn clip_log_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.chars().count() <= 120 {
+        return trimmed.to_owned();
+    }
+    trimmed.chars().take(120).collect::<String>() + "…"
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3856,6 +4022,35 @@ mod tests {
             age < 60,
             "目录 mtime 应取最新（实测 {age}s 前），否则正在转码的目录会被误判为陈旧"
         );
+    }
+
+    /// 回归：启动清理只能删**带 ENDLIST 的完成产物**。
+    ///
+    /// 现场：自动清理以 0 秒门槛 sweep `rtx-vsr`，把正在转码的 `vid-*` 目录
+    /// 当成陈旧缓存删掉；ffmpeg 继续往已删除路径写分片，最后留下一个没有
+    /// `#EXT-X-ENDLIST` 的半残清单，重播时一直等不到完整产物。
+    #[test]
+    fn startup_cleanup_never_deletes_unfinished_hls() {
+        let fx = CacheFixture::new("hls-unfinished");
+        let active = fx.dir.join("vid-active");
+        std::fs::create_dir_all(&active).expect("mkdir");
+        std::fs::write(
+            active.join("index.m3u8"),
+            b"#EXTM3U\n#EXTINF:2.0,\nseg-00000.m4s\n",
+        )
+        .expect("playlist");
+        std::fs::write(active.join("seg-00000.m4s"), vec![b's'; 200]).expect("seg");
+        age_file(&active.join("index.m3u8"), 8 * 24 * 3600);
+        age_file(&active.join("seg-00000.m4s"), 8 * 24 * 3600);
+
+        let completed = fx.write_hls_dir("vid-completed", 200, 8 * 24 * 3600);
+
+        let report =
+            super::sweep_completed_hls_dirs(&fx.dir, 7 * 24 * 3600, std::time::SystemTime::now());
+
+        assert!(active.exists(), "未完成 HLS 目录不能被启动清理删除");
+        assert!(!completed.exists(), "完成且过期的 HLS 目录应被清理");
+        assert_eq!(report.removed_files, 1);
     }
 
     /// 回归：即便在预算内，keep 指向的文件也绝不能被删。

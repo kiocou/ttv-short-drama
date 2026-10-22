@@ -1012,8 +1012,19 @@ async fn start_in_directory(
     if !persist {
         let _ = std::fs::remove_dir_all(&directory);
     }
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("创建增强缓存目录失败：{error}"))?;
+    // ⚠️ 诊断：错误信息**必须带上绝对路径**。
+    //
+    // 这个报错在 UI 上只表现为「播放源连接受阻 / 一直缓冲」，排查时无法分辨是
+    // 父目录不存在、路径超长、还是这条路径本身被拒。带上路径之后，"到底是哪一层
+    // 写不进去"一目了然，不必再逐层猜（2026-10-22 实测踩过这个坑）。
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        let exists = directory.exists();
+        format!(
+            "创建增强缓存目录失败（路径={}，已存在={}）：{error}",
+            directory.display(),
+            exists
+        )
+    })?;
 
     let ffmpeg = crate::short_drama_app::ffmpeg_path()?;
     let playlist = directory.join("index.m3u8");

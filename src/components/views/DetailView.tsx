@@ -10,6 +10,8 @@ import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
 import { StatusBadge } from '../common/StatusBadge';
 import { RelatedSeriesSection } from '../common/RelatedSeriesSection';
+import { SeriesSeasonsDialog } from '../common/SeriesSeasonsDialog';
+import { canLookupSeasons } from '../../services/relatedSeries';
 import { 
   Play, 
   ArrowLeft, 
@@ -20,6 +22,7 @@ import {
   X,
   Search,
   Layers,
+  Layers3,
   Check,
   Heart
 } from 'lucide-react';
@@ -41,20 +44,30 @@ export const DetailView: React.FC = () => {
   const [detail, setDetail] = useState<SeriesDetail | null>(null);
   const [isDescExpanded, setIsDescExpanded] = useState(false);
   const [showAllEpisodesModal, setShowAllEpisodesModal] = useState(false);
+  /**
+   * 「系列剧」弹窗。
+   *
+   * 与「全部选集」弹窗并列放在这一层（而不是塞进 `RelatedSeriesSection`）：它属于
+   * **这部剧本身**的操作入口，和"猜你喜欢"推荐的其它剧是两个语义；放在详情页也
+   * 让它和选集面板共用同一套弹窗外壳与 Esc/遮罩关闭行为。
+   */
+  const [showSeasonsDialog, setShowSeasonsDialog] = useState(false);
 
-  // 打开详情页就预签名接下来几集的播放直链。
+  // 打开详情页只预热**最可能被点开的那一集**。
   //
-  // `stream` 只有两次 App API 往返、不下载任何媒体，实测固定 2.16s，是首播
-  // 耗时里最大的一块固定开销。用户在详情页通常停留数秒到数十秒，正好覆盖它；
-  // 点集时后端直接命中缓存，这段等待就消失了。从"继续观看"那一集开始取，
-  // 因为那是最可能被点的。失败静默——预签名是纯优化。
+  // 旧实现一次预签名 6 集（后端 3 路并发），会在用户点“立即播放”时同时占着
+  // 多路 worker 与 App API 往返；而首播真正需要的只有一集。点得越快，越容易
+  // 撞上这轮并发，表现为“立即播放后一直缓冲”。收敛到一集之后，签名与预转
+  // 都只服务当前入口，首播等待最短。
   useEffect(() => {
     if (!detail || detail.episodes.length === 0) return;
     const anchor = detail.episodes.findIndex(ep => (ep.watchedSeconds || 0) > 0 && !ep.isFinished);
-    const start = anchor >= 0 ? anchor : 0;
-    const vids = detail.episodes.slice(start, start + 6).map(ep => ep.id);
-    if (vids.length === 0) return;
-    void ipcService.playback.prefetchStream(vids, detail.type === 'comic' ? 1004 : 1);
+    const target = detail.episodes[anchor >= 0 ? anchor : 0];
+    if (!target) return;
+    void ipcService.playback.prefetchStream(
+      [target.id],
+      detail.type === 'comic' ? 1004 : 1,
+    );
   }, [detail]);
 
   /**
@@ -474,6 +487,34 @@ export const DetailView: React.FC = () => {
                 <Tv className="w-4 h-4 text-slate-500" />
                 <span>分享此剧</span>
               </button>
+
+              {/*
+                「系列剧」入口：把这部剧**其它所有季**铺成一个弹窗。
+
+                ## 为什么在这一行、为什么带条件
+
+                位置：主操作行是详情页唯一"这部剧能做什么"的集中入口，用户扫一眼
+                就知道有这一项；而它紧挨在「分享此剧」之后，不打断"播放 → 追剧 →
+                分享"这条主链路。
+
+                条件：`canLookupSeasons` 与数据层用的是**同一份**判定（不分季的剧、
+                guo 源、18+ 频道都返回 false）。不共用的话必然漂移成"按钮点得开、
+                窗口永远是空的"——那比没有按钮更糟。判不出来就整颗按钮不渲染，
+                而不是渲染一颗点了没反应的按钮。
+
+                配色：沿用选集面板头部 `Layers` 图标的蓝族，与「系列」这件事在
+                全站的一致性对齐（violet 是"猜你喜欢/推荐"的语义色，这里不是推荐）。
+              */}
+              {detail && canLookupSeasons(detail) && (
+                <button
+                  onClick={() => setShowSeasonsDialog(true)}
+                  title="查看这个系列的其它季"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-50/90 hover:bg-blue-100 text-blue-700 border border-blue-200/70 text-xs font-semibold shadow-xs active:scale-95 transition-all cursor-pointer"
+                >
+                  <Layers3 className="w-4 h-4 text-blue-600" />
+                  <span>系列剧</span>
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -574,11 +615,21 @@ export const DetailView: React.FC = () => {
           )}
         </MicaCard>
 
-        {/* 猜你喜欢：同系列接续季优先，凑不满一屏用同频道其它剧补位。
+        {/* 猜你喜欢：只出同频道其它剧，**同系列已在数据层剔除**（用户要求把系列
+            短剧移出这一栏，改由上面的「系列剧」按钮弹窗完整展示）。
             替换掉原来的「可用播放解析通道与健康度」面板——那一块的数据源
             （`detail.sources`）在真实链路里恒为空，永远只显示一句占位文案。 */}
         <RelatedSeriesSection detail={detail} onOpen={handleOpenRelated} />
       </div>
+
+      {/* 系列剧弹窗：铺开这部剧**其它所有季**，当前季不在其中（数据层已排除）。 */}
+      {showSeasonsDialog && (
+        <SeriesSeasonsDialog
+          detail={detail}
+          onOpen={handleOpenRelated}
+          onClose={() => setShowSeasonsDialog(false)}
+        />
+      )}
 
       {/* 选集弹窗 (Modal) */}
       {showAllEpisodesModal && (

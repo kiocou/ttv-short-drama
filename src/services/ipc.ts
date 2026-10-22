@@ -570,7 +570,17 @@ async guoCover(seriesId: string): Promise<string | null> {
      * 失败返回 `null`（封面渲染不了不该影响列表），且**不缓存失败**。
      */
     async cover(url: string): Promise<string | null> {
-      if (!isTauriEnvironment() || !url.trim()) return null;
+      // 诊断打点：封面这条链路失败时 UI 上只表现为"首字占位"，与"还在加载"、
+      // "域名被拒"、"后端没启动"完全无法区分。这里把**入口状态**与**结果**各打一行，
+      // 排查时不必再靠猜。
+      if (!isTauriEnvironment()) {
+        console.warn('[cover] 非 Tauri 环境，封面代理不可用:', url.slice(0, 90));
+        return null;
+      }
+      if (!url.trim()) {
+        console.warn('[cover] 封面地址为空');
+        return null;
+      }
       const cached = shelfCoverCache.get(url);
       if (cached !== undefined) return cached;
       const inflight = shelfCoverInflight.get(url);
@@ -578,10 +588,14 @@ async guoCover(seriesId: string): Promise<string | null> {
 
       const request = invokeBackend<string>('short_drama_app_cover_proxy', { url })
         .then(dataUrl => {
+          console.info('[cover] 代理成功:', url.slice(0, 70), '→', dataUrl.length, '字符');
           rememberShelfCover(url, dataUrl);
           return dataUrl;
         })
-        .catch(() => null)
+        .catch((error) => {
+          console.warn('[cover] 代理失败:', url.slice(0, 90), '原因:', errorText(error, '未知'));
+          return null;
+        })
         .finally(() => {
           shelfCoverInflight.delete(url);
         });

@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useRef, useEffect, useCallback, useMemo, ReactNode } from 'react';
 import { PlaybackUiState, PlaybackSession } from '../types/playback';
 import { SeriesDetail, EpisodeItem } from '../types/series';
-import { ipcService, isTauriEnvironment } from '../services/ipc';
+import { ipcService, isTauriEnvironment, errorText } from '../services/ipc';
 import { attachSource, isHlsUrl, detachSource, takeHlsFatal } from '../services/hlsAttach';
 import { dismissPip, openPip } from '../services/pip';
 import { redactUrl, tracePlayback } from '../services/playbackTrace';
@@ -263,13 +263,25 @@ function beginStreamingWindow(): void {
  * 延时结束窗口：给出画后的整集转码留出余量。
  *
  * 带回代际校验，理由见 `streamingGeneration` 的注释。
+ *
+ * ⚠️ 2026-10-21：这个余量必须**按整集转码时长**算，不能按"出画后再等一会儿"。
+ *
+ * 实测（ttv-playback.log）：
+ *   228.5s 预转开始（槽位 1000606）→ 269.6s 才转完，**耗时 41062ms**
+ *   而闸门在出画后 6 秒就放开了 —— 于是预取与正在播的那一路并行，
+ *   NVENC 串行，两边都变慢。用户感受到的是"拖动要等 1.7 秒""切集要等 4 秒"。
+ *
+ * 正常情况下一集转码只要 3~10 秒（13~29 倍实时），但被抢时会恶化到 40 秒以上。
+ * 所以这里把窗口下限抬到 8 秒、上限 24 秒：宁可预取晚一点，也不要和播放抢。
+ * 上限仍由 `STREAMING_WINDOW_MAX_MS` 兜底，不会永久占着闸门。
  */
 function endStreamingWindowAfter(ms: number): void {
+  const settleMs = Math.min(24_000, Math.max(ms, 8_000));
   const generation = streamingGeneration;
   window.setTimeout(() => {
     if (generation !== streamingGeneration) return;
     endStreamingWindow();
-  }, ms);
+  }, settleMs);
 }
 
 /** 退出流式转码窗口：递减，真正归零由超时兜底。 */
@@ -580,6 +592,18 @@ const MAX_STREAM_RECOVER = 2;
  * 取 1200ms 与末尾复核同一个量级——短到用户还在看最后一帧，长到后端已经有反应。
  */
 const STREAM_RECOVER_DELAY_MS = 1200;
+
+/**
+ * 拖到未转码区域后的等待参数。
+ *
+ * 转码是 13~29 倍实时，所以"缺的那几秒内容"通常几百毫秒就补上了。轮询间隔取
+ * 250ms（比一个分片短一个数量级，用户感知不到延迟），超时取 8 秒 —— 覆盖
+ * "要等 30 秒内容"这种最坏情况（30/15≈2 秒）仍有 4 倍余量。
+ *
+ * 超时后的兜底是重开这一集，不是继续等：转码真卡死时等下去没有意义。
+ */
+const SEEK_WAIT_POLL_MS = 250;
+const SEEK_WAIT_TIMEOUT_MS = 8000;
 
 /**
  * 一次播放生命周期内，流式源恢复的**总预算**（次数 + 时间）。
@@ -1789,7 +1813,20 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         //
         // 用一个覆盖转码余量的延时释放，比"立刻释放"正确、比"等后端通知"简单
         // （不必为它新增一条 IPC）。超时释放本身还有 90 秒硬上限兜底，不会泄漏。
-        endStreamingWindowAfter(STREAMING_TRANSCODE_SETTLE_MS);
+        //
+        // ⚠️ 余量按**本集实际时长**估：转码速度实测 13~29 倍实时，取保守的 8 倍
+        // （被抢时会恶化），再乘 1.6 安全系数。一集 130 秒 → 约 26 秒，由
+        // `endStreamingWindowAfter` 钳到 24 秒上限。
+        //
+        // 为什么不能写死 6 秒：实测 228.5s 起预转、269.6s 才转完（41 秒），
+        // 而闸门 6 秒就放开了 —— 预取与播放并行，NVENC 串行，两边都慢。
+        const episodeSeconds = streamingSourceTotalSeconds > 0
+          ? streamingSourceTotalSeconds
+          : (streaming.durationMs ?? 0) / 1000;
+        const settleMs = episodeSeconds > 0
+          ? Math.round((episodeSeconds / 8) * 1000 * 1.6)
+          : STREAMING_TRANSCODE_SETTLE_MS;
+        endStreamingWindowAfter(settleMs);
         // ⚠️ **不要在这里补发整集 mp4 解析**（2026-10-17 实测卡顿回归后移除）。
         //
         // 曾在这里延时 `STREAMING_TRANSCODE_SETTLE_MS + 1000` 调 `ensureFullPromise()`，
@@ -2249,6 +2286,14 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 又点了一集，主窗口这边必须先把小窗拆掉，否则两路声音会同时响。同理，从小窗
   // "回到播放器"时这一步是空操作（窗口已经关掉了）。
   const runOpenEpisode = async (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string) => {
+    /**
+     * App 链路（本地解析 / 整集 HLS）没成功时的结局，用于在**最后的公开网页
+     * 兜底也失败**时如实报出真正的原因，而不是那句会误导人的
+     * "该集没有公开网页播放信息，可能仅限官方 App"。
+     *
+     * 取值：`null` 表示还没走 App 链路（例如 guo 源）；否则是 `PlayOutcome`。
+     */
+    let appChainOutcome: PlayOutcome | null = null;
     // H.264 增强任务会持续读取上一集源流，换集时必须显式停掉；否则旧 ffmpeg 会和新会话抢 CPU/带宽。
     if (activeSessionRef.current > 0) {
       void ipcService.playback.command(activeSessionRef.current, 'stop').catch(() => undefined);
@@ -2612,6 +2657,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           return;
         }
         // 本地解析也失败（API 拒绝/网络断）：最后再试公开网页直链兜底。
+        //
+        // 诊断打点（2026-10-21）：走到这里意味着 App 链路（worker 签名 / 下载 /
+        // 解密 / 转码）没成功。而用户最终看到的是**公开网页**那条链路的错误
+        // （"该集没有公开网页播放信息，可能仅限官方 App"）——红果剧的公开页
+        // 本来就只提供默认集，这条兜底对它们是**确定性失败**的，于是真实原因被
+        // 一句误导性文案顶掉。把 App 侧的真实结局记下来，兜底也失败时优先报它。
+        appChainOutcome = outcome;
+        tracePlayback(
+          `本地解析未成功 结局=${outcome} 集=${ep.id} 会话=${newSessionId}（转公开网页兜底）`,
+        );
       }
 
       // 本地解析失败后的公开直链兜底：会话已作废（用户已离开）就直接放弃——
@@ -2638,7 +2693,26 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           session = await ipcService.playback.open(seriesId, ep.id, selectedQuality, startPosition, newSessionId);
         } catch (webError) {
           if (activeSessionRef.current !== newSessionId) return;
-          throw webError;
+          /**
+           * ## 兜底也失败时，报**真正**的原因（2026-10-21）
+           *
+           * 红果剧的公开页只提供默认集（`provider.rs::open_episode` 里那条
+           * "该集没有公开网页播放信息，可能仅限官方 App"就是这个分支），所以
+           * 对绝大多数红果剧，这条兜底是**确定性失败**的。此前直接把它的错误
+           * 抛上去，用户看到的就是那句"可能仅限官方 App"——而真正的原因是
+           * App 链路自己没成功，与网页无关。用户正是被这句话带偏的。
+           *
+           * 现在把两条链路的原因拼在一起，并**以 App 链路的结局为主**：
+           * 正常情况它才是决定性的那一环；只有 guo 源（`appChainOutcome` 为
+           * null，没走 App 链路）才直接报网页原因。
+           */
+          const webText = errorText(webError, '公开网页播放失败');
+          const appText = appChainOutcome ? `本地解析结局=${appChainOutcome}` : '';
+          throw new Error(
+            appText
+              ? `${appText}；公开网页兜底也失败：${webText}`
+              : webText,
+          );
         }
       }
       // 预取下一集：URL 已可用即可触发，不等 play() 成功——自动播放被拦等
@@ -2852,12 +2926,30 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     } catch (err) {
       if (activeSessionRef.current === newSessionId) {
         noteFailure('打开集数失败', err);
+        /**
+         * ## 为什么这里不能写 `(err as Error).message`（2026-10-21 修「错误原因被吞」）
+         *
+         * Tauri 的 `invoke` 被后端 `Err(String)` 拒绝时，抛出来的是**那个原字符串
+         * 本身，不是 Error 对象**。于是 `(err as Error).message` 恒为 `undefined`，
+         * `||` 右侧兜底成 `'MEDIA_LOAD_FAILED'` —— 后端辛苦拼出来的真实原因
+         * （"该集没有公开网页播放信息"这类）在**错误码**里彻底丢失，界面上只剩
+         * 一句通用文案。用户报「播放不了」时，连是哪条链路失败都看不出来。
+         *
+         * 现在用 `errorText` 统一收口（它就是为了这个坑写的，见 ipc.ts），
+         * 并把真实原因放进 `detail` 透传给错误卡，同时 `code` 保持稳定的机器码。
+         */
+        const detail = errorText(err, '未知错误');
         setUiState({
           kind: 'error',
           sessionId: newSessionId,
-          code: (err as Error).message || 'MEDIA_LOAD_FAILED',
+          code: 'MEDIA_LOAD_FAILED',
           recoverable: true,
         });
+        // 真实原因单独透传：错误卡优先显示它，而不是那句通用文案。
+        setErrorDetail(detail);
+        tracePlayback(
+          `打开集数失败 集=${episodeId || '(首集)'} 会话=${newSessionId} 原因=${detail}`,
+        );
       }
     }
   };
@@ -2891,6 +2983,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 换集瞬间撤销上一次结尾留下的复核：它绑的是旧会话的播放位置，
     // 落到新一集上就是"刚开始播就被推进下一集"。
     cancelTailProbe();
+    // 同样撤销在途的「等待转码推进」：它的目标位置属于旧集，落到新集上是错的。
+    cancelSeekWait();
     const key = `${seriesId}|${episodeId || ''}|${Math.round(startPosition)}|${qualityOverride || ''}`;
     const inflight = openInFlightRef.current.get(key);
     if (inflight) return inflight;
@@ -3014,20 +3108,34 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       return;
     }
     if (beyondTranscoded) {
+      /**
+       * 拖到还没转好的位置：**等它转出来，而不是重开这一集**（2026-10-21 重做）。
+       *
+       * ## 上一版为什么不行
+       *
+       * 上一版在这里调 `openEpisode(...)` 从目标位置重新开播。实测（ttv-playback.log，
+       * 同一集连续四次拖动）暴露了两个连锁问题：
+       *
+       *   1. `runOpenEpisode` 开头会 `command(旧会话,'stop')` —— 把**正在转码的
+       *      ffmpeg 杀掉**。后端于是从 0 重新起一路，转码进度被清零。
+       *   2. 进度清零后 `seekable.end` 反而变小：实测四次拖动依次是
+       *      21.0s → 11.3s → 36.9s → 40.2s，用户看到的就是「拖到 35 秒又弹回灰色」
+       *      以及画面一闪一闪（每闪一次就是一次重新挂载）。
+       *
+       * ## 现在的做法
+       *
+       * 转码本身一直在推进（实测 13~29 倍实时），缺的只是时间。所以这里**不动播放链路**：
+       * 记下目标位置，按"分片就绪"轮询，一旦 `seekable.end` 追上目标就正常 seek 过去。
+       * 超时才退回重开（兜底，避免永远等不到）。
+       *
+       * 这样既不会杀转码，也不会有重新挂载的闪烁。
+       */
       tracePlayback(
-        `拖动到未转码区域 目标=${clamped.toFixed(1)}s 可寻址末端=${seekableEnd.toFixed(1)}s 会话=${activeSessionRef.current}（从该位置续转）`,
+        `拖动到未转码区域 目标=${clamped.toFixed(1)}s 可寻址末端=${seekableEnd.toFixed(1)}s 会话=${activeSessionRef.current}（等待转码推进）`,
       );
-      // 先记下位置：即便后面重开失败，续播点也不至于丢。
       setPosition(clamped);
       saveProgressThrottled(clamped, duration, true);
-      const ctx = handlerCtxRef.current;
-      if (ctx.currentSeries && ctx.currentEpisode) {
-        void openEpisodeRef.current(
-          ctx.currentSeries.id,
-          ctx.currentEpisode.id,
-          clamped,
-        );
-      }
+      waitForSeekable(video, clamped);
       return;
     }
     video.currentTime = clamped;
@@ -3037,6 +3145,93 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
 
   const seekRelative = (deltaSeconds: number) => {
     seek(position + deltaSeconds);
+  };
+
+  /**
+   * 当前的「等待转码推进」任务（同一时刻只允许一个）。
+   *
+   * 为什么必须互斥：一次点击会同时触发 `pointerdown` 与 `pointerup` 两次落定，
+   * 每次都会启动一个轮询器。两个轮询器各自落位一次，就是两次 `currentTime` 赋值
+   * —— 用户看到的是画面闪一下。实测日志里每条「转码已推进到」都出现两次，
+   * 间隔 50~170ms，正是这个原因。
+   */
+  const seekWaitRef = useRef<{ timer: number; target: number } | null>(null);
+
+  const cancelSeekWait = () => {
+    if (seekWaitRef.current) {
+      window.clearTimeout(seekWaitRef.current.timer);
+      seekWaitRef.current = null;
+    }
+  };
+
+  /**
+   * 等转码推进到目标位置，然后落位。
+   *
+   * 为什么不是"重开这一集"：重开会先 stop 掉正在转的 ffmpeg，进度清零，
+   * 可寻址范围反而变小 —— 用户看到「拖过去又弹回来 + 画面闪」。
+   * 而转码本身是 13~29 倍实时，缺的只是时间，等它就行。
+   *
+   * 超时兜底：极端情况下（转码停滞、源断了）不能永远等，到点退回重开一次。
+   */
+  const waitForSeekable = (video: HTMLVideoElement, target: number) => {
+    // 同一目标重复调用直接忽略；不同目标则取代旧的（用户又拖了一次）。
+    if (seekWaitRef.current && Math.abs(seekWaitRef.current.target - target) < 0.5) return;
+    cancelSeekWait();
+    const sessionAtWait = activeSessionRef.current;
+    const deadline = performance.now() + SEEK_WAIT_TIMEOUT_MS;
+    const poll = () => {
+      seekWaitRef.current = null;
+      // 会话已换（用户切集/退出）：这次等待作废。
+      if (activeSessionRef.current !== sessionAtWait) return;
+      if (videoRef.current !== video) return;
+      let end = 0;
+      try {
+        if (video.seekable && video.seekable.length > 0) {
+          end = video.seekable.end(video.seekable.length - 1);
+        }
+      } catch {
+        // 读不到就当作还没就绪，下一拍再试。
+      }
+      if (Number.isFinite(end) && end >= target - 0.3) {
+        tracePlayback(`转码已推进到 ${end.toFixed(1)}s，落位到 ${target.toFixed(1)}s`);
+        video.currentTime = target;
+        setPosition(target);
+        saveProgressThrottled(target, duration, true);
+        return;
+      }
+      /**
+       * 光等不够：hls.js 是**按播放位置**决定拉哪一片的。
+       *
+       * 播放头留在旧位置时，它只会请求旧位置附近的分片，目标位置那一片永远不会被拉，
+       * `seekable.end` 也就不会长到目标值 —— 等到超时也不会有进展。
+       *
+       * 所以每一拍都把 `currentTime` 往目标推一次：浏览器会把它夹到当前可寻址末端，
+       * 而 hls.js 看到播放位置前移，就会继续往后拉分片。末端随转码推进而增长，
+       * 下一拍再推一次，直到真正落到目标。
+       *
+       * 这不会造成"画面一闪一闪"：位置只在可寻址范围内微调，不会重新挂载播放链路。
+       */
+      try {
+        video.currentTime = Math.min(target, end > 0 ? end - 0.05 : 0);
+      } catch {
+        // 元素还没就绪：下一拍再试。
+      }
+      if (performance.now() >= deadline) {
+        // 等不到了：如实记一笔，退回重开（这是唯一的兜底，不是常规路径）。
+        tracePlayback(
+          `等待转码超时（${SEEK_WAIT_TIMEOUT_MS}ms）目标=${target.toFixed(1)}s 末端=${end.toFixed(1)}s，退回重开这一集`,
+        );
+        const ctx = handlerCtxRef.current;
+        if (ctx.currentSeries && ctx.currentEpisode) {
+          void openEpisodeRef.current(ctx.currentSeries.id, ctx.currentEpisode.id, target);
+        }
+        return;
+      }
+      const timer = window.setTimeout(poll, SEEK_WAIT_POLL_MS);
+      seekWaitRef.current = { timer, target };
+    };
+    const timer = window.setTimeout(poll, SEEK_WAIT_POLL_MS);
+    seekWaitRef.current = { timer, target };
   };
 
   const setVolume = (vol: number) => {
@@ -3159,6 +3354,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     stopStallWatchdog();
     // 末尾复核同理：人已经离开播放器，之后那次复核若能落地，会把下一集隐形拉起。
     cancelTailProbe();
+    // 等待转码推进的任务同样收掉：它会改 currentTime，人已退出时那是隐形操作。
+    cancelSeekWait();
     // 兜底链的分支判定同样作废：下次进播放器时新一集还没决定走哪条源，
     // 留着旧标记会让那一次的错误被静默跳过（审查 F3）。
     resetStreamingSource();

@@ -1084,6 +1084,41 @@ fn parse_series_item(item: &Value) -> Option<SeriesItem> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // 诊断：目录卡封面全空时，需要立刻区分「源没给 pic」与「字段名不是 pic」——
+    // 两者在 UI 上都只是剧名首字，光看界面永远分不出来。只打第一条，避免刷屏。
+    if cover.is_empty() {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let keys = item
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default();
+            let pic_like = item
+                .as_object()
+                .map(|object| {
+                    object
+                        .iter()
+                        .filter(|(key, _)| {
+                            let lower = key.to_ascii_lowercase();
+                            lower.contains("pic")
+                                || lower.contains("cover")
+                                || lower.contains("img")
+                        })
+                        .map(|(key, value)| {
+                            format!(
+                                "{key}={}",
+                                value.to_string().chars().take(60).collect::<String>()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .unwrap_or_default();
+            crate::trace::log(format!(
+                "[anime] 目录条目缺封面 标题={title} 字段={keys} 疑似封面字段={pic_like}"
+            ));
+        }
+    }
     let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
     // continu 形如 "158|周日18:40更"：竖线前是已更新集数。
     let continu = item.get("continu").and_then(Value::as_str).unwrap_or("");

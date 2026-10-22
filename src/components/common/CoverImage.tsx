@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { tracePlayback } from '../../services/playbackTrace';
 
 /**
  * 封面图的统一渲染入口（全应用唯一）。
@@ -79,6 +80,21 @@ export interface CoverImageProps {
 const MAX_ATTEMPTS = 3;
 
 /**
+ * `resolveSrc` 失败后的重试退避（毫秒）。
+ *
+ * 数组长度 = 总尝试次数。首项是**第一次失败后**等多久再试，所以 3 项 = 最多 3 次。
+ *
+ * 为什么需要它（而不是像 `MAX_ATTEMPTS` 那样靠 `img.onError`）：`resolveSrc` 这一路
+ * 的失败发生在**拿到地址之前**（后端还没就绪 / worker 冷启动 / IPC 抖动），此时
+ * 连 `<img>` 都还没渲染，`onError` 根本没有机会触发。旧实现把这一类一次性判死，
+ * 首屏十几张卡于是一起停在剧名首字上、永不恢复（用户报告「封面全丢」）。
+ *
+ * 退避取 800ms / 2.4s：worker 冷启动实测 0.6–1.9s，第一档覆盖不了还有第二档；
+ * 再长就没有意义了（用户已经在往下滚，卡也不再视口内）。
+ */
+const RESOLVE_RETRY_DELAYS_MS = [800, 2400, 4000];
+
+/**
  * `resolveSrc` 返回值已经是**可直接使用的地址**的判定。
  *
  * 只有落在这里面之外的才当作本地文件路径去走 `convertFileSrc`。
@@ -101,6 +117,14 @@ const RESOLVED_URL_PATTERN = /^(data|blob|https?|asset|ipc):/i;
  * 切回来时再触发——正是想要的懒加载语义。
  */
 const COVER_ROOT_MARGIN = '800px 0px';
+
+/**
+ * 封面诊断的去重集合（仅排查期使用）。
+ *
+ * 一屏几十张卡、每次渲染都会重跑组件体，不加去重会把日志刷满。用
+ * 「标题 + 地址前缀」做键：同一张卡的重复渲染被压掉，不同卡各自留一条。
+ */
+const coverDiagLogged = new Set<string>();
 
 let coverObserver: IntersectionObserver | null = null;
 const coverCallbacks = new WeakMap<Element, () => void>();
@@ -192,9 +216,44 @@ export const CoverImage: React.FC<CoverImageProps> = ({
   const [attempt, setAttempt] = useState(0);
   /** 重试次数用尽（或 guo 封面解析失败）：不再渲染 `img`，只留占位。 */
   const [givenUp, setGivenUp] = useState(false);
+  /**
+   * `resolveSrc` 这条通道已经放弃（重试用尽 / 宿主说没有）。
+   *
+   * 与 `givenUp` 分开是必须的：`resolveSrc` 失败**不等于**这张卡没有封面 ——
+   * 原地址可能本身就是可直连的 jpg（首页货架就是这种情况：同一个地址在详情页
+   * 直连能出图）。只有"解析失败 **且** 直连也失败"才该落到 `givenUp`。
+   */
+  const [resolveFailed, setResolveFailed] = useState(false);
   /** guo 封面解析结果：null = 尚未解析，其余 = 可用地址（失败走 givenUp）。 */
   const [resolvedUrl, setResolvedUrl] = useState<string | null>(null);
-  const resolveAttemptedRef = useRef(false);
+  /** 已用掉几次 `resolveSrc` 尝试（见 `RESOLVE_RETRY_DELAYS_MS`）。 */
+  const resolveAttemptRef = useRef(0);
+  /** 解析请求在途：防止同一张卡并发打两次 IPC。 */
+  const resolveInFlightRef = useRef(false);
+  /** 退避计时器的触发信号：ref 不能做 effect 依赖，用一个计数器把它带进去。 */
+  const [resolveTick, setResolveTick] = useState(0);
+  /**
+   * 解析函数的最新引用。
+   *
+   * **不能让它出现在 effect 依赖里**（2026-10-21 修「三处封面全丢」）：
+   * `SeriesCard` 传的是 `coverResolver(series.id, series.cover)` —— 一个**内联箭头
+   * 函数**，父组件每次重渲染都是全新 identity。而 effect 的 cleanup 会把
+   * `cancelled` 置 true，于是每一轮重渲染都发生这件事：
+   *
+   *   1. effect 发车，`resolveInFlightRef = true`；
+   *   2. 父组件因任意原因重渲染（滚动、收藏态、时间戳）→ 新箭头函数 identity；
+   *   3. cleanup 跑：`cancelled = true`、`resolveInFlightRef = false`；
+   *   4. 新 effect 跑：`resolveInFlightRef` 已是 false，重新发车；
+   *   5. 上一轮的 IPC 此时返回，撞上 `if (cancelled) return` → **结果被丢弃**。
+   *
+   * 也就是"每次都发车、每次都丢掉结果"，`setResolvedUrl` 永远执行不到。表现正是
+   * 用户看到的那三处（动漫 / 新剧 / 正在热播）全部只剩剧名首字。
+   *
+   * 讽刺的是原注释早就写明"请求在尝试时捕获 `resolveSrc` 引用而不是跟着它的
+   * identity 重启"，只是依赖数组里仍然写着 `resolveSrc`，代码没照注释做。
+   */
+  const resolveSrcRef = useRef<typeof resolveSrc>(resolveSrc);
+  resolveSrcRef.current = resolveSrc;
   const holderRef = useRef<HTMLDivElement | null>(null);
   /** 上一个地址：用来区分“首次挂载”与“地址真的变了”。 */
   const prevUrlRef = useRef('');
@@ -205,13 +264,66 @@ export const CoverImage: React.FC<CoverImageProps> = ({
   onUnavailableRef.current = onUnavailable;
   const reportedUnavailableRef = useRef(false);
 
-  // guo 源（resolveSrc）忽略直接地址——站源封面直连在 WebView 里不可用，
-  // 必须等 Rust 换回本地缓存的图片。
-  const url = resolveSrc ? (resolvedUrl ?? '') : directUrl;
+  /**
+   * 实际喂给 `<img>` 的地址。
+   *
+   * ## 为什么 `resolveSrc` 解析不出结果时要**回退到原地址**（2026-10-21 修「首页封面全丢」）
+   *
+   * 旧写法是 `resolveSrc ? (resolvedUrl ?? '') : directUrl` —— 只要宿主给了解析器，
+   * 原地址就被**彻底丢弃**。这个取舍原本成立（当时解析器只服务两类"直连必然失败"
+   * 的封面：guo 源的加密封面、红果的 HEIC），但它把"解析失败"与"没有封面"画上了
+   * 等号：
+   *
+   *   - 详情页 Hero 没传 `resolveSrc`，走 `directUrl` 直连，封面正常；
+   *   - 首页货架传了 `resolveSrc`（红果 HEIC），一旦代理这一路拿不到（后端未就绪、
+   *     worker 冷启动、域名不在白名单），`url` 就是空串 —— `<img>` 根本不渲染，
+   *     卡片永远停在剧名首字上，**而那个原地址其实是能用的**（同一个地址在详情页
+   *     直连就有图）。
+   *
+   * 现在改成三段式：解析成功用解析结果 → 解析彻底失败则回退原地址直连 → 两者都
+   * 没有才认输。heic 原地址在 WebView2 里确实解不出来，但那时 `<img>` 会 `onError`
+   * 走既有的重试与 `givenUp` 流程，结论与现在一致；而**非 heic 的原地址（官网抓来
+   * 的 jpg/webp）因此重新变得可用**——这正是详情页一直能显示、首页显示不出来的差别。
+   */
+  const url = resolveSrc
+    ? (resolvedUrl ?? (resolveFailed ? directUrl : ''))
+    : directUrl;
   const hasSource = Boolean(directUrl || resolveSrc);
 
   /**
-   * **只在地址真的变了**时整体重来（换剧 / 节点被复用）。
+   * 诊断打点：封面全丢时，需要区分四种完全不同的原因 ——
+   * ① 宿主没给解析器（`resolveSrc` 为 undefined，地址不像 heic）；
+   * ② 给了但没触发（`started` 卡在 false，视口观察器没命中）；
+   * ③ 触发了但拿不到（代理失败，`shelf.cover` 会另打一条）；
+   * ④ 拿到了但 `<img>` 解不出像素（heic 直连的典型表现）。
+   *
+   * 四者在 UI 上都是"首字占位"，光看界面永远分不出来。
+   *
+   * ⚠️ 走 `tracePlayback`（落进 ttv-playback.log）而不是 `console`：开发版窗口的
+   * DevTools 焦点在自动化环境里拿不稳，而"前端到底收到了什么封面地址"这个证据
+   * 不能靠猜。日志是唯一稳定的落点。
+   *
+   * 用 `挂载计数` 限流：一屏几十张卡，每张只打首次，靠模块级 Set 去重。
+   */
+  useEffect(() => {
+    if (givenUp || loaded) return;
+    const key = `${title}|${directUrl.slice(0, 40)}`;
+    if (coverDiagLogged.has(key)) return;
+    coverDiagLogged.add(key);
+    tracePlayback(
+      `封面挂载 标题=${(title || '').slice(0, 12)} 有解析器=${resolveSrc ? 1 : 0}` +
+      ` 有直连=${directUrl ? 1 : 0} 地址长=${directUrl.length}` +
+      ` 像heic=${/\.heic(\?|$)/i.test(directUrl) ? 1 : 0} started=${started ? 1 : 0}`,
+    );
+  });
+
+  /**
+   * **只在源地址真的变了**时整体重来（换剧 / 节点被复用）。
+   *
+   * ⚠️ 锚定的是 `directUrl` 而不是 `url`：`url` 在「解析成功 / 回退直连」之间会变
+   * （空串 ↔ 真实地址），拿它当判据会让"解析失败后回退"这一步被当成"换了新图"，
+   * 于是解析重试预算被清零 → 又发起一轮解析 → 再次失败 → 再回退……无限循环。
+   * 真正标识"这张卡要显示哪张图"的是源地址本身。
    *
    * 不能在挂载时无条件重置：图片命中缓存时 `load` 事件会赶在 passive effect 之前触发
    * （React 的顺序是 提交 DOM → layout effect → passive effect），于是 `onLoad` 刚把
@@ -220,12 +332,28 @@ export const CoverImage: React.FC<CoverImageProps> = ({
    * 实测证据：滚动过去之后仍有 8 张卡停留在 `opacity: 0`，而它们的 `img.complete` 已是 `true`。
    */
   useEffect(() => {
-    if (prevUrlRef.current === url) return;
-    prevUrlRef.current = url;
+    const sourceKey = directUrl || title;
+    if (prevUrlRef.current === sourceKey) return;
+    prevUrlRef.current = sourceKey;
     setLoaded(false);
     setAttempt(0);
     setGivenUp(false);
-  }, [url]);
+    setResolveFailed(false);
+    /**
+     * **换剧必须清掉上一张的解析结果**（2026-10-21）。
+     *
+     * 列表用的是复用式渲染：格子被复用成另一部剧时，本组件实例不销毁，只是换
+     * props。`resolvedUrl` 属于**上一张图的产物**，留着就等于把 A 的海报画在 B 的
+     * 卡上——比没有封面更糟，因为它看起来是"对的"。
+     *
+     * 解析 effect 的第一句是 `resolvedUrl !== null` 就 return，所以不清它的话，
+     * 新剧连一次解析都不会发车，永远显示上一部剧的封面。
+     */
+    setResolvedUrl(null);
+    // 换地址（换剧 / 格子被复用）要把**解析重试预算**一起重置：那份额度属于
+    // 上一张图，带过来会让新封面少试几次，甚至一次都不试。
+    resolveAttemptRef.current = 0;
+  }, [directUrl, title]);
 
   /** 进入视口（提前一屏）才开始加载；guo 源的解析也等这个信号，避免整页一起打 IPC。 */
   useEffect(() => {
@@ -238,35 +366,85 @@ export const CoverImage: React.FC<CoverImageProps> = ({
   }, [hasSource, started]);
 
   /**
-   * guo 封面解析：视口到达后向 Rust 换本地缓存路径 → asset URL。
+   * 异步封面解析：视口到达后向宿主换真实地址。
    *
-   * 只尝试一次（`resolveAttemptedRef`）：解析失败 = 这张卡没有可用封面
-   * （guo-core 已带源侧 Referer 试过一轮），直接走 givenUp，不再发第二次请求。
+   * ## 为什么允许重试（2026-10-21 修「封面全丢且永不恢复」）
+   *
+   * 旧实现是「本次挂载内只尝试一次」（`resolveAttemptedRef` 一发判死）。对 guo 源
+   * 那是对的（guo-core 已带源侧 Referer 试过一轮，失败就是真没有封面）；但对红果
+   * HEIC 那一路是**错的**：`shelf.cover` 在三种完全可自愈的情形下都会返回 null ——
+   * 应用刚启动后端还没就绪、随包 worker 冷启动中、单次网络抖动。旧实现把这些
+   * 一次性抖动记成了"这张卡没有封面"，而且**整个挂载周期内不再重试**：首屏 12 张
+   * 卡片于是一起停在剧名首字上，无论等多久都不会自己恢复（用户报告「封面全丢」）。
+   *
+   * 现在改成**有限次退避重试**：失败后按 `RESOLVE_RETRY_DELAYS_MS` 等一会儿再来，
+   * 用尽预算才判死。判死的语义没变——真的没有封面时仍然是首字占位，只是不再是
+   * "一次抖动判无期"。
+   *
    * 请求在尝试时捕获 `resolveSrc` 引用而不是跟着它的 identity 重启——宿主每次
    * 渲染都会传新箭头函数，跟着重启会把在途结果当"过期"丢掉。
    */
   useEffect(() => {
-    if (!resolveSrc || !started || resolvedUrl !== null || resolveAttemptedRef.current) return;
-    resolveAttemptedRef.current = true;
-    const request = resolveSrc;
+    if (!resolveSrcRef.current || !started || resolvedUrl !== null) return;
+    // 解析通道已放弃（重试用尽）：交给 `directUrl` 直连，这里不再发车。
+    if (resolveFailed || givenUp) return;
+    if (resolveAttemptRef.current >= RESOLVE_RETRY_DELAYS_MS.length) return;
+    if (resolveInFlightRef.current) return;
+
+    const attemptIndex = resolveAttemptRef.current;
+    // 取 ref 里的最新实现，但**不把它写进依赖**（理由见 `resolveSrcRef` 的注释）。
+    const request = resolveSrcRef.current;
+    resolveInFlightRef.current = true;
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
     void (async () => {
       try {
         const resolved = await request();
+        if (cancelled) return;
         if (!resolved) {
-          setGivenUp(true);
+          // 宿主明确说"这次拿不到"：排一次退避重试，用尽预算才判死。
+          if (attemptIndex + 1 < RESOLVE_RETRY_DELAYS_MS.length) {
+            resolveAttemptRef.current = attemptIndex + 1;
+            resolveInFlightRef.current = false;
+            retryTimer = setTimeout(() => {
+              // 用一次 state 抖动把 effect 重新跑起来（依赖里没有可变 ref）。
+              setResolveTick(tick => tick + 1);
+            }, RESOLVE_RETRY_DELAYS_MS[attemptIndex]);
+            return;
+          }
+          resolveInFlightRef.current = false;
+          setResolveFailed(true);
           return;
         }
+        resolveInFlightRef.current = false;
         if (RESOLVED_URL_PATTERN.test(resolved)) {
           setResolvedUrl(resolved);
           return;
         }
         const convertFileSrc = await loadConvertFileSrc();
-        setResolvedUrl(convertFileSrc(resolved));
+        if (!cancelled) setResolvedUrl(convertFileSrc(resolved));
       } catch {
+        if (cancelled) return;
+        resolveInFlightRef.current = false;
+        if (attemptIndex + 1 < RESOLVE_RETRY_DELAYS_MS.length) {
+          resolveAttemptRef.current = attemptIndex + 1;
+          retryTimer = setTimeout(() => setResolveTick(tick => tick + 1), RESOLVE_RETRY_DELAYS_MS[attemptIndex]);
+          return;
+        }
         setGivenUp(true);
       }
     })();
-  }, [resolveSrc, started, resolvedUrl]);
+
+    return () => {
+      cancelled = true;
+      resolveInFlightRef.current = false;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+    // `resolveTick` 只用于把"该重试了"这个信号带进 effect；它本身不参与任何计算。
+    // ⚠️ **不要**把 `resolveSrc` 加回依赖：它是内联箭头函数，每次父组件重渲染都会
+    // 换 identity，cleanup 会因此把在途请求的结果丢掉（详见 `resolveSrcRef`）。
+  }, [started, resolvedUrl, givenUp, resolveFailed, resolveTick]);
 
   /** 封面确定不可得时通知宿主一次（宿主据此移除卡片）。 */
   useEffect(() => {

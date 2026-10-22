@@ -1708,11 +1708,63 @@ fn main() {
                 });
             }
 
-            // 动漫专区 HLS 本地代理：随应用启动（幂等），m3u8/ts 全部经它转发。
+            // 动漫专区 HLS 本地代理：**必须在 setup 内同步完成**。
+            //
+            // 旧实现用 spawn 异步启动。目录请求可能比它先到，`proxied_image_url`
+            // 此时返回 None，封面退回境外原地址；而播放地址也会带着未改写的远端
+            // m3u8 进入 hls.js，最终表现为封面全空、视频一直缓冲。
+            //
+            // 绑定 loopback 端口本身是毫秒级操作，同步做不会明显拖慢启动，
+            // 却能保证"第一次请求到达时，代理一定已经可用"。
+            match tauri::async_runtime::block_on(crate::hls_proxy::start()) {
+                Ok(port) => crate::trace::log(format!("[hls] 本地代理已启动 127.0.0.1:{port}")),
+                Err(error) => crate::trace::log(format!("[hls] 本地代理启动失败：{error}")),
+            }
+
+            // ===== 预热解析 worker 的 Python 环境（2026-10-22，首帧提速）=====
+            //
+            // ## 为什么值得做
+            //
+            // 红果整集播放的第一道门是「拿播放直链」，它由随包 Python worker 完成
+            // （`run_worker_subcommand` 每次 **spawn 一个新的 python.exe**）。冷启动
+            // 要付：解释器初始化 + `requests`/签名库等一大批 import + 读盘。
+            // 日志实测这条链路固定 **2.2 秒**，而它完全在用户点播放**之后**才开始跑
+            // —— 用户感知就是"点开先黑等两秒"。
+            //
+            // ## 为什么用 `selftest`
+            //
+            // 它只做纯逻辑断言（URL 拼装 / 错误码判定 / 画质回退），**不联网、
+            // 不读设备凭据、不写任何文件**，却会 import 全部依赖模块 —— 正好把
+            // 解释器与这些模块预热进系统文件缓存。
+            //
+            // ## 为什么放在后台
+            //
+            // 预热不该推迟第一帧：丢到后台，失败也静默（预热失败只意味着这次没省下
+            // 时间，绝不该影响播放）。
             tauri::async_runtime::spawn(async {
-                match crate::hls_proxy::start().await {
-                    Ok(port) => eprintln!("[ttv] HLS 代理已启动: 127.0.0.1:{port}"),
-                    Err(error) => eprintln!("[ttv] HLS 代理启动失败: {error}"),
+                let Ok((python, worker, _ffmpeg)) = crate::short_drama_app::worker_paths() else {
+                    return;
+                };
+                let mut command = tokio::process::Command::new(&python);
+                command
+                    .arg(&worker)
+                    .arg("selftest")
+                    .env("PYTHONNOUSERSITE", "1")
+                    .env("PYTHONIOENCODING", "utf-8")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                #[cfg(windows)]
+                command.creation_flags(0x0800_0000); // 别弹控制台黑窗
+                match command.status().await {
+                    Ok(status) if status.success() => {
+                        crate::trace::log("[worker] Python 环境预热完成（首次解析不再付冷启动）")
+                    }
+                    Ok(status) => crate::trace::log(format!(
+                        "[worker] 预热退出码 {:?}（不影响播放，只是没省下冷启动）",
+                        status.code()
+                    )),
+                    Err(error) => crate::trace::log(format!("[worker] 预热失败（忽略）：{error}")),
                 }
             });
 

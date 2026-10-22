@@ -94,7 +94,37 @@ impl AnimeProvider {
     }
 
     async fn get_json(&self, query: &str) -> Result<Value, String> {
-        let url = format!("{BFZY_API}{query}");
+        // ⚠️ **必须补 `?`**（2026-10-22 修「动漫专区封面全空」）。
+        //
+        // `BFZY_API` 末尾已经是 `/`（`…/provide/vod/`），而各个调用方传进来的
+        // `query` 形如 `ac=detail&t=39&pg=1`，**不带前导 `?`**。原实现直接
+        // `format!("{BFZY_API}{query}")`，拼出来是：
+        //
+        //     https://bfzyapi.com/api.php/provide/vod/ac=detail&t=39&pg=1
+        //                                              ^ 少了 `?`
+        //
+        // 于是 `ac=detail` 被当成**路径的一部分**，服务端认不出这条请求，回落到
+        // 默认的 `ac=list` 口径 —— 只返回 8 个字段
+        // （`vod_id/vod_name/type_id/type_name/vod_en/vod_time/vod_remarks/vod_play_from`），
+        // **恰好不含 `vod_pic`**，也不含 `vod_play_url`（分集）。
+        //
+        // 表现极具迷惑性：列表能出、标题能出、集数备注能出，只有封面全空，
+        // 而且 `parse_series_item` 里根本找不到 `vod_pic` 这个键 —— 排查时
+        // 极易误判成"源站没给封面"。实测同一台机器：
+        //   带 `?`  → 60530 字节 / 83 字段 / 有 vod_pic
+        //   缺 `?`  → 1482 字节  /  8 字段 / 无 vod_pic
+        //
+        // `trim_start_matches('?')` 只是防御：万一将来有人把 `?` 写进了 query，
+        // 也不会拼出 `??`。
+        let url = format!("{BFZY_API}?{}", query.trim_start_matches('?'));
+        // 诊断：把**实际请求的 URL** 打进内存缓冲。动漫封面为空的排查里，
+        // 「请求到底带了 ac=detail 还是 ac=list」是第一个必须钉死的事实 ——
+        // 两者返回的字段数差一个数量级（8 vs 83），而 `ac=list` 恰好不含
+        // `vod_pic`，表现与"源站没给封面"完全一样。只打一次，避免刷屏。
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::trace::log(format!("[anime-url] {url}"));
+        }
         let response = self
             .client
             .get(&url)
@@ -105,10 +135,32 @@ impl AnimeProvider {
         if !response.status().is_success() {
             return Err(format!("动漫源响应异常: HTTP {}", response.status()));
         }
+        let content_encoding = response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+            .to_owned();
         let bytes = response
             .bytes()
             .await
             .map_err(|error| format!("动漫源读取失败: {error}"))?;
+        // 诊断：确认响应是否被压缩、解压后是否仍是 gzip 头（`1f8b`）。
+        // 若 body 以 `1f8b` 开头而 content-encoding 显示 gzip，说明 reqwest 没解压
+        // —— 那会让 serde 只解析出少数顶层字段，封面随之消失。
+        static LOGGED_BODY: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED_BODY.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let magic = bytes
+                .iter()
+                .take(2)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            crate::trace::log(format!(
+                "[anime-body] 编码={content_encoding} 字节={} 头={magic}",
+                bytes.len()
+            ));
+        }
         serde_json::from_slice(&bytes).map_err(|error| format!("动漫源数据解析失败: {error}"))
     }
 
@@ -224,8 +276,16 @@ impl AnimeProvider {
         let title = str_field(&vod, &["vod_name"]).unwrap_or_else(|| "未命名动漫".into());
         // 封面过本地代理：暴风封面域名是境外 IP，直连在部分网络下超时，详见
         // `hls_proxy::proxied_image_url`。代理未启动时原样返回，行为不变。
-        let cover = str_field(&vod, &["vod_pic"]).unwrap_or_default();
-        let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
+        // 字段回退与列表一致（`vod_pic` → `vod_pic_thumb` → `vod_pic_slide`）：
+        // 详情页若只认 `vod_pic`，会出现「列表有封面、点进去却空白」的来源不一致。
+        // 封面保留**源站原始地址**，不在这里改写成 `127.0.0.1` 代理地址。
+        //
+        // 代理端口与令牌每次进程启动都会变，而目录结果会被前端缓存、也可能在
+        // 代理尚未就绪时生成。把这种易失地址交给 `<img>`，重启或缓存命中后就是
+        // 一条死链，表现正是动漫页整片只剩剧名首字。暴风图床实测 HTTP/HTTPS
+        // 都可直连（200 image/jpeg），让 WebView 直接加载更稳。
+        let cover =
+            str_field(&vod, &["vod_pic", "vod_pic_thumb", "vod_pic_slide"]).unwrap_or_default();
         let tags = class_tags(&vod);
         let (episodes, episodes_count) = parse_episodes(&vod, series_id);
 
@@ -407,8 +467,58 @@ fn parse_series_item(vod: &Value) -> Option<SeriesItem> {
     );
     let title = str_field(vod, &["vod_name"])?;
     // 同 detail：封面走本地代理，境外图床直连会超时。
-    let cover = str_field(vod, &["vod_pic"]).unwrap_or_default();
-    let cover = crate::hls_proxy::proxied_image_url(&cover).unwrap_or(cover);
+    //
+    // ⚠️ **必须按顺序回退多个字段**（2026-10-21 修「动漫专区封面全丢」）。
+    // 苹果CMS 系接口（`ac=detail`）的三个封面字段各有分工，不是每个源都填满：
+    //   * `vod_pic`        竖版主图，多数条目有，但**部分源整页留空**；
+    //   * `vod_pic_thumb`  横版缩略图，`vod_pic` 空时往往有值；
+    //   * `vod_pic_slide`  轮播图，前两者都空时的最后兜底。
+    // 原实现只看 `vod_pic`，一旦该页它为空，整页卡片就只剩剧名首字——而同一批
+    // 数据里明明存在可用的其它封面字段。
+    let cover = str_field(vod, &["vod_pic", "vod_pic_thumb", "vod_pic_slide"]).unwrap_or_default();
+    // 诊断：封面为空时把**原始字段**打进内存环形缓冲（`trace_tail` 可读回）。
+    //
+    // 不写文件：本机上文件写入被拒（os error 5），日志落不了盘；而 `trace::log`
+    // 的内存缓冲走 IPC 就能取出来，是这类"只能看到空值"的问题唯一可靠的证据来源。
+    if cover.is_empty() {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let (key_count, all_keys) = vod
+                .as_object()
+                .map(|object| {
+                    (
+                        object.len(),
+                        object.keys().cloned().collect::<Vec<_>>().join(","),
+                    )
+                })
+                .unwrap_or((0, String::new()));
+            let pic_like = vod
+                .as_object()
+                .map(|object| {
+                    object
+                        .iter()
+                        .filter(|(key, _)| {
+                            let lower = key.to_ascii_lowercase();
+                            lower.contains("pic")
+                                || lower.contains("img")
+                                || lower.contains("cover")
+                        })
+                        .map(|(key, value)| {
+                            format!(
+                                "{key}={}",
+                                value.to_string().chars().take(70).collect::<String>()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .unwrap_or_default();
+            crate::trace::log(format!(
+                "[anime-cover] 空封面 标题={title} 字段数={key_count} 全部字段=[{all_keys}] 图片类=[{pic_like}]"
+            ));
+        }
+    }
+    // 同上：封面存原始地址。只有**播放列表/分片**才需要本地代理。
     let type_name = str_field(vod, &["type_name"]).unwrap_or_else(|| "动漫".into());
     let remarks = str_field(vod, &["vod_remarks"]).unwrap_or_default();
     // 集数从 remarks（"更新至第6集"/"第10集"）提取；"已完结"等无数字 remarks

@@ -1,6 +1,6 @@
 [package]
 name = "ttv-short-drama"
-version = "0.2.30"
+version = "0.2.31"
 description = "TTV Short Drama desktop application"
 authors = ["TTV"]
 edition = "2021"
@@ -13,7 +13,19 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# ⚠️ 必须启用 `gzip`（并顺带 deflate/brotli）。
+#
+# 只写 `rustls-tls` 时 reqwest **不会解压**响应体，而暴风动漫源
+# （`bfzyapi.com`）对 `ac=detail` 会返回 gzip（字节头 `1f8b`）。后果非常隐蔽：
+# `serde_json::from_slice` 面对压缩字节**不报错**，而是把它当普通 JSON 解析，
+# 只解析出 `type_id / vod_id / vod_name / vod_remark / vod_time` 这几个顶层短
+# 字符串字段，`vod_pic`（封面）、`vod_play_url`（分集）等大字段全部丢失。
+#
+# 表现就是：动漫专区**列表能出、标题能出，但封面全空**，且 `parse_series_item`
+# 里根本找不到 `vod_pic` 这个键——排查时极易误判成"源站没给封面"。
+# 实测同一 URL：不带 gzip 协商 60530 字节 / 83 字段，带 gzip 协商 17040 字节，
+# 而后者正是出问题的那条。启用后 reqwest 会自动协商并透明解压。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate", "brotli"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = "0.21"
 serde = { version = "1", features = ["derive"] }
