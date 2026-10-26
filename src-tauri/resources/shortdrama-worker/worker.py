@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -89,9 +91,143 @@ def download_headers() -> dict[str, str]:
     }
 
 
+# 并发下载参数。
+#
+# 4 路是保守值：单连接实测 0.5~3MB/s 波动极大（同一部剧的两集，一集 7.5MB
+# 只要 2.5 秒、另一集 10MB 要 23 秒），4 路足以把慢节点的吞吐拉起来；
+# 再往上（8/16）收益递减，而且更容易触发 CDN 的连接数风控。
+PARALLEL_MIN_BYTES = 4 * 1024 * 1024
+PARALLEL_WORKERS = 4
+PARALLEL_CHUNK = 512 * 1024
+
+
 def download_source(session: requests.Session, real_url: str, source: Path) -> None:
-    """下载当前授权会话允许的媒体源。"""
-    response = session.get(real_url, headers=download_headers(), timeout=120, stream=True)
+    """下载当前授权会话允许的媒体源。
+
+    ## 为什么改成多连接并发（2026-10-25，实机日志驱动）
+
+    `ttv-playback.log` 里同一部剧相邻两集的下载耗时差了 9 倍：
+
+        第 5 集   resolve 返回 耗时=2488ms  字节=7.5MB
+        第 6 集   worker 完成  耗时=23219ms 字节=10.0MB   ← 用户看到的"切集不秒开"
+
+    单连接顺序下载没有任何并行度，慢节点就慢到底。而关闭 VSR 时整集 mp4 是
+    **播放主路径**（不是退路），这一段延迟直接等于用户的等待。
+
+    ## 做法
+
+    1. 先 `Range: bytes=0-0` 探一次：拿总长度、确认服务端支持分段（206）；
+    2. 支持且文件 >= `PARALLEL_MIN_BYTES` → 4 路 Range 并发写同一文件的不同区段
+       （先按最终大小预分配，每个线程用自己的 `r+b` 句柄 `seek` 写入，互不覆盖）；
+    3. 任何一路失败重试 3 次；整体仍失败 → **回退单连接顺序下载**（会清空重下），
+       兼容不认 Range 或对并发限流的节点，绝不把拼坏的文件交给上层解密。
+
+    进度仍按 10% 一档上报，并发时用锁汇总；总进度只增不减。
+    """
+    headers = download_headers()
+    total = 0
+    supports_range = False
+    with session.get(
+        real_url,
+        headers={**headers, "Range": "bytes=0-0"},
+        timeout=120,
+        stream=True,
+    ) as probe:
+        if probe.status_code == 403:
+            raise PermissionError("CDN 拒绝当前播放会话（403）：此集需要在官方已授权会话中播放")
+        if probe.status_code == 206:
+            content_range = probe.headers.get("content-range") or ""
+            try:
+                total = int(content_range.rsplit("/", 1)[1])
+            except (IndexError, ValueError):
+                total = 0
+            supports_range = total > 0
+
+    if supports_range and total >= PARALLEL_MIN_BYTES:
+        try:
+            _download_parallel(session, real_url, source, headers, total)
+            return
+        except Exception:  # noqa: BLE001 - 任何失败都必须能退回单连接
+            # 不清空这里：`_download_sequential` 会以 "wb" 重开文件，覆盖掉半成品。
+            emit({"event": "progress", "stage": "download", "percent": 0})
+    _download_sequential(session, real_url, source, headers)
+
+
+def _download_parallel(
+    session: requests.Session,
+    real_url: str,
+    source: Path,
+    headers: dict[str, str],
+    total: int,
+) -> None:
+    """按 Range 把文件切成 `PARALLEL_WORKERS` 段并发下载，写入同一个文件。"""
+    segment = total // PARALLEL_WORKERS
+    ranges: list[tuple[int, int]] = []
+    for index in range(PARALLEL_WORKERS):
+        start = index * segment
+        end = total - 1 if index == PARALLEL_WORKERS - 1 else start + segment - 1
+        ranges.append((start, end))
+
+    # 预分配到最终大小：每个线程 seek 后直接写自己的区段，省掉"分段临时文件 +
+    # 合并"那一次完整 IO。Windows 上不同句柄写同一文件的不同区域是安全的。
+    with source.open("wb") as handle:
+        handle.truncate(total)
+
+    progress_lock = threading.Lock()
+    state = {"done": 0, "last_pct": -10}
+
+    def fetch(start: int, end: int) -> None:
+        attempt = 0
+        while True:
+            try:
+                with session.get(
+                    real_url,
+                    headers={**headers, "Range": f"bytes={start}-{end}"},
+                    timeout=180,
+                    stream=True,
+                ) as response:
+                    response.raise_for_status()
+                    written = 0
+                    with source.open("r+b") as handle:
+                        handle.seek(start)
+                        for chunk in response.iter_content(chunk_size=PARALLEL_CHUNK):
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            written += len(chunk)
+                            with progress_lock:
+                                state["done"] += len(chunk)
+                                pct = int(state["done"] * 100 / total)
+                                if pct >= state["last_pct"] + 10:
+                                    state["last_pct"] = pct
+                                    emit({"event": "progress", "stage": "download", "percent": pct})
+                expected = end - start + 1
+                if written != expected:
+                    raise IOError(f"分片字节数不符：{written}/{expected}")
+                return
+            except Exception:
+                attempt += 1
+                if attempt >= 3:
+                    raise
+                time.sleep(attempt)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+        for future in concurrent.futures.as_completed([pool.submit(fetch, s, e) for s, e in ranges]):
+            future.result()
+
+    size = source.stat().st_size
+    if size != total:
+        raise IOError(f"下载长度不符：{size}/{total}")
+
+
+def _download_sequential(
+    session: requests.Session,
+    real_url: str,
+    source: Path,
+    headers: dict[str, str],
+) -> None:
+    """单连接顺序下载（原实现，作为不支持 Range / 并发失败时的兜底）。"""
+    response = session.get(real_url, headers=headers, timeout=120, stream=True)
     if response.status_code == 403:
         response.close()
         raise PermissionError("CDN 拒绝当前播放会话（403）：此集需要在官方已授权会话中播放")

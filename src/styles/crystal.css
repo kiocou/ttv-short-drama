@@ -128,6 +128,41 @@
   -webkit-backdrop-filter: none;
 }
 
+/*
+ * ===== VSR 关闭时的「合成打断器」（2026-10-25）=====
+ *
+ * ## 为什么"关掉转码"关不掉超分
+ *
+ * 应用侧的开关只决定**是否为超分而转码**：开 = 转 H.264 分片，关 = 源编码直连
+ * （红果实测 `h265_hvc1`，已用 ffmpeg 核对）。但当前驱动 + WebView2（已开
+ * `PlatformHEVCDecoderSupport`）对 **HEVC 一样会做 RTX VSR**，于是关掉之后
+ * 画面依然被超分、驱动角标依然亮 —— 用户看到的就是"开关没反应"。
+ *
+ * ## 唯一有效的应用侧手段：让它离开独立呈现平面
+ *
+ * 上面那条「禁止祖先 transform / backdrop-filter」的规则本来是为了让 VSR
+ * **生效**（不变量 26，实测 HUD 带 blur 时 VSR 失效、去掉就恢复）。这里反向
+ * 使用它：只要视频被合成器接管，驱动就拿不到干净的视频呈现平面，超分自然停。
+ *
+ * ## ⚠️ 为什么**不能**用 filter（2026-10-25 实机事故）
+ *
+ * 第一版写的是 `filter: brightness(1.0001)`，结果"播到某处画面卡住、媒体时钟
+ * 停走"：日志里 `timeupdate 心跳`（每 5 秒一条）从此消失，且没有 `waiting` /
+ * `error` / `ended` 任何事件 —— 媒体管线整个冻住了。原因是 Chromium 对
+ * `<video>` 应用 filter 会强制把每一帧渲进离屏纹理再合成（pixel readback），
+ * 在 WebView2 + 这版驱动上会直接打断视频呈现链路。
+ *
+ * 换成 `opacity: 0.999`：它同样让元素成为合成层，但走的是标准 alpha 合成，
+ * 不做 readback，媒体时钟不受影响；0.999 在视觉上不可分辨。
+ *
+ * **只在 VSR 关闭时挂**（`vsrEnabled ? '' : ' ttv-vsr-off'`）。开启时这条路径
+ * 完全不存在，不会给播放器多一个合成层。
+ */
+.ttv-vsr-off {
+  transform: translateZ(0);
+  opacity: 0.999;
+}
+
 /* HUD 层：顶部标题岛 + 底部操控坞 */
 .ttv-hud {
   position: absolute;
@@ -138,7 +173,31 @@
   justify-content: space-between;
   padding: 26px;
   pointer-events: none;
-  transition: opacity 0.3s ease, transform 0.3s var(--curve-fluent);
+  /*
+    ⚠️ **只过渡 opacity，不碰 transform**（2026-10-22 修「播放器动画卡顿」）。
+
+    ## 为什么去掉 transform
+
+    这里原本是 `transition: opacity .3s, transform .3s` + 隐藏态
+    `transform: scale(.985)`。那个 0.985 的缩放只有 1.5%，肉眼几乎看不出，
+    代价却是：**只要 HUD 上有 transform，它就是一个独立的合成层**，而 HUD 覆盖
+    整个视频舞台（`inset: 0`）。控制条每次显示/隐藏都要重建这块合成区域，
+    与视频的呈现平面争合成器时间 —— 用户看到的就是"鼠标一动控制条弹出来时
+    画面顿一下"。
+
+    项目不变量 26 记的正是这件事：`crystal.css:110` 的实测结论是「去模糊**并**
+    移除祖先 transform」之后 `ToggleNvidiaVpSuperResolution(on=true)` 才恢复
+    （2 秒采样 34 次）。HUD 不是 video 的祖先而是兄弟，所以它不会让 VSR 失效，
+    但它照样是一次覆盖全屏的合成 —— 卡顿和 VSR 是同一个根因的两个表现。
+
+    ## 为什么去掉了也不影响观感
+
+    隐藏时保留 opacity 淡出，控制条自己仍有 `translateY` 的入场位移（见下方
+    `.ttv-top-bar` / `.ttv-dock` 的规则）。"整层微微缩小"这个细节本来就在
+    1.5% 的量级，去掉之后只剩淡出，反而更干净 —— 播放器里任何多余的动效都在
+    和视频抢注意力。
+  */
+  transition: opacity 0.3s ease;
 }
 
 /*
@@ -149,15 +208,13 @@
 .ttv-hud.is-hidden {
   opacity: 0;
   pointer-events: none;
-  transform: scale(0.985);
 }
 
-/* 控制器收起（锁定）态：整层淡出并轻微内缩，画面完全让给视频 */
+/* 控制器收起（锁定）态：整层淡出，画面完全让给视频 */
 .ttv-hud.is-locked,
 .ttv-player.is-locked .ttv-hud {
   opacity: 0;
   pointer-events: none;
-  transform: scale(0.985);
 }
 
 .ttv-player.is-locked .ttv-top-bar,
@@ -1055,7 +1112,22 @@
   left: 0;
   width: 100%;
   transition: transform 0.38s var(--curve-fluent);
-  will-change: transform;
+  /*
+    ⚠️ **不写 `will-change: transform`**（2026-10-22 修「播放器动画卡顿」）。
+
+    这里原本挂着它，而 `.roller-list` 在一集播放器里有 **6 个**（时:分的四位
+    数字 + 冒号两侧各一组）。`will-change` 会给每个元素分配独立的合成层，
+    于是光时间读数就常驻 6 个层 —— 实测整个应用有 13 个 will-change 元素，
+    其中 6 个是它。
+
+    为什么可以直接去掉：`.roller-list` 的位移是 `translateY`，浏览器对
+    transform 动画本来就会在**动画期间**自动提升为合成层，结束后释放。手动
+    挂 `will-change` 唯一的作用是"提前"提升，而这里的动画由用户交互（切集、
+    调音量）触发、频率极低，提前提升毫无收益，只剩常驻开销。
+
+    这与 `MicaCard` 里那条"不加 will-change-transform"的结论同源：合成层
+    不是免费的，成批重复的元素尤其不能挂。
+  */
 }
 
 .roller-list span {
@@ -1151,6 +1223,162 @@
   background: var(--fluent-blue);
   color: #fff;
   box-shadow: 0 2px 8px rgba(0, 120, 212, 0.4);
+}
+
+/* ==========================================================================
+   10b. 视频增强浮层（播放页「增强」按钮：VSR 开关 + 补帧预留位）
+   ========================================================================== */
+
+/*
+  比清晰度 / 倍速菜单宽：它承载的是「开关 + 两行说明」，不是一列档位。
+  定位改成右对齐（right 而不是 left: 50%）：宽度一旦超过按钮到窗口右边缘的
+  距离，居中就会把面板推出屏幕外。
+
+  ⚠️ 这里只覆盖几何与排布，**不引入任何 backdrop-filter / filter**：
+  `.ttv-video-stage` 内的模糊会把视频拉进合成器，直接让 RTX VSR 失效
+  （见本文件顶部第 2 节与不变量 26）。
+*/
+.crystal-flyout.ttv-enhance-flyout {
+  left: auto;
+  right: -6px;
+  /* 比其它气泡更贴近按钮（默认 14px）：这块浮层高约 220px，向上展开时底边
+     正好压在进度槽上；6px 已经是"不贴脸"的下限，能少遮一条槽。 */
+  bottom: calc(100% + 6px);
+  transform: translateY(8px) scale(0.96);
+  min-width: 262px;
+  max-width: 292px;
+  padding: 8px;
+  gap: 4px;
+}
+
+.crystal-flyout.ttv-enhance-flyout.open {
+  transform: translateY(0) scale(1);
+}
+
+.ttv-enhance-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 8px 7px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.ttv-enhance-head-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: 0.2px;
+}
+
+/* 「切换后立即重载本集」：这是用户唯一能预判"画面会短暂准备一下"的提示。 */
+.ttv-enhance-head-hint {
+  font-size: 10.5px;
+  /* 浮层是半透明的（舞台内禁用 backdrop-filter，见第 2 节）：亮画面上 0.55 的
+     白字合成后对比不足 2:1，提到 0.72 才接近可读。暗色主题同样吃这一条。 */
+  color: rgba(255, 255, 255, 0.72);
+  white-space: nowrap;
+}
+
+/* 一行 = 一个能力。整行可点（.crystal-menu-item 那种"点按钮"的密度太小，
+   说明文字放不下），与设置页 toggle 行的手感一致。 */
+.ttv-enhance-row {
+  /* button 默认 box-sizing 不一定被全局 reset 覆盖：width:100% + padding 会把
+     右侧开关挤出浮层，点击区域落到浮层外，表现就是"点不动"。 */
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.ttv-enhance-row:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* 提高一级特异性：`.ttv-player button:focus-visible`（crystal.css 末尾）是 (0,2,1)，
+   而动漫播放器的根类含 `ttv-player`、短剧不含 —— 同一条焦点环会在两个播放器里
+   长得不一样。这里写成同样的形状，胜负只由"后定义"决定。 */
+.ttv-player .ttv-enhance-row:focus-visible,
+.ttv-enhance-row:focus-visible {
+  outline: 2px solid rgba(56, 189, 248, 0.7);
+  outline-offset: 1px;
+}
+
+/* 补帧预留位已在发布前移除，对应的 `.is-disabled` / `.ttv-enhance-badge`
+   一组样式一并删掉（没有使用者的样式比没有样式更糟：下次改这里会以为它还活着）。 */
+
+.ttv-enhance-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.ttv-enhance-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.ttv-enhance-row.is-disabled .ttv-enhance-title {
+  color: rgba(255, 255, 255, 0.58);
+}
+
+.ttv-enhance-desc {
+  font-size: 11px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.72);
+  white-space: normal;
+}
+
+/*
+  开关：与设置页 Toggle 同一套语义，尺寸缩到浮层密度。
+  只用 background-color 与**小滑块**的 transform，不做模糊、也不给整行挂
+  常驻 transform —— 舞台内任何把 video 拉进合成器的东西都会打掉 VSR。
+*/
+.ttv-enhance-switch {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  width: 30px;
+  height: 18px;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.22);
+  transition: background-color 0.18s ease;
+  flex-shrink: 0;
+}
+
+.ttv-enhance-switch.is-on {
+  background: var(--fluent-blue, #0078d4);
+}
+
+.ttv-enhance-knob {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transform: translateX(0);
+  transition: transform 0.18s var(--curve-fluent, cubic-bezier(0.2, 0.9, 0.3, 1));
+}
+
+.ttv-enhance-switch.is-on .ttv-enhance-knob {
+  transform: translateX(12px);
 }
 
 /* 垂直音量柱 */
@@ -1372,16 +1600,29 @@
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 9px;
   outline: none;
-  transition: border-color 0.15s, background-color 0.15s;
+  transition: border-color 0.15s, background-color 0.15s, box-shadow 0.18s var(--curve-fluent);
 }
 
 .ttv-field::placeholder {
   color: rgba(255, 255, 255, 0.42);
 }
 
+/* 聚焦用双环（内圈压白、外圈晕天蓝），与 index.css 的 `.ttv-input` 同一套
+   语汇——浅色页面的搜索框与播放器里的选集搜索框，聚焦时应该是同一个动作。
+
+   这里**不能**用 outline：`.ttv-drawer-box` 是 `overflow: hidden` 的抽屉，
+   outline 会被裁掉一半（项目里 TitleBar 搜索框踩过同一个坑）。也**不能**用
+   backdrop-filter 做发光——播放器舞台内一切背景模糊都会把视频拉进合成器，
+   打掉 RTX VSR（不变量 26）。box-shadow 是纯绘制、不取样背景，安全。
+
+   内圈用白色而不是品牌色：底是 10% 白的深色玻璃，品牌蓝在这个底色上对比度
+   不够，读不出"咬合"；白色内圈在任何视频画面上都稳定。 */
 .ttv-field:focus {
-  border-color: rgba(56, 189, 248, 0.65);
+  border-color: rgba(56, 189, 248, 0.55);
   background: rgba(255, 255, 255, 0.14);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.42),
+    0 0 0 3px rgba(56, 189, 248, 0.22);
 }
 
 /* 分组药丸（1-50 / 51-100 ...） */
@@ -1438,7 +1679,10 @@
   .crystal-drawer-box,
   .ttv-drawer-overlay,
   .roller-list,
-  .ep-card-item {
+  .ep-card-item,
+  /* 增强浮层里的开关滑块（2026-10-25）：漏了它，减动效偏好下拨开关仍有位移。 */
+  .ttv-enhance-switch,
+  .ttv-enhance-knob {
     transition-duration: 0.01ms !important;
   }
 }

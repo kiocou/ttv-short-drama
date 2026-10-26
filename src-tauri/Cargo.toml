@@ -1,6 +1,6 @@
 [package]
 name = "ttv-short-drama"
-version = "0.2.31"
+version = "0.2.41"
 description = "TTV Short Drama desktop application"
 authors = ["TTV"]
 edition = "2021"

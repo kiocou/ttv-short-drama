@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useAppStore } from '../../stores/useAppStore';
+import { useSettingsStore } from '../../stores/useSettingsStore';
 import { enterFullscreen, leaveFullscreen } from '../../services/windowFx';
 import { isTauriEnvironment } from '../../services/ipc';
 import { PlayerHud } from './PlayerHud';
@@ -97,6 +98,20 @@ export const AnimeVideoSurface: React.FC = () => {
     enterPip,
   } = useAnimePlayer();
   const { isFullscreen, setIsFullscreen, navigateTo, previousView, showToast } = useAppStore();
+  /**
+   * 视频增强开关：动漫页也提供同一个入口（所有视频播放页都有「增强」按钮）。
+   *
+   * 与短剧的差别只有一处——**动漫不重载**。动漫源走 `anime_provider` 的本地代理
+   * 转发（`main.rs` 里那份 `is_anime` 分支在 `media_enhance` 之前就直接返回），
+   * 全程不经过 `media_enhance` 的转码链路。编码由上游决定（`anime_provider.rs`
+   * 只做转发，不保证是 H.264），所以这里不能断言"动漫一定有驱动超分"。
+   * 拨动只是改全局设置，影响的是之后看的短剧 / 漫剧；浮层里那句
+   * "此开关不影响当前播放"就是为此写的（不变量 8）。
+   *
+   * 走 `updateSettings` 而不是自己存一份状态：设置页、短剧播放页、这里必须是
+   * 同一份真相，否则三处开关迟早互相打架。
+   */
+  const { settings, updateSettings } = useSettingsStore();
 
   /**
    * 进入画中画。
@@ -499,7 +514,10 @@ export const AnimeVideoSurface: React.FC = () => {
       */}
       <video
         ref={setVideoRef}
-        className="w-full h-full object-contain cursor-pointer"
+        // 与短剧同款：VSR 关闭时把视频推进合成器，让驱动不再超分（见
+        // VideoSurface 里 `.ttv-vsr-off` 的长注释）。动漫源本来不经转码链路，
+        // 这条是"关闭=真的没有增强"的唯一落点。
+        className={`w-full h-full object-contain cursor-pointer${settings.vsrEnabled !== false ? '' : ' ttv-vsr-off'}`}
         onClick={handleSurfaceClick}
         playsInline
       />
@@ -636,6 +654,10 @@ export const AnimeVideoSurface: React.FC = () => {
         effectivePlaybackRate={boost?.rate ?? null}
         currentQuality={quality}
         qualityOptions={qualities}
+        vsrEnabled={settings.vsrEnabled !== false}
+        onToggleVsr={(enabled) => updateSettings({ vsrEnabled: enabled })}
+        // 动漫源不经过转码链路：浮层如实说明这个开关作用于短剧/漫剧。
+        vsrAppliesToSource={false}
         onToggleLock={() => setIsLocked(value => !value)}
         onToggleFullscreen={toggleFullscreen}
         onUserActivity={handleUserActivity}

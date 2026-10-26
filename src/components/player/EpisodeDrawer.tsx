@@ -45,6 +45,17 @@ export const EpisodeDrawer: React.FC = () => {
     if (!isSideDrawerOpen) setFilterKeyword('');
   }, [isSideDrawerOpen]);
 
+  /**
+   * 分组索引必须随**剧**重置（2026-10-26 修「换一部只有 1 组的剧，网格是空的」）。
+   *
+   * `activeGroupIndex` 此前只活在组件状态里：看多集剧停在第 3 组，换一部只有
+   * 1 组的剧时索引越界，网格直接渲染成空 —— 用户以为"这部没有剧集"。
+   * 抽屉是常驻 DOM 的，所以这个 effect 一定来得及在渲染前把它压回 0。
+   */
+  useEffect(() => {
+    setActiveGroupIndex(0);
+  }, [currentSeries?.id]);
+
   if (!currentSeries) return null;
 
   const totalEpisodes = currentSeries.episodes.length;

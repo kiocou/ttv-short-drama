@@ -2,10 +2,12 @@ import React, { createContext, useContext, useState, useRef, useEffect, useCallb
 import { PlaybackUiState, PlaybackSession } from '../types/playback';
 import { SeriesDetail, EpisodeItem } from '../types/series';
 import { ipcService, isTauriEnvironment, errorText } from '../services/ipc';
-import { attachSource, isHlsUrl, detachSource, takeHlsFatal } from '../services/hlsAttach';
+import { attachSource, isHlsUrl, detachSource, takeHlsFatal, hintHlsLoadPosition } from '../services/hlsAttach';
 import { dismissPip, openPip } from '../services/pip';
 import { redactUrl, tracePlayback } from '../services/playbackTrace';
-import { isPlayheadAtPlayableTail } from '../services/playbackTail';
+import { isBufferComplete, isPlayheadAtPlayableTail } from '../services/playbackTail';
+import { resolveStartTarget } from '../services/playbackStart';
+import { planSeek, seekableReached } from '../services/seekPlan';
 import { useSettingsStore } from './useSettingsStore';
 
 /**
@@ -81,6 +83,14 @@ interface PlaybackContextType {
   isSideDrawerOpen: boolean;
   isDiagnosticsOpen: boolean;
   videoRef: React.RefObject<HTMLVideoElement | null>;
+  /**
+   * 把 `<video>` 交给 store（callback ref）。
+   *
+   * 播放器宿主的写法必须是 `<video ref={registerVideoElement}>`——
+   * 不能再用 `<video ref={videoRef}>`：那样元素被重挂时 store 感知不到，
+   * 监听器会留在被丢弃的旧元素上（见 `videoElement` 那段说明）。
+   */
+  registerVideoElement: (element: HTMLVideoElement | null) => void;
   openEpisode: (seriesId: string, episodeId?: string, startPosition?: number, qualityOverride?: string) => Promise<void>;
   togglePlay: () => void;
   seek: (seconds: number) => void;
@@ -89,6 +99,22 @@ interface PlaybackContextType {
   toggleMute: () => void;
   setPlaybackRate: (rate: number) => void;
   setQuality: (quality: string) => void;
+  /**
+   * 视频增强（RTX VSR）当前是否开启。
+   *
+   * 数据源是**全局设置**（设置页与播放页共用同一个开关，落库在
+   * `UserSettings.vsrEnabled`）。播放页只做"读取 + 一个写入口"，不另存一份
+   * 状态——两份状态必然出现"设置页关了、播放页还显示开"。
+   */
+  vsrEnabled: boolean;
+  /**
+   * 用户在本播放页拨动 VSR 开关。
+   *
+   * 这里**只写设置**：让当前这一集立即重走新链路的动作统一由 Provider 内那个
+   * 监听 `settings.vsrEnabled` 的 effect 负责。设置页与播放页因此走同一条生效
+   * 路径——不会出现"设置页改了实时生效、播放页改了要退出再进"。
+   */
+  setVsrEnabled: (enabled: boolean) => void;
   playNextEpisode: () => void;
   playPrevEpisode: () => void;
   toggleSideDrawer: (open?: boolean) => void;
@@ -106,6 +132,11 @@ interface PlaybackContextType {
    * 把当前这一集交给画中画小窗继续播（返回 false 表示没交出去，调用方应留在播放器）。
    */
   enterPip: () => Promise<boolean>;
+  /**
+   * 当前正在播的流地址（本地 HLS / 直链）。补帧窗口要用它自己起播，
+   * 所以必须能从这里取到「眼前这一集」的真实地址，而不是重新解析一次。
+   */
+  getCurrentStreamUrl: () => string;
   /**
    * 是否正在"切换"到另一部剧/另一集（而非首次进入播放器）。
    *
@@ -130,6 +161,25 @@ interface PlaybackContextType {
   stallNotice: string | null;
   /** 用户手动关掉卡死提示。 */
   dismissStallNotice: () => void;
+  /**
+   * 「这一段还没转好」提示，null 表示不显示。
+   *
+   * ## 为什么与 `stallNotice` 分开（2026-10-24）
+   *
+   * 两者说的完全不是一件事：
+   *   - `stallNotice`：画面**卡住了**，正在自动恢复（看门狗判停滞）；
+   *   - 这个：用户点了进度条上还没转好的位置，播放**没有出问题**，只是那段
+   *     内容还在转码。用户要做的动作也不同（前者等它自愈，后者再点一次）。
+   *
+   * 合成一个字段就会出现"点了结尾 → 弹'画面卡住了，正在尝试恢复'"这种
+   * 误导性文案 —— 画面根本没卡，是用户点到了还没转好的地方。
+   *
+   * 生命周期同样由 store 管，且**必须**在换集 / 新的一次 seek / 恢复播放时清空，
+   * 否则它会一直挂在画面上。
+   */
+  seekNotice: string | null;
+  /** 用户手动关掉「还没转好」提示。 */
+  dismissSeekNotice: () => void;
 }
 
 /**
@@ -154,6 +204,16 @@ interface PlaybackContextType {
 type PlaybackActionsContextType = Omit<PlaybackContextType,
   | 'position' | 'duration' | 'buffered' | 'uiState' | 'prepareStatus'
   | 'isSwitching' | 'errorDetail' | 'stallNotice' | 'finishedAll' | 'videoRef' | 'sessionId'
+  // `registerVideoElement` 与 `videoRef` 同理：只有播放器宿主（VideoSurface）
+  // 需要它，非播放页宿主拿到它也没有元素可挂。
+  | 'registerVideoElement'
+  // `seekNotice` 只服务播放器自己的画面提示（VideoSurface），非播放器宿主
+  // （发现页/详情页/历史/小窗桥）拿到它也没有地方渲染，不进低频动作专线。
+  | 'seekNotice'
+  // `vsrEnabled` 只有播放器控制条需要（`PlayerControls` 用整表）。留在专线里
+  // 会让"拨一下开关"重建 `actionsValue` 并广播给发现页/详情页/历史页，
+  // 而它们一个都用不上。写入函数 `setVsrEnabled` 仍留在专线上（引用稳定）。
+  | 'vsrEnabled'
 >;
 
 /** 原生解析 worker 上报的进度（Rust 转发的 `shortdrama://app-resolve` 事件）。 */
@@ -441,15 +501,23 @@ function bufferedEndSeconds(video: HTMLVideoElement): number {
  * 一律是 0，续播是保存的进度），偏移超过 0.5 秒时打点——这是该症状唯一的现场证据。
  */
 function alignPlayhead(video: HTMLVideoElement, startPosition: number, sessionId: number): void {
-  const target = Number.isFinite(startPosition) && startPosition > 0 ? startPosition : 0;
-  const before = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-  if (Math.abs(before - target) > 0.5) {
+  const resolved = resolveStartTarget({
+    startPosition,
+    duration: video.duration,
+    currentTime: video.currentTime,
+  });
+  if (resolved.clampedFromEnd) {
     tracePlayback(
-      `起播点收敛 期望=${target.toFixed(2)}s 元素现值=${before.toFixed(2)}s 会话=${sessionId}（换源没有重置位置，强制归位）`,
+      `起播点越界（${startPosition.toFixed(1)}s ≥ 时长 ${video.duration.toFixed(1)}s），改为从头播 会话=${sessionId}`,
+    );
+  }
+  if (resolved.drifted) {
+    tracePlayback(
+      `起播点收敛 期望=${resolved.target.toFixed(2)}s 元素现值=${(Number.isFinite(video.currentTime) ? video.currentTime : 0).toFixed(2)}s 会话=${sessionId}（换源没有重置位置，强制归位）`,
     );
   }
   try {
-    video.currentTime = target;
+    video.currentTime = resolved.target;
   } catch {
     // `readyState === HAVE_NOTHING` 时给 currentTime 赋值会抛 InvalidStateError。
     // 那种状态下位置天然是 0，随后的 `loadedmetadata` 会再次校准，不必在这里补救。
@@ -739,6 +807,7 @@ function startDramaStallWatchdog(
           paused: video.paused,
           seeking: video.seeking,
           ended: video.ended,
+          playbackRate: video.playbackRate,
         },
         TAIL_END_STALL_WINDOW_SECONDS,
       )
@@ -791,10 +860,60 @@ const PlaybackActionsContext = createContext<PlaybackActionsContextType | null>(
 export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   // 接通用户设置：默认清晰度、自动连播、倒计时秒数此前全是死代码——
   // SettingsView 能改、能存盘，但播放器从不读取，等于摆设。
-  const { settings } = useSettingsStore();
+  //
+  // `updateSettings` 供播放页的「增强」浮层使用（VSR 开关与设置页同一份数据）。
+  const { settings, updateSettings } = useSettingsStore();
+  /**
+   * 视频增强（RTX VSR）开关：设置里的值是**唯一真相**。
+   *
+   * `!== false` 与设置页、`useSettingsStore` 的归一化完全同款：旧设置记录里没有
+   * 这个字段时展开是 `undefined`，必须落到"开"（Rust 侧 `AtomicBool` 初值也是开）。
+   */
+  const vsrEnabled = settings.vsrEnabled !== false;
+  /**
+   * VSR 开关的即时镜像。
+   *
+   * 预取调度发生在**定时器**与**异步续体**里（`scheduleNextEpisodePrewarm`、
+   * `startFull().then(...)`），那里的闭包读不到最新渲染值；而这些调度必须
+   * 按"当前开关"决定预取哪种产物（整集 HLS / 整集 mp4）。
+   */
+  const vsrEnabledRef = useRef(vsrEnabled);
+  vsrEnabledRef.current = vsrEnabled;
+  /**
+   * 「视频增强」的代际号。
+   *
+   * ## 为什么需要它
+   *
+   * 开关变化后要让当前这一集重走新链路，做法是拿同一位置、同一档清晰度再调一次
+   * `openEpisode`。而 `openEpisode` 对"同键在途"会去重，键里只有
+   * `剧|集|取整位置|清晰度`——**没有任何一位能区分链路**。
+   *
+   * 于是两种真实场景会静默失效：
+   *   1. 首播还在解析时用户拨开关：键完全相同，命中旧任务（旧链路），开关"没反应"；
+   *   2. 暂停在片头（位置 0）时连拨两次：两次键相同，第二次复用的还是第一次那条。
+   *
+   * 每次开关变化自增一位，键就与新链路绑定，旧任务绝不会被复用。
+   */
+  const enhanceEpochRef = useRef(0);
   const [sessionId, setSessionId] = useState<number>(100);
   const [currentSeries, setCurrentSeries] = useState<SeriesDetail | null>(null);
   const [currentEpisode, setCurrentEpisode] = useState<EpisodeItem | null>(null);
+  /**
+   * `currentSeries` / `currentEpisode` 的镜像 ref。
+   *
+   * 用途只有一个：`scheduleNextEpisodePrewarm` 的**定时器回调**里要读最新的
+   * 剧与集。定时器是几百毫秒到二十几秒后才触发的，闭包捕获的那份 React state
+   * 早已过期（用户可能已经换剧、切集、离开播放器），必须读到当前值才能判断
+   * "这次调度是否还该发车"。
+   *
+   * 不用 `useEffect` 同步而是直接赋值：ref 的写入必须在**渲染阶段**完成，
+   * 才能保证同一帧里任何同步路径读到的都是最新值（与 `openEpisodeRef`
+   * 的写法一致）。写 ref 不是副作用，不会引起额外渲染。
+   */
+  const currentSeriesRef = useRef<SeriesDetail | null>(null);
+  const currentEpisodeRef = useRef<EpisodeItem | null>(null);
+  currentSeriesRef.current = currentSeries;
+  currentEpisodeRef.current = currentEpisode;
   const [uiState, setUiState] = useState<PlaybackUiState>({ kind: 'idle' });
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [position, setPosition] = useState<number>(0);
@@ -824,6 +943,14 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const [isSwitching, setIsSwitching] = useState<boolean>(false);
   // 悬停预热的在途计数，见 prewarmEpisode 的并发上限说明。
   const prewarmInflightRef = useRef<number>(0);
+  /**
+   * 连播预取的去重标记（`seriesId:episodeId`）。
+   *
+   * 调度点挂在 `timeupdate` 上，每秒会触发 4 次；不去重就会反复发车。
+   * 只记"最近一次预取的是哪一集"，因为连播是单向前进的——用户切到下一集后
+   * 这个键自然变成新的，不需要保存整个历史。
+   */
+  const prewarmedNextRef = useRef<string>('');
   /**
    * 首帧预解池：episodeCacheKey → 已解到 canplay 的探针。
    *
@@ -866,6 +993,37 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  /**
+   * 当前挂载的媒体元素（**元素身份**，不只是 ref）。
+   *
+   * ## 为什么需要它（2026-10-25 修「进度条 00:00 / 00:00」）
+   *
+   * 媒体监听器（timeupdate / waiting / playing / ended / error）只能绑在**具体的
+   * 那个 `<video>` 元素**上，而它们所在的 effect 依赖是 `[]` —— 「只绑定一次」
+   * 是刻意的（历史上把十几个 state 列进依赖，导致倒计时每秒都把 6 个监听器
+   * 摘一遍再绑一遍）。
+   *
+   * 但一旦 `<video>` 被重挂（开发期 HMR 热替换 `VideoSurface`、宿主被 React
+   * 重建、任何原因换了元素），这份"只绑一次"就永久失效：新元素在播，事件却全
+   * 发给那块被丢弃的旧元素。现场表现就是本项目反复踩到的那组症状：
+   *
+   *   - 进度条永远 `00:00 / 00:00`、拖不动；
+   *   - 到结尾不触发 `ended`（连播不生效、停在最后一帧）；
+   *   - 旧的 `<video>` 仍在解码，整机观感变卡。
+   *
+   * 日志实证（本次）：`首帧-宿主 监听器已绑定 video` 只出现在 559s，
+   * 之后一千秒里 `timeupdate 心跳`（每 5 秒一条）一条都没有。
+   *
+   * 所以绑定必须由**元素身份**驱动：`<video ref={registerVideoElement}>` 在
+   * 挂载/卸载时把元素写进来，effect 依赖它 —— 换元素就自动重绑。
+   */
+  const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
+  const registerVideoElement = useCallback((element: HTMLVideoElement | null) => {
+    // 两个都要写：`videoRef.current` 是全文件几十处同步读的地方（起播、seek、
+    // 看门狗），不能只留 state；state 只负责触发"元素变了 → 重绑监听器"。
+    videoRef.current = element;
+    setVideoElement(element);
+  }, []);
   const activeSessionRef = useRef<number>(100);
   const backupUrlRef = useRef<string>('');
   const hasTriedBackupRef = useRef<boolean>(false);
@@ -1012,6 +1170,14 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   const saveProgressThrottledRef = useRef<(pos: number, dur: number, force?: boolean) => void>(() => {});
 
   const [stallNotice, setStallNotice] = useState<string | null>(null);
+  /**
+   * 「这一段还没转好」提示（见 `PlaybackContextType.seekNotice`）。
+   *
+   * 与 `stallNotice` 分开：一个说"画面卡住了，正在自愈"，一个说"你点的地方还没
+   * 转好，再点一次"。合成一个字段会给出误导性文案。
+   */
+  const [seekNotice, setSeekNotice] = useState<string | null>(null);
+  const dismissSeekNotice = useCallback(() => setSeekNotice(null), []);
 
   /**
    * 全剧播完信号：连播开启时最后一集正常 ended。
@@ -1071,6 +1237,40 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     /** 预约时的播放位置：`timeupdate` 用它判断"画面其实还在走"，是复核的反证。 */
     position: number;
   } | null>(null);
+
+  /**
+   * 末尾**静默**兜底（2026-10-25 新增，修「关掉 VSR 后播到结尾卡住不播」）。
+   *
+   * ## 它解决的是哪一类
+   *
+   * `handleWaiting` 里那套末尾复核只认 `waiting` 事件 —— 而现场有一种更糟的
+   * 情况：**没有任何事件**。日志里只看到 `playing`，之后 `timeupdate 心跳`
+   * （每 5 秒必打一条）整段消失，既没有 `waiting` / `error`，也没有 `ended`。
+   * 媒体时钟停走，界面停在最后一帧 —— 用户说的"卡住就不播放了"。
+   *
+   * 这种状态下所有事件驱动的兜底（waiting 复核、卡死看门狗、`ended`）**都不会
+   * 被触发**，只能靠一个与媒体事件无关的轮询来收尾。
+   *
+   * ## 判据（三条同时成立才收）
+   *
+   *   1. 仍在播放态（`!paused && !ended && !seeking`）—— 用户暂停在结尾看画面、
+   *      或正在拖动，都不算卡住；
+   *   2. 播放头已在末尾 1.2 秒窗口内；
+   *   3. 连续 3 拍（每拍 1 秒）位置变化 < 0.05 秒。
+   *
+   * 倍速播放时第 3 条天然不成立（1 秒推进 1.5~3 秒），不会误判；这也是为什么
+   * 用"位置停滞"而不是"过了多少秒"做判据。
+   *
+   * 命中后直接走 `handleEnded` 的完整语义（落盘 100%、连播闩锁、末集返回详情），
+   * 不另写一套结算逻辑 —— 一集只能被结算一次这件事由 `tryClaimAutoAdvance` 保证。
+   */
+  const tailEndGuardRef = useRef<number | null>(null);
+  const stopTailEndGuard = useCallback(() => {
+    if (tailEndGuardRef.current !== null) {
+      window.clearTimeout(tailEndGuardRef.current);
+      tailEndGuardRef.current = null;
+    }
+  }, []);
 
   const cancelTailProbe = useCallback(() => {
     if (tailProbeRef.current) {
@@ -1599,7 +1799,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       });
       // attachSource 内部会先 detachSource，并把 hls.js 实例挂在 video 上，
       // 换集/退出时由 detachSource 统一拆掉——不需要在这里手动管生命周期。
-      await attachSource(video, hlsUrl);
+      //
+      // 第三个参数是**起播点**：hls.js 默认（`startPosition: -1`）会拿元素残留的
+      // `currentTime` 当起点，而换集不换元素 —— 不显式给，新一集就会从上一集停下的
+      // 位置拉流。这里的 `alignPlayhead`（下方）虽然也会写 `currentTime`，但那是
+      // 挂载**之后**的事，hls.js 的起点在 `loadSource` 那一刻就定了。
+      await attachSource(video, hlsUrl, startPosition);
       markSourceCommitted(sessionId, episodeId);
       await firstFrameReady;
       if (activeSessionRef.current !== sessionId) return 'stale';
@@ -1827,6 +2032,64 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           ? Math.round((episodeSeconds / 8) * 1000 * 1.6)
           : STREAMING_TRANSCODE_SETTLE_MS;
         endStreamingWindowAfter(settleMs);
+        // ===== 连播预取：等本集转完，再把下一集转好 =====
+        //
+        // ## 为什么发车时机不能直接用 `settleMs`（2026-10-22 实测修正）
+        //
+        // 第一版就是拿 `settleMs` 当发车时刻，结果测出「连按两次下一集，
+        // 第二次仍然黑等 5431ms」——因为 `settleMs` 是**保守上界**：
+        //   119 秒的集 → (119/8)×1.6 = 23.8 秒
+        // 而实测整集转码只要 5.6 秒（92.7 秒正片，16 倍实时）。那 18 秒是
+        // 纯白等，等完了才发车，用户早就切过去了。
+        //
+        // `settleMs` 那个保守值本身没写错——它管的是**闸门**（宁可多按住一会儿
+        // 也不要让两路抢 CPU），宽松一点没有代价。但**发车**要的是"本集转完的
+        // 那一刻"，用上界去近似就等于系统性迟到。
+        //
+        // ## 新的估算：用实测转码速率
+        //
+        // 实测 13~29 倍实时（同一台机器、同一类片源），取**偏保守的 12 倍**
+        // 并加 1.5 秒固定开销（起进程 + 首片落地）。119 秒的集 → 约 11.4 秒，
+        // 比 23.8 秒提前 12 秒，仍留了足够余量（真慢了也只是预取晚一点，
+        // 不影响正在播的那一路）。
+        //
+        // 下限 4 秒：再快也不可能 4 秒内转完一集，发早了就是和本集抢。
+        // 上限 20 秒：与 `settleMs` 的 24 秒上限保持同一量级，避免极端长片
+        // 把预取推到用户已经切走之后。
+        //
+        // ⚠️ `TRANSCODE_RATE` 从 12 下调到 5（2026-10-23 修「偶发 4.5 秒等待」）。
+        //
+        // 12 这个值来自"最快样本"（92.7 秒正片 5.6 秒转完 = 16 倍），但实机日志里
+        // 有明确的反例：
+        //
+        //   7775.710s  [vsr] 转码完成 会话=1003889 耗时=9746ms   ← 48 秒的集
+        //
+        // 48 / 9.746 ≈ **4.9 倍实时**。而当时 `prewarmDelayMs` 按 12 倍算只给了
+        // 5.4 秒就发车，于是用户在预取还没转完时就切了过去（日志里
+        // 「同一 vid 正在转码，共用产物」），只能陪着等 —— 那就是用户报的
+        // 「偶尔卡四五秒」。
+        //
+        // 取 5 倍是"覆盖到最慢样本"的保守值：48 秒的集 → 约 11.1 秒发车，
+        // 比真实转码完成（9.7 秒）留了 1.4 秒余量。代价是预取更晚开始，但只要
+        // 早于用户切集就够——一集 48 秒，用户不会在 11 秒内切走。
+        const TRANSCODE_RATE = 5;       // 倍实时，实测最慢 4.9 取 5（覆盖慢样本）
+        const TRANSCODE_STARTUP_MS = 1500; // 起进程 + 首片落地
+        const prewarmDelayMs = episodeSeconds > 0
+          ? Math.min(20_000, Math.max(4_000, Math.round((episodeSeconds / TRANSCODE_RATE) * 1000 + TRANSCODE_STARTUP_MS)))
+          : STREAMING_TRANSCODE_SETTLE_MS;
+        // 为什么要等而不是立刻发：NVENC 的编码单元是串行的，本集还在转的时候
+        // 起第二路，只会把两边都拖慢（实测两路各 9.4 秒 vs 单路 5.6 秒）。
+        //
+        // 为什么要发：不发的后果就是用户每次点「下一集」都黑等 3.6~5.1 秒
+        // （日志实测），而这段时间里 CPU 其实是**空闲**的 —— 上一集早就转完了。
+        // 这是纯粹的浪费，也是这次要修的东西。
+        //
+        // 用 `setTimeout` 而不是 `endStreamingWindowAfter` 的回调：后者是纯
+        // 计数管理、不暴露钩子，改它要动那条被反复踩过的闸门逻辑，风险不对等。
+        // 这里独立一个定时器，换集时由 `runOpenEpisode` 的 reset 语义自然覆盖
+        // （旧集的定时器到点后 `prewarmedNextRef` 已是新键，或 series 已换，
+        //  `prewarmNextEpisode` 内部的 idx 查不到就直接返回）。
+        scheduleNextEpisodePrewarmRef.current(prewarmDelayMs, episodeId);
         // ⚠️ **不要在这里补发整集 mp4 解析**（2026-10-17 实测卡顿回归后移除）。
         //
         // 曾在这里延时 `STREAMING_TRANSCODE_SETTLE_MS + 1000` 调 `ensureFullPromise()`，
@@ -1856,7 +2119,21 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     if (!streamingWindowReleased) {
       endStreamingWindow();
     }
-    return startFull();
+    const fullAttempt = startFull();
+    /**
+     * VSR 关：整集 mp4 是主路径，播起来之后立刻预取下一集。
+     *
+     * 这条出口是"本集第一次播放（缓存未命中）"走的路 —— 它没有经过上面的
+     * `warmAdjacentEpisodes`（那条只在 mp4 快路径命中时调），所以必须在这里补一次
+     * 调度，否则关闭增强时下一集永远没有预取，切集就要现场等 6~7 秒。
+     */
+    if (!vsrEnabledRef.current) {
+      void fullAttempt.then(outcome => {
+        if (outcome !== 'ok' || activeSessionRef.current !== sessionId) return;
+        scheduleNextEpisodePrewarmRef.current(0, episodeId);
+      });
+    }
+    return fullAttempt;
   };
 
   // 统一的本地解析入口：把在途 promise 记到 ref 上，供 error 事件链等待复用。
@@ -2008,6 +2285,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 必须连同 dispose 一起清，只清 Map 不释放会让解码器挂在脱离文档流的
     // video 上直到 WebView 回收。
     drainPreparedPool();
+    /**
+     * VSR 关：整集 mp4 是**播放主路径**（不是退路），所以下一集值得提前下。
+     *
+     * 走 `scheduleNextEpisodePrewarm(0)` 而不是这里直接发车：那条调度会读**最新**
+     * 的剧/集（定时器触发时），避免这里捕获的旧闭包把已经不看的那一集预取下来。
+     */
+    if (!vsrEnabledRef.current) {
+      scheduleNextEpisodePrewarmRef.current(0, currentEpisodeId);
+      return;
+    }
     // ⚠️ **整集 mp4 预取队列已停用**（2026-10-17，实测卡顿回归）。
     //
     // 原实现预取「下三集 + 上一集」，每集都是 worker 下载整集 + 解密 + 重编码
@@ -2040,25 +2327,29 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 只预转**下一集**，不预转下三集：每路转码都会占满显卡编码单元约 6 秒，
     // 而连播只关心下一集；下两集之后用户多半还没看到，提前转纯属与当前播放抢资源。
     //
-    // 时机：延后到整集转码余量之后再发车（本集出画后 6 秒窗口内不打扰）。
-    // 一集正片至少几十秒，这个延迟对"下一集要用时"毫无影响。
+    // ===== 预转**下一集**的整集 HLS =====
+    //
+    // ⚠️ 这里**不再自己发车**（2026-10-23 修「联播每集都卡十几秒」）。
+    //
+    // 曾经这里有一份 `setTimeout(..., STREAMING_TRANSCODE_SETTLE_MS + 1000)`
+    // 的预转，与 `playNativeResolvedFile` 里那条按集时长估算的调度**并存**。
+    // 两者打架的后果在实机日志里非常清楚：
+    //
+    //   连播预取 下一集=xxx
+    //   本集仍在流式转码窗口内，跳过下一集预转   ← 每一次都被挡掉
+    //
+    // 因为旧路径的固定 7 秒延迟**正好落在转码窗口内**（窗口按
+    // `episodeSeconds / 8 × 1.6` 算，短剧 36~47 秒的集只有 7~9 秒，而
+    // `streamingInFlight()` 在这整段里都是 true）。于是预取从来没成功过，
+    // 每集都要现场解析——实测一次 12378ms，用户看到的就是"联播不顺畅"。
+    //
+    // 现在统一由 `scheduleNextEpisodePrewarm`（见 `playNativeResolvedFile`）
+    // 负责：它按**实测转码速率**估算发车时刻，且不查 `streamingInFlight()`
+    // ——那个闸门是为"悬停预热"设计的，连播场景下本集转完后编码单元就空闲了。
+    //
+    // 保留 `nextEpisode` 的求值只为下面 `prefetchStream` 那类旁路逻辑不受影响。
     const nextEpisode = series.episodes[idx + 1];
-    if (nextEpisode && series.type !== 'anime') {
-      window.setTimeout(() => {
-        // 会话已作废（用户切走/退出播放器）就不再预转：那台机器上正在播的
-        // 已经不是这一集了，占用转码资源只会拖慢用户真正在看的那一路。
-        if (activeSessionRef.current !== sessionAtRequest) return;
-        // ⚠️ 本集还在转码窗口内也不要发车：预转与"正在播的那一集"共用同一块
-        // 编码单元（实测 NVENC 串行），两路重叠会把正在播的那一路挤慢 ——
-        // 这正是 `MAX_PREWARM_INFLIGHT` 下调要治的病，而这条预转此前没有任何
-        // 前端闸门（审查 F7；后端现在也有一道闸门兜底）。
-        if (streamingInFlight()) {
-          tracePlayback('本集仍在流式转码窗口内，跳过下一集预转');
-          return;
-        }
-        void ipcService.playback.prewarmStreamNative(series.id, nextEpisode.id, contentType);
-      }, STREAMING_TRANSCODE_SETTLE_MS + 1000);
-    }
+    void nextEpisode;
   };
 
   /**
@@ -2125,8 +2416,160 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // ⚠️ 播放中不预热：编码单元是串行的（NVENC 实测），此刻发车只会挤慢
     // 正在播的那一路。悬停发生在播放器内（选集抽屉）时命中这里。
     if (streamingInFlight()) return;
+    /**
+     * VSR 关：要预热的产物是**整集 mp4**。
+     *
+     * `prewarmStreamNative` 在 VSR 关时会被后端直接跳过
+     * （`short_drama_app_prewarm_stream` 的门禁：那条链路产出 H.264 HLS，属于增强
+     * 链路）—— 所以关闭增强时这里以前是**空转**。改成让 worker 后台把整集下到盘上。
+     */
+    if (!vsrEnabled) {
+      const quality = currentQuality || 'auto';
+      void ipcService.playback
+        .resolveNative(seriesId, episodeId, contentType, quality)
+        .catch(() => undefined);
+      return;
+    }
     void ipcService.playback.prewarmStreamNative(seriesId, episodeId, contentType);
   };
+
+  /**
+   * 连播预取：起播稳定后，主动把**下一集**的整集 HLS 转好。
+   *
+   * ## 为什么必须有它（2026-10-22 修「切下一集必缓冲 3.6~5.1 秒」）
+   *
+   * 实机日志给出的证据（ttv-playback.log）：
+   *
+   *   命中缓存的那次（用户在选集里点了一集已转好的）：
+   *     485.928s 打开集
+   *     485.932s [vsr] 复用已转好的整集 HLS（未起转码）
+   *     485.973s 整集 HLS 出画 耗时=46ms          ← 无缝
+   *
+   *   未命中的连播（几乎每次「下一集」都是这样）：
+   *     470.486s 打开集
+   *     470.904s [红果] worker stream stage=sign
+   *     472.305s [红果] worker stream stage=model
+   *     472.305s [红果] worker stream stage=fallback
+   *     473.979s [红果] 流式开播 预签名已命中=false
+   *     475.539s [vsr] 首段尚未落地，先交地址交由播放器重试
+   *     475.542s 流式开播 返回 耗时=5076ms
+   *     475.937s 整集 HLS 出画 耗时=5448ms      ← 用户看到的"正在缓冲"
+   *
+   * 也就是说：**切换本身的机制没问题（46ms 那次就是证明），缺的是"下一集
+   * 在用户切过去之前就已经转好"**。后端 `start_video_cache` 早就有按 vid 目录
+   * 复用 ENDLIST 产物的能力，`short_drama_app_prewarm_stream` 也早就实现好了
+   * —— 但前端从来只在「选集抽屉悬停」和「详情页悬停」时调用它，**连播路径一次
+   * 都没调过**。用户连着看五集，就有五次 5 秒的黑等。
+   *
+   * ## 为什么不能直接复用 prewarmEpisode
+   *
+   * 它开头有 `if (streamingInFlight()) return`——播放中一律不预热。那条闸门
+   * 是为「悬停」场景设计的：悬停时用户正在看当前集，此时起第二路 ffmpeg 会和
+   * 正在转的那一路抢 NVENC（编码单元串行，实测两路各 9.4 秒、四路各 20 秒，
+   * 总时长不减少，只是把正在播的挤慢）。
+   *
+   * 连播不一样：**当前集转完之后编码单元就空闲了**。一集 44 秒、转码 13~29 倍
+   * 实时，实测 5.6 秒转完 92.7 秒正片；等本集转完（`endStreamingWindowAfter`
+   * 已按集时长估出余量并释放闸门），再发下一集，两者**不会重叠**。
+   *
+   * 所以这里不查 `streamingInFlight()`，而是等一个"本集转码已完成"的信号。
+   * 用一个保守的延时窗口实现（见 `NEXT_EPISODE_PREWARM_DELAY_MS`）。
+   *
+   * ## 为什么只预取下一集，不预取更多
+   *
+   * `MAX_PREWARM_INFLIGHT` 已经是 1，且热备一集就够覆盖连播——备两集收益是零，
+   * 代价是把正在播的那一路挤慢。用户看到第 N 集时只需要 N+1 就绪。
+   */
+  const prewarmNextEpisode = useCallback(
+    (series: SeriesDetail | null, episodeId: string | null, contentType: number) => {
+      if (!series || !episodeId) return;
+      // 与 prewarmEpisode 同一套排除条件，理由见那里。
+      if (series.type === 'anime' || series.id.startsWith('anime_')) return;
+      if (series.id.startsWith('guo:')) return;
+      const idx = series.episodes.findIndex(e => e.id === episodeId);
+      if (idx < 0 || idx >= series.episodes.length - 1) return; // 已是最后一集
+      const next = series.episodes[idx + 1];
+      const key = `${series.id}:${next.id}`;
+      // 同一集只发一次：`timeupdate` 会反复触发调度点，不去重就会重复发车
+      // （虽然后端 `stable_slot_of` 会同槽位去重，但每次调用仍要跑一遍
+      //  `ensure_stream_cached` 的签名检查，纯浪费）。
+      if (prewarmedNextRef.current === key) return;
+      prewarmedNextRef.current = key;
+      /**
+       * VSR 关：下一集的产物是**整集 mp4**，而 `prewarm_stream` 在 VSR 关时被后端
+       * 直接跳过（`short_drama_app_prewarm_stream` 的门禁）—— 也就是说关闭增强时
+       * **此前一次预取都没有**：每次切集都要现场让 worker 下载 6~7 秒（日志实测
+       * `resolve 返回 耗时=7220ms`），用户看到的正是"关了增强，切集还是和开着一样等"。
+       *
+       * 这里改成让 worker 在后台把下一集整集下到盘上：下次切集 `resolve` 直接命中
+       * 后端缓存（实测 `耗时=7ms`），连播种子的那次等待就消失了。
+       *
+       * 档位取 `handlerCtxRef` 里的当前值：后端按 requested_quality 落盘，预取与
+       * 播放的档位不一致就命中不了（`episodeCacheKey` 那条历史结论同理）。
+       */
+      if (!vsrEnabledRef.current) {
+        const quality = handlerCtxRef.current.currentQuality || 'auto';
+        void ipcService.playback
+          .resolveNative(series.id, next.id, contentType, quality)
+          .catch(() => undefined);
+        tracePlayback(`连播预取（整集） 下一集=${next.id} 档位=${quality}`);
+        return;
+      }
+      void ipcService.playback.prewarmStreamNative(series.id, next.id, contentType);
+      tracePlayback(`连播预取 下一集=${next.id} 类型=${contentType}`);
+    },
+    [],
+  );
+
+  /**
+   * 延时调度「下一集预取」的定时器句柄。
+   *
+   * 同一时刻只允许有一个在等：换集时新的一次调度必须把上一次撤掉，否则
+   * 旧定时器到点会为**已经不看的那一集**发一次车，白烧一路转码。
+   */
+  const nextPrewarmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * `scheduleNextEpisodePrewarm` 的转发 ref。
+   *
+   * `runOpenEpisode` 定义在它之前，而 `const` 箭头函数不提升。直接引用能跑
+   * 只是因为"调用时机在渲染之后"这个偶然事实——一旦有人把 `runOpenEpisode`
+   * 的调用点挪到渲染阶段，就会变成 ReferenceError。用 ref 转发把这条隐式
+   * 依赖变成显式的。
+   */
+  const scheduleNextEpisodePrewarmRef = useRef<(delayMs: number, episodeId: string) => void>(() => {});
+
+  /**
+   * 安排一次「本集转完后预取下一集」。
+   *
+   * 抽成独立函数而不是内联在 `runOpenEpisode` 里，是因为它需要读**最新**的
+   * `currentSeries` / `currentEpisode`（定时器触发时闭包里那份可能已经过期）。
+   * 用 ref 转发拿最新值，与项目里 `openEpisodeRef` / `playNextEpisodeRef`
+   * 是同一套写法。
+   */
+  const scheduleNextEpisodePrewarm = (delayMs: number, episodeId: string) => {
+    if (nextPrewarmTimerRef.current) {
+      clearTimeout(nextPrewarmTimerRef.current);
+      nextPrewarmTimerRef.current = null;
+    }
+    nextPrewarmTimerRef.current = setTimeout(() => {
+      nextPrewarmTimerRef.current = null;
+      // 到点时再读一次当前上下文：延时期间用户可能已经切走、换剧或离开播放器。
+      const series = currentSeriesRef.current;
+      const ep = currentEpisodeRef.current;
+      if (!series || !ep) return;
+      // 目标集必须仍是这次调度的那一集。用户已经切到别集时，新一次
+      // `runOpenEpisode` 会重新调度，旧的那次直接作废。
+      if (ep.id !== episodeId) return;
+      const contentType = series.type === 'comic' ? 1004 : 1;
+      prewarmNextEpisode(series, ep.id, contentType);
+    }, Math.max(0, delayMs));
+  };
+  // 转发给 `runOpenEpisode`（它定义在本函数之前）：那里是箭头函数的函数体，
+  // 只在**运行时**被调用，而那时本次渲染早已把 ref 填好。
+  // 不用直接引用是因为 `const` 箭头函数没有提升——直接引用虽然靠调用时序也能跑，
+  // 但那属于"侥幸正确"，把顺序改一下就变成 ReferenceError。
+  scheduleNextEpisodePrewarmRef.current = scheduleNextEpisodePrewarm;
 
   const playLocalFile = async (
     playUrl: string,
@@ -2298,6 +2741,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     if (activeSessionRef.current > 0) {
       void ipcService.playback.command(activeSessionRef.current, 'stop').catch(() => undefined);
     }
+    // 末尾静默兜底属于上一集：新集要重新武装（`handlePlaying` 里做），
+    // 旧的那条续体如果不能被及时收掉，会在新集播到一半时按旧位置判一次"播完"。
+    stopTailEndGuard();
     // 换集 = 上一个会话整体作废（`stop` 已收掉它那一路 ffmpeg），流式转码窗口随之清零。
     // 这里用硬复位而不是递减：会话被替换时，上一条链路留在后台的续体可能再也执行不到
     // 它自己的释放点，靠递减会让计数慢慢涨上去、把整集预取永久关掉。
@@ -2329,6 +2775,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       stallRecoveredRef.current.clear();
       setStallNotice(null);
     }
+    // 「这一段还没转好」属于**上一集/上一次拖动**：换集必须清掉，否则它会跟着
+    // 新一集挂在画面上（新一集的转码进度与那条文案毫无关系）。
+    setSeekNotice(null);
     stallReloadingRef.current = false;
 
     const newSessionId = (activeSessionRef.current += 1);
@@ -2454,8 +2903,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         animeVideo.volume = isMutedRef.current ? 0 : volumeRef.current;
         animeVideo.muted = isMutedRef.current;
         // m3u8（本地代理流）经 hls.js 挂载；mp4 直链仍走普通 src。
+        // 起播点必须随挂载一起交给 hls.js（见 `attachSource` 的同名参数）：
+        // 动漫换集同样不换元素，元素上残留的是上一集的位置。
         if (isHlsUrl(session.url)) {
-          await attachSource(animeVideo, session.url);
+          await attachSource(animeVideo, session.url, startPosition);
         } else {
           detachSource(animeVideo);
           animeVideo.src = session.url;
@@ -2551,10 +3002,28 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       hasTriedNativeResolveRef.current = false;
       // 快路径：该集此前已解析出本地文件（首次播放成功或预取完成）。
       // 直接秒开本地 mp4，跳过注定失败的公开直链试探（省 3-10 秒）。
+      //
+      // ⚠️ **VSR 开着时一律不走这条快路径**（2026-10-25 修「关闭再打开 VSR 没反应」）。
+      //
+      // 这张表里存的是 `resolveNative` 产出的**整集 mp4**，而它的编码是**源编码**
+      // （红果实测 `h265_hvc1`）。VSR 的硬条件是 H.264（不变量 25），播这份文件
+      // 等于把增强静默跳过。现场日志：
+      //
+      //   [+83.8s] VSR 开关生效：… 按原位置重新解析（链路=转码分片）
+      //   [+83.9s] 媒体 loadeddata 首帧就绪 耗时=98ms     ← 98ms 是本地文件，不是转码
+      //   [+84.7s] [红果] worker stream stage=sign        ← 转码到这时才开始
+      //
+      // 也就是说：VSR 关着时下载的那份 HEVC mp4 被登记在表里，开关拨回「开」之后
+      // 仍然命中它 → `openStreamNative` / `playStreamingHls` 一次都没执行 → 开关
+      // "看起来生效了"（日志还写着转码分片），画面却还是那份没有增强的源。
+      // 与历史上「把清晰度从缓存键里去掉」是同一类错误：缓存键必须能区分**链路**。
+      //
+      // 代价为零：需要兜底时下面还有 `startFull()` 那条路，它用的 `ensureFullPromise`
+      // 本来就不读这张表。
       const video = videoRef.current;
       const cachedKey = episodeCacheKey(seriesId, ep.id, selectedQuality);
       const cachedPlayUrl = resolvedFileByVidRef.current.get(cachedKey);
-      if (video && cachedPlayUrl && cachedPlayUrl !== '__prefetching__') {
+      if (video && cachedPlayUrl && cachedPlayUrl !== '__prefetching__' && !vsrEnabled) {
         video.dataset.sessionId = String(newSessionId);
         backupUrlRef.current = '';
         hasTriedBackupRef.current = true;
@@ -2777,7 +3246,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           video.addEventListener('error', done, { once: true });
         });
         if (session.streamKind === 'hls' || isHlsUrl(session.url)) {
-          await attachSource(video, session.url);
+          // 起播点随挂载交给 hls.js（理由见 `attachSource` 的同名参数）。
+          await attachSource(video, session.url, startPosition);
         } else {
           detachSource(video);
           video.src = session.url;
@@ -2985,7 +3455,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     cancelTailProbe();
     // 同样撤销在途的「等待转码推进」：它的目标位置属于旧集，落到新集上是错的。
     cancelSeekWait();
-    const key = `${seriesId}|${episodeId || ''}|${Math.round(startPosition)}|${qualityOverride || ''}`;
+    // 键里必须带「增强代际」：切换 VSR / 补帧后是同一集、同一位置、同一清晰度，
+    // 只有这一位能把"新链路"和"还在途的旧链路任务"区分开（见 `enhanceEpochRef`
+    // 的说明）。少了它，拨开关会命中旧任务，表现为"开关动了、画面没变"。
+    const key = `${seriesId}|${episodeId || ''}|${Math.round(startPosition)}|${qualityOverride || ''}|${enhanceEpochRef.current}`;
     const inflight = openInFlightRef.current.get(key);
     if (inflight) return inflight;
     const task = runOpenEpisode(seriesId, episodeId, startPosition, qualityOverride)
@@ -3057,31 +3530,36 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     setFinishedAll(false);
     finishedAllEpisodeRef.current = null;
     const video = videoRef.current;
-    const clamped = Math.max(0, Math.min(seconds, duration || 0));
     /**
-     * 拖到「还没转好的位置」时，必须显式让后端续转 —— 否则会被浏览器夹回。
+     * ===== 落位判定收口到 `planSeek`（2026-10-24）=====
      *
-     * ## 用户报的现象（2026-10-21）
+     * ## 用户报的现象
      *
-     * 「转码在 20 秒，我切到 30 秒，进度条会跳到 20 秒这里，不会跳到 30 秒；
-     *   如果在 25，我点开始还会跳到 25，并不会跳到 30 秒」
+     * 「点击播放器任意位置（比如点击结尾），它会跳转到转码后的最后位置，
+     *   而不是跳到点击的对应位置。」
      *
-     * ## 为什么会夹回
+     * ## 为什么
      *
-     * 播放源是「边转边播」的整集 HLS：清单里此刻只有已切好的分片，于是
-     * `video.seekable.end()` 只到已转位置（20 秒）。MSE 规范要求 seek 目标落在
-     * **可寻址范围**内，超出范围时浏览器会把 `currentTime` 夹到范围末端 ——
-     * 于是赋值 30 秒后立刻回弹到 20 秒。用户看到的就是"拖不过去"。
+     * 进度条的分母是**源片真实时长**（后端下发的权威值），而播放源是边转边播的
+     * 整集 HLS —— `video.seekable.end()` 只到已转位置。旧实现为了绕开浏览器的
+     * 夹取，主动把播放头推到 `seekable.end - 0.05`：
      *
-     * 而进度条显示用的 `duration` 是**源片真实时长**（权威值），所以滑块本身
-     * 允许拖到 30 秒 —— 两套时间基不一致，矛盾就暴露在这里。
+     * ```ts
+     * // 旧代码（已删）
+     * if (shouldPush) { video.currentTime = pushTarget; }   // pushTarget = min(target, end - 0.05)
+     * ```
      *
-     * ## 处置
+     * 于是一个"还没转好"的等待，被表现成了"跳到转码末端"的**错误落位**。
+     * 超时之后还会再推一次（`video.currentTime = max(0, end - 0.05)`），
+     * 把同一个错误变成永久的。
      *
-     * 目标位置超出可寻址末端时，走「从该位置重新开播」：后端 `open_stream`
-     * 会按新位置续转（`start_video_cache` 会从 ENDLIST 判定继续写后续分片），
-     * 重新挂载后 seek 落在合法范围内。这与用户手动重开这一集的等价，
-     * 只是不用他手动。
+     * ## 现在
+     *
+     * - 在可寻址范围内 → 立即落位（绝大多数情况）；
+     * - 超出范围 → 进等待，**播放头不动**，等转码追上目标再落位；
+     * - 超时 → 如实提示"这一段还没转好"，**停在原处**，绝不跳到末端冒充成功。
+     *
+     * 三个播放面共用 `planSeek` / `seekableReached`，语义只有一份。
      */
     let seekableEnd = 0;
     try {
@@ -3091,56 +3569,34 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     } catch {
       // 尚未就绪的媒体元素访问 seekable 可能抛错：按"不可寻址"处理。
     }
-    /**
-     * 只有「流式源 + 目标明显超出已转范围」才走续转。
-     *
-     * 留 0.5 秒容差：`seekable.end` 与用户拖的落点之间本就有几十毫秒误差，
-     * 卡死在等号上会让每次正常拖动都触发一次重开。
-     */
-    const beyondTranscoded = streamingSourceRef.current
-      && Number.isFinite(seekableEnd)
-      && seekableEnd > 0
-      && clamped > seekableEnd + 0.5;
+    const plan = planSeek({ requested: seconds, duration, seekableEnd });
+
     // 拖动过程中只更新界面读数，不触发续转 —— 见 `onSeek` 的签名说明。
-    // 不这样的话，拖 3 秒会经过几十个像素，每个都发一次 open_stream。
-    if (beyondTranscoded && previewing) {
-      setPosition(clamped);
+    // 不这样的话，拖 3 秒会经过几十个像素，每个都发一次等待。
+    if (previewing) {
+      setPosition(plan.target);
       return;
     }
-    if (beyondTranscoded) {
-      /**
-       * 拖到还没转好的位置：**等它转出来，而不是重开这一集**（2026-10-21 重做）。
-       *
-       * ## 上一版为什么不行
-       *
-       * 上一版在这里调 `openEpisode(...)` 从目标位置重新开播。实测（ttv-playback.log，
-       * 同一集连续四次拖动）暴露了两个连锁问题：
-       *
-       *   1. `runOpenEpisode` 开头会 `command(旧会话,'stop')` —— 把**正在转码的
-       *      ffmpeg 杀掉**。后端于是从 0 重新起一路，转码进度被清零。
-       *   2. 进度清零后 `seekable.end` 反而变小：实测四次拖动依次是
-       *      21.0s → 11.3s → 36.9s → 40.2s，用户看到的就是「拖到 35 秒又弹回灰色」
-       *      以及画面一闪一闪（每闪一次就是一次重新挂载）。
-       *
-       * ## 现在的做法
-       *
-       * 转码本身一直在推进（实测 13~29 倍实时），缺的只是时间。所以这里**不动播放链路**：
-       * 记下目标位置，按"分片就绪"轮询，一旦 `seekable.end` 追上目标就正常 seek 过去。
-       * 超时才退回重开（兜底，避免永远等不到）。
-       *
-       * 这样既不会杀转码，也不会有重新挂载的闪烁。
-       */
+
+    if (plan.kind === 'wait') {
       tracePlayback(
-        `拖动到未转码区域 目标=${clamped.toFixed(1)}s 可寻址末端=${seekableEnd.toFixed(1)}s 会话=${activeSessionRef.current}（等待转码推进）`,
+        `拖动到未转码区域 目标=${plan.target.toFixed(1)}s 可寻址末端=${plan.seekableEnd.toFixed(1)}s 会话=${activeSessionRef.current}（等待转码推进，播放头留在原处）`,
       );
-      setPosition(clamped);
-      saveProgressThrottled(clamped, duration, true);
-      waitForSeekable(video, clamped);
+      // 上一次的"还没转好"提示先撤掉：这次是新目标，结果还没出来。
+      setSeekNotice(null);
+      // 进度条先显示用户点的位置：他要的是"那里"，不是"现在能播到的地方"。
+      setPosition(plan.target);
+      saveProgressThrottled(plan.target, duration, true);
+      waitForSeekable(video, plan.target);
       return;
     }
-    video.currentTime = clamped;
-    setPosition(clamped);
-    saveProgressThrottled(clamped, duration, true);
+
+    // 可寻址范围内：正常落位。这一行是唯一会立即改变画面的路径。
+    video.currentTime = plan.target;
+    setPosition(plan.target);
+    saveProgressThrottled(plan.target, duration, true);
+    // 用户重新点了一次并且成功了：上一次"还没转好"的提示到此为止。
+    setSeekNotice(null);
   };
 
   const seekRelative = (deltaSeconds: number) => {
@@ -3157,11 +3613,55 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    */
   const seekWaitRef = useRef<{ timer: number; target: number } | null>(null);
 
+  /**
+   * 「用户点了、但还没转好」的目标位置（秒）。
+   *
+   * ## 为什么必须有它（2026-10-26 修「点了 90s，进度条弹回 20s」）
+   *
+   * 等待期间每一拍 `timeupdate` 都会把**真实**播放头写进 `position`，于是用户
+   * 刚拖到 90s、进度条立刻弹回当前能播的 20s —— `seekPlan` 的注释承诺"等待期间
+   * 播放头不动、如实显示用户点的位置"，但 UI 读数被 timeupdate 覆盖了。
+   *
+   * 语义：非空 = 有一次等待在途，`position` / 落盘都按它显示；落位成功、用户
+   * 再次拖动、换集、离开播放器时清空。
+   */
+  const seekWaitTargetRef = useRef<number | null>(null);
+
+  /**
+   * 「等待转码推进」任务的代际号：每次新的拖动自增一次。
+   *
+   * 轮询器靠它判断自己是否已被取代（见 `waitForSeekable` 里的说明）。
+   * 不用 `seekWaitRef` 本身做判断，是因为 `poll` 第一行会把它清空，
+   * 之后每一拍都读不到"当前目标是谁"。
+   */
+  const seekWaitGenerationRef = useRef(0);
+
+  /**
+   * 上一次向 hls.js 下达「从目标位置拉流」的位置（秒）。
+   *
+   * 用途见 `waitForSeekable` 里那段注释：等待期间每一拍都会调
+   * `hintHlsLoadPosition`，而它会重建加载状态机 —— 目标不变就没必要重复下达。
+   * 记住上次下达的位置，只有目标变了（或首次）才再下一次。
+   *
+   * 每次新的拖动/换集都要清空（`cancelSeekWait` 里一并重置），否则新目标会
+   * 沿用旧目标的"已下达位置"，导致第一拍不下达。
+   */
+  const lastHintRef = useRef<number | null>(null);
+
   const cancelSeekWait = () => {
+    // 推进代际号：让**已经排上队但还没跑**的那一拍也立刻失效。
+    // 只清 timer 不够 —— `poll` 可能正在执行中（它已经通过了 `isCurrent()`），
+    // 清 timer 对它无效，下次它自己排下一拍时才会发现代际号变了。
+    seekWaitGenerationRef.current += 1;
     if (seekWaitRef.current) {
       window.clearTimeout(seekWaitRef.current.timer);
       seekWaitRef.current = null;
     }
+    // "已下达位置"属于上一次拖动：不清掉的话，新目标的第一拍会因为
+    // `|target - lastHint| < 1.0` 而拒绝下达。
+    lastHintRef.current = null;
+    // 目标位置也一并作废：新的拖动/换集会重新设置它。
+    seekWaitTargetRef.current = null;
   };
 
   /**
@@ -3177,9 +3677,33 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 同一目标重复调用直接忽略；不同目标则取代旧的（用户又拖了一次）。
     if (seekWaitRef.current && Math.abs(seekWaitRef.current.target - target) < 0.5) return;
     cancelSeekWait();
+    // 记下"用户要的是这里"：等待期间 `timeupdate` 不许把进度条弹回真实播放头
+    // （见 `seekWaitTargetRef` 的说明）。
+    seekWaitTargetRef.current = target;
     const sessionAtWait = activeSessionRef.current;
+    /**
+     * 本次等待的**代际号**。
+     *
+     * ## 为什么必须有它（2026-10-23 修「进度条回弹」）
+     *
+     * 用户连续拖动时会产生多个轮询器。旧实现在 `poll` 第一行就把
+     * `seekWaitRef.current` 置 null，于是**后续每一拍都无法判断自己是否已被
+     * 新的拖动取代**——一个追着 20s 的旧轮询器会继续把 `currentTime` 往 20s 推，
+     * 而用户已经拖到 58s 了。日志里的证据正是这样：
+     *
+     *   963.548s  转码已推进到 36.9s，落位到 20.1s   ← 目标 20.1，但用户早已拖走
+     *   966.417s  转码已推进到 64.1s，落位到 58.0s
+     *
+     * 两次落位方向相反，用户看到的就是"往前走了又弹回来"。
+     *
+     * 代际号让每一拍都能确认"我还是当前那一次等待吗"，不是就直接退出。
+     */
+    const generation = (seekWaitGenerationRef.current += 1);
+    const isCurrent = () => seekWaitGenerationRef.current === generation;
     const deadline = performance.now() + SEEK_WAIT_TIMEOUT_MS;
     const poll = () => {
+      // 被更新的拖动取代：这一拍什么都不做（新轮询器会接管）。
+      if (!isCurrent()) return;
       seekWaitRef.current = null;
       // 会话已换（用户切集/退出）：这次等待作废。
       if (activeSessionRef.current !== sessionAtWait) return;
@@ -3192,39 +3716,78 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       } catch {
         // 读不到就当作还没就绪，下一拍再试。
       }
-      if (Number.isFinite(end) && end >= target - 0.3) {
+      if (seekableReached(end, target)) {
         tracePlayback(`转码已推进到 ${end.toFixed(1)}s，落位到 ${target.toFixed(1)}s`);
+        // 已落位：读数交回真实播放头（否则 target 会一直压着 position）。
+        seekWaitTargetRef.current = null;
         video.currentTime = target;
         setPosition(target);
         saveProgressThrottled(target, duration, true);
         return;
       }
       /**
-       * 光等不够：hls.js 是**按播放位置**决定拉哪一片的。
+       * ===== 等的时候**不动播放头**，改用 hls.js 的加载位置（2026-10-24 根治）=====
        *
-       * 播放头留在旧位置时，它只会请求旧位置附近的分片，目标位置那一片永远不会被拉，
-       * `seekable.end` 也就不会长到目标值 —— 等到超时也不会有进展。
+       * ## 旧实现为什么错
        *
-       * 所以每一拍都把 `currentTime` 往目标推一次：浏览器会把它夹到当前可寻址末端，
-       * 而 hls.js 看到播放位置前移，就会继续往后拉分片。末端随转码推进而增长，
-       * 下一拍再推一次，直到真正落到目标。
+       * 旧代码每一拍都写 `video.currentTime = min(target, end - 0.05)`，
+       * 注释里给的理由是"hls.js 按播放位置决定拉哪一片，播放头不动就拉不到目标分片"。
+       * **这个前提是对的，但用它去移动播放头是错的**——那就是用户报的
+       * 「点结尾却跳到转码后的最后位置」：
        *
-       * 这不会造成"画面一闪一闪"：位置只在可寻址范围内微调，不会重新挂载播放链路。
+       *   拍 1：end=20.0 → 播放头被写到 19.95   ← 用户看到画面跳到 19.95
+       *   拍 2：end=22.5 → 又写到 22.45         ← 又跳
+       *
+       * 每次写 `currentTime` 都让解码器重起一组帧（"画面反复跳几帧"就是这么来的），
+       * 而用户点的 90 秒始终没有被请求过。超时那一刻还会再推一次 `end - 0.05`，
+       * 把这次错误落位变成**永久**的。
+       *
+       * ## 正确做法
+       *
+       * 播放头留在用户按下时的位置（画面继续播/暂停），把"我要这个位置"这件事
+       * 交给 hls.js 的加载器：`startLoad(target)` 让它按目标位置重建拉流，
+       * **完全不碰 `video.currentTime`**。转码追上后由上面那一支真正落位。
+       *
+       * 这也是唯一同时满足两个约束的做法：
+       *   - 画面不能跳（用户没要求跳）；
+       *   - 目标分片必须被请求（否则永远等不到）。
+       *
+       * 每拍只下达一次（`lastHintRef` 记住上次的位置，目标不变就不重复下达）：
+       * `startLoad` 会重建加载状态机，每 250ms 来一次纯属浪费。
        */
-      try {
-        video.currentTime = Math.min(target, end > 0 ? end - 0.05 : 0);
-      } catch {
-        // 元素还没就绪：下一拍再试。
+      if (lastHintRef.current === null || Math.abs(lastHintRef.current - target) >= 1.0) {
+        // ⚠️ 先下达、再记录（2026-10-26 修）。旧写法先写 `lastHintRef = target`
+        // 再调 hint，而 `hintHlsLoadPosition` 在 hls 实例尚未 attach 时会返回
+        // false（注释明说"下一拍再试"）—— 但目标已经被记成"已下达"，于是**永远
+        // 不会再试**，整个等待窗口里分片都不会被请求。
+        const hinted = hintHlsLoadPosition(video, target);
+        lastHintRef.current = hinted ? target : null;
+        tracePlayback(
+          `催拉目标分片 目标=${target.toFixed(1)}s 可寻址末端=${end.toFixed(1)}s 方式=${hinted ? 'hls.js startLoad' : '原生（无 hls 实例）'}`,
+        );
       }
       if (performance.now() >= deadline) {
-        // 等不到了：如实记一笔，退回重开（这是唯一的兜底，不是常规路径）。
+        /**
+         * ## 超时：如实报告，绝不跳到末端冒充成功（2026-10-24 根治）
+         *
+         * 旧实现在这里写 `video.currentTime = max(0, end - 0.05)`，注释是
+         * "让用户至少停在能播到的地方"。但那正是这个 bug 的最后一步：
+         * 用户点结尾 → 等了 8 秒 → 被强行放到已转码末端 → **看起来像是"点了结尾
+         * 就跳到末端"**，而且这次是永久的，用户以为已经落位了。
+         *
+         * 现在停在原处，并通过 `stallNotice` 如实告诉用户"这一段还没转好"。
+         * 用户可以再点一次（转码 13~29 倍实时，通常早就追上了），
+         * 也可以什么都不做 —— 播放头本来就没被动过。
+         */
         tracePlayback(
-          `等待转码超时（${SEEK_WAIT_TIMEOUT_MS}ms）目标=${target.toFixed(1)}s 末端=${end.toFixed(1)}s，退回重开这一集`,
+          `等待转码超时（${SEEK_WAIT_TIMEOUT_MS}ms）目标=${target.toFixed(1)}s 末端=${end.toFixed(1)}s，保持在原位（不跳到末端、不重开会话）`,
         );
-        const ctx = handlerCtxRef.current;
-        if (ctx.currentSeries && ctx.currentEpisode) {
-          void openEpisodeRef.current(ctx.currentSeries.id, ctx.currentEpisode.id, target);
-        }
+        // 超时后把读数交回真实播放头：继续压着 target 会让进度条永远停在
+        // 一个播不到的位置（用户会以为已经落位了）。提示已经如实说明。
+        seekWaitTargetRef.current = null;
+        setSeekNotice(
+          `这一段还没转好（已转 ${Math.floor(end)} 秒 / 目标 ${Math.floor(target)} 秒），稍等再点一次`,
+        );
         return;
       }
       const timer = window.setTimeout(poll, SEEK_WAIT_POLL_MS);
@@ -3298,12 +3861,130 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
   };
 
+  /**
+   * 视频增强（VSR）开关的**唯一写入口**（播放页浮层、设置页都最终落在这里）。
+   *
+   * 只写设置。让当前这一集立即重走新链路的动作在下面那个 effect 里统一做——
+   * 这样"用户在设置页改"与"用户在播放页改"是同一套生效路径，不存在两条各说
+   * 各话的实现。
+   */
+  const setVsrEnabled = useCallback((enabled: boolean) => {
+    updateSettings({ vsrEnabled: enabled });
+  }, [updateSettings]);
+
+  /**
+   * ===== 视频增强开关：播放中切换必须**立即**生效 =====
+   *
+   * ## 只写设置为什么不够
+   *
+   * `vsrEnabled` 的真实作用点是**后端 resolve 的那一刻**：`main.rs` 的
+   * `enhance_short_drama_session` 读进程级 `AtomicBool`（红果 worker 读的是
+   * 注入的 `TTV_SD_VSR`）。已经开播的这一集，链路在起播时就定型了：
+   *   - 开 → 关：画面来自本地 H.264 分片，关掉开关不会自己变回原始源；
+   *   - 关 → 开：画面来自原始源/整集 mp4，不重新 resolve 就不会触发转码。
+   * 所以只写设置的表现是"开关动了、画面一点没变，要退出播放器再进才生效"——
+   * 这正是历史上「开关 VSR 都没用」反馈里最容易被当成"开关没生效"的那一半。
+   *
+   * ## 做法：同集换源，不是重开一集
+   *
+   * 用**元素真值位置 + 当前清晰度**再调一次 `openEpisode`。`runOpenEpisode` 里
+   * `qualitySwitchRequested` 那条分支本来就是"同一集换一路源、保留进度、不把
+   * 进度条归零"的成熟路径（切清晰度走的就是它），切换增强与它完全同构：
+   * 变的是链路，不是内容。
+   *
+   * ⚠️ `enhanceEpochRef` 必须在调用前自增：`openEpisode` 对"同键在途"会去重，
+   * 而键里没有开关状态。少了这一步，首播解析途中拨开关会命中旧的解析任务。
+   *
+   * ## 不重载的两种情况（设置照样落库，下次开播自然走新链路）
+   *
+   *   - 没有当前集 / 已经离开播放器（`stopPlayback` 会把 `uiState` 复位成 idle，
+   *     而 `currentSeries` 仍留着——所以判据必须是 uiState，不能只看有没有剧）。
+   *   - 控制条收起、浮层关闭都不影响：这里只看设置与播放状态。
+   */
+  const vsrSwitchRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    const next = settings.vsrEnabled !== false;
+    // 第一次跑到这里只同步基准值：设置是**异步**从后端拉的（`useSettingsStore`
+    // 的初值是"默认全开"），落库为「关」的用户在回填那一刻也会看到一次"变化"，
+    // 那不是用户拨动，不能上报、更不能重载。
+    if (vsrSwitchRef.current === null) {
+      vsrSwitchRef.current = next;
+      return;
+    }
+    if (vsrSwitchRef.current === next) return;
+    vsrSwitchRef.current = next;
+    tracePlayback(
+      `VSR 开关切换为：${next ? '开（H.264 分片 / 增强链路）' : '关（原始源直链）'}`,
+    );
+    if (!currentSeries || !currentEpisode) return;
+    if (uiState.kind === 'idle') return;
+    /**
+     * 「画面里装的确实就是当前这一集」才允许重载。
+     *
+     * 切集 / 换剧的窗口里 `currentEpisode` 已经换成新集，而 `<video>` 还挂着旧源：
+     * 这时拿元素位置当新集的起播点，新集会从旧集的 30~60 秒开始播（一集才 33~68 秒，
+     * 常常直接落到结尾）；而且下面这次 `openEpisode` 会递增会话号，把用户刚点的那次
+     * 换集判成 stale，等于把用户的点击吃掉。
+     *
+     * 正常播放时三个值恒等；换集途中 / 首播解析途中必然不等 —— 跳过即可，开关值
+     * 已经落库（`settings_save` 是同步命令、先写 `AtomicBool` 再落库），下一次
+     * 开播自然走新链路。这也是一条隐含前提：将来若把 `settings_save` 改成 async，
+     * 这里必须先 await 它。
+     */
+    const committed = videoCommittedRef.current;
+    if (
+      !committed
+      || committed.episodeId !== currentEpisode.id
+      || committed.sessionId !== activeSessionRef.current
+    ) {
+      tracePlayback('VSR 开关已落库，但画面正在换集，本次不重载（下一次开播自然走新链路）');
+      return;
+    }
+    enhanceEpochRef.current += 1;
+    /**
+     * 两张「上一链路的产物」缓存必须一起清掉。
+     *
+     * - `resolvedFileByVidRef`：整集 mp4 地址（源编码多半是 HEVC，VSR 认不了）。
+     *   不清的话 VSR 关→开 时会命中它，转码链路一次都不会被调用（P0）。
+     *   上面快路径已加 `!vsrEnabled` 兜底，这里再清一遍，避免它被别的路径读到。
+     * - `resolvedGuoSessionRef`：guo 源的完整会话（含增强后的 URL 与 streamKind）。
+     *   键同样不含链路维度，命中就等于沿用上一轮链路的地址。
+     */
+    resolvedFileByVidRef.current.clear();
+    resolvedGuoSessionRef.current.clear();
+    const video = videoRef.current;
+    const at = video && Number.isFinite(video.currentTime) ? video.currentTime : position;
+    /**
+     * ⚠️ **不要**在这里 `video.pause()`（2026-10-25 修「关掉增强后视频停在暂停」）。
+     *
+     * 曾经为了"避免新源从 `at` 起播造成倒退"这里先冻结画面。但实测这笔账算错了：
+     *
+     *   - 收益几乎为零：两条链路的重新准备都很快 —— VSR 关（整集 mp4 缓存命中）
+     *     实测 `resolve 返回 耗时=7ms`，VSR 开（复用已转好的整集 HLS）
+     *     `整集 HLS 出画 耗时=153ms`。几十毫秒的倒退用户根本感知不到；
+     *   - 代价却是一个真故障：`pause()` 之后那一路 `play()` 走的是**异步续体**，
+     *     WebView2 的自动播放许可（user activation）在 await 之后不再保证，
+     *     `playBounded` 可能拿到 `autoplay-blocked` —— 于是视频就**停在暂停**，
+     *     用户看到的正是"关一下增强，画面不动了"。
+     *
+     * 现在旧画面继续播，新源出画后由 `playing` 事件接管，位置差在 0.1~0.2 秒内。
+     */
+    tracePlayback(
+      `VSR 开关生效：第 ${currentEpisode.episodeNumber} 集 @ ${at.toFixed(1)}s 按原位置重新解析（链路=${next ? '转码分片' : '原始源'}）`,
+    );
+    void openEpisode(currentSeries.id, currentEpisode.id, at, currentQuality);
+  }, [settings.vsrEnabled]);
+
   // 下一集
   const playNextEpisode = useCallback(() => {
     if (!currentSeries || !currentEpisode) return;
     const currentIndex = currentSeries.episodes.findIndex(e => e.id === currentEpisode.id);
     if (currentIndex >= 0 && currentIndex < currentSeries.episodes.length - 1) {
       const nextEp = currentSeries.episodes[currentIndex + 1];
+      // 打点：区分"自动连播"与"用户按键"。两者都走这里，出问题时这行能说明是谁。
+      tracePlayback(
+        `playNextEpisode 调用 当前集=${currentEpisode.id} → 下一集=${nextEp.id} 会话=${activeSessionRef.current} 位置=${videoRef.current ? videoRef.current.currentTime.toFixed(2) : 'n/a'}s`,
+      );
       openEpisode(currentSeries.id, nextEp.id, 0);
     }
   }, [currentSeries, currentEpisode]);
@@ -3362,6 +4043,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 流式转码窗口一并归零（本次会话整体作废，`stop` 已收掉它那一路 ffmpeg）。
     resetStreamingWindow();
     setStallNotice(null);
+    // 离开播放器：那条"还没转好"的提示不该跟着到下一个页面。
+    setSeekNotice(null);
 
     const video = videoRef.current;
     if (video) {
@@ -3381,6 +4064,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     finishedAllEpisodeRef.current = null;
     // 回到 idle 而不是保留 playing/buffering：否则重新进入播放器时
     // 界面会先闪一下上一集的加载遮罩。
+    // 末尾静默兜底属于"这一集"：离开播放器必须收掉，否则它的续体会在后台
+    // 调一次 handleEnded，把用户已经放弃的那一集结算成"看完了"并触发连播。
+    stopTailEndGuard();
     setUiState(prev => (prev.kind === 'idle' ? prev : { kind: 'idle' }));
   }, []);
 
@@ -3402,20 +4088,70 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const series = currentSeries;
     const episode = currentEpisode;
     if (!video || !series || !episode) return false;
-    const position = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    /**
+     * 交接起点：**已播完的集必须从头开始**（2026-10-23 修「小窗卡在正在准备画面」）。
+     *
+     * ## 现场
+     *
+     * 日志显示主窗口在 `48.07s / 48.1s`（已播完）时把 `position=48` 传给了小窗：
+     *
+     *   225.441s  打开集 ... 期望起点=48s
+     *   240.610s  timeupdate 位置=48.07s 时长=48.1s   ← 一加载就在结尾
+     *
+     * 小窗拿到 48 秒的起点后，视频一挂载就 `ended`，而 `handleEnded` 里的
+     * `autoNext` 分支又要走 `playEpisode(下一集)` —— 那条链路在小窗刚创建、
+     * 交接包还没完全就绪时会静默失败，结果就是画面永远停在「正在准备画面」。
+     *
+     * ## 判据
+     *
+     * 与 `usableDuration` 比较而不是与 `video.duration` 比：后者在边转边播时
+     * 等于"已转码进度"，不可靠。留 1.5 秒余量——用户停在最后 1.5 秒内时，
+     * 他要看的是"下一集"，不是"这一集的最后 1.5 秒"。
+     */
+    const totalForHandoff = usableDuration(video);
+    const rawPosition = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const nearEnd = totalForHandoff > 0 && rawPosition >= totalForHandoff - 1.5;
+    /**
+     * 已播完时交接**下一集**（而不是把这一集从 0 重播）。
+     *
+     * 用户点画中画的意图是"继续看下去"，而这一集已经看完了——从 0 重播会让他
+     * 再看一遍刚看完的内容，是更差的体验。只有当"没有下一集"时才退回从头播。
+     *
+     * 注意 `episode` / `position` 必须一起换：只换 id 不换起点会让小窗从上一集
+     * 的进度（48 秒）开始播新一集，直接又跳到结尾。
+     */
+    let handoffEpisode = episode;
+    let handoffPosition = rawPosition;
+    if (nearEnd) {
+      const idx = series.episodes.findIndex(item => item.id === episode.id);
+      const nextEp = idx >= 0 ? series.episodes[idx + 1] : undefined;
+      if (nextEp) {
+        handoffEpisode = nextEp;
+        handoffPosition = 0;
+        tracePlayback(
+          `进入画中画：本集已播完（${rawPosition.toFixed(2)}/${totalForHandoff.toFixed(2)}s），改交接下一集 ${nextEp.id}`,
+        );
+      } else {
+        // 最后一集：没有下一集可接，只能从头播这一集（比停在结尾强）。
+        handoffPosition = 0;
+        tracePlayback(
+          `进入画中画：本集已播完且是最后一集，起点归零（${rawPosition.toFixed(2)}/${totalForHandoff.toFixed(2)}s）`,
+        );
+      }
+    }
     if (!video.paused) video.pause();
     try {
       await openPip({
         kind: 'drama',
         seriesId: series.id,
-        episodeId: episode.id,
+        episodeId: handoffEpisode.id,
         title: series.title,
         cover: series.cover,
         channel: series.type,
         totalEpisodes: series.episodesCount,
-        episodeNumber: episode.episodeNumber,
+        episodeNumber: handoffEpisode.episodeNumber,
         quality: currentQuality || 'auto',
-        position,
+        position: handoffPosition,
         volume,
         muted: isMuted,
         rate: playbackRate,
@@ -3428,6 +4164,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           title: item.title,
         })),
       });
+      /**
+       * 交接成功 = 主窗口这一路必须**交干净**（2026-10-26 修「同一集两条会话」）。
+       *
+       * 现在的交接只是把主窗口 `hide()`，`currentView` 仍是 `player`，所以
+       * App.tsx 里那条 `if (!isPlayer) stopPlayback()` **永远不会触发**。
+       * 结果是：主窗口的会话（含转码 ffmpeg）一直挂着，小窗又新开一个 ——
+       * 同一集两条会话、两路转码，用户感知是"进小窗后越来越卡"。
+       *
+       * 直接复用 `stopPlayback`：pause + 落盘 + detachSource + 作废会话号 +
+       * 收预取池/看门狗，正是这里要的"交出去"语义，不另写一份。
+       */
+      stopPlayback();
       return true;
     } catch (error) {
       noteFailure('进入画中画失败', error);
@@ -3478,6 +4226,56 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 看门狗唯一的定时器型资源，组件卸载必须收口。Provider 理论上与窗口同寿，
   // 但 HMR 与严格模式会重挂载，漏掉就是一条常驻 interval。
   useEffect(() => () => { stopStallWatchdog(); }, [stopStallWatchdog]);
+
+  /**
+   * 武装「末尾静默兜底」（每次 `playing` 重新武装，见 `tailEndGuardRef` 的说明）。
+   *
+   * 与卡死看门狗的分工：
+   *   - 看门狗治"画面该在动却不动"，恢复手段是重试 / 重装载；
+   *   - 这个治"已经播到结尾、所有事件都不再来了"，恢复手段是**当作播完**收尾
+   *     （落盘 100% + 触发连播），绝不重载 —— 重载只会让用户再看一遍结尾。
+   */
+  const armTailEndGuard = () => {
+    stopTailEndGuard();
+    const sessionId = activeSessionRef.current;
+    let lastPos = -1;
+    let idleTicks = 0;
+    const tick = () => {
+      tailEndGuardRef.current = null;
+      const video = videoRef.current;
+      if (!video || activeSessionRef.current !== sessionId) return;
+      // 用户暂停在结尾看画面 / 正在拖进度：都不是卡住，重置计数继续等。
+      if (video.paused || video.ended || video.seeking) {
+        lastPos = video.currentTime;
+        idleTicks = 0;
+        tailEndGuardRef.current = window.setTimeout(tick, 1000);
+        return;
+      }
+      const total = usableDuration(video);
+      const cur = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+      if (!(total > 0) || cur < total - 1.2) {
+        lastPos = cur;
+        idleTicks = 0;
+        tailEndGuardRef.current = window.setTimeout(tick, 1000);
+        return;
+      }
+      if (lastPos >= 0 && Math.abs(cur - lastPos) < 0.05) {
+        idleTicks += 1;
+      } else {
+        idleTicks = 0;
+      }
+      lastPos = cur;
+      if (idleTicks >= 3) {
+        tracePlayback(
+          `末尾静默兜底：位置=${cur.toFixed(2)}s 时长=${total.toFixed(1)}s 连续 ${idleTicks}s 未推进且没有任何媒体事件 → 按播完收尾`,
+        );
+        handleEndedRef.current?.();
+        return;
+      }
+      tailEndGuardRef.current = window.setTimeout(tick, 1000);
+    };
+    tailEndGuardRef.current = window.setTimeout(tick, 1000);
+  };
 
   /**
    * 武装卡死看门狗——**只在真正开播这一刻调用**。
@@ -3575,7 +4373,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
 
   // 监听播放器事件（缓冲、时间更新、结束）——只绑定一次，永不重绑。
   useEffect(() => {
-    const video = videoRef.current;
+    // ⚠️ 绑定源是**元素身份**（`videoElement`），不是 `videoRef.current`：
+    // 元素被重挂时只有前者会变（见 `videoElement` 的长注释）。
+    const video = videoElement;
     if (!video) return;
 
     // 起播打点「首帧-宿主」这个基准值。正常应该远小于 2000ms（本地文件是
@@ -3638,9 +4438,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         window.clearTimeout(probe.timer);
         tailProbeRef.current = null;
       }
-      setPosition(cur);
+      /**
+       * 等待转码期间，`position` 读数按**用户点的目标**显示。
+       *
+       * 否则每 250ms 一次的 `timeupdate` 会把真实播放头写回进度条：用户拖到 90s，
+       * 100ms 后就弹回当前能播的 20s —— 正是 `seekPlan` 注释承诺要避免的观感
+       * （2026-10-26 修）。落位/超时/再次拖动时 `seekWaitTargetRef` 会清空。
+       */
+      const pendingSeek = seekWaitTargetRef.current;
+      setPosition(pendingSeek !== null ? pendingSeek : cur);
       setDuration(dur);
-      saveProgressThrottledRef.current(cur, dur);
+      saveProgressThrottledRef.current(pendingSeek !== null ? pendingSeek : cur, dur);
       // 心跳：5 秒一条，带齐"界面读数到底该是多少"的三个输入。
       // 用户报"画面在播、进度条不动"时，只有这行能分清是事件没来、被守卫挡掉，
       // 还是时长算成了 0 —— 三种情况的处置完全不同。
@@ -3673,6 +4481,25 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       const sessionId = activeSessionRef.current;
       const position = video.currentTime;
       const bufferedAt = bufferedEndSeconds(video);
+      /**
+       * 预约这一刻的播放速率。
+       *
+       * ## 为什么必须记下来（2026-10-22 修「长按倍速会误跳下一集」）
+       *
+       * 下面那个 `clockIdle` 判据比的是"1.2 秒后播放头有没有动"。在 1x 下
+       * 0.06 秒的容差是合理的；但**倍速下这个判据会给出完全相反的答案**：
+       *
+       *   - 3x 正常播放时，1.2 秒该推进 3.6 秒，`clockIdle` 必然为 false（安全）；
+       *   - 可是 `waiting` 期间时钟**是停住的**。用户长按加速 → 倍速切换让
+       *     hls.js 重取分片 → 派发 `waiting` → 1.2 秒后复核读到的还是那个
+       *     旧位置 → `clockIdle` 为 true → 判成播完 → **跳下一集**。
+       *
+       * 于是"长按倍速"变成了"跳集触发器"，而且因为 `handleEnded` 里会把进度
+       * 按 100% 落盘，进度条直接飞到结尾。这就是用户报的两个症状同源。
+       *
+       * 记下速率，复核时按 `rate × 时间` 算"应该推进多少"，而不是用固定 0.06。
+       */
+      const rateAtSchedule = video.playbackRate;
       const timer = window.setTimeout(() => {
         tailProbeRef.current = null;
         // 会话已作废 / 用户离开播放器：这次复核属于旧会话，静默丢弃。
@@ -3686,6 +4513,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           paused: video.paused,
           seeking: video.seeking,
           ended: video.ended,
+          playbackRate: video.playbackRate,
         })) {
           // 复核期间播放头已经离开末尾（例如用户拖回去）：按实际是否还有画面
           // 决定要不要显示"缓冲中"。
@@ -3698,7 +4526,21 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           }
           return;
         }
-        const clockIdle = Math.abs(video.currentTime - position) <= 0.06;
+        /**
+         * 时钟"停住"的判据必须按倍速换算。
+         *
+         * 旧写法 `Math.abs(currentTime - position) <= 0.06` 在 1x 下成立、在
+         * 倍速下**恰好反过来**：3x 时正常播放 1.2 秒该推进 3.6 秒，任何小于
+         * 3.6 秒的推进都会被这条判成"没动"。而 `waiting` 期间时钟本来就停着，
+         * 于是这条判据对"倍速 + waiting"这个组合永远给 true —— 误判播完。
+         *
+         * 改成"实际推进量 vs 该推进量"的比例判据：真的在播时比例接近 1，
+         * 真的停住时接近 0。取 25% 为界——解码抖动可能让推进略慢于理论值，
+         * 但不会慢到只剩四分之一。
+         */
+        const expectedAdvance = (TAIL_PROBE_DELAY_MS / 1000) * Math.max(rateAtSchedule, 1);
+        const actualAdvance = video.currentTime - position;
+        const clockIdle = actualAdvance < expectedAdvance * 0.25;
         const dataIdle = bufferedEndSeconds(video) <= bufferedAt + 0.06;
         if (!clockIdle || !dataIdle) {
           // 时钟还在走 / 缓冲还在长：这不是末尾停滞，是正常播放或慢网缓冲。
@@ -3709,7 +4551,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           return;
         }
         tracePlayback(
-          `末尾停滞复核命中：按本集播完处理 current=${video.currentTime.toFixed(2)}s duration=${usableDuration(video).toFixed(2)}s buffered=${bufferedEndSeconds(video).toFixed(2)}s readyState=${video.readyState}`,
+          `末尾停滞复核命中：按本集播完处理 current=${video.currentTime.toFixed(2)}s duration=${usableDuration(video).toFixed(2)}s buffered=${bufferedEndSeconds(video).toFixed(2)}s readyState=${video.readyState} 倍速=${rateAtSchedule}x 应推进=${expectedAdvance.toFixed(2)}s 实推进=${actualAdvance.toFixed(2)}s`,
         );
         handleEndedRef.current?.();
       }, TAIL_PROBE_DELAY_MS);
@@ -3761,18 +4603,43 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
        * 瞬时抖动会在下一个 `timeupdate` 自行前进，复核随之作废。
        */
       const total = usableDuration(video);
-      const atTail = isPlayheadAtPlayableTail({
+      const tailSnapshot = {
         currentTime: video.currentTime,
         duration: total,
         bufferedEnd: bufferedEndSeconds(video),
         paused: video.paused,
         seeking: video.seeking,
         ended: video.ended,
-      });
+        playbackRate: video.playbackRate,
+      };
+      const atTail = isPlayheadAtPlayableTail(tailSnapshot);
       // ⚠️ 末尾复核必须放在 `readyState >= 3` 早退**之前**：末段全部进缓冲时
       // readyState 恰好是 4，而卡死就发生在这一刻。旧实现把它早退掉，
       // 判定连执行的机会都没有（这也解释了为什么打点里只剩 waiting 没有下文）。
       if (atTail) {
+        /**
+         * 缓冲已经覆盖整集末尾 → **不必等 1.2 秒复核**，当场判播完。
+         *
+         * ## 为什么可以不等（2026-10-23 修「每集末尾卡一下」）
+         *
+         * 实机日志里 5 次末尾停滞全部是"数据已经全部到齐"：
+         *
+         *   current=43.19 duration=43.24 buffered=43.26
+         *   current=44.63 duration=44.84 buffered=44.86（3x 倍速）
+         *
+         * `buffered` 已经 ≥ `duration`，再等也不会来新数据 —— 那 1.2 秒是纯延迟，
+         * 用户看到的就是"画面停在最后一帧不动，一秒多之后才切集"。
+         *
+         * 判据用 `isBufferComplete`（比 `atTail` 更严：要求缓冲真的到顶），
+         * 所以"播放头追上缓冲、但后面还有分片没落地"的情况仍然走复核，不会误判。
+         */
+        if (isBufferComplete(tailSnapshot)) {
+          tracePlayback(
+            `末尾数据已齐，立即判定播完 current=${video.currentTime.toFixed(2)}s duration=${total.toFixed(2)}s buffered=${tailSnapshot.bufferedEnd.toFixed(2)}s`,
+          );
+          handleEndedRef.current?.();
+          return;
+        }
         scheduleTailProbe();
       }
       if (video.readyState >= 3) return;
@@ -3807,6 +4674,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       cancelTailProbe();
       // 真正开播这一刻才武装看门狗（装载等待期里没有帧是正常的）。
       armStallWatchdog();
+      // 末尾静默兜底同样从这一刻起算：每次 `playing` 都重新武装，换集/暂停都会
+      // 由 tick 内部的条件自行退出或重置（见 `tailEndGuardRef`）。
+      armTailEndGuard();
       // 画面真的回来了就收回卡死提示。第 1 级原地重试恢复时由看门狗的 onHealthy
       // 负责，但第 2 级重装载换了一个**新的**看门狗实例（stalled 初值 false，
       // onHealthy 永远不会来），只能由这里兜底——否则横幅会一直挂在正常播放上。
@@ -3830,6 +4700,18 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     };
 
     const handleEnded = () => {
+      /**
+       * ⚠️ 这里**必须打点**（2026-10-23 补）。
+       *
+       * 此前整个 `handleEnded` 没有任何日志，于是"视频没播完就跳到下一集"这种
+       * 故障在 `ttv-playback.log` 里**完全没有痕迹**——只能看到 `打开集`，却分不清
+       * 是 `ended` 事件、末尾复核、还是用户按键触发的。排查时只能靠猜。
+       *
+       * 这一行把"谁触发的"和"当时播到哪"一起记下来，是后面所有判断的依据。
+       */
+      tracePlayback(
+        `handleEnded 触发 current=${Number.isFinite(video.currentTime) ? video.currentTime.toFixed(2) : 'NaN'}s duration=${usableDuration(video).toFixed(2)}s 会话=${activeSessionRef.current} 集=${videoCommittedRef.current?.episodeId ?? '(未标记)'}`,
+      );
       // 一集播完，看门狗的使命就结束了："本该在播却不播"的前提不再成立。
       // 不停掉的话，播完静置 10 秒它会照着 ended 状态（paused 仍为 false）
       // 误判成卡死并拉起恢复流程。下一集真正开播时 handlePlaying 会重新武装。
@@ -3837,6 +4719,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 末尾复核（`waiting` 那条路）与看门狗的 `onTailEnd` 可能先后都到：
       // 这里把在途复核收掉，保证一集只结算一次。
       cancelTailProbe();
+      // 末尾静默兜底同理：它自己也可能正是这次的触发者，收掉避免重复排拍。
+      stopTailEndGuard();
       setIsPlaying(false);
       setUiState({ kind: 'ended', sessionId: activeSessionRef.current });
       // 落盘"这一集看完了"必须归属**真正放完的那一集**。
@@ -3893,6 +4777,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       // 源已经报错：恢复交给下面的三级兜底链（备用直链 → Blob → 本地解析），
       // 看门狗此刻只会跟它抢同一块画面。
       stopStallWatchdog();
+      // 末尾静默兜底也一并收掉：这一集已经报了错，不能再被它判成"播完了"。
+      stopTailEndGuard();
       // 接管流程（adoptPreparedSource / playDirect）进行中：这次 error 是它自己的
       // 事务，由它重试或判死。这里若抢先弹错误页，就会出现"视频已播起来、
       // 界面却停在错误页"，也会让 playDirect 的兜底完全失效。
@@ -4033,7 +4919,9 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
                   throw new Error('流式源自愈：没有可用的播放地址');
                 }
                 streamUrlRef.current = url;
-                return attachSource(el, url)
+                // 自愈重挂的是**同一集**，所以起播点就是恢复位置本身：交给 hls.js
+                // 从一开始就拉正确的位置，比"从头拉再 seek 过去"少一次无效请求。
+                return attachSource(el, url, resumeAt > 0.5 ? resumeAt : 0)
                   .then(() => {
                     // 恢复位置必须等 metadata（2026-10-20 复查修正）。
                     //
@@ -4293,8 +5181,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // isMuted 都列进依赖，导致倒计时每秒、每次换集都全量摘绑 6 个监听器——
     // 既是性能抖动源，也有 listener 泄漏风险。所有需要的状态改由
     // handlerCtxRef 实时读取，saveProgressThrottled 用 ref 间接调用。
+    // 依赖只留**元素身份**：同一个元素不重绑（否则每次渲染都要摘挂 7 个监听器，
+    // 这正是当年把十几个 state 列进依赖踩过的坑）；换了元素必须重绑，
+    // 否则进度条 00:00 / 到结尾不连播（2026-10-25 修复的正是这一类）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [videoElement]);
 
   /**
    * 两条 context 的拆分（见 PlaybackActionsContextType 的说明）。
@@ -4323,6 +5214,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     toggleMute,
     setPlaybackRate,
     setQuality,
+    setVsrEnabled,
     playNextEpisode,
     playPrevEpisode,
     toggleSideDrawer: (open) => setIsSideDrawerOpen(prev => open ?? !prev),
@@ -4331,7 +5223,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     setMuted,
     prewarmEpisode,
     enterPip,
+    getCurrentStreamUrl: () => streamUrlRef.current || "",
     dismissStallNotice,
+    // `seekNotice` 本身不进 actions 专线（见 `PlaybackActionsContextType` 的
+    // Omit 说明），但**关闭动作**要进：小窗回流桥等宿主可能想撤掉它。
+    dismissSeekNotice,
   };
 
   /**
@@ -4361,6 +5257,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         isSideDrawerOpen,
         isDiagnosticsOpen,
         videoRef,
+        registerVideoElement,
         openEpisode,
         togglePlay,
         seek,
@@ -4369,6 +5266,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         toggleMute,
         setPlaybackRate,
         setQuality,
+        vsrEnabled,
+        setVsrEnabled,
         playNextEpisode,
         playPrevEpisode,
         toggleSideDrawer: (open) => setIsSideDrawerOpen(prev => open ?? !prev),
@@ -4381,8 +5280,11 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         errorDetail,
         prewarmEpisode,
         enterPip,
+    getCurrentStreamUrl: () => streamUrlRef.current || "",
         stallNotice,
         dismissStallNotice,
+        seekNotice,
+        dismissSeekNotice,
   };
 
   /**
@@ -4393,6 +5295,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    */
   const actionsValue = useMemo<PlaybackActionsContextType>(() => ({
     currentSeries,
+    getCurrentStreamUrl: () => streamUrlRef.current || "",
     currentEpisode,
     isPlaying,
     volume,
@@ -4411,6 +5314,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     toggleMute: () => actionsRef.current!.toggleMute(),
     setPlaybackRate: (rate) => actionsRef.current!.setPlaybackRate(rate),
     setQuality: (quality) => actionsRef.current!.setQuality(quality),
+    setVsrEnabled: (enabled) => actionsRef.current!.setVsrEnabled(enabled),
     playNextEpisode: () => actionsRef.current!.playNextEpisode(),
     playPrevEpisode: () => actionsRef.current!.playPrevEpisode(),
     toggleSideDrawer: (open) => actionsRef.current!.toggleSideDrawer(open),
@@ -4421,6 +5325,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       actionsRef.current!.prewarmEpisode(seriesId, episodeId, contentType),
     enterPip: () => actionsRef.current!.enterPip(),
     dismissStallNotice: () => actionsRef.current!.dismissStallNotice(),
+    dismissSeekNotice: () => actionsRef.current!.dismissSeekNotice(),
   }), [
     currentSeries, currentEpisode, isPlaying, volume, isMuted, playbackRate, currentQuality,
     availableQualities, isSideDrawerOpen, isDiagnosticsOpen,

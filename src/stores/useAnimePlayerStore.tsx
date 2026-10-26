@@ -17,6 +17,8 @@ import {
   type AnimeStreamKind,
 } from '../services/animePlayback';
 import { dismissPip, openPip } from '../services/pip';
+import { hintHlsLoadPosition } from '../services/hlsAttach';
+import { planSeek } from '../services/seekPlan';
 import type { EpisodeItem, SeriesDetail } from '../types/series';
 // 只借用有界起播这个纯 DOM 工具（不变量 21）：动漫 store 仍然是独立的一份状态，
 // 不引用 usePlaybackStore 的任何 state / context。
@@ -88,7 +90,7 @@ interface AnimePlayerContextValue {
   open: (seriesId: string, episodeId?: string, startPosition?: number, qualityOverride?: string) => Promise<void>;
   close: () => void;
   togglePlay: () => void;
-  seekTo: (seconds: number) => void;
+  seekTo: (seconds: number, previewing?: boolean) => void;
   seekRelative: (delta: number) => void;
   setVolume: (value: number) => void;
   toggleMute: () => void;
@@ -122,6 +124,15 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
   const [isPlaying, setIsPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
+  /**
+   * `duration` 的即时镜像。
+   *
+   * `seekTo` 是 `useCallback([])`（稳定引用，避免每帧重建控制层），闭包里读不到
+   * 最新的 state。而落位判定必须用**当前**时长做上界夹取，否则用户在时长还没
+   * 探测出来时点进度条会拿到一个不受约束的位置。
+   */
+  const durationRef = useRef(0);
+  durationRef.current = duration;
   const [buffered, setBuffered] = useState(0);
   // 默认音量与短剧播放器对齐（0.85）：两个播放器起播音量不同，用户会以为音量键失灵。
   const [volume, setVolumeState] = useState(0.85);
@@ -143,6 +154,8 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
    */
   const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
   const sessionRef = useRef(0);
+  /** 上一次"起播点落位"的撤销函数（换集 / 关闭时清掉残留监听，见 applySeek）。 */
+  const pendingSeekCleanupRef = useRef<(() => void) | null>(null);
   const watchdogRef = useRef<(() => void) | null>(null);
   const lastSaveRef = useRef(0);
   const seriesRef = useRef<SeriesDetail | null>(null);
@@ -250,6 +263,16 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
   /** 停止当前会话：拆 hls、停看门狗、清源。 */
   const haltCurrent = useCallback((clearSource: boolean) => {
     stopWatchdog();
+    // 换集/关闭：撤掉上一次"起播点落位"可能还挂着的 loadedmetadata 监听。
+    // 不撤的话，下一集的 metadata 到达时会把下一集 seek 回上一集的位置。
+    if (pendingSeekCleanupRef.current) {
+      try {
+        pendingSeekCleanupRef.current();
+      } catch {
+        // 忽略：元素可能已卸载
+      }
+      pendingSeekCleanupRef.current = null;
+    }
     const video = videoRef.current;
     if (video) {
       try {
@@ -361,18 +384,38 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
       video.volume = mutedRef.current ? 0 : volumeRef.current;
       video.dataset.sessionId = String(sessionId);
 
-      await attachAnimeSource(video, session.url, kind);
+      // 起播点随挂载交给 hls.js：它默认（`startPosition: -1`）拿元素残留的
+      // `currentTime` 当起点，而动漫换集同样不换元素 —— 不显式给就会从上一集
+      // 停下的位置接着播（下方那次 seek 是挂载之后的事，来不及）。
+      await attachAnimeSource(video, session.url, kind, startPosition);
       if (sessionRef.current !== sessionId) return;
       // 源挂载完成后再恢复倍速：下一集必须继承用户设定，而不是随媒体装载回到 1x。
       video.playbackRate = rateRef.current;
 
       if (startPosition > 0) {
+        let settled = false;
+        /**
+         * 起播点落位：**必须能撤**（2026-10-26 修）。
+         *
+         * 这块 `<video>` 是跨集复用的。旧实现只在 `loadedmetadata` 真正到达时
+         * 才移除监听：如果这一次 metadata 永远不来（源报错、用户切集、会话作废），
+         * 监听就留在元素上，等**下一集**的 metadata 到达时把下一集 seek 回
+         * 上一集的起播点 —— 表现为"换集后莫名从前一集的位置开始"。
+         */
         const applySeek = () => {
+          video.removeEventListener('loadedmetadata', applySeek);
+          if (settled) return;
+          settled = true;
+          // 会话已换 / 元素已换：这次落位属于上一集，什么都不做。
+          if (sessionRef.current !== sessionId || videoRef.current !== video) return;
           try {
             video.currentTime = startPosition;
           } catch {
             // 源尚未可 seek：忽略，用户可手动拖
           }
+        };
+        pendingSeekCleanupRef.current = () => {
+          settled = true;
           video.removeEventListener('loadedmetadata', applySeek);
         };
         if (video.readyState >= 1) applySeek();
@@ -582,15 +625,68 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
     }
   }, [persistHistory]);
 
-  const seekTo = useCallback((seconds: number) => {
+  /**
+   * 落位。
+   *
+   * ## 为什么不再直接 `video.currentTime = seconds`（2026-10-24 根治）
+   *
+   * 用户报的是「点击播放器任意位置（比如点击结尾），它会跳转到转码后的最后位置」。
+   * 根因与主播放器同一个：进度条的分母是**展示时长**，而元素的可寻址范围
+   * （`seekable.end`）可能只到已缓冲/已转码的位置。MSE 会把超范围的 seek
+   * 静默夹到范围末端 —— 于是"点结尾"变成"跳到能播到的最后一点"。
+   *
+   * 动漫源的形态更杂（本地代理的 m3u8 / 整段 mp4），但判定是同一套：
+   * 在范围内立即落位；超出范围就交给 `hintHlsLoadPosition` 催加载，并**保持
+   * 播放头不动**，等 `seekable` 长到目标再落位。
+   */
+  const seekTo = useCallback((seconds: number, previewing = false) => {
     const video = videoRef.current;
     if (!video) return;
-    try {
-      video.currentTime = Math.max(0, seconds);
-      setPosition(video.currentTime);
-    } catch {
-      // 目标超出可 seek 范围（流式源在极端情况下）：忽略
+    /**
+     * 拖动预览：只更新读数，**不发 seek、不催加载**（2026-10-26 修）。
+     *
+     * `ProgressBar` 在拖动过程中每个 `pointermove` 都会调 `onSeek(..., true)`，
+     * 短剧侧的 `seek(seconds, previewing)` 一直有这条早退，而动漫的 `seekTo`
+     * 只收一个参数 —— previewing 被静默忽略，一次拖动就发出几十次 seek +
+     * `hintHlsLoadPosition`（后者会重建 hls 加载状态机），表现为"拖着拖着画面卡"。
+     */
+    if (previewing) {
+      const total = durationRef.current;
+      const target = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+      setPosition(total > 0 ? Math.min(target, total) : target);
+      return;
     }
+    let seekableEnd = 0;
+    try {
+      if (video.seekable && video.seekable.length > 0) {
+        seekableEnd = video.seekable.end(video.seekable.length - 1);
+      }
+    } catch {
+      // 尚未就绪：按"不可寻址"处理。
+    }
+    const plan = planSeek({
+      requested: seconds,
+      duration: durationRef.current,
+      seekableEnd,
+    });
+    if (plan.kind === 'immediate') {
+      try {
+        video.currentTime = plan.target;
+        setPosition(video.currentTime);
+      } catch {
+        // 元素还没就绪：忽略，用户可再点一次。
+      }
+      return;
+    }
+    /**
+     * 超出可寻址范围：只更新界面读数与加载位置，**不动播放头**。
+     *
+     * 这里刻意不做"轮询到就落位"那一套（主播放器有，因为它要处理续转与自愈）：
+     * 动漫源是完整的远端 m3u8/mp4，浏览器自己会把 `seekable` 补齐到整段，
+     * 补上之后用户再点一次就落在正确位置。硬等反而会让"点了没反应"变成常态。
+     */
+    setPosition(plan.target);
+    hintHlsLoadPosition(video, plan.target);
   }, []);
 
   const seekRelative = useCallback((delta: number) => {

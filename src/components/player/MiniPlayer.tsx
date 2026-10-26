@@ -15,11 +15,17 @@ import {
 import { generateNextSessionId, ipcService } from '../../services/ipc';
 import { attachAnimeSource, detachAnimeSource, streamKindOf } from '../../services/animePlayback';
 import { attachSource, detachSource } from '../../services/hlsAttach';
+import { isBufferComplete, isPlayheadAtPlayableTail } from '../../services/playbackTail';
+import { resolveStartTarget } from '../../services/playbackStart';
+import { planSeek, seekableReached } from '../../services/seekPlan';
+import { hintHlsLoadPosition } from '../../services/hlsAttach';
+import { tracePlayback } from '../../services/playbackTrace';
 import { formatTime } from './ProgressBar';
 import {
   closePip,
   listenPip,
   PIP_HANDOFF_EVENT,
+  PIP_SHOW_FAILED_EVENT,
   PIP_SHOWN_EVENT,
   readPipHandoff,
   reportPipProgress,
@@ -49,6 +55,15 @@ import {
 
 /** 进度上报间隔：太密会让 IPC 变成每秒十几次的噪音，太疏则系统关闭时丢进度。 */
 const REPORT_INTERVAL_MS = 2000;
+
+/**
+ * 小窗「等转码追上目标再落位」的轮询参数。
+ *
+ * 与主播放器同量级（250ms / 8s）：转码是 13~29 倍实时，缺的内容通常几百毫秒
+ * 就补上；轮询间隔比一个分片（0.6~3 秒）短一个数量级，用户感知不到延迟。
+ */
+const PIP_SEEK_WAIT_POLL_MS = 250;
+const PIP_SEEK_WAIT_TIMEOUT_MS = 8000;
 
 /**
  * `play()` 的保底时限。
@@ -167,6 +182,31 @@ export const MiniPlayer: React.FC = () => {
    * 会继续转、继续占磁盘与 CPU（主播放器在 `stopPlayback` 里做的就是这件事）。
    */
   const backendSessionRef = useRef(0);
+  /**
+   * 这一集"该从第几秒开始"—— 等 `loadedmetadata` 到达后再校准一次的期望值。
+   *
+   * ## 为什么需要它（2026-10-24）
+   *
+   * `playEpisode` 在 `attachSource` 之后立刻写 `video.currentTime = target`，但那一刻
+   * 新源的 metadata 往往还没到（整集 HLS 的清单可能刚落地，`readyState` 还是
+   * `HAVE_NOTHING`）。规范里这种赋值要么抛 `InvalidStateError`、要么被静默忽略，
+   * **两种情况都不会记住这个意图**：等 metadata 真的到了，位置仍是元素残留的旧值。
+   *
+   * 主播放器用"等首帧就绪（`firstFrameReady`）再 `alignPlayhead`"解决这件事；
+   * 小窗没有那条等待链，所以改成"记下意图，metadata 一到就落实"。
+   *
+   * `null` 表示没有待落实的起播点（正常播放中）。落实一次即清空——否则用户手动
+   * 拖动进度条后会被这个残留值拽回去。
+   */
+  const pendingStartRef = useRef<number | null>(null);
+  /**
+   * 末尾复核的定时器（判"播完却收不到 `ended`"用的）。
+   *
+   * 声明放在这里（而不是 `handleWaiting` 旁边）是因为 `playEpisode` 也要用它：
+   * 换集时必须撤掉上一集的复核，否则它判的是上一集的结尾，会让新一集刚起播
+   * 就被判成"播完"直接跳集。`const` 不提升，放在后面 `playEpisode` 会撞 TDZ。
+   */
+  const tailProbeRef = useRef<{ timer: number; position: number } | null>(null);
   /** 取"该信哪个时长"：权威值优先，拿不到才退回媒体元素。 */
   const usableDuration = useCallback((video: HTMLVideoElement | null): number => {
     if (streamingTotalRef.current > 0) return streamingTotalRef.current;
@@ -212,6 +252,39 @@ export const MiniPlayer: React.FC = () => {
   }, [muted, usableDuration, volume]);
 
   /**
+   * 媒体事件全量打点（临时诊断，2026-10-24）。
+   *
+   * 现象：小窗里 `attachSource` 成功、`hls.js 已挂载`，但日志里**没有一条**
+   * `loadstart` / `loadeddata` / `canplay` / `playing` / `waiting` ——
+   * 说明 `<video>` 元素根本没开始加载。没有媒体事件，我加的所有兜底
+   * （`onWaiting` 里的末尾判定）就永远没有触发机会。
+   *
+   * 这里把原生事件直接挂到元素上并打点，绕过 React 的合成事件，
+   * 拿到的是"元素到底收到了什么"。定位完可以删。
+   */
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const events = [
+      'loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'canplaythrough',
+      'playing', 'waiting', 'stalled', 'suspend', 'abort', 'emptied',
+      'seeking', 'seeked', 'ended', 'error', 'durationchange',
+    ];
+    const handlers = events.map(name => {
+      const fn = () => {
+        tracePlayback(
+          `小窗媒体事件 ${name} readyState=${video.readyState} paused=${video.paused} t=${video.currentTime.toFixed(2)} dur=${Number.isFinite(video.duration) ? video.duration.toFixed(2) : 'NaN'} err=${video.error ? video.error.code : 0}`,
+        );
+      };
+      video.addEventListener(name, fn);
+      return { name, fn };
+    });
+    return () => {
+      for (const { name, fn } of handlers) video.removeEventListener(name, fn);
+    };
+  }, []);
+
+  /**
    * 解析并播放指定集。
    *
    * 所有 `await` 之后都要复查会话号：解析（短剧要等工作线程下载、动漫要重新取直链）
@@ -237,6 +310,44 @@ export const MiniPlayer: React.FC = () => {
     detachSource(video);
     // 换集即作废旧时长权威值，否则进度条会沿用上一集的总长。
     streamingTotalRef.current = 0;
+    /**
+     * 界面上的时长与位置也要**当场**清掉（2026-10-24）。
+     *
+     * 只清 `streamingTotalRef` 是不够的：`duration` / `position` 是 state，新源就绪前
+     * 它们仍是上一集的值。用户点"下一集"的那一帧于是看到"进度条还在上一集的位置、
+     * 分母还是上一集的时长"，直到新源 `timeupdate` 才跳回去 —— 这正是"进度条没有
+     * 重置"的一半来源（另一半是 hls.js 真的从旧位置起播，见下方 `pendingStartRef`）。
+     *
+     * 清成 0 是诚实的：此刻确实还没有任何可播数据。等 metadata 到了再由
+     * `onLoadedMetadata` 填上真实值。
+     */
+    setPosition(0);
+    setDuration(0);
+    setBuffered(0);
+    /**
+     * 上一集的末尾复核一并撤销。
+     *
+     * 它判的是**上一集**的结尾（`tailProbeRef` 里存着上一集的位置），留着会让
+     * 新一集刚起播就被它判成"播完"直接跳集。
+     *
+     * ⚠️ 这里不能直接调 `cancelTailProbe()`：那个 `useCallback` 定义在本函数
+     * **之后**（它依赖 `handleWaiting`，而 `handleWaiting` 又依赖本函数用到的
+     * 一批状态），`const` 不提升，调用会撞 TDZ。所以直接操作 ref —— 逻辑只有
+     * "清定时器 + 置 null"两步，没必要为它把整条依赖链倒过来。
+     */
+    if (tailProbeRef.current) {
+      window.clearTimeout(tailProbeRef.current.timer);
+      tailProbeRef.current = null;
+    }
+
+    // 换集前先停掉上一集的后端会话（2026-10-26 修「连按两次下一集留下两路 ffmpeg」）。
+    // 下面两条链路都会覆盖 `backendSessionRef.current`，旧会话号一丢就再没人能停它：
+    // 两路转码同时读源、写盘、抢 CPU，用户看到的是"小窗越切越卡"。
+    const previousBackendSession = backendSessionRef.current;
+    if (previousBackendSession > 0) {
+      backendSessionRef.current = 0;
+      void ipcService.playback.command(previousBackendSession, 'stop').catch(() => undefined);
+    }
 
     try {
       // guo 与动漫同走 playback_open（后端按 id 前缀路由到 guo-core / 动漫源）：
@@ -254,7 +365,12 @@ export const MiniPlayer: React.FC = () => {
           true,
         );
         if (sessionRef.current !== session) return;
-        await attachAnimeSource(video, opened.url, streamKindOf(opened.url, opened.streamKind));
+        await attachAnimeSource(
+          video,
+          opened.url,
+          streamKindOf(opened.url, opened.streamKind),
+          startPosition,
+        );
       } else {
         /**
          * 短剧/漫剧：**优先走整集 HLS**，与主播放器同一条链路。
@@ -283,7 +399,9 @@ export const MiniPlayer: React.FC = () => {
         if (stream && stream.streamKind === 'hls' && stream.playUrl) {
           const totalMs = stream.durationMs ?? 0;
           if (Number.isFinite(totalMs) && totalMs >= 1000) streamingTotalRef.current = totalMs / 1000;
-          await attachSource(video, stream.playUrl);
+          // 起播点必须随挂载一起交给 hls.js：它默认拿元素残留的 `currentTime`
+          // 当起点，而换集时那里是上一集停下的位置（见 attachSource 的同名参数）。
+          await attachSource(video, stream.playUrl, startPosition);
         } else {
           // 后端明确回 "file"（VSR 关闭 / 盘上只有旧链路的整集 mp4）：
           // 那条会话不用再停，`open_stream` 自己不会留转码进程。
@@ -305,19 +423,90 @@ export const MiniPlayer: React.FC = () => {
       video.playbackRate = plan.rate || 1;
       video.volume = plan.volume;
       video.muted = plan.muted;
-      if (startPosition > 0) {
-        try {
-          video.currentTime = startPosition;
-        } catch {
-          // metadata 未就绪时会被忽略：播放开始后会自然回到 0，不影响起播。
-        }
+      /**
+       * ===== 起播点必须**无条件**归位，不能只在 `startPosition > 0` 时写 =====
+       *
+       * ## 现场（2026-10-24 用户报告）
+       *
+       * 「画中画里切集，进度条不会重置，而是回到之前的位置继续播，导致这一集
+       * 看不到后面」—— 也就是换集后进度条不从 0 开始。
+       *
+       * ## 根因
+       *
+       * 小窗只有一块常驻 `<video>`，换集**不换元素**。旧写法是：
+       *
+       * ```ts
+       * if (startPosition > 0) { video.currentTime = safeStart; }
+       * ```
+       *
+       * 而换集/下一集/上一集传进来的 `startPosition` 恒为 **0**（见 `stepEpisode`
+       * 与 `handleEnded`），于是这一整段**根本不执行** —— 元素上的 `currentTime`
+       * 还是上一集停下的那个值。
+       *
+       * 为什么这会真的从旧位置起播：hls.js 的 `startPosition` 默认值是 `-1`，
+       * 语义正是"拿 `media.currentTime` 当起点"（见 `usePlaybackStore` 里
+       * `alignPlayhead` 的同一段注释，主播放器早就踩过并修好了，小窗漏了）。
+       * 于是 `attachSource` 重建 MediaSource 后，hls.js 顺着元素残留的位置开始
+       * 拉流：进度条停在上集的位置、只播剩下的那点，本集后半段永远看不到。
+       *
+       * 更隐蔽的一层：`attachSource` 内部先 `detachSource`（`removeAttribute('src')`）
+       * 再挂新实例。清 `src` 按规范会把 `currentTime` 归 0，但那是**异步**的
+       * （媒体加载算法在任务队列里跑），而 hls.js 紧接着就同步读了 `currentTime`。
+       * 也就是说"清 src 就自动归零"这个假设在两个异步时序之间是不成立的。
+       *
+       * ## 所以
+       *
+       * 目标位置由调用方给定（连播/换集一律是 0，只有从主窗口交接进来才可能是
+       * 续播点），**0 也要显式写一次**。偏移超过 0.5 秒时打点 —— 这是该症状
+       * 唯一能留在日志里的现场证据。
+       *
+       * 起点还必须**夹在时长之内**，否则一挂载就 `ended`（2026-10-23）：主窗口在
+       * 48.07s / 48.1s（已播完）时把 `position=48` 传了过来，小窗设 `currentTime=48`
+       * 后立刻到结尾 → 触发 `handleEnded` → 而那条自动续播分支在窗口刚创建时
+       * 静默失败 → 画面永远停在「正在准备画面」。万一时长与起点仍不匹配（不同
+       * 清晰度的时长差、旧交接包），宁可从头播也不要在结尾卡死。
+       *
+       * 用 `video.duration` 而不是权威时长：此处只能拿到元素自己的值，而它是判断
+       * "这个位置对当前这个源合不合法"的唯一依据。
+       */
+      const resolved = resolveStartTarget({
+        startPosition,
+        duration: video.duration,
+        currentTime: video.currentTime,
+      });
+      if (resolved.clampedFromEnd) {
+        tracePlayback(
+          `小窗起播点越界（${startPosition.toFixed(1)}s ≥ 时长 ${video.duration.toFixed(1)}s），改为从头播`,
+        );
       }
+      if (resolved.drifted) {
+        tracePlayback(
+          `小窗起播点收敛 期望=${resolved.target.toFixed(2)}s 元素现值=${(Number.isFinite(video.currentTime) ? video.currentTime : 0).toFixed(2)}s 会话=${session}（换集没有重置位置，强制归位）`,
+        );
+      }
+      try {
+        video.currentTime = resolved.target;
+      } catch {
+        // `readyState === HAVE_NOTHING` 时给 currentTime 赋值会抛 InvalidStateError。
+        // 那种状态下位置天然是 0，随后的 `loadedmetadata` 会再次校准（见
+        // `pendingStartRef`），不必在这里补救。
+      }
+      // 记下"这一集该从哪开始"：metadata 到达后要再校准一次。原因见
+      // `pendingStartRef` 的注释 —— 上面这次赋值在源还没就绪时会被忽略。
+      pendingStartRef.current = resolved.target;
 
       try {
         // 有界起播：整集 HLS 的清单还没落地时，`play()` 会一直挂着不返回，
         // 小窗就会永久停在"加载中"而没有错误可看（见 PLAY_PENDING_TIMEOUT_MS）。
+        tracePlayback(
+          `小窗起播前状态 readyState=${video.readyState} paused=${video.paused} currentSrc=${video.currentSrc ? 'yes' : 'no'} duration=${video.duration}`,
+        );
         await playBounded(video);
+        tracePlayback(`小窗 playBounded 成功 readyState=${video.readyState} paused=${video.paused}`);
       } catch (error) {
+        tracePlayback(
+          `小窗 playBounded 失败 ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)} readyState=${video.readyState}`,
+        );
         if (sessionRef.current !== session) return;
         const blocked = error instanceof DOMException && error.name === 'NotAllowedError';
         const aborted = error instanceof DOMException && error.name === 'AbortError';
@@ -479,13 +668,44 @@ export const MiniPlayer: React.FC = () => {
    */
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      void import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
+      void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
         const current = getCurrentWindow();
-        void current.show().catch(() => {});
+        /**
+         * ⚠️ **只有 show() 真的成功，才允许广播 `pip://shown`**（2026-10-23 修
+         * 「点画中画后两个窗口都没了」）。
+         *
+         * 旧写法是 `void current.show().catch(() => {})` 之后**无条件** emit：
+         * 一旦 show 失败（窗口创建时 WebView2 参数不当、窗口被系统拒绝显示等），
+         * 主窗口仍然收到 `pip://shown` 并隐藏自己 —— 结果是**两个窗口都看不见**，
+         * 用户只能去任务管理器结束进程。实测日志里只剩一条
+         * 「画中画就绪：主窗口已隐藏」，之后再无 `画中画结束`，正是这个形态。
+         *
+         * 现在把 show 的结果当作闸门：
+         *   - 成功 → 广播 `pip://shown`，主窗口隐藏（正常路径）；
+         *   - 失败 → 不广播，并广播 `pip://show-failed`，主窗口据此**保持可见**，
+         *     用户至少还能看到主界面并重试。
+         */
+        let shown = false;
+        try {
+          await current.show();
+          shown = true;
+        } catch {
+          shown = false;
+        }
+        // 焦点失败不影响"窗口已显示"，单独兜住即可。
         void current.setFocus().catch(() => {});
-        void import('@tauri-apps/api/event')
-          .then(({ emit }) => emit(PIP_SHOWN_EVENT))
-          .catch(() => {});
+        try {
+          const { emit } = await import('@tauri-apps/api/event');
+          if (shown) {
+            await emit(PIP_SHOWN_EVENT);
+          } else {
+            // 主窗口监听这个事件把界面恢复回来（见 PipReturnBridge）。
+            await emit(PIP_SHOW_FAILED_EVENT);
+          }
+        } catch {
+          // 事件系统不可达：什么都不做。主窗口仍保持可见（没有收到 shown），
+          // 用户看到的是"点了画中画但没反应"，比两个窗口全消失好得多。
+        }
       }).catch(() => {});
     }, 0);
     return () => window.clearTimeout(timer);
@@ -534,15 +754,121 @@ export const MiniPlayer: React.FC = () => {
     return () => clearInterval(timer);
   }, []);
 
+  /**
+   * 小窗的「等转码追上目标再落位」。
+   *
+   * 与主播放器同一套语义（`planSeek` / `seekableReached`），但小窗没有自愈链，
+   * 所以实现刻意更小：
+   *   - 每拍只做两件事：读 `seekable.end`、够到了就落位；
+   *   - **不动播放头**（旧写法会推到 `end - 0.05`，那正是"点结尾跳到转码末端"）；
+   *   - 目标变了（用户又点了一次）就由新的等待取代旧的；
+   *   - 会话变了（换集/关窗）立刻作废。
+   *
+   * 超时给 8 秒，与主播放器同量级：转码是 13~29 倍实时，缺的内容通常几百毫秒
+   * 就补上；真卡住时继续等没有意义，`handleWaiting` 的末尾兜底会接手。
+   */
+  const seekWaitRef = useRef<{ timer: number; target: number; generation: number } | null>(null);
+  const seekWaitGenerationRef = useRef(0);
+
+  const cancelSeekWaitInPip = useCallback(() => {
+    seekWaitGenerationRef.current += 1;
+    if (seekWaitRef.current) {
+      window.clearTimeout(seekWaitRef.current.timer);
+      seekWaitRef.current = null;
+    }
+  }, []);
+
+  const waitForSeekableInPip = useCallback((video: HTMLVideoElement, target: number) => {
+    // 同一目标重复触发（pointerdown + pointerup）直接忽略。
+    if (seekWaitRef.current && Math.abs(seekWaitRef.current.target - target) < 0.5) return;
+    cancelSeekWaitInPip();
+    const generation = seekWaitGenerationRef.current;
+    const sessionAtWait = sessionRef.current;
+    const deadline = performance.now() + PIP_SEEK_WAIT_TIMEOUT_MS;
+
+    const poll = () => {
+      if (seekWaitGenerationRef.current !== generation) return;
+      seekWaitRef.current = null;
+      if (sessionRef.current !== sessionAtWait) return;
+      if (videoRef.current !== video) return;
+      let end = 0;
+      try {
+        if (video.seekable && video.seekable.length > 0) {
+          end = video.seekable.end(video.seekable.length - 1);
+        }
+      } catch {
+        // 读不到：下一拍再试。
+      }
+      if (seekableReached(end, target)) {
+        tracePlayback(`小窗转码已推进到 ${end.toFixed(1)}s，落位到 ${target.toFixed(1)}s`);
+        try {
+          video.currentTime = target;
+          setPosition(target);
+        } catch {
+          // 元素已失效：放弃。
+        }
+        return;
+      }
+      if (performance.now() >= deadline) {
+        // 超时保持原位：不跳到末端（那正是要根治的错误落位）。
+        tracePlayback(
+          `小窗等待转码超时 目标=${target.toFixed(1)}s 末端=${end.toFixed(1)}s，保持在原位`,
+        );
+        return;
+      }
+      const timer = window.setTimeout(poll, PIP_SEEK_WAIT_POLL_MS);
+      seekWaitRef.current = { timer, target, generation };
+    };
+    const timer = window.setTimeout(poll, PIP_SEEK_WAIT_POLL_MS);
+    seekWaitRef.current = { timer, target, generation };
+  }, [cancelSeekWaitInPip]);
+
+  /**
+   * 落位。
+   *
+   * ## 为什么不再直接赋值（2026-10-24 根治）
+   *
+   * 用户报的是「点击播放器任意位置（比如点击结尾），它会跳转到转码后的最后位置」。
+   * 小窗的进度条分母同样是**源片真实时长**（`streamingTotalRef`），而播放源是
+   * 边转边播的整集 HLS —— `seekable.end` 只到已转位置。MSE 会把超范围的 seek
+   * 静默夹到末端，于是"点结尾"变成"跳到能播到的最后一点"。
+   *
+   * 现在与主播放器同一套判定（`planSeek`）：
+   *   - 范围内 → 立即落位；
+   *   - 超出 → 只更新读数 + 让 hls.js 从目标位置拉流，**播放头不动**；
+   *   - 等转码追上后由 `waitForSeekableInPip` 落位。
+   */
   const seekTo = useCallback((seconds: number) => {
     const video = videoRef.current;
     if (!video || !Number.isFinite(seconds)) return;
+    let seekableEnd = 0;
     try {
-      video.currentTime = Math.max(0, seconds);
+      if (video.seekable && video.seekable.length > 0) {
+        seekableEnd = video.seekable.end(video.seekable.length - 1);
+      }
     } catch {
-      // 尚未可寻址：忽略。
+      // 尚未就绪：按"不可寻址"处理。
     }
-  }, []);
+    const plan = planSeek({
+      requested: seconds,
+      duration: usableDuration(video),
+      seekableEnd,
+    });
+    if (plan.kind === 'immediate') {
+      cancelSeekWaitInPip();
+      try {
+        video.currentTime = plan.target;
+        setPosition(plan.target);
+      } catch {
+        // 尚未可寻址：忽略。
+      }
+      return;
+    }
+    // 超出可寻址范围：只改读数与加载位置，绝不动播放头（见 `planSeek` 的注释）。
+    setPosition(plan.target);
+    hintHlsLoadPosition(video, plan.target);
+    waitForSeekableInPip(video, plan.target);
+  }, [cancelSeekWaitInPip, usableDuration, waitForSeekableInPip]);
 
   const seekRelative = useCallback((delta: number) => {
     const video = videoRef.current;
@@ -602,6 +928,110 @@ export const MiniPlayer: React.FC = () => {
     const next = handoff.episodes[index + 1];
     if (next) void playEpisode(handoff, next.id, 0);
   }, [handoff, hasNext, playEpisode, report]);
+
+  /**
+   * 末尾停滞兜底：**播完却收不到 `ended` 时，自己判播完**（2026-10-24）。
+   *
+   * ## 现场（ttv-playback.log，小窗会话 900000001）
+   *
+   * ```
+   *  58.020s  画中画就绪
+   *  67.068s  连播预取 下一集=...          ← 下一集其实已经备好
+   *  81.922s  hls.js 错误 bufferAppendNoProgress
+   * 102.021s  hls.js 错误 bufferStalledError
+   * 107.575s  hls.js 错误 mediaSourceRequiresReset
+   * 107.577s  小窗回流 位置=48s            ← 用户手动关掉，位置停在结尾
+   * ```
+   *
+   * 整段里**没有任何 `ended`**。原因与主播放器当年踩的是同一个：
+   * 播放源是边转边播的整集 HLS，末尾分片与容器时长差几十毫秒，Chromium
+   * 不会派发 `ended`；而 MSE 在末尾追加不动时会抛 `bufferStalledError`，
+   * 随后 `mediaSourceRequiresReset` —— 播放器既不放下一集，也永远停在
+   * 「正在准备画面」。
+   *
+   * ## 为什么主播放器没这个问题
+   *
+   * `usePlaybackStore` 里有 `isPlayheadAtPlayableTail` + 1.2 秒复核 +
+   * `isBufferComplete` 立即判定三件套。**小窗一个都没有** ——
+   * 它的 `onWaiting` 只有 `setIsLoading(true)`，然后就一直等下去。
+   *
+   * ## 这里的做法
+   *
+   * 与主播放器同一套判据（复用 `playbackTail` 的纯函数，不重复实现）：
+   * `waiting` 时若"播放头停在可播末端"且"缓冲已覆盖末尾"，立即按播完处理；
+   * 否则预约 1.2 秒复核，期间时钟推进就撤销。判完调 `handleEnded`，
+   * 于是自动连播、进度落盘、`isLoading` 复位全都走既有路径。
+   */
+  const cancelTailProbe = useCallback(() => {
+    if (tailProbeRef.current) {
+      window.clearTimeout(tailProbeRef.current.timer);
+      tailProbeRef.current = null;
+    }
+  }, []);
+
+  const handleWaiting = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) {
+      setIsLoading(true);
+      return;
+    }
+    const snapshot = {
+      currentTime: video.currentTime,
+      duration: usableDuration(video),
+      bufferedEnd: video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0,
+      paused: video.paused,
+      seeking: video.seeking,
+      ended: video.ended,
+      playbackRate: video.playbackRate,
+    };
+    // 数据已全部到齐：不必等复核，当场判播完。
+    if (isPlayheadAtPlayableTail(snapshot) && isBufferComplete(snapshot)) {
+      tracePlayback(
+        `小窗末尾数据已齐，立即判定播完 current=${video.currentTime.toFixed(2)}s duration=${snapshot.duration.toFixed(2)}s`,
+      );
+      setIsLoading(false);
+      handleEnded();
+      return;
+    }
+    // 停在可播末端但缓冲未到顶：预约一次复核（与主播放器同一个 1.2 秒窗口）。
+    if (isPlayheadAtPlayableTail(snapshot) && !tailProbeRef.current) {
+      const position = video.currentTime;
+      const timer = window.setTimeout(() => {
+        tailProbeRef.current = null;
+        const v = videoRef.current;
+        if (!v || v.paused || v.seeking || v.ended) return;
+        const after = {
+          currentTime: v.currentTime,
+          duration: usableDuration(v),
+          bufferedEnd: v.buffered.length > 0 ? v.buffered.end(v.buffered.length - 1) : 0,
+          paused: v.paused,
+          seeking: v.seeking,
+          ended: v.ended,
+          playbackRate: v.playbackRate,
+        };
+        if (!isPlayheadAtPlayableTail(after)) {
+          setIsLoading(v.readyState < 3);
+          return;
+        }
+        // 时钟没推进才算真的停住（按倍速换算，与主播放器一致）。
+        const expected = 1.2 * Math.max(v.playbackRate || 1, 1);
+        if (v.currentTime - position < expected * 0.25) {
+          tracePlayback(
+            `小窗末尾停滞复核命中：按本集播完处理 current=${v.currentTime.toFixed(2)}s duration=${after.duration.toFixed(2)}s`,
+          );
+          setIsLoading(false);
+          handleEnded();
+        } else {
+          setIsLoading(v.readyState < 3);
+        }
+      }, 1200);
+      tailProbeRef.current = { timer, position };
+    }
+    setIsLoading(true);
+  }, [handleEnded, usableDuration]);
+
+  // 换集 / 卸载时收掉在途复核，避免它落到新一集上。
+  useEffect(() => () => cancelTailProbe(), [cancelTailProbe]);
 
   // 键盘快捷键与主播放器保持一致（空格/方向键/Esc）。
   useEffect(() => {
@@ -675,12 +1105,46 @@ export const MiniPlayer: React.FC = () => {
         onClick={togglePlay}
         onTimeUpdate={(event) => {
           const video = event.currentTarget;
+          // 时钟真的往前走了 → 撤销在途的末尾复核（与主播放器同一条反证）。
+          const probe = tailProbeRef.current;
+          if (probe && video.currentTime > probe.position + 0.06) cancelTailProbe();
           setPosition(video.currentTime);
           setDuration(usableDuration(video));
           setBuffered(video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0);
           report();
         }}
         onDurationChange={(event) => setDuration(usableDuration(event.currentTarget))}
+        /**
+         * 新源 metadata 到达：把 `playEpisode` 记下的起播点真正落实。
+         *
+         * 这一步不能省（2026-10-24）。`playEpisode` 里那次 `video.currentTime = target`
+         * 发生在 `attachSource` 之后，而整集 HLS 那一刻常常还是 `HAVE_NOTHING`：
+         * 赋值被忽略、也不会有任何报错。等到 metadata 就绪（这里）才是唯一保证
+         * 生效的时机 —— 少了它，换集后就会从上一集残留的位置起播。
+         *
+         * 落实后立刻清空：用户随后手动拖进度条不该被这个残留意图拽回去。
+         */
+        onLoadedMetadata={(event) => {
+          const video = event.currentTarget;
+          setDuration(usableDuration(video));
+          const pending = pendingStartRef.current;
+          if (pending === null) return;
+          pendingStartRef.current = null;
+          const resolved = resolveStartTarget({
+            startPosition: pending,
+            duration: video.duration,
+            currentTime: video.currentTime,
+          });
+          if (!resolved.drifted) return;
+          try {
+            video.currentTime = resolved.target;
+            tracePlayback(
+              `小窗 metadata 就绪后校准起播点 期望=${resolved.target.toFixed(2)}s 校正前=${(Number.isFinite(video.currentTime) ? video.currentTime : 0).toFixed(2)}s`,
+            );
+          } catch {
+            // 极少数情况下仍不可寻址：位置保持现状，至少不会卡死。
+          }
+        }}
         onProgress={(event) => {
           const video = event.currentTarget;
           setBuffered(video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0);
@@ -693,7 +1157,7 @@ export const MiniPlayer: React.FC = () => {
           setIsPlaying(false);
           report(true);
         }}
-        onWaiting={() => setIsLoading(true)}
+        onWaiting={handleWaiting}
         onPlaying={() => setIsLoading(false)}
         onVolumeChange={(event) => {
           setVolume(event.currentTarget.volume);

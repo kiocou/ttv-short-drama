@@ -31,6 +31,7 @@ import {
   SkipForward,
   RotateCcw,
   RotateCw,
+  Info,
 } from 'lucide-react';
 
 export const VideoSurface: React.FC = () => {
@@ -55,8 +56,12 @@ export const VideoSurface: React.FC = () => {
     errorDetail,
     stallNotice,
     dismissStallNotice,
+    seekNotice,
+    dismissSeekNotice,
     finishedAll,
     sessionId,
+    vsrEnabled,
+    registerVideoElement,
   } = usePlaybackStore();
 
   /**
@@ -475,9 +480,29 @@ export const VideoSurface: React.FC = () => {
     >
       {/* 核心 HTML5 视频渲染宿主 */}
       <video
-        ref={videoRef}
+        // ⚠️ 必须是 `registerVideoElement`（callback ref），不能是 `videoRef`：
+        // 元素被重挂时 store 只有通过它才感知得到，并据此重绑媒体监听器。
+        // 用普通 ref 的后果是「进度条 00:00 / 到结尾不连播」（见 store 里
+        // `videoElement` 那段说明）。
+        ref={registerVideoElement}
         playsInline
-        className="w-full h-full object-contain cursor-pointer"
+        /*
+          VSR 关闭时**故意**把视频推进合成器（`.ttv-vsr-off`）。
+
+          ## 为什么必须这么做（2026-10-25 实测确认）
+
+          应用侧的「VSR 开关」只控制**是否为超分而转码**：开 = 转 H.264 分片，
+          关 = 源编码直连（红果实测是 HEVC / hvc1，`ffmpeg -i` 已核对）。但当前
+          驱动 + WebView2（已开 `PlatformHEVCDecoderSupport`）**对 HEVC 一样会做
+          RTX VSR**，所以关掉之后画面依然被超分、驱动角标依然亮 —— 用户看到的
+          就是"开关没反应"。
+
+          唯一能让"关闭"真的生效的办法，是让视频离开独立呈现平面：舞台里那条
+          「禁止祖先 transform / backdrop-filter」的规则本来是为了让 VSR **生效**
+          （不变量 26），这里反向用它来让 VSR **失效**。只在关闭时挂，开启时这条
+          路径完全不存在，不会有任何额外合成开销。
+        */
+        className={`w-full h-full object-contain cursor-pointer${vsrEnabled ? '' : ' ttv-vsr-off'}`}
         onClick={handleVideoSurfaceClick}
         onPointerUp={handleSurfacePointerUp}
         onPointerCancel={handleSurfacePointerUp}
@@ -577,6 +602,36 @@ export const VideoSurface: React.FC = () => {
             <button
               type="button"
               onClick={dismissStallNotice}
+              className="btn-fluent-action -mr-1.5 flex-shrink-0 pointer-events-auto"
+              title="关闭提示"
+              aria-label="关闭提示"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/*
+        「这一段还没转好」（2026-10-24）。
+
+        与上面的卡死提示**分开渲染**：两者说的不是一件事 —— 卡死是"画面停了、
+        正在自愈"，这里是"你点的位置还没转好、画面本身正常"。文案、颜色、
+        用户该做的动作都不同，合成一张卡会给出误导信息。
+
+        位置放在卡死提示下方（top-36），两条同时出现时不会互相盖住
+        （卡死时播放确实可能同时在等转码，那种情况两条都成立）。
+      */}
+      {seekNotice && (
+        <div className="absolute top-36 inset-x-0 z-30 flex justify-center pointer-events-none px-6">
+          <div className="min-w-[268px] max-w-md px-4 py-3 rounded-2xl bg-black/70 shadow-2xl border border-white/15 flex items-center gap-2.5">
+            <Info className="w-4 h-4 text-sky-400 flex-shrink-0" />
+            <span className="text-xs font-semibold text-white leading-relaxed">
+              {seekNotice}
+            </span>
+            <button
+              type="button"
+              onClick={dismissSeekNotice}
               className="btn-fluent-action -mr-1.5 flex-shrink-0 pointer-events-auto"
               title="关闭提示"
               aria-label="关闭提示"

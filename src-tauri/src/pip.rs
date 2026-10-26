@@ -79,6 +79,12 @@ pub const EVENT_HANDOFF: &str = "pip://handoff";
 /// 前端侧的广播点见 `bootPip` / `MiniPlayer` 的 revealWindow；这里的复用分支
 /// 也要补一条：复用意味着窗口早就加载好了，不会再走一次"首帧后 show"。
 pub const EVENT_SHOWN: &str = "pip://shown";
+/// 小窗 → 主窗口：**小窗没能显示出来**（show / set_focus 失败）。
+///
+/// 主窗口是收到 `pip://shown` 才隐藏自己的，所以"显示失败"必须有一条明确的
+/// 反向信号：否则要么两个窗口一起消失，要么主窗口一直等着。前端常量的同名定义
+/// 见 `services/pip.ts` 的 `PIP_SHOW_FAILED_EVENT`。
+pub const EVENT_SHOW_FAILED: &str = "pip://show-failed";
 
 /// 小窗默认尺寸（逻辑像素，16:9）。再小就看不清人脸，再大就不叫"小窗"了。
 const DEFAULT_WIDTH: f64 = 420.0;
@@ -207,11 +213,17 @@ fn corner_position(app: &AppHandle) -> (f64, f64) {
 /// （同一标签第二次 build 会直接报错），只下发改动后的交接包。
 fn ensure_window(app: &AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
-        let _ = window.show();
-        let _ = window.set_focus();
-        // 复用分支不会走前端的"首帧后 show"，所以那一拍的通知必须由这里补：
-        // 主窗口在等 `pip://shown` 才隐藏自己，漏发就会两个窗口同时可见。
-        let _ = app.emit_to(MAIN_WINDOW_LABEL, EVENT_SHOWN, ());
+        // ⚠️ 复用分支必须**确认 show 成功**才广播 `pip://shown`（2026-10-26 修）。
+        // 主窗口据此 hide() 自己：show() 失败还照发通知，结果就是"两个窗口都
+        // 不见了"——而那时用户已经完全看不到画面、也没有入口把它叫回来。
+        let shown = window.show().is_ok() && window.set_focus().is_ok();
+        if shown {
+            // 复用分支不会走前端的"首帧后 show"，所以那一拍的通知必须由这里补：
+            // 主窗口在等 `pip://shown` 才隐藏自己，漏发就会两个窗口同时可见。
+            let _ = app.emit_to(MAIN_WINDOW_LABEL, EVENT_SHOWN, ());
+        } else {
+            let _ = app.emit_to(MAIN_WINDOW_LABEL, EVENT_SHOW_FAILED, ());
+        }
         return Ok(());
     }
 
@@ -228,6 +240,48 @@ fn ensure_window(app: &AppHandle) -> Result<(), String> {
         .skip_taskbar(true)
         .shadow(true)
         .resizable(true)
+        // ⚠️ **必须与主窗口同款的后台豁免参数**（2026-10-23 修「画中画切集卡死」）。
+        //
+        // ## 为什么小窗缺了它就会卡
+        //
+        // 主窗口在 `tauri.conf.json` 里配了 `--disable-backgrounding-occluded-windows`
+        // 与 `--disable-renderer-backgrounding`，但**小窗是运行时新建的**，
+        // `WebviewWindowBuilder` 不会继承主窗口的 `additionalBrowserArgs` ——
+        // 不显式传就完全用默认值。
+        //
+        // 后果：画中画窗口按定义就是"被别的窗口遮挡"（`always_on_top` + 用户在前台
+        // 干别的）。WebView2 的默认策略会把这类窗口判定为后台，然后
+        // **静默暂停其中的视频播放**（`AbortError: video-only background media was
+        // paused to save power`）。用户看到的就是"切一集就卡住好久，点一下下一集
+        // 才恢复"——因为那次点击带来了一次短暂的前台激活，播放被允许跑起来。
+        //
+        // ## ⚠️ 传这个参数会**整体覆盖** wry 的默认值，必须自己补全
+        //
+        // 这是 2026-10-23 踩过的坑（现象：点画中画后主窗口隐藏、小窗根本不出现，
+        // 枚举该进程一个窗口都没有）。`wry-0.55.1/src/webview2/mod.rs:294` 是：
+        //
+        // ```rust
+        // let additional_browser_args = pl_attrs.additional_browser_args
+        //     .unwrap_or_else(|| { /* 默认值：--disable-features=... + autoplay ... */ });
+        // ```
+        //
+        // 也就是说**只要传了字符串，wry 那套默认参数就一个都不会生效**，包括
+        // `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`
+        // 与 `--autoplay-policy`。所以下面必须把默认值原样抄上，再追加我们要的
+        // 后台豁免项 —— 少抄一项就会让 WebView2 以非预期配置初始化。
+        //
+        // 三个后台豁免参数各自的作用：
+        //   - `disable-backgrounding-occluded-windows`：被遮挡也不降优先级；
+        //   - `disable-renderer-backgrounding`：渲染进程不进后台节流；
+        //   - `disable-background-timer-throttling`：定时器不被降频到 1 次/秒
+        //     （进度上报与看门狗都依赖定时器精度）。
+        .additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+             --autoplay-policy=no-user-gesture-required \
+             --disable-background-timer-throttling \
+             --disable-backgrounding-occluded-windows \
+             --disable-renderer-backgrounding",
+        )
         // **先不可见，由前端在首帧渲染完成后 show()**。
         //
         // WebView2 创建窗口到页面出画之间有一段"白底空窗"：窗口一 build 就可见的话，
@@ -399,6 +453,9 @@ pub async fn pip_open(app: AppHandle, handoff: PipHandoff) -> Result<(), String>
     }
     if let Ok(mut progress) = state.progress.lock() {
         *progress = PipProgress {
+            // 初始位置必须带上交接点：小窗"打开后立刻被关闭/被系统关掉"时，
+            // 回流用的是这份快照。留 0 会把主窗口从 0 秒起播（2026-10-26 修）。
+            position: handoff.position.max(0.0),
             volume: handoff.volume,
             muted: handoff.muted,
             rate: handoff.rate,

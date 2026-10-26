@@ -18,7 +18,51 @@ import {
   Layers,
   Lock,
   LockOpen,
+  Sparkles,
 } from 'lucide-react';
+
+/**
+ * 播放进度条。
+ *
+ * ⚠️ **数据必须由 props 传入，不能自己读 store**（2026-10-24 修「动漫进度条不动」）。
+ *
+ * ## 上一版错在哪
+ *
+ * 为了减少重渲染，曾让这里直接 `usePlaybackStore()` 订阅短剧的 store，理由是
+ * "高频刷新限制在叶子组件里"。但 `PlayerHud` 是**短剧与动漫共用**的呈现层，
+ * 而动漫的数据在 `useAnimePlayerStore` —— 于是动漫播放器的进度条读的永远是
+ * 短剧 store 里的值（0 或上一次短剧的残留），**完全不动**。
+ *
+ * 这违反了这个组件文件头写明的边界：「本组件不读任何 store、不碰 `<video>`、
+ * 不做会话判定。它渲染什么完全由 props 决定」。为了性能优化打破这条边界，
+ * 代价是两个播放器串了数据 —— 不值得。
+ *
+ * ## 性能怎么办
+ *
+ * 交给调用方：短剧侧把 `position` 等高频字段包在一个只订阅这些字段的小组件里
+ * 传进来（见 `VideoSurface` 的 `HudLiveData`），动漫侧传它自己的值。HUD 本身
+ * 保持纯 props，两个播放器各喂各的。
+ */
+const LiveProgressBar: React.FC<{
+  position: number;
+  duration: number;
+  buffered: number;
+  onSeek: (seconds: number, previewing?: boolean) => void;
+}> = ({ position, duration, buffered, onSeek }) => (
+  <ProgressBar position={position} duration={duration} buffered={buffered} onSeek={onSeek} />
+);
+
+/** 滚轮时间读数：同样纯 props。 */
+const LiveTimeReadout: React.FC<{ position: number; duration: number }> = ({ position, duration }) => (
+  <div
+    className="ttv-time"
+    aria-label={`已播放 ${Math.floor(position)} 秒，共 ${Math.floor(duration)} 秒`}
+  >
+    <RollingTime value={position} />
+    <span className="time-sep">/</span>
+    <RollingTime value={duration} variant="duration" />
+  </div>
+);
 
 /**
  * 播放器 HUD（顶部标题岛 + 底部操控坞）——短剧与动漫**共用同一套呈现层**。
@@ -62,6 +106,14 @@ export interface PlayerHudProps {
   /** 返回按钮的 tooltip（短剧是"返回剧集列表"，动漫是"返回详情"）。 */
   backTitle?: string;
 
+  /*
+    `position` / `duration` / `buffered` 由调用方传入（2026-10-24 恢复）。
+
+    曾经为了减少重渲染把这三项从 props 摘掉、改由叶子组件自己读 store，
+    结果动漫播放器读到的是短剧 store 的值，进度条完全不动。这个组件是
+    两个播放器共用的呈现层，数据必须由调用方喂——性能优化交给调用方做
+    （短剧侧有 `HudLiveData` 只订阅高频字段），而不是在这里跨界读 store。
+  */
   position: number;
   duration: number;
   buffered: number;
@@ -86,6 +138,33 @@ export interface PlayerHudProps {
   currentQuality: string;
   qualityOptions: PlayerQualityOption[];
 
+  /**
+   * 视频增强（RTX VSR）当前是否开启。
+   *
+   * ⚠️ 与 position / duration 同理：**必须由调用方喂**。短剧侧读
+   * `usePlaybackStore`、动漫侧读 `useAnimePlayerStore` / 设置，HUD 自己不碰
+   * 任何 store —— 动漫进度条读到短剧 store 那次事故就是打破这条边界的代价。
+   */
+  vsrEnabled: boolean;
+  /**
+   * 用户拨动 VSR 开关。
+   *
+   * 调用方负责真正的写设置与"让当前这一集立即走新链路"：短剧侧是
+   * `usePlaybackStore().setVsrEnabled`（内部会按原位置重新解析），动漫侧直接写
+   * 全局设置（动漫源不经过转码链路，见 `vsrAppliesToSource`）。
+   */
+  onToggleVsr: (enabled: boolean) => void;
+  /**
+   * 当前播放源是否真的受 VSR 链路影响。
+   *
+   * 动漫源是原生 H.264 直连，本来就走驱动侧增强，没有"转码才有 VSR"这回事。
+   * 传 `false` 时浮层会如实写明"此开关作用于短剧/漫剧"，而不是让用户拨了
+   * 一个在这块画面上看不出效果、还以为是坏了的开关（不变量 8：诚实报告边界）。
+   *
+   * 默认 `true`（短剧/漫剧）。
+   */
+  vsrAppliesToSource?: boolean;
+
   onToggleLock: () => void;
   /** 交给画中画小窗播放（独立置顶窗口，可拖动、可拉伸改大小）。 */
   onEnterPip: () => void;
@@ -95,7 +174,7 @@ export interface PlayerHudProps {
   onPointerMove?: (e: React.MouseEvent) => void;
 
   onTogglePlay: () => void;
-  onSeek: (seconds: number) => void;
+  onSeek: (seconds: number, previewing?: boolean) => void;
   onSeekRelative: (deltaSeconds: number) => void;
   onVolumeChange: (value: number) => void;
   onToggleMute: () => void;
@@ -124,6 +203,9 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   effectivePlaybackRate = null,
   currentQuality,
   qualityOptions,
+  vsrEnabled,
+  onToggleVsr,
+  vsrAppliesToSource = true,
   onToggleLock,
   onEnterPip,
   onToggleFullscreen,
@@ -145,6 +227,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   const [showVolumeSlider, setShowVolumeSlider] = useState(false);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
+  const [showEnhanceMenu, setShowEnhanceMenu] = useState(false);
 
   const controlsRef = useRef<HTMLDivElement | null>(null);
 
@@ -155,6 +238,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
         setShowQualityMenu(false);
         setShowSpeedMenu(false);
         setShowVolumeSlider(false);
+        setShowEnhanceMenu(false);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
@@ -167,8 +251,24 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
       setShowQualityMenu(false);
       setShowSpeedMenu(false);
       setShowVolumeSlider(false);
+      setShowEnhanceMenu(false);
     }
   }, [isLocked]);
+
+  /**
+   * Esc 收起增强浮层。
+   *
+   * 它是 `role="dialog"`，用户会预期 Esc 能退出（下面那条「锁定态 Esc 解锁」是
+   * 另一回事，两者互不影响）。清晰度 / 倍速是纯气泡，没有这个预期，不在这里统一处理。
+   */
+  useEffect(() => {
+    if (!showEnhanceMenu) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowEnhanceMenu(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showEnhanceMenu]);
 
   // Esc 解锁：收起后鼠标若已停住，键盘是唯一的出口
   useEffect(() => {
@@ -264,8 +364,8 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
         {/* 底部操控坞：进度槽与控件同处一张晶体大卡片 */}
         <div className="ttv-dock" onClick={(e) => e.stopPropagation()}>
           <div ref={controlsRef} className="mica-crystal-card crystal-surface">
-            {/* 进度槽内嵌于卡片顶部 */}
-            <ProgressBar position={position} duration={duration} buffered={buffered} onSeek={onSeek} />
+            {/* 进度槽内嵌于卡片顶部（数据由调用方传入，见 PlayerHudProps 的说明） */}
+            <LiveProgressBar position={position} duration={duration} buffered={buffered} onSeek={onSeek} />
 
             <div className="controls-deck-row">
               {/* 左侧：集数切换、快进快退、播放主键、滚轮时间读数 */}
@@ -343,12 +443,8 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
 
                 <div className="crystal-divider" />
 
-                {/* 机械滚轮时间读数 */}
-                <div className="ttv-time" aria-label={`已播放 ${Math.floor(position)} 秒，共 ${Math.floor(duration)} 秒`}>
-                  <RollingTime value={position} />
-                  <span className="time-sep">/</span>
-                  <RollingTime value={duration} variant="duration" />
-                </div>
+                {/* 机械滚轮时间读数（自己订阅 store，不吃 props 链的高频更新） */}
+                <LiveTimeReadout position={position} duration={duration} />
               </div>
 
               {/* 右侧：音量、清晰度、倍速、选集、全屏 */}
@@ -361,6 +457,9 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                     setShowVolumeSlider(prev => !prev);
                     setShowQualityMenu(false);
                     setShowSpeedMenu(false);
+                    // 四个浮层必须互斥：增强浮层宽 292px，叠在倍速/清晰度之上时
+                    // 会把对方整个盖住（同 z-index 50，DOM 靠后者在上）。
+                    setShowEnhanceMenu(false);
                   }}
                   onToggleMute={onToggleMute}
                   onVolumeChange={(v) => onVolumeChange(v)}
@@ -377,6 +476,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowQualityMenu(prev => !prev);
                       setShowSpeedMenu(false);
                       setShowVolumeSlider(false);
+                      setShowEnhanceMenu(false);
                     }}
                     title={qualitySelectable ? '切换清晰度' : '当前播放源仅提供单一画质'}
                     className="btn-text-action"
@@ -414,6 +514,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowSpeedMenu(prev => !prev);
                       setShowQualityMenu(false);
                       setShowVolumeSlider(false);
+                      setShowEnhanceMenu(false);
                     }}
                     className={`btn-text-action${effectivePlaybackRate !== null ? ' is-boosting' : ''}`}
                     title="切换播放倍速（长按 ← / → 临时加速，加速中按 ↑ / ↓ 换档）"
@@ -446,6 +547,90 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                     <div className="crystal-menu-note">
                       长按 ← / → 临时加速，加速中按 ↑ / ↓ 换档（智能 / 1.5x / 2x / 3x）
                     </div>
+                  </div>
+                </div>
+
+                {/*
+                  视频增强：VSR 超分开关。**所有视频播放页共用**
+                  （短剧 / 漫剧由 PlayerControls 接线，动漫由 AnimeVideoSurface 接线）。
+
+                  ## 为什么放在这里而不是设置页
+                  用户拨这个开关的时机永远是"正看着这一集"的时候。放在设置页等于
+                  让人先退出播放器、改设置、再回来找进度 —— 而链路本身完全支持
+                  原地重载（见 usePlaybackStore 里 `vsrSwitchRef` 那段）。
+
+                  ## 视觉约束
+                  浮层只用 `.crystal-flyout` / `.crystal-surface`，与清晰度、倍速
+                  菜单同一套材质：`.ttv-video-stage` 内所有 backdrop-filter 被强制
+                  关掉（crystal.css 第 122 行那条规则），所以这里不会把视频拉进
+                  合成器、也不会再次踩到"增强失效"那个坑（不变量 26）。
+                */}
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowEnhanceMenu(prev => !prev);
+                      setShowQualityMenu(false);
+                      setShowSpeedMenu(false);
+                      setShowVolumeSlider(false);
+                    }}
+                    className={`btn-text-action${vsrEnabled ? ' is-on' : ''}`}
+                    title="视频增强：VSR 超分（实时生效）"
+                    aria-haspopup="dialog"
+                    aria-expanded={showEnhanceMenu}
+                    aria-controls="ttv-enhance-panel"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>增强</span>
+                  </button>
+
+                  <div
+                    id="ttv-enhance-panel"
+                    // `hudShown` 必须一起判：HUD 在 2.5 秒无指针活动后整体淡出，
+                    // 而浮层自己的 `.open` 会把 `pointer-events` 恢复成 auto ——
+                    // 只看 showEnhanceMenu 的话，用户读文案时不动鼠标，浮层淡出到
+                    // 看不见，却仍有一块 292×~220px 在吃点击，误触直接切 VSR 并
+                    // 重载本集。视频画面上的透明可点区域是这里最不能接受的东西。
+                    className={`crystal-flyout crystal-surface ttv-enhance-flyout${showEnhanceMenu && hudShown ? ' open' : ''}`}
+                    role="dialog"
+                    aria-label="视频增强"
+                    // 收起时整块 `inert`：既不可交互也不可聚焦。只靠 opacity:0 +
+                    // pointer-events:none 的话，键盘 Tab 会落进一个看不见的对话框
+                    // （清晰度菜单是既有实现，这里不复制那个缺口）。
+                    inert={!showEnhanceMenu || !hudShown}
+                  >
+                    <div className="ttv-enhance-head">
+                      <span className="ttv-enhance-head-title">视频增强</span>
+                      <span className="ttv-enhance-head-hint">
+                        {vsrAppliesToSource ? '切换后立即重载本集' : '只作用于短剧 / 漫剧'}
+                      </span>
+                    </div>
+
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={vsrEnabled}
+                      aria-label="VSR 视频增强"
+                      aria-describedby="ttv-enhance-vsr-desc"
+                      // 浮层收起时内部控件不可聚焦：隐藏但可 Tab 到等于让键盘用户
+                      // 掉进一个看不见的对话框（清晰度菜单是既有实现，这里不复制它）。
+                      tabIndex={showEnhanceMenu ? 0 : -1}
+                      onClick={() => onToggleVsr(!vsrEnabled)}
+                      className="ttv-enhance-row"
+                    >
+                      <span className="ttv-enhance-label">
+                        <span className="ttv-enhance-title">VSR 视频增强</span>
+                        <span className="ttv-enhance-desc" id="ttv-enhance-vsr-desc">
+                          {vsrAppliesToSource
+                            ? '转成 H.264 分片交给 NVIDIA 驱动超分；关闭后回退到未增强的旧链路（起播更快）。驱动侧是否超分仍由 NVIDIA App 决定。'
+                            : '动漫源不经转码链路，此开关不影响当前播放。'}
+                        </span>
+                      </span>
+                      <span className={`ttv-enhance-switch${vsrEnabled ? ' is-on' : ''}`} aria-hidden="true">
+                        <span className="ttv-enhance-knob" />
+                      </span>
+                    </button>
                   </div>
                 </div>
 

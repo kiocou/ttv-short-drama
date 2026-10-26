@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useCatalogStore } from '../../stores/useCatalogStore';
 import { useAppStore, ShelfKind } from '../../stores/useAppStore';
 import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useSettingsStore } from '../../stores/useSettingsStore';
 import { ipcService } from '../../services/ipc';
-import { shelfFeedSupports } from '../../stores/useShelfFeed';
+import { shelfFeedSupports, useShelfFeed } from '../../stores/useShelfFeed';
 import { StatusBadge } from '../common/StatusBadge';
 import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
@@ -181,6 +181,17 @@ export const ExploreView: React.FC = () => {
    * 走 CoverImage 的异步解析，不过滤）；加载失败的按 id 移除。
    */
   const visibleItems = items.filter(item => {
+    /**
+     * 频道必须匹配（2026-10-26 修「漫剧区的猜你喜欢显示短剧」）。
+     *
+     * 目录是异步聚合的，慢源超过 6000ms 时会「先用已有结果渲染」—— 那批"已有
+     * 结果"是**上一个频道**的条目。`visibleItems` 既是货架/网格的来源，也是
+     * 「猜你喜欢」的候选池，于是漫剧栏会拿短剧去推荐（本次实机：短剧区和漫剧区
+     * 的猜你喜欢是同一部《人到中年》）。
+     *
+     * `adult` 是聚合名单、条目的 `type` 由源决定，不能按频道过滤。
+     */
+    if (channel !== 'adult' && item.type !== channel) return false;
     if (hiddenSeriesIds.has(item.id)) return false;
     if (!item.id.startsWith('guo:') && !(item.cover || '').trim()) return false;
     return true;
@@ -239,7 +250,37 @@ export const ExploreView: React.FC = () => {
    *   - 现有条目里没有任何合格候选（全被 historySeriesIds 排除了）。
    * 那种情况是永久的，留一个空槽没有意义。
    */
-  const showRandomSlot = isLoading || hasRandomCandidates(visibleItems, historySeriesIds);
+  /**
+   * 「猜你喜欢」的候选池：目录条目 + 两路货架。
+   *
+   * ## 为什么要把货架并进来（2026-10-26 修「漫剧区的猜你喜欢无法显示」）
+   *
+   * 实机现场（0.2.40 安装版，漫剧次元）：
+   *
+   *   发现更多漫剧 (0 部)
+   *   目录加载失败：目录数据加载失败（1 个源均无响应）—— hongguo: 等待超过 6 秒
+   *
+   * 而同一页的「正在热播 / 新剧」走的是**另一条接口**（红果 App 榜单），数据正常。
+   * 此前候选池只看目录条目，目录一挂整块「猜你喜欢」就消失了 —— 用户看到的正是
+   * "漫剧区的猜你喜欢不显示"。
+   *
+   * 现在把两路货架并进候选池：目录失败时仍有内容可推荐，目录正常时候选更多。
+   * 去重后保持出现顺序（目录优先），保证"换一批"有足够多的轮换空间。
+   */
+  const hotShelf = useShelfFeed('hot', channel);
+  const newShelf = useShelfFeed('new', channel);
+  const randomPool = useMemo(() => {
+    const seen = new Set<string>();
+    const pool: SeriesItem[] = [];
+    for (const item of [...visibleItems, ...hotShelf.items, ...newShelf.items]) {
+      if (!item.id || seen.has(item.id)) continue;
+      seen.add(item.id);
+      pool.push(item);
+    }
+    return pool;
+  }, [visibleItems, hotShelf.items, newShelf.items]);
+
+  const showRandomSlot = isLoading || hasRandomCandidates(randomPool, historySeriesIds);
   const mergedTwoColumns = showContinueSlot && showRandomSlot;
 
   /**
@@ -608,7 +649,7 @@ if (!sentinel || !root || !hasMore) return;
 
           {showRandomSlot && (
             <RandomWatchSection
-              items={visibleItems}
+              items={randomPool}
               excludeIds={historySeriesIds}
               onWatch={handleRandomWatch}
               onDetail={handleCardClick}

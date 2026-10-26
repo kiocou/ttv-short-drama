@@ -53,6 +53,8 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
     toggleMute,
     setPlaybackRate,
     setQuality,
+    vsrEnabled,
+    setVsrEnabled,
     playNextEpisode,
     playPrevEpisode,
     toggleSideDrawer,
@@ -60,6 +62,9 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
     enterPip,
   } = usePlaybackStore();
 
+  // 补帧入口已在发布前移除（独立窗口方案不成熟：需要另起 D3D11 窗口、
+  // 与主窗口两套音频/进度，且调试徽标漏在界面上）。后端 `frame_interp_set`
+  // 命令保留但不再被前端调用。
   const { goBack } = useAppStore();
 
   /**
@@ -107,6 +112,8 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
       effectivePlaybackRate={effectivePlaybackRate}
       currentQuality={currentQuality}
       qualityOptions={availableQualities}
+      vsrEnabled={vsrEnabled}
+      onToggleVsr={setVsrEnabled}
       onToggleLock={onToggleLock}
       onToggleFullscreen={onToggleFullscreen}
       onUserActivity={onUserActivity}

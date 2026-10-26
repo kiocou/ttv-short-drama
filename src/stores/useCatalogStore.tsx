@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef, useMemo, ReactNode } from 'react';
-import { ChannelType, SeriesItem, CatalogFilter } from '../types/catalog';
+import { ChannelType, SeriesItem, CatalogFilter, CatalogPage } from '../types/catalog';
 import { ipcService, errorText } from '../services/ipc';
 import { WatchHistoryItem } from '../types/history';
 import { enabledSourcesForTab, adultTabSources } from '../services/guoSources';
@@ -280,11 +280,69 @@ const loadMoreFailuresRef = useRef(0);
    * 合并时按 id 去重：不同源可能推同一���（同一部剧被多个站转载），卡片上会
    * 标出来源，但网格里不该出现两张一模一样的卡。
    */
+  /**
+   * 后台预热"最可能被点开"的那几部剧的详情。
+   *
+   * ## 为什么值得（2026-10-24）
+   *
+   * 点一张卡到详情页出来，中间要等一次 `series_detail`：guo 源是一次站源往返
+   * （实测 200–1500ms，maccms 型更慢），红果是一次公开页解析。而用户在网格上
+   * **悬停 300ms 以上**才会触发 `SeriesCard` 的 `onPrefetch`（见 ExploreView），
+   * 直接点、键盘回车、触控板轻点都不会悬停 —— 那条预热对"看到就点"的用户完全
+   * 不生效，而这类用户恰恰是最在意速度的。
+   *
+   * 这里在首屏卡片落地后，挑**最前面的几部**（网格是 2–6 列，前三部就是首行的
+   * 前半）在后台把详情取回来。命中之后点开是 0 往返 —— 与悬停预热走的是同一个
+   * `ipcService.series.getDetail` 缓存，两条路互相补位，不重复请求。
+   *
+   * ## 为什么只取 3 部、还要错开
+   *
+   * - **3 部**：网格首行最多 6 张，但用户的注意力集中在前 2–3 张；再多就是把
+   *   带宽花在"大概不会点"的卡上，而 guo 源的详情是逐个站源请求，站方有限流
+   *   （guo-core 同源串行 + 250ms 间隔），抢多了会让真正要用的请求排队。
+   * - **错开 260ms**：guo-core 的限流器按源串行，同一源连发三发也是排队；错开发
+   *   只是让第一发的响应先回来（用户已经能点进去了），后两发在空闲期完成。
+   * - **不 await、失败静默**：这是纯优化，任何失败都不该影响目录。
+   */
+  const warmTopDetails = useCallback((items: SeriesItem[]) => {
+    if (items.length === 0) return;
+    // 页面在后台（用户切走了）时不预热：那纯属浪费源站配额。
+    if (typeof document !== 'undefined' && document.hidden) return;
+    const targets = items.slice(0, 3);
+    targets.forEach((item, index) => {
+      window.setTimeout(() => {
+        if (typeof document !== 'undefined' && document.hidden) return;
+        void ipcService.series.getDetail(item.id).catch(() => {});
+      }, 260 * index);
+    });
+  }, []);
+
   const requestAllSources = useCallback(async (
     sources: string[],
     base: Omit<CatalogFilter, 'source' | 'page' | 'cursor'>,
     pageFor: (source: string) => number,
     force = false,
+    /**
+     * 渐进回调：**任何一个源回来就通知一次**，参数是"到目前为止能显示的全部内容"。
+     *
+     * ## 为什么需要它（2026-10-24）
+     *
+     * 原来这里是纯 `Promise.allSettled`：必须等**最慢的那个源**。默认只启用红果时
+     * 看不出来，但用户在设置里勾了 3 个源之后，首屏就是"最快的源 0.5 秒就回来了，
+     * 却要陪着最慢的源等到 6 秒超时"——这 5.5 秒里界面只有一个转圈，用户看到的是
+     * 卡死。而这几十条卡片其实早就可以铺上去了。
+     *
+     * 现在每个源一落地就回调一次，调用方直接把结果 `setItems` 铺上去，后面的源
+     * 陆续把卡片追加进来。首屏耗时从「最慢源」变成「最快源」。
+     *
+     * ## 顺序为什么是"到达顺序"而不是"源表顺序"
+     *
+     * 按源表顺序合并的话，后到的源要插在它"该在"的位置，已经铺上去的卡片会被整体
+     * 挤走 —— 用户正看着的卡突然跳位，比晚半秒出图糟糕得多。到达顺序天然是**追加**，
+     * 已显示的卡片永不移动。代价是同一批源的排列顺序与以前不同（快源在前），这对
+     * 浏览没有实际影响。
+     */
+    onPartial?: (partial: FetchedPage) => void,
   ) => {
     /**
      * 单源等待上限。**这是首屏的关键闸门**。
@@ -301,7 +359,41 @@ const loadMoreFailuresRef = useRef(0);
      */
     const SOURCE_TIMEOUT_MS = 6000;
     let timedOut = false;
-    const settled = await Promise.allSettled(sources.map(source => {
+    /**
+     * 已落地的源结果，按**到达顺序**保存（元素是 `[source, page]`）。
+     *
+     * 用到达顺序而不是索引顺序，是为了让渐进渲染是纯追加（见 `onPartial` 的注释）。
+     */
+    const arrived: Array<{ source: string; page: CatalogPage }> = [];
+    /** 还没落地的源数：只有它归零才算"这一轮结束"。 */
+    let pending = sources.length;
+    /** 已确定失败的源（渐进回调要用它如实报告，不预判在途的源）。 */
+    const failedSoFar: string[] = [];
+    /**
+     * 合并已到达的结果。
+     *
+     * `settled` 的语义与旧实现一致：失败源不参与合并，但**要记下来**用于报错。
+     */
+    const mergeArrived = () => {
+      const seen = new Set<string>();
+      const items: SeriesItem[] = [];
+      const categories: string[] = [];
+      let hasMore = false;
+      const hasMoreBySource: Record<string, boolean> = {};
+      for (const { source, page } of arrived) {
+        for (const item of page.items) {
+          if (seen.has(item.id)) continue;
+          seen.add(item.id);
+          items.push(item);
+        }
+        for (const name of page.categories) categories.push(name);
+        hasMore = hasMore || page.hasMore;
+        hasMoreBySource[source] = page.hasMore;
+      }
+      return { items, categories, hasMore, hasMoreBySource };
+    };
+
+    const tracked = sources.map(source => {
       const page = pageFor(source);
       const request = requestCatalog(
         `${source}_${base.channel}_${base.category}_${base.audience}_${base.sort}_${base.keyword || ''}_p${page}`,
@@ -316,8 +408,27 @@ const loadMoreFailuresRef = useRef(0);
             reject(new Error(`等待超过 ${SOURCE_TIMEOUT_MS / 1000} 秒`));
           }, SOURCE_TIMEOUT_MS);
         }),
-      ]);
-    }));
+      ]).then(
+        value => {
+          arrived.push({ source, page: value });
+          pending -= 1;
+          // 只在这一轮还没结束时通知：最后一个源落地之后由调用方用最终结果统一
+          // 提交（那里还要写缓存、登记 seenIds、补集数），不必再多推一次。
+          if (onPartial && pending > 0 && arrived.length > 0) {
+            // `failedSources` 此刻只填**已经确定失败**的那几个（超时/报错已落地的），
+            // 还在途的源不预判——它可能下一秒就回来。
+            onPartial({ ...mergeArrived(), failedSources: failedSoFar.slice() });
+          }
+          return value;
+        },
+        error => {
+          pending -= 1;
+          failedSoFar.push(source);
+          throw error;
+        },
+      );
+    });
+    const settled = await Promise.allSettled(tracked);
     if (timedOut) {
       // 到点没回来的源不会因为这次超时被放弃：`allSettled` 已经把它们的
       // rejected 结果记为"本轮失败"，下一轮 loadMore 仍会重试。这里只记一行
@@ -325,10 +436,6 @@ const loadMoreFailuresRef = useRef(0);
       traceCatalog(`目录聚合：有源超过 ${SOURCE_TIMEOUT_MS}ms 未返回，先用已有结果渲染`);
     }
 
-    const seen = new Set<string>();
-    const items: SeriesItem[] = [];
-    const categories: string[] = [];
-    let hasMore = false;
     const failures: string[] = [];
     /**
      * 每个失败源**各自的**错误原文。
@@ -339,29 +446,13 @@ const loadMoreFailuresRef = useRef(0);
      * 唯一源的某一句话——不把它带出来，界面上就只剩一个无法行动的结论。
      */
     const failureReasons: string[] = [];
-    // 逐源的"还有没有下一页"。聚合的 `hasMore` 是"或"，拿它判断**单个**源到没到
-    // 底必然出错：一个只有 30 条的源会被反复请求，而它回来的东西在 id 去重后
-    // 永远是 0 条。收尾时必须逐源看这张表，见 loadMore。
-    const hasMoreBySource: Record<string, boolean> = {};
 
     settled.forEach((outcome, index) => {
       const source = sources[index];
       if (outcome.status === 'rejected') {
         failures.push(source);
         failureReasons.push(`${source}: ${errorText(outcome.reason, '未知错误')}`);
-        // 本轮失败的源**不算**到底：不置 0，下一轮 loadMore 还会再试它一次。
-        hasMoreBySource[source] = true;
-        return;
       }
-      const page = outcome.value;
-      for (const item of page.items) {
-        if (seen.has(item.id)) continue;
-        seen.add(item.id);
-        items.push(item);
-      }
-      for (const name of page.categories) categories.push(name);
-      hasMore = hasMore || page.hasMore;
-      hasMoreBySource[source] = page.hasMore;
     });
 
     if (sources.length === 0) {
@@ -374,7 +465,20 @@ const loadMoreFailuresRef = useRef(0);
         `目录数据加载失败（${failures.length} 个源均无响应）—— ${failureReasons.join('；')}`,
       );
     }
-    return { items, categories, hasMore, hasMoreBySource, failedSources: failures };
+    // 逐源的"还有没有下一页"。聚合的 `hasMore` 是"或"，拿它判断**单个**源到没到
+    // 底必然出错：一个只有 30 条的源会被反复请求，而它回来的东西在 id 去重后
+    // 永远是 0 条。收尾时必须逐源看这张表，见 loadMore。
+    //
+    // 失败源预置 `true`：本轮失败**不算**到底，下一轮 loadMore 还会再试它一次。
+    const merged = mergeArrived();
+    const hasMoreBySource: Record<string, boolean> = {};
+    for (const source of sources) hasMoreBySource[source] = true;
+    for (const source of Object.keys(merged.hasMoreBySource)) {
+      hasMoreBySource[source] = merged.hasMoreBySource[source];
+    }
+    // 最终合并用**到达顺序**（与渐进回调完全一致）：这样"渐进铺上去的卡片"与
+    // "最终提交的列表"顺序相同，不会在最后一个源落地时整体重排一次。
+    return { ...merged, hasMoreBySource, failedSources: failures };
   }, [requestCatalog]);
 
   /**
@@ -520,7 +624,42 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
           delete inflightRef.current[`${key}|force`];
         }
       };
-      let res = await requestAllSources(sources, base, () => 1, force);
+      /**
+       * 渐进首屏：**第一个源回来就把卡片铺上去**，不等其余源。
+       *
+       * ## 为什么（2026-10-24）
+       *
+       * 原来首屏要等所有启用源都落地（或逐个撞 6 秒超时）。默认只启用红果时看不
+       * 出来；一旦用户在设置里勾了 3 个源，首屏就是"最快的那个 0.5 秒就好了，界面
+       * 却陪最慢的源等到 6 秒"——这 5.5 秒只有一个转圈，用户看到的是卡死。
+       *
+       * ## 只动界面，不动账本
+       *
+       * 这里**不写 `cacheRef` / `seenIdsRef` / `pagingRef`**：那三份是"这一轮已经
+       * 定稿的状态"，中途写进去会让最后的提交与 loadMore 的页码判断读到半成品。
+       * 渐进回调只负责一件事：让用户先看见内容。
+       *
+       * 骨架屏同时撤掉（`setIsLoading(false)`）：卡片已经在屏幕上了，再挂一层
+       * "正在加载"的骨架等于否认自己刚画出来的东西。页头那条细进度条仍由
+       * `isLoading` 之外的状态表达（见 ExploreView），所以这里撤掉是安全的。
+       */
+      const commitPartial = (partial: FetchedPage) => {
+        if (requestId !== requestIdRef.current) return;
+        if (partial.items.length === 0) return;
+        setItems(partial.items);
+        setCategories(mergeCategories(
+          categoryVocabularyRef.current[vocabularyKey(sourceKey, channel)] ?? [],
+          partial.categories,
+        ));
+        setHasMore(partial.hasMore);
+        setActiveSources(sources);
+        setIsLoading(false);
+        // 首屏卡片一出现就预热它们的封面：一次 IPC 解析一批，而不是等每张卡各自
+        // 进视口再各发一次（见 `ipcService.catalog.guoCoverPrefetch`）。
+        void ipcService.catalog.guoCoverPrefetch(partial.items.map(item => item.id));
+        warmTopDetails(partial.items);
+      };
+      let res = await requestAllSources(sources, base, () => 1, force, commitPartial);
       // The public comic page occasionally returns its shell before the rank
       // articles are present. Retry up to twice instead of caching a false
       // empty page——一次重试实测仍可能拿到空壳，两次覆盖 90%+ 的抖动。
@@ -553,6 +692,10 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
       setCategories(mergedCategories);
       setHasMore(res.hasMore);
       setActiveSources(sources);
+      // 最终提交后再预热一次：渐进阶段只覆盖"先到的那批"，其余源补进来的卡片
+      // 在这一刻才第一次出现在列表里（已预热的会被 `guoCoverPrefetch` 跳过）。
+      void ipcService.catalog.guoCoverPrefetch(res.items.map(item => item.id));
+      warmTopDetails(res.items);
       // 漫剧卡片先出，集数随后补齐（原因见 fillEpisodeCounts）。
       if (channel === 'comic') {
         void fillEpisodeCounts(cacheKey, res.items, requestId);
@@ -571,7 +714,7 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
     setContinueWatching(histories[0] || null);
     setHistorySeriesIds(new Set(histories.map(item => item.seriesId)));
     return ok;
-  }, [audience, category, channel, refreshCategoryVocabulary, requestAllSources, sort, sources]);
+  }, [audience, category, channel, refreshCategoryVocabulary, requestAllSources, sort, sources, warmTopDetails]);
 
   useEffect(() => {
     loadData();
@@ -584,6 +727,17 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
   const setChannel = useCallback((newChannel: ChannelType) => {
     setChannelState(newChannel);
     setCategoryState('全部');
+    /**
+     * 切频道时**必须清空上一频道的目录条目**（2026-10-26 修）。
+     *
+     * 慢源会触发「有源超过 6000ms 未返回，先用已有结果渲染」，那批"已有结果"
+     * 其实是上一个频道的列表；不清空的话，漫剧栏的货架是漫剧、而「猜你喜欢」
+     * 的候选池还是短剧（本次实机两栏推荐了同一部剧）。
+     *
+     * 清空不会造成空白：视图在 `isLoading && items.length === 0` 时渲染骨架屏。
+     */
+    setItems([]);
+    setIsLoading(true);
     // 切频道时换成新频道"已知"的词表；未知就先只留"全部"，等目录响应或后台
     // 汇总补齐。刻意不无条件清空——那正是"题材消失又出现"的来源之一。
     setCategories(mergeCategories(
@@ -691,6 +845,8 @@ const loadData = useCallback(async (kw?: string, options?: { force?: boolean }) 
       if (channel === 'comic') {
         void fillEpisodeCounts(slotKey, fresh, requestId);
       }
+      // 新卡片落地即预热封面（与首屏 `commitPartial` 同一条路径，见那里的注释）。
+      void ipcService.catalog.guoCoverPrefetch(fresh.map(item => item.id));
     }
     const mergedCategories = mergeCategories(
       categoryVocabularyRef.current[vocabularyKey(sourceKey, channel)] ?? [],

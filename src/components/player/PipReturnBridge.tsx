@@ -3,6 +3,7 @@ import { ipcService } from '../../services/ipc';
 import {
   listenPip,
   PIP_RETURNED_EVENT,
+  PIP_SHOW_FAILED_EVENT,
   PIP_SHOWN_EVENT,
   type PipHandoff,
   type PipProgress,
@@ -94,22 +95,22 @@ async function handleReturned(ctx: PipBridgeContext, payload: PipReturnedPayload
   const { progress } = payload;
   const episodeId = progress.episodeId || handoff.episodeId;
   /**
-   * 起播秒数必须与集号**同源**。
+   * 小窗**换过集**时，position 不可信。
    *
-   * 小窗会在后台自动连播：它切到下一集之后，`progress.episodeId` 立刻就是新集，
-   * 而 `progress.position` 在那次 `report(true)` 落地前仍可能是**上一集的末尾**
-   * （`timeupdate` 与换源是两条时序）。旧实现无条件把 `progress.position` 配上
-   * 新集号交给 `openEpisode`，于是"从小窗回到播放器"会从上一集结尾的位置开始
-   * 播 —— 用户看到的就是"进度条不在 0、从一个莫名其妙的时间点继续"。
+   * ⚠️ 旧判据 `progress.episodeId === episodeId` 恒为真（episodeId 就是从
+   * `progress.episodeId` 推出来的），所以注释里描述的"小窗自动连播后位置还是上一集"
+   * 这种情况一次都检测不到（2026-10-26 复查确认）。两个后果：
+   *   - 回到主窗口时用上一集末尾的位置播新一集（从结尾开始，几乎立刻 ended）；
+   *   - `saveHistory` 用未修正的 progress，把**新一集**按旧集位置/时长写成接近
+   *     100% 已看完，历史页直接显示错集。
    *
-   * 判据：位置与集号必须指向同一集（`progress.episodeId` 缺失时无法确认，
-   * 就退回交接时记下的那一集的位置；换了集则一律从头播）。
+   * 正确判据只能和**交接时那一集**比：小窗换过集 → 位置归零、落盘也按 0 上报
+   * （`saveHistory` 对 duration=0 有保护，不会覆盖已有进度）。
    */
-  const progressMatchesEpisode = Boolean(progress.episodeId) && progress.episodeId === episodeId;
-  const handoffMatchesEpisode = !progress.episodeId && episodeId === handoff.episodeId;
-  const candidate = progressMatchesEpisode || handoffMatchesEpisode
-    ? (progressMatchesEpisode ? progress.position : handoff.position)
-    : 0;
+  const switchedInPip = Boolean(progress.episodeId) && progress.episodeId !== handoff.episodeId;
+  const candidate = switchedInPip
+    ? 0
+    : (Number.isFinite(progress.position) ? progress.position : handoff.position);
   const position = Number.isFinite(candidate) && candidate > 0 ? candidate : 0;
 
   if (payload.mode === 'return') {
@@ -129,7 +130,13 @@ async function handleReturned(ctx: PipBridgeContext, payload: PipReturnedPayload
     }
   }
 
-  await saveHistory(handoff, episodeId, progress);
+  // 落盘必须与起播用**同一个**位置：换过集就按 0 上报，否则新一集会被写成
+  // "用旧集末尾位置看完"（见上面 `switchedInPip` 的说明）。
+  await saveHistory(
+    handoff,
+    episodeId,
+    switchedInPip ? { ...progress, position: 0, duration: 0 } : progress,
+  );
   await ctx.loadHistory();
 }
 
@@ -208,6 +215,26 @@ export const PipReturnBridge: React.FC = () => {
       tracePlayback(`小窗回流 mode=${payload.mode} 集=${payload.progress.episodeId ?? '(未知)'} 位置=${Math.round(payload.progress.position)}s`);
       void setMainWindowVisible(true);
       void handleReturned(latestRef.current, payload);
+    }).then(off => {
+      if (disposed) off();
+      else offs.push(off);
+    });
+    /**
+     * 小窗**显示失败** → 主窗口保持可见（2026-10-23 补）。
+     *
+     * 这是「点画中画后两个窗口都没了」的兜底：旧实现里小窗无条件广播
+     * `pip://shown`，主窗口据此隐藏；一旦 `show()` 其实失败，屏幕上就什么都不剩，
+     * 用户只能去任务管理器结束进程。
+     *
+     * 现在小窗只在 show 成功后广播 shown，失败时广播这个事件。主窗口收到后
+     * **不需要做任何"恢复"动作**——它本来就没隐藏（没收到 shown）。这里只把
+     * 切换态清掉，让播放器回到正常可操作状态，并如实提示一次。
+     */
+    void listenPip<unknown>(PIP_SHOW_FAILED_EVENT, () => {
+      if (disposed) return;
+      tracePlayback('画中画显示失败：主窗口保持可见（未执行隐藏）');
+      // 主窗口本来就还可见（没收到 shown），这里**不做任何窗口操作**是刻意的：
+      // 去调 setMainWindowVisible(true) 反而会在某些时序下把刚显示的主窗口再闪一次。
     }).then(off => {
       if (disposed) off();
       else offs.push(off);

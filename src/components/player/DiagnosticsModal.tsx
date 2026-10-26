@@ -33,7 +33,19 @@ export const DiagnosticsModal: React.FC = () => {
   const [live, setLive] = useState<LiveStats>(EMPTY_LIVE);
   useEffect(() => {
     if (!isDiagnosticsOpen) return;
-    const video = document.querySelector('video') as FrameVideo | null;
+    /**
+     * 取**正在渲染**的那块 `<video>`（2026-10-26 修）。
+     *
+     * 短剧宿主是常驻 DOM 的（离开播放器只是 `display:none`），动漫播放器另有
+     * 自己的一块。旧写法 `querySelector('video')` 拿的是文档里第一块 —— 在动漫
+     * 页会一直采样那块隐藏的短剧元素，`requestVideoFrameCallback` 永不回调，
+     * 面板上的 fps 恒为 0，看起来像"性能炸了"。
+     */
+    const videos = Array.from(document.querySelectorAll('video')) as FrameVideo[];
+    const video = videos.find(el => el.videoWidth > 0 && el.offsetParent !== null)
+      ?? videos.find(el => el.videoWidth > 0)
+      ?? videos[0]
+      ?? null;
     if (!video) return;
     let frames = 0;
     let handle = 0;
