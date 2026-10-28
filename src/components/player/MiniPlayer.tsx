@@ -799,7 +799,8 @@ export const MiniPlayer: React.FC = () => {
       } catch {
         // 读不到：下一拍再试。
       }
-      if (seekableReached(end, target)) {
+      // 与主播放器同一判据：转码中要求目标后方还有一片已落盘的内容。
+      if (seekableReached(end, target, duration)) {
         tracePlayback(`小窗转码已推进到 ${end.toFixed(1)}s，落位到 ${target.toFixed(1)}s`);
         try {
           video.currentTime = target;

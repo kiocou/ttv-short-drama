@@ -239,7 +239,20 @@ const NVENC_ARGS: &[&str] = &[
     "-c:v",
     "h264_nvenc",
     "-preset",
-    "p4",
+    // p2 而非 p4：整集实测（168 秒 1080p 短剧、含真实码率上限 1407k/2814k）
+    //   p4 → 23.4 秒（7.2 倍实时），30.1MB
+    //   p2 → 12.7 秒（13.2 倍实时），30.5MB
+    // 快 1.84 倍，体积几乎不变，p2 相对 p4 的 SSIM 是 0.97（Y 0.96）。
+    //
+    // 为什么速度在这里等于功能：整集 HLS 是边转边播，**可拖动范围 = 已转码时长**。
+    // p4 时用户出画后要等约 22 秒才能拖到片尾，期间拖动会被"可寻址末端"挡住
+    // （日志实证：`拖动到未转码区域 目标=95.5s 可寻址末端=64.1s`）。p2 把这个
+    // 窗口缩到约 12 秒，是当前架构下改善"进度条拖不动"最直接的手段。
+    //
+    // 代价是运动估计精度略降。上面那次 SSIM 是"p2 相对 p4"，不是"相对源"；
+    // 短剧以对话为主、运动少，实际观感差异远小于该数字。若哪天要退回画质优先，
+    // 把这里改回 p4 即可，其余参数无需变动。
+    "p2",
     "-cq",
     "23",
     "-pix_fmt",
@@ -349,6 +362,18 @@ const HLS_PACKAGING_ARGS: &[&str] = &[
     "1",
     "-hls_list_size",
     "0",
+    // `-hls_playlist_type event`：**这一条决定"拖动进度条会不会跳回原处"**。
+    //
+    // 不写它时，转码中的清单既没有 `#EXT-X-ENDLIST` 也没有 `#EXT-X-PLAYLIST-TYPE`，
+    // hls.js 只能按 **live 流**处理 —— 于是它会持续跟随 live edge（最新分片）。
+    // 实测症状（ttv-playback.log）：
+    //   落位到 111.4s        ← 用户点的位置，代码确实写进去了
+    //   timeupdate 位置=121.52s  ← 实际播放在 live edge，跳了 10 秒
+    // 加上 event 之后清单带 `#EXT-X-PLAYLIST-TYPE:EVENT`，hls.js 就知道
+    // "这是只增不减的点播流"，seek 到已转码部分不会被拉回 edge。
+    // 转码结束时 ffmpeg 仍会补 `#EXT-X-ENDLIST`，最终形态就是完整 VOD。
+    "-hls_playlist_type",
+    "event",
     "-hls_flags",
     "independent_segments",
     "-hls_segment_type",
@@ -378,6 +403,9 @@ const HLS_PACKAGING_ARGS_X264: &[&str] = &[
     "1",
     "-hls_list_size",
     "0",
+    // 与硬件档同理：没有 event 类型时 hls.js 会把转码中的清单当 live 流追 edge。
+    "-hls_playlist_type",
+    "event",
     "-hls_flags",
     "independent_segments",
     "-hls_segment_type",

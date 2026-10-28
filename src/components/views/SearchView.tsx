@@ -163,6 +163,9 @@ export const SearchView: React.FC = () => {
           setNextPage(page.page + 1);
           // 首屏已可用，先收掉 loading，用户不用为补充来源继续等。
           setIsLoading(false);
+          // 搜索结果里可能混着 guo 源条目（用户启用了 guo 源时），它们的封面要
+          // 走 guo-core：一次 IPC 解析一批，而不是等每张卡各自进视口各发一次。
+          void ipcService.catalog.guoCoverPrefetch(page.items.map(item => item.id));
         })
         .catch((err: unknown) => {
           if (requestId !== requestIdRef.current) return;
@@ -215,6 +218,8 @@ export const SearchView: React.FC = () => {
       setHasMore(result.hasMore);
       setTotal(result.total);
       setNextPage(page + 1);
+      // 翻页新进来的卡片同样要预热封面（已预热的会被跳过）。
+      void ipcService.catalog.guoCoverPrefetch(result.items.map(item => item.id));
     } catch (err) {
       // 不动已有结果：翻页失败没理由把用户已经看到的几十张卡片清空。
       if (requestId === requestIdRef.current) {

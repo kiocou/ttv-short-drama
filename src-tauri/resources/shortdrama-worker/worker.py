@@ -808,6 +808,21 @@ def hongguo_business_error(payload: dict) -> str | None:
     return None
 
 
+class GatewaySilentReject(PermissionError):
+    """网关静默拒绝：HTTP 200 但 body 为空。
+
+    单独成一个类型（继承 PermissionError，因此既有 `except PermissionError: raise`
+    的处理方式全部照旧生效），是为了让**换线**与**重试**两个决策能分开：
+
+    - 不重试：实测该状态在 20 秒内每 4 秒重试都不自愈，密集重试纯属白等。
+    - 仍换线：它按分钟级间歇出现（同一 vid 在 t=90s 失败、t=119s 成功），
+      换一条线路是唯一可能立刻拿到结果的免费动作，不能一并砍掉。
+
+    继承 PermissionError 而非新基类，保证任何尚未区分它的旧分支
+    （例如 `_feed_request` 的 `except PermissionError: raise`）行为不变。
+    """
+
+
 def signed_post(session: requests.Session, url: str, payload: dict,
                 device_id: str, install_id: str) -> dict:
     """liushen 六代签名 + POST，返回响应 JSON。
@@ -855,6 +870,23 @@ def signed_post(session: requests.Session, url: str, payload: dict,
                     f"红果接口拒绝请求（HTTP {response.status_code}）：{response.text[:200]}"
                 )
             response.raise_for_status()
+            # 「HTTP 200 + 空 body」是网关的**静默拒绝**，不是网络抖动。
+            #
+            # 实测（2026-10-27，同一设备凭据）：连续 10 次单请求全部返回
+            # status=200 / Content-Length: 0，且在 20 秒观察窗口内每 4 秒重试一次
+            # 也始终为空 —— 它不会自愈。而旧逻辑把它当作 `json.JSONDecodeError`
+            # 落进下面的通用重试分支，于是每层各重试 3 次、叠上 1s/2s 退避，
+            # 再乘上 3 条备用线路：9 次请求真实只花 1.84 秒，用户却要等 13~15 秒，
+            # 其中约 11.2 秒是纯粹白等的 `time.sleep`。
+            #
+            # 因此这里与 4xx 同样处理：确定性拒绝，立即抛出、不再重试。
+            # 判定条件刻意写得很窄 —— 必须是 2xx、body 为空、且 Content-Length
+            # 显式为 0 或缺失；只要 body 有内容就照常走下面的 JSON 解析，
+            # 真正的网络抖动（超时、连接重置、5xx）仍保留原有重试与换线能力。
+            if not response.content:
+                raise GatewaySilentReject(
+                    "红果接口静默拒绝请求（HTTP 200 空响应）：该视频可能不可用或凭据受限。"
+                )
             data = response.json()
             error = hongguo_business_error(data)
             if error:
@@ -870,11 +902,28 @@ def signed_post(session: requests.Session, url: str, payload: dict,
 
 def signed_post_failover(session: requests.Session, urls: list[str], payload: dict,
                          device_id: str, install_id: str) -> dict:
-    """主备域名：网络/5xx 换线；111104 等业务错误不换线。"""
+    """主备域名：网络/5xx/静默拒绝换线；111104 等业务错误不换线。
+
+    `GatewaySilentReject` 单独先于 `PermissionError` 捕获：它虽然按"不重试"
+    处理（同一线路上密集重试实测无效），但换线是免费且有效的动作 ——
+    线路间策略不同，实测出现过一条线静默拒绝、另一条线正常返回的情形。
+    其余 `PermissionError`（4xx、111104、110001 等业务拒绝）仍立即抛出，
+    因为换线不会改变服务端对同一业务请求的判定。
+    """
     last_error: Exception | None = None
     for index, url in enumerate(urls):
         try:
             return signed_post(session, url, payload, device_id, install_id)
+        except GatewaySilentReject as error:
+            # 静默拒绝：本线路不再重试，但立刻换下一条。
+            last_error = error
+            if index + 1 < len(urls):
+                emit({
+                    "event": "progress",
+                    "stage": "sign",
+                    "message": f"主线路静默拒绝，已自动切换备用线路（{urlsplit(url).netloc}）",
+                })
+            continue
         except PermissionError:
             raise
         except (requests.RequestException, ValueError, json.JSONDecodeError) as error:
@@ -1091,7 +1140,7 @@ def probe_duration_ms(ffmpeg: str, url: str, key_hex: str | None) -> int:
 _X264_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
               "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-profile:v", "high",
               "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
-_NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23",
+_NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p2", "-cq", "23",
                "-pix_fmt", "yuv420p", "-profile:v", "high",
                "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
 # 低配档：降分辨率（理由见 video_encoder_args 末尾分支）。crf 放宽一档，
@@ -1963,13 +2012,22 @@ def _feed_item(entry) -> dict | None:
 
 
 def _feed_request(session, path, device_id, install_id, aid, *, query=None, body=None):
-    """主备域名轮询一次请求。业务性拒绝（PermissionError）不换线，直接抛。"""
+    """主备域名轮询一次请求。业务性拒绝（PermissionError）不换线，直接抛。
+
+    例外：`GatewaySilentReject`（HTTP 200 空 body）仍要换线。它原本是靠
+    `json.JSONDecodeError` 落进下面的通用分支才换线的；改成独立类型后如果不显式
+    捕获，就会跟着 `PermissionError` 一起被直接抛出，feed/榜单链路将失去原有的
+    换线能力 —— 那是行为回退，不是优化。
+    """
     last_error: Exception | None = None
     for url in player_urls(path, install_id, device_id, aid):
         try:
             if body is None:
                 return signed_get(session, url, query or {}, device_id, install_id)
             return signed_post(session, url, body, device_id, install_id)
+        except GatewaySilentReject as error:
+            last_error = error
+            continue
         except PermissionError:
             raise
         except (requests.RequestException, ValueError, json.JSONDecodeError) as error:

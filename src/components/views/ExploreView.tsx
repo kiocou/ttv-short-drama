@@ -4,7 +4,7 @@ import { useAppStore, ShelfKind } from '../../stores/useAppStore';
 import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useSettingsStore } from '../../stores/useSettingsStore';
-import { ipcService } from '../../services/ipc';
+import { ipcService, coverResolver } from '../../services/ipc';
 import { shelfFeedSupports, useShelfFeed } from '../../stores/useShelfFeed';
 import { StatusBadge } from '../common/StatusBadge';
 import { FluentButton } from '../common/FluentButton';
@@ -586,7 +586,8 @@ if (!sentinel || !root || !hasMore) return;
                   placeholderTextClassName="text-2xl"
                   className="transition-transform duration-300 group-hover:scale-105"
                   loading="eager"
-                />
+                
+                resolveSrc={coverResolver(continueWatching.seriesId, continueWatching.seriesCover)}/>
                 <div className="absolute inset-0 bg-black/10 transition-colors group-hover:bg-black/0" />
               </div>
 

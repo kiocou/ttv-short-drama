@@ -3,7 +3,10 @@
 mod anime_provider;
 mod dmghg_bridge;
 mod guo_provider;
+// 红果短剧的原生客户端：完整替代原 Python worker 的签名、目录与播放解析链路。
 mod hls_proxy;
+mod hongguo;
+mod hongguo_bridge;
 mod media_enhance;
 mod models;
 mod pip;
@@ -553,6 +556,95 @@ async fn guo_cover(
         .map_err(|error| error.to_string())?
 }
 
+/// 批量封面：一次 IPC 解析一屏的封面路径。
+///
+/// ## 为什么需要它（2026-10-24）
+///
+/// 前端原来是**每张卡一次 `guo_cover`**。一页 30 张卡 = 30 次 IPC + 30 次
+/// `spawn_blocking` 派发 + 30 次 FFI；而 Tauri 的每次 `invoke` 都要过一次
+/// 序列化与事件循环，这些固定开销叠加起来，在首屏上比真正的网络时间还显眼。
+/// 更要紧的是它**无法被排序**：谁先谁后完全取决于各卡的 IntersectionObserver
+/// 回调顺序，于是"用户真正在看的头几张"可能排在滚动区深处的卡片后面。
+///
+/// 批量接口把这一屏收成一次调用：后端按入参顺序解析，返回同序的
+/// `Option<String>` 数组。前端一次拿到整屏结果，逐卡 setState 即可。
+///
+/// ## 并发度为什么是 4
+///
+/// guo-core 的封面通道自己限并发（`nativeCoverCache.slots` = 4），并且有
+/// `pending` 去重。Rust 侧把并发开到正好等于这个数，既用满它、又不会把多余的任务
+/// 挤在它门口排队（那样只会让 `spawn_blocking` 池被无意义的等待占住）。
+/// 更高并发拿不到更多吞吐 —— 瓶颈是那 4 个槽位。
+///
+/// ## 门闩
+///
+/// 逐条过 `series_source_allowed`：受控源的那一条返回 `None` 而**不是**整批报错
+/// —— 一批里混着 18+ 与非 18+ 是常态（搜索、历史、收藏都会跨源），整批 Err 会让
+/// 一次混排把普通封面也一起弄丢。这与单条 `guo_cover` 的报错语义不同是有意的：
+/// 单条调用是"我就要这一张"，被拒必须说出来；批量是"这一屏尽量给我"，能给的给。
+#[tauri::command]
+async fn guo_cover_batch(
+    series_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Option<String>>, String> {
+    if series_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    /// 与 guo-core `nativeCoverCache.slots` 一致，见上方注释。
+    const COVER_CONCURRENCY: usize = 4;
+    let show_adult = adult_sources_allowed(&state);
+    let provider = state.guo_provider.clone();
+    // 门闩在进阻塞池之前算完：`adult_sources_allowed` 读一次库，不该在阻塞池里
+    // 每条都读一遍（那是 30 次 SQLite 查询）。
+    tauri::async_runtime::spawn_blocking(move || {
+        // 结果槽按**原始入参长度**开：被门闩拒掉的位置保留 `None`，其余按原下标
+        // 回填。这样返回值与 `series_ids` 严格同序，前端可以按下标对齐。
+        let total = series_ids.len();
+        let results: Vec<Option<String>> = vec![None; total];
+        // 门闩先过一遍：被拒的直接跳过（槽里已经是 None）。
+        let allowed: Vec<(usize, String)> = series_ids
+            .into_iter()
+            .enumerate()
+            .filter(|(_, series_id)| series_source_allowed(series_id, show_adult))
+            .collect();
+        if allowed.is_empty() {
+            return results;
+        }
+
+        // 固定 4 个 worker 从同一个下标游标取活：比 `chunks(4)` 好，因为每条耗时
+        // 差异很大（命中缓存 0ms、冷封面要下载），按块切会让某一块拖住整批。
+        let cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slots = std::sync::Arc::new(std::sync::Mutex::new(results));
+        let workers = COVER_CONCURRENCY.min(allowed.len());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let provider = provider.clone();
+                let cursor = std::sync::Arc::clone(&cursor);
+                let slots = std::sync::Arc::clone(&slots);
+                let allowed = &allowed;
+                scope.spawn(move || loop {
+                    let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((slot, series_id)) = allowed.get(index) else {
+                        return;
+                    };
+                    // 单条失败只丢那一条：封面对列表是装饰，不该因为一张图把整屏打成空。
+                    let path = provider.cover(series_id).ok().flatten();
+                    if let Ok(mut guard) = slots.lock() {
+                        if let Some(cell) = guard.get_mut(*slot) {
+                            *cell = path;
+                        }
+                    }
+                });
+            }
+        });
+        std::sync::Arc::try_unwrap(slots)
+            .map(|mutex| mutex.into_inner().unwrap_or_default())
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 /// 19 个 guo 源的站源任务/健康度状态（go 侧 `nativeSourceStatus`，原样透传）。
 ///
 /// 逐个源查而不是让 go 侧一次返回全部：`sourceStatus` 只吃一个 source。
@@ -673,6 +765,156 @@ pub(crate) fn vsr_is_enabled() -> bool {
 /// 落库值 → 运行期开关。`setup`（启动）与 `settings_save`（改设置）各调一次。
 fn set_vsr_enabled(enabled: bool) {
     vsr_enabled().store(enabled, Ordering::Relaxed);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 视频补帧：**独立窗口**方案
+//
+// 为什么不是就地补帧：WebView2 窗口无法被补帧链路捕获 —— DXGI / WGC 抓出来是
+// 整屏黑，GDI 抓取直接让引擎 0xC0000005 崩溃（三种 captureApi 都实测过）。
+// 所以补帧必须由一个自己的 D3D11 窗口承载：本模块只负责它的进程生命周期，
+// 渲染与补帧逻辑全在那个窗口里（realtime/LsfgDemo）。
+//
+// 与 VSR 的关系：VSR 作用在 WebView2 的 <video> 上（NVIDIA 驱动 + 本地 H.264 分片），
+// 补帧窗口走自绘 D3D11 呈现，**不经过驱动 VSR 那条路径**，两者不能叠加。
+// ───────────────────────────────────────────────────────────────────────────
+
+fn frame_interp_process() -> &'static Mutex<Option<std::process::Child>> {
+    static P: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(None))
+}
+
+/// 关掉补帧窗口（幂等）。退出应用、关开关都走这里。
+pub(crate) fn frame_interp_stop() {
+    let mut guard = frame_interp_process().lock().unwrap();
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// 找补帧程序：优先随包资源，其次本地构建产物（开发态）。
+fn find_frame_interp_exe(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(dir) = app.path().resource_dir() {
+        let p = dir.join("lsfg").join("LsfgDemo.exe");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let dev = std::path::PathBuf::from(
+        "D:/Users/kioco/Documents/deepseek-harness/default-workspace/lsfg_research/realtime/LsfgDemo/bin/Release/net10.0-windows/LsfgDemo.exe",
+    );
+    if dev.exists() {
+        return Some(dev);
+    }
+    None
+}
+
+/// 把本地 HLS 服务地址映射回磁盘文件。
+///
+/// 前端拿到的是 `http://127.0.0.1:<port>/rtx/<n>/vid-<id>/index.m3u8?token=...`，
+/// 而 **ffmpeg 打不开这条地址**（实测：curl 200 且内容正确，ffmpeg 一律报
+/// `Invalid data found when processing input`，与 UA / allowed_extensions 无关）。
+/// 但同一份产物在磁盘上，ffmpeg 读本地文件完全正常 —— 直接映射回路径最稳。
+fn local_stream_path(url: &str) -> Option<std::path::PathBuf> {
+    let vid = url.split("/vid-").nth(1)?;
+    let id: String = vid.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if id.is_empty() {
+        return None;
+    }
+    let base = crate::short_drama_app::cache_dir().join("rtx-vsr");
+    let dir = base.join(format!("vid-{id}"));
+    let m3u8 = dir.join("index.m3u8");
+    if m3u8.exists() {
+        Some(m3u8)
+    } else {
+        None
+    }
+}
+
+/// 开/关补帧窗口。返回 true 表示窗口已启动。
+///
+/// `hls_url` 是前端当前正在播的地址（本地 HLS 或直链），补帧窗口自己用 ffmpeg
+/// 边解边播，不依赖主窗口。
+// 参数是前端一次量到的窗口矩形与起播参数，天然就是这么多；聚合成 struct
+// 只会换来一次额外的序列化层，不值得。
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn frame_interp_set(
+    app: tauri::AppHandle,
+    hls_url: Option<String>,
+    enabled: bool,
+    multiplier: Option<u32>,
+    rect_x: Option<f64>,
+    rect_y: Option<f64>,
+    rect_w: Option<f64>,
+    rect_h: Option<f64>,
+    start_seconds: Option<f64>,
+) -> Result<bool, String> {
+    frame_interp_stop();
+    if !enabled {
+        return Ok(false);
+    }
+    let raw_url =
+        hls_url.ok_or_else(|| "当前会话还没有可用的流地址（先起播再开补帧）".to_string())?;
+    // 优先用磁盘上的同一份产物；映射失败才退回原始地址。
+    let url = match local_stream_path(&raw_url) {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => raw_url,
+    };
+    let exe = find_frame_interp_exe(&app)
+        .ok_or_else(|| "补帧程序未安装（找不到 LsfgDemo.exe）".to_string())?;
+    let mult = multiplier.unwrap_or(2).clamp(2, 5);
+
+    // 把前端量到的「视频区域」（CSS 像素，相对客户区）换算成屏幕像素：
+    // 补帧窗口无边框盖在这块矩形上，观感就是"在原播放器里补帧"。
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_string())?;
+    let scale = win.scale_factor().map_err(|e| e.to_string())?;
+    let inner = win.inner_position().map_err(|e| e.to_string())?;
+
+    let cx = rect_x.unwrap_or(0.0);
+    let cy = rect_y.unwrap_or(0.0);
+    let mut cw = rect_w.unwrap_or(0.0);
+    let mut ch = rect_h.unwrap_or(0.0);
+    if cw < 64.0 || ch < 64.0 {
+        // 前端没量到（比如舞台还没挂载）：退化成整窗覆盖。
+        let size = win.inner_size().map_err(|e| e.to_string())?;
+        cw = size.width as f64 / scale;
+        ch = size.height as f64 / scale;
+    }
+
+    let px = inner.x + (cx * scale).round() as i32;
+    let py = inner.y + (cy * scale).round() as i32;
+    let pw = ((cw * scale).round() as i32).max(320);
+    let ph = ((ch * scale).round() as i32).max(240);
+
+    // 补帧按 16:9 处理，高度扣掉控制条；宽度取偶数（D3D 纹理要求）
+    let bar_h = 46;
+    let video_w = (pw / 2) * 2;
+    let video_h = (((ph - bar_h) / 2) * 2).max(240);
+
+    let child = std::process::Command::new(&exe)
+        .arg("--hls")
+        .arg(&url)
+        .arg("--size")
+        .arg(format!("{video_w}x{video_h}"))
+        .arg("--fps")
+        .arg("30")
+        .arg("--mult")
+        .arg(mult.to_string())
+        .arg("--start")
+        .arg(format!("{:.2}", start_seconds.unwrap_or(0.0).max(0.0)))
+        .arg("--borderless")
+        .arg("--x")
+        .arg(px.to_string())
+        .arg("--y")
+        .arg(py.to_string())
+        .spawn()
+        .map_err(|e| format!("启动补帧窗口失败：{e}"))?;
+    *frame_interp_process().lock().unwrap() = Some(child);
+    Ok(true)
 }
 
 /// 非动漫链路统一转成 H.264 分片流。失败保留原 URL，由前端既有备份链路播放。
@@ -1248,6 +1490,22 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
     // 注意这里**不做任何强制改写**：它是真实可用的用户设置，不是不变量 8
     // 里那批「能力受限、如实归零」的字段。
     set_vsr_enabled(settings.vsr_enabled);
+    // 18+ 总开关一变，**必须作废 guo 侧已算出来的内容缓存**（封面路径 / 详情 /
+    // 档位）。原因见 `GuoProvider::clear_content_caches` 的注释：缓存里存的是
+    // "已放行时算出来的答案"，关掉开关后前端只要还握着旧路径就能继续渲染缩略图，
+    // 而 `guo_cover` 的门闩此时根本不会被调用到 —— 门闩等于漏了。
+    //
+    // 只在**真的变了**时才清：设置页会为其它无关字段反复保存（拖滑块、切主题），
+    // 每次都清会把封面缓存的收益抹平。读不到旧值就按"变了"处理（保守：清缓存只是
+    // 让下一次重算，不清则可能泄露已禁内容）。
+    let adult_toggled = state
+        .database
+        .settings_get()
+        .map(|previous| previous.show_adult_sources != settings.show_adult_sources)
+        .unwrap_or(true);
+    if adult_toggled {
+        state.guo_provider.clear_content_caches();
+    }
     // 代理模式：运行期即时生效。用户切到「直连」时立刻把代理判死，不必重启 ——
     // 这正是这个开关存在的意义：出现"目录加载失败"时，用户能自己一步绕过去。
     settings.proxy_mode = normalize_proxy_mode(&settings.proxy_mode);
@@ -1348,7 +1606,7 @@ fn clear_directory(path: &Path) -> Result<u64, String> {
 /// `<crate>/target/debug/ttv-short-drama.exe`，回退两级即 crate 根目录，
 /// 最终数据落在 `<crate>/.app-data/`（开发态通常空间充足）。
 /// 只有该位置不可写时才退回系统默认目录。
-fn app_storage_root() -> Option<PathBuf> {
+pub(crate) fn app_storage_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
     // 只有 **cargo 构建产物**（<crate>/src-tauri/target/{debug,release}/）才把数据
@@ -1802,6 +2060,7 @@ fn main() {
             catalog_suggest,
             catalog_categories,
             guo_cover,
+            guo_cover_batch,
             guo_source_status,
             guo_source_check,
             guo_proxy_get,
@@ -1811,6 +2070,7 @@ fn main() {
             playback_open,
             playback_command,
             playback_snapshot,
+            frame_interp_set,
             short_drama_app_status,
             short_drama_app_set_device,
             short_drama_app_resolve,

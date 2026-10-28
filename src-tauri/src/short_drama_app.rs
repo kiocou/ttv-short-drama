@@ -145,6 +145,31 @@ fn release_stream_inflight(vid: &str) {
 /// 取（或补齐）某 vid 的播放直链，**全进程去重**。
 ///
 /// 命中 `stream` 缓存直接返回；否则领取在途权、跑一次 worker，落缓存后交还。
+/// 取某 vid 的播放直链：**优先 Rust 原生**，失败才回退 Python worker。
+///
+/// 原生实现是移植过来的 openhongguo 协议：一次往返直接拿到全部码流地址与
+/// CENC 密钥（实测 150~250ms），而 worker 那条要两次往返（实测 3.5s）。
+/// 回退保留是因为上游接口随时可能改版 —— 原生解析失败时 worker 仍能兜底，
+/// 用户不会因为一次协议变更就完全播不了。
+async fn fetch_stream_payload_with_fallback<R: Runtime>(
+    app: &AppHandle<R>,
+    vid: &str,
+    profile: HongguoAppProfile,
+) -> Result<serde_json::Value, String> {
+    match crate::hongguo_bridge::fetch_stream_payload(vid).await {
+        Ok(payload) => {
+            crate::trace::log(format!("[红果] 原生解析命中 vid={vid}"));
+            Ok(payload)
+        }
+        Err(error) => {
+            crate::trace::log(format!(
+                "[红果] 原生解析失败，回退 worker vid={vid} 原因={error}"
+            ));
+            run_worker_subcommand(app, "stream", vid, "stream", profile).await
+        }
+    }
+}
+
 /// 没领到在途权的调用方轮询等前一条落缓存（上限与 worker 自身超时同量级）。
 async fn ensure_stream_cached<R: Runtime>(
     app: &AppHandle<R>,
@@ -156,8 +181,8 @@ async fn ensure_stream_cached<R: Runtime>(
     }
     let acquired = claim_stream_inflight(vid)?;
     if !acquired {
-        // 已有同 vid 的签名在跑：等它落缓存。两次 API 往返实测 2.2 秒，
-        // 给 20 秒余量（含网络抖动），超时后自己再跑一次兜底。
+        // 已有同 vid 的签名在跑：等它落缓存。原生链路实测 200ms 量级，
+        // worker 回退是两次往返 2.2 秒，给 20 秒余量（含网络抖动）。
         for _ in 0..80u32 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             if let Some(cached) = peek_stream(vid) {
@@ -169,7 +194,7 @@ async fn ensure_stream_cached<R: Runtime>(
         // 又以为有 leader 在跑而继续等。
         crate::trace::log(format!("[红果] 等待在途签名超时，自跑一次 vid={vid}"));
         let _ = claim_stream_inflight(vid);
-        let payload = match run_worker_subcommand(app, "stream", vid, "stream", profile).await {
+        let payload = match fetch_stream_payload_with_fallback(app, vid, profile).await {
             Ok(payload) => {
                 store_stream(vid, &payload);
                 peek_stream(vid).ok_or_else(|| "签名结果未能落缓存。".to_owned())
@@ -179,7 +204,7 @@ async fn ensure_stream_cached<R: Runtime>(
         release_stream_inflight(vid);
         return payload;
     }
-    let result = match run_worker_subcommand(app, "stream", vid, "stream", profile).await {
+    let result = match fetch_stream_payload_with_fallback(app, vid, profile).await {
         Ok(payload) => {
             store_stream(vid, &payload);
             peek_stream(vid).ok_or_else(|| "签名结果未能落缓存。".to_owned())
@@ -2794,6 +2819,76 @@ async fn convert_heic_to_jpeg(
     bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     let ffmpeg = ffmpeg_path()?;
+
+    // ===== 首选：临时文件（2026-10-27 修「猜你喜欢封面有时出不来」）=====
+    //
+    // HEIC 是**需要随机访问**的容器（`ftyp` + `meta` + `mdat` 各自定位 atom）。
+    // 喂 `pipe:0` 时 ffmpeg 无法 seek，实测直接失败：
+    //
+    //   原实现（管道）：exit=127，产出 0 字节
+    //     [mov,mp4,m4a,3gp,3g2,mj2] stream 0, offset 0x168: partial file
+    //   文件输入：      exit=0，产出 120722 字节 JPEG
+    //
+    // 也就是说管道那条路对 HEIC **一直是坏的**，只是有些源恰好 atom 顺序线性、
+    // 能蒙混过去，于是表现为"封面有时出不来"。日志里同一张图反复重试十几次
+    // （`封面代理失败 封面转码失败` 连刷）就是它在反复失败。
+    //
+    // 先写文件再转，文件写在**系统临时目录**（不是缓存目录）：
+    //   - 缓存目录可能被用户的清理策略盯着；
+    //   - 这里只活几毫秒，放系统临时目录语义更对。
+    // 写不进去时（历史上遇到过 `os error 5` 的受限环境）仍回退管道，
+    // 保持"至少还有一次机会"，不让修复本身变成新的单点。
+    let tmp_dir = std::env::temp_dir();
+    let tmp_path = tmp_dir.join(format!("ttv-heic-{}.heic", uuid::Uuid::new_v4()));
+    let written = std::fs::write(&tmp_path, bytes).is_ok();
+    if written {
+        let mut command = tokio::process::Command::new(&ffmpeg);
+        command
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-i")
+            .arg(&tmp_path)
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-q:v")
+            .arg("4")
+            .arg("-f")
+            .arg("mjpeg")
+            .arg("pipe:1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        let result = match command.output().await {
+            Ok(output) if output.status.success() && !output.stdout.is_empty() => Ok(output.stdout),
+            Ok(output) => Err(format!(
+                "封面转码失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("未知原因")
+            )),
+            Err(error) => Err(format!("封面转码进程失败：{error}")),
+        };
+        let _ = std::fs::remove_file(&tmp_path);
+        if let Ok(jpeg) = result {
+            // 尽力写进持久缓存（写失败不影响本次显示）。
+            let _ = std::fs::write(cache_dir.join(format!("{key}.jpg")), &jpeg);
+            return Ok(jpeg);
+        }
+    }
+    // 回退：管道（受限环境下没有可写临时目录时仍试一次）。
+    convert_heic_via_pipe(&ffmpeg, cache_dir, key, bytes).await
+}
+
+/// 管道形式的 HEIC 转码（回退路径，见上面 `convert_heic_to_jpeg` 的说明）。
+async fn convert_heic_via_pipe(
+    ffmpeg: &std::path::Path,
+    cache_dir: &std::path::Path,
+    key: &str,
+    bytes: &[u8],
+) -> Result<Vec<u8>, String> {
     // ===== 全走管道，一个文件都不写 =====
     //
     // ## 为什么不再用临时文件（2026-10-21 修「三处封面全丢」）
@@ -2812,7 +2907,7 @@ async fn convert_heic_to_jpeg(
     //
     // 产物形态与文件方式完全一致（`-f mjpeg pipe:1`，实测单张 39KB、文件头
     // `ffd8ffe0`），前端不需要任何改动。
-    let mut command = tokio::process::Command::new(&ffmpeg);
+    let mut command = tokio::process::Command::new(ffmpeg);
     command
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -3057,18 +3152,53 @@ pub async fn short_drama_app_prefetch_stream<R: Runtime>(
             let app_handle = app.clone();
             let target = vid.clone();
             handles.push(tokio::spawn(async move {
-                match run_worker_subcommand(&app_handle, "stream", &target, "prefetch", profile)
-                    .await
-                {
-                    Ok(payload) => {
-                        store_stream(&target, &payload);
-                        true
-                    }
+                // ⚠️ 必须走 `claim_stream_inflight`，不能用裸 `run_worker_subcommand`。
+                //
+                // 这是首播「点下去还要等 3.5 秒」的真正成因：预签名此前完全不碰在途表，
+                // 于是用户点播放时 `open_stream` 的 `ensure_stream_cached` 看不到
+                // "同一集已经有一条签名在跑"，直接当成冷启动又发一趟完整签名。
+                // 实测日志里两件事经常只差 200ms 发车（预签名 28.8s、播放 29.0s），
+                // 结果播放这条白等了一次 2.5s 的 API 往返 —— 而预签名那条稍后落地，
+                // 反而成了没人用的孤儿结果（`预签名已命中=false` 之后紧接着
+                // `预签名跳过 …` 的日志就是这个现象）。
+                //
+                // 接入在途表之后：先到的那条当 leader 跑 worker，后到的走 follower
+                // 轮询等它落缓存。用户点播放时若预签名已在跑，等的是「剩余时间」
+                // 而不是「再一整个往返」；实测命中路径 13~64ms 就是这个量级。
+                let claimed = match claim_stream_inflight(&target) {
+                    Ok(value) => value,
                     Err(error) => {
                         eprintln!("[ttv] 预签名跳过 {target}：{error}");
-                        false
+                        return false;
                     }
+                };
+                if !claimed {
+                    // 已有同 vid 的签名在跑（可能是用户点播放触发的 `open_stream`）：
+                    // 不必重复发车，等它落缓存即可。这里只等不写，避免两条链路
+                    // 同时 store_stream 造成后写覆盖前写。
+                    for _ in 0..40u32 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if peek_stream(&target).is_some() {
+                            return true;
+                        }
+                    }
+                    return false;
                 }
+                let outcome =
+                    match fetch_stream_payload_with_fallback(&app_handle, &target, profile).await {
+                        Ok(payload) => {
+                            store_stream(&target, &payload);
+                            true
+                        }
+                        Err(error) => {
+                            eprintln!("[ttv] 预签名跳过 {target}：{error}");
+                            false
+                        }
+                    };
+                // 无论成败都要摘表项：失败后留着表项会让后续 20 秒内的
+                // `open_stream` 误以为"有 leader 在跑"而空等（僵尸 leader）。
+                release_stream_inflight(&target);
+                outcome
             }));
         }
         for handle in handles {
@@ -3265,9 +3395,15 @@ pub async fn short_drama_app_qualities<R: Runtime>(
         return Err("缺少有效的集 vid。".into());
     }
     let profile = HongguoAppProfile::from_input(input.content_type, input.app_id)?;
-    let payload = match run_worker_subcommand(&app, "stream", &vid, "stream", profile).await {
+    // 走与播放链路**同一个**取数入口：原生优先、worker 兜底。
+    // 这里原来直接调 worker，原生接入后 worker 因凭据失效恒失败，
+    // 画质菜单就永远是空的 —— 那正是「分辨率不能全部支持」的成因。
+    let payload = match fetch_stream_payload_with_fallback(&app, &vid, profile).await {
         Ok(payload) => payload,
-        Err(_) => return Ok(Vec::new()),
+        Err(error) => {
+            crate::trace::log(format!("[红果] 清晰度列表取数失败 vid={vid} 原因={error}"));
+            return Ok(Vec::new());
+        }
     };
     let variants = payload
         .get("variants")

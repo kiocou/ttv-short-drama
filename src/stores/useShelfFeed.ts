@@ -224,6 +224,17 @@ export function useShelfFeed(kind: ShelfKind, channel: ChannelType): ShelfFeed {
         // 去重为空的页会让无限流停住。
         pagesLoaded: prev.pagesLoaded + 1,
       }));
+      /**
+       * 卡片落地即预热封面（2026-10-24）。
+       *
+       * 货架的条目来自红果 App 接口，其中一部分是 guo id（用户启用了 guo 源时），
+       * 它们的封面要走 guo-core。`guoCoverPrefetch` 只处理 guo id，非 guo 的
+       * （红果 HEIC）由各自卡片走 `shelf.cover`，这里不碰。
+       *
+       * 放在 `setState` 之后、不 await：封面是装饰，预热失败由卡片自己的退避
+       * 重试兜住。
+       */
+      void ipcService.catalog.guoCoverPrefetch(merged.map(item => item.id));
     } catch (error) {
       if (requestId !== requestIdRef.current) return;
       setState(prev => ({

@@ -191,7 +191,7 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
         {(series.rating || mark) && (
           <div className="absolute top-2 right-2 flex flex-col items-end gap-1">
             {series.rating && (
-              <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-black/65 text-amber-300">
+              <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-black/65 text-amber-300 tabular-nums">
                 <Star className="w-2.5 h-2.5 fill-current" />
                 <span>{series.rating.toFixed(1)}</span>
               </span>
@@ -208,8 +208,22 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
         )}
 
         {/* 悬停快捷播放图标 (实体凸出的立体浮雕圆盘) */}
-        <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-200 bg-black/20">
-          <div className="w-11 h-11 rounded-full fluent-convex-disc text-white flex items-center justify-center shadow-lg transform scale-75 group-hover:scale-100 transition-all duration-200 ease-[cubic-bezier(0.34,1.56,0.64,1)]">
+        <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-black/20">
+          {/*
+            圆盘出场用**欠阻尼弹簧**（`--spring-pop`，ζ=0.462，过冲 19%）。
+            旧写法是 `cubic-bezier(0.34,1.56,0.64,1)`——那是"假弹簧"：冲过去、
+            回来、然后停住，没有余振。真弹簧会多摆两下才收敛，手感上更接近
+            "被按下去又弹起来"。
+
+            两条实现细节：
+              1. `transition-all` 收窄成 `transition-[transform]`：圆盘上还有
+                 `fluent-convex-disc` 自带的 `box-shadow` / `background` 过渡，
+                 用 `all` 会让它们也吃这条 0.52s 的弹簧曲线，显得发飘；
+              2. **不加 `will-change`**：卡片是成批重复的高频元素（首屏 24 张、
+                 无限流后上百张），为每个圆盘预留合成层得不偿失（同 MicaCard
+                 里那段 backdrop-filter 的实测结论）。
+          */}
+          <div className="w-11 h-11 rounded-full fluent-convex-disc text-white flex items-center justify-center shadow-lg transform scale-75 group-hover:scale-100 transition-transform ttv-spring-pop">
             <Play className="w-5 h-5 fill-current ml-0.5" />
           </div>
         </div>
@@ -256,7 +270,7 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
           </div>
         )}
         {series.heat && series.heat > 0 && (
-          <div className="text-[10px] font-medium text-slate-400">
+          <div className="text-[10px] font-medium text-slate-400 tabular-nums">
             {series.heat >= 10_000 ? `${Math.round(series.heat / 10_000)}万热度` : `${series.heat.toLocaleString()} 热度`}
           </div>
         )}

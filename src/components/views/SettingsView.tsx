@@ -59,7 +59,10 @@ import {
 
 /** 条目标题 / 说明文字的字阶。全页只有这两级，不要再随手加第三级。 */
 const TITLE_CLS = 'text-xs font-semibold text-slate-800';
-const HINT_CLS = 'text-[11px] text-slate-400 leading-relaxed';
+/* `text-pretty` 加在这里而不是逐个调用点：HINT_CLS 是设置页所有说明段落的
+   唯一入口（十几处），一处生效即全覆盖。说明文字是这一页真正的正文——最长
+   的那几条（站源网络、缓存策略）会折到三四行，末行孤字最刺眼。 */
+const HINT_CLS = 'text-[11px] text-slate-400 leading-relaxed text-pretty';
 
 /**
  * 外观卡片的分段选项。
@@ -194,7 +197,7 @@ const Toggle: React.FC<{
     } ${disabled ? 'opacity-45 pointer-events-none' : ''}`}
   >
     <span
-      className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition duration-200 ease-in-out ${
+      className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ttv-spring-pop ${
         checked ? 'translate-x-4' : 'translate-x-0'
       }`}
     />
@@ -573,8 +576,20 @@ const SourceStatusPanel: React.FC = () => {
         />
       </button>
 
-      {open && (
-        <div className="flex flex-col gap-2 animate-fluent-slide-down">
+      {/* 体检面板：用 Grid `0fr → 1fr` 折叠，不再条件渲染。
+          理由见 index.css 的 `.ttv-collapse` 长注释：`fr` 由浏览器按内容分配，
+          所以展开/收起都是真实高度、不需要 JS 量、也不怕行数变化（19 个源
+          各自可能带一段检查步骤，高度是动态的）。
+
+          为什么这里敢改成**始终挂载**：内容是 19 行状态 + 少量按钮，量级稳定，
+          不是日志那种会涨到 800 行的列表；折叠后行高真的是 0，且外层
+          `content-visibility` 让浏览器跳过不可见部分的渲染。换来的是收起时
+          也有完整动画——条件渲染做不到这一点（卸载即消失）。 */}
+      <div
+        className={`ttv-collapse${open ? ' is-open' : ''}`}
+        aria-hidden={!open}
+      >
+        <div className="flex flex-col gap-2" style={{ contentVisibility: 'auto' }}>
           <p className={HINT_CLS}>
             状态读的是 guo-core 自己的体检结果，<span className="text-slate-500">不再是源表里那份手填快照</span>。
             「未检测」表示还没跑过体检——既不代表源坏了，<span className="text-slate-500">也不代表它可用</span>。
@@ -605,7 +620,7 @@ const SourceStatusPanel: React.FC = () => {
                   <span className="text-[10px] text-slate-400">
                     {row && row.count > 0 ? (row.hasMore ? '有更多页' : '已到底') : '—'}
                   </span>
-                  <span className="text-[10px] font-mono text-slate-400 ml-auto">{formatUpdatedAt(row?.updatedAt)}</span>
+                  <span className="text-[10px] font-mono text-slate-400 ml-auto tabular-nums">{formatUpdatedAt(row?.updatedAt)}</span>
                   <button
                     type="button"
                     disabled={!canCheck || busy}
@@ -673,7 +688,7 @@ const SourceStatusPanel: React.FC = () => {
             </FluentButton>
           </div>
         </div>
-      )}
+      </div>
     </div>
   );
 };
@@ -1133,11 +1148,16 @@ export const SettingsView: React.FC = () => {
           {/* RTX VSR 播放链路：开 = 源流转 H.264 分片（让驱动触发 VSR，首次起播
               稍慢），关 = 原始源直连（起播更快、无 VSR 增强）。文案必须如实——
               增强是完全由转码换来的，没有"档位"可选，见 AGENTS.md 不变量 8。
-              与「视频清晰度」那行的"档位来自源流实测"是同一套诚实边界。 */}
+              与「视频清晰度」那行的"档位来自源流实测"是同一套诚实边界。
+
+              播放页也有同一个开关（右下角「增强」浮层）：两处读写的是**同一份**
+              设置，且切换后会按原位置立即重载当前集（见 usePlaybackStore 里
+              `vsrSwitchRef` 那段），所以文案里必须提一句，否则用户会以为
+              "设置页改完要退出播放器才生效"。 */}
           <div className="pt-4 border-t border-black/[0.04]">
             <SettingRow
               title="RTX VSR 视频增强"
-              hint="打开：源流转码成 H.264 分片，让 NVIDIA 驱动做 RTX VSR 增强（首次起播多等一次转码）。关闭：回到原始源直连，起播更快，但没有 RTX VSR 增强。"
+              hint="打开：源流转码成 H.264 分片，让 NVIDIA 驱动做 RTX VSR 增强（首次起播多等一次转码）。关闭：回到原始源直连，起播更快，但没有 RTX VSR 增强。播放页右下角的「增强」浮层也能随时切换，正在看的那一集会按原位置立即重新准备。"
             >
               <Toggle
                 checked={settings.vsrEnabled !== false}
@@ -1267,7 +1287,7 @@ export const SettingsView: React.FC = () => {
                 <select
                   value={settings.playbackCacheMb}
                   onChange={event => updateSettings({ playbackCacheMb: Number(event.target.value) })}
-                  className="h-8 rounded-lg border border-slate-200/80 bg-white px-2.5 text-xs font-semibold text-slate-700 shadow-xs outline-none focus:ring-2 focus:ring-blue-400/40 cursor-pointer"
+                  className="ttv-input h-8 rounded-lg border border-slate-200/80 bg-white px-2.5 text-xs font-semibold text-slate-700 shadow-xs outline-none cursor-pointer"
                   aria-label="剧集缓存自动清理上限"
                 >
                   <option value="512">512 MB</option>

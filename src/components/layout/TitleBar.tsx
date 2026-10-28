@@ -409,7 +409,7 @@ export const TitleBar: React.FC = () => {
                 }
               }}
               placeholder="搜索短剧、漫剧、战神逆袭、豪门甜宠..."
-              className="w-full h-7 pl-8 pr-7 text-xs bg-white text-slate-800 placeholder-slate-400 rounded-lg border-none focus:outline-none shadow-xs transition-all"
+              className="ttv-input w-full h-7 pl-8 pr-7 text-xs bg-white text-slate-800 placeholder-slate-400 rounded-lg border-none shadow-xs"
             />
             {searchKeyword && (
               <button

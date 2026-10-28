@@ -285,9 +285,18 @@ export const CoverImage: React.FC<CoverImageProps> = ({
    * 走既有的重试与 `givenUp` 流程，结论与现在一致；而**非 heic 的原地址（官网抓来
    * 的 jpg/webp）因此重新变得可用**——这正是详情页一直能显示、首页显示不出来的差别。
    */
-  const url = resolveSrc
-    ? (resolvedUrl ?? (resolveFailed ? directUrl : ''))
-    : directUrl;
+  // ⚠️ 2026-10-27 修「猜你喜欢封面有几率消失」：
+  //
+  // 原写法只在 `resolveFailed` 时才回退直连 —— 于是"解析已开始、尚未返回"这段
+  // 窗口里 `url` 是空串，`<img>` 连渲染都不会发生，用户看到的就是一片空白。
+  // 实测日志（119 次挂载，107 次 `started=0`）说明大量卡片长期停在这个状态。
+  //
+  // 非 heic 的直连地址本来就能直接出图（详情页一直这么用），没有理由等解析。
+  // heic 则相反：直连在 WebView2 里必然解不出像素，先试它只会白白消耗重试预算，
+  // 所以仍然等解析结果、失败后才回退。判定沿用日志里那条正则，保持口径一致。
+  const isHeicSource = /\.heic(\?|$)/i.test(directUrl);
+  const url = resolvedUrl
+    ?? (isHeicSource ? (resolveFailed ? directUrl : '') : directUrl);
   const hasSource = Boolean(directUrl || resolveSrc);
 
   /**

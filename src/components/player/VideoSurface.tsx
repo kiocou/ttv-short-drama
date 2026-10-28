@@ -31,7 +31,6 @@ import {
   SkipForward,
   RotateCcw,
   RotateCw,
-  Info,
 } from 'lucide-react';
 
 export const VideoSurface: React.FC = () => {
@@ -57,7 +56,6 @@ export const VideoSurface: React.FC = () => {
     stallNotice,
     dismissStallNotice,
     seekNotice,
-    dismissSeekNotice,
     finishedAll,
     sessionId,
     vsrEnabled,
@@ -76,6 +74,36 @@ export const VideoSurface: React.FC = () => {
     tick: playerToastTick,
     show: showPlayerToast,
   } = usePlayerToast();
+
+  /**
+   * 「正在加载到 X 秒」并入**画面中央那套操作提示**，不再单独占一张卡片。
+   *
+   * ## 为什么不新建一种提示
+   *
+   * 播放器里已经有一套中央提示（快进/音量/全屏都走它，圆形、半透明、一闪即隐）。
+   * 再叠一张带关闭按钮的横条卡，同一个画面上就出现两种提示语言 ——
+   * 用户反馈"界面很乱"，这是对的。
+   *
+   * ## 怎么做到"持续显示"
+   *
+   * `PlayerToast` 是 760ms 自动淡出的（设计如此：快捷键反馈不该赖着不走）。
+   * 而"正在加载"需要一直显示到转码追上。做法是**依赖 `seekNotice` 每次变化
+   * 重新 show 一次**：store 那边每 250ms 轮询会把文案（已转秒数）刷新一次，
+   * 于是提示被持续点亮；追上后 store 置 null，不再 show，它自然淡出。
+   *
+   * 文案拆两行：主行说去哪，副行说进度。
+   */
+  useEffect(() => {
+    if (!seekNotice) return;
+    const target = /加载到\s*(\d+)\s*秒/.exec(seekNotice)?.[1];
+    const done = /已转\s*(\d+)\s*秒/.exec(seekNotice)?.[1];
+    showPlayerToast({
+      key: 'seek-wait',
+      icon: <RotateCw className="w-9 h-9 animate-spin" />,
+      label: target ? `正在加载到 ${target} 秒` : '正在加载',
+      detail: done ? `已转 ${done} 秒` : undefined,
+    });
+  }, [seekNotice, showPlayerToast]);
 
   // 全屏状态放在 App 级：标题栏需要据此隐藏，播放器只负责切换它。
   // 返回详情页也在这里发起（而非 store 内部）：导航权归组件层，store 只出信号。
@@ -622,25 +650,9 @@ export const VideoSurface: React.FC = () => {
         位置放在卡死提示下方（top-36），两条同时出现时不会互相盖住
         （卡死时播放确实可能同时在等转码，那种情况两条都成立）。
       */}
-      {seekNotice && (
-        <div className="absolute top-36 inset-x-0 z-30 flex justify-center pointer-events-none px-6">
-          <div className="min-w-[268px] max-w-md px-4 py-3 rounded-2xl bg-black/70 shadow-2xl border border-white/15 flex items-center gap-2.5">
-            <Info className="w-4 h-4 text-sky-400 flex-shrink-0" />
-            <span className="text-xs font-semibold text-white leading-relaxed">
-              {seekNotice}
-            </span>
-            <button
-              type="button"
-              onClick={dismissSeekNotice}
-              className="btn-fluent-action -mr-1.5 flex-shrink-0 pointer-events-auto"
-              title="关闭提示"
-              aria-label="关闭提示"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
+      {/* 「正在加载到 X 秒」不再单独占一张卡：它改走画面中央那套操作提示
+          （与「快进 5 秒」「音量 60%」同一形态），见下面 `seekNotice` 的 effect。
+          用户反馈过两套提示并存"界面很乱"，这里只保留中央提示一种。 */}
 
       {/*
         唯一的加载提示：右下角小胶囊。首次起播与换集共用同一形态，

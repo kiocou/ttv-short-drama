@@ -6,6 +6,7 @@ import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
 import { BackToTop } from '../common/BackToTop';
 import { CoverImage } from '../common/CoverImage';
+import { coverResolver } from '../../services/ipc';
 import {
   Heart,
   Play,
@@ -132,7 +133,8 @@ export const FavoritesView: React.FC = () => {
                       fallbackChar="剧"
                       placeholderTextClassName="text-base"
                       loading="eager"
-                    />
+                    
+                resolveSrc={coverResolver(item.seriesId, item.cover)}/>
                     <div className="absolute inset-0 bg-black/20 group-hover:bg-black/40 flex items-center justify-center transition-colors">
                       <Play className="w-5 h-5 text-white fill-current opacity-80 group-hover:opacity-100 transform group-hover:scale-110 transition-transform" />
                     </div>

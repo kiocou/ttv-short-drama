@@ -32,6 +32,38 @@ interface HlsInstance {
 const HLS_KEY = '__ttv_hls__';
 
 /**
+ * 让 hls.js **从指定位置**开始拉流，而不移动播放头。
+ *
+ * ## 为什么需要这个（2026-10-24）
+ *
+ * 用户点了进度条上"还没转好"的位置时，播放器不能把播放头推到可寻址末端
+ * （那正是"点击跳到转码最后位置"这个 bug），但也不能什么都不做 ——
+ * hls.js 是**按播放位置**决定拉哪一片的，播放头不动，目标位置那片永远不会被请求，
+ * `seekable.end` 也就永远长不到目标值。
+ *
+ * 正确做法是直接命令它：`startLoad(position)` 会让加载器按新位置重建
+ * `startPosition` 并从那里拉清单/分片，**完全不碰 `video.currentTime`**。
+ * 转码追上之后，上层再真正落位。
+ *
+ * 非 hls 源（原生 `<video src>`）没有这个能力：那种情况由浏览器自己的
+ * Range 请求处理，直接赋值即可，本函数是空操作。
+ *
+ * @returns 是否真的下达了"从该位置拉流"的命令（供调用方打点）。
+ */
+export function hintHlsLoadPosition(video: HTMLVideoElement, seconds: number): boolean {
+  const hls = (video as unknown as Record<string, unknown>)[HLS_KEY] as HlsInstance | undefined;
+  if (!hls || typeof hls.startLoad !== 'function') return false;
+  if (!Number.isFinite(seconds) || seconds < 0) return false;
+  try {
+    hls.startLoad(seconds);
+    return true;
+  } catch {
+    // 实例正在销毁/尚未 attach：忽略，下一拍再试。
+    return false;
+  }
+}
+
+/**
  * 元素上登记的「按倍速调整缓冲目标」回调。
  *
  * 播放器只有一块常驻 `<video>`，换集不换元素。不登记回调就没法在
@@ -136,7 +168,58 @@ export function nativeHlsSupported(video: HTMLVideoElement): boolean {
   return video.canPlayType('application/vnd.apple.mpegurl') === 'probably';
 }
 
-export async function attachSource(video: HTMLVideoElement, url: string): Promise<void> {
+export async function attachSource(
+  video: HTMLVideoElement,
+  url: string,
+  /**
+   * 这一集该从第几秒开始（默认 0 = 从头）。
+   *
+   * ## 为什么必须由调用方显式给（2026-10-24 修「画中画换集不从 0 开始」）
+   *
+   * hls.js 的 `startPosition` 默认值是 **-1**，语义是"拿 `media.currentTime` 当起点"
+   * —— 也就是说**换集时的起播位置取决于元素上残留的旧值**。
+   *
+   * 而 `detachSource` 里的 `removeAttribute('src')` 虽然按规范会把 `currentTime`
+   * 归 0，但那是媒体加载算法在**任务队列里异步**执行的；紧接着的 `hls.attachMedia`
+   * / `hls.loadSource` 是同步的，读到的是**还没被归零**的那个值。于是：
+   *
+   *   上一集播到 40s → 换集 → hls.js 以为"这一集也从 40s 开始" → 进度条不从 0
+   *   走、只播剩下那一小段，本集后半段永远看不到。
+   *
+   * 调用方在 `attachSource` **之后**写 `video.currentTime = 0` 也来不及：hls.js 的
+   * 起点在 `loadSource` 那一刻就已经定了，之后的赋值只会被它当作一次 seek。
+   *
+   * 所以这里把它做成显式参数，并在 `new Hls({...})` 里传下去。传 `undefined` 时
+   * 保持 hls.js 的默认行为（-1），但那等于把起播点交给元素残留值 —— 播放器不该
+   * 依赖这种隐式状态。
+   */
+  startPosition = 0,
+): Promise<void> {
+  /**
+   * ===== 为什么这里**仍然**是"先拆后挂"，而不是复用实例 =====
+   *
+   * 2026-10-23 曾尝试改成复用（`existing.loadSource(url)`），理由是"切集时
+   * `destroy()` + `new Hls()` 太重"。查过 hls.js 1.7.3 的源码之后放弃了：
+   *
+   * ```js
+   * loadSource(url) {
+   *   this.stopLoad();
+   *   if (media && loadedSource && loadedSource !== loadingSource) {
+   *     this.detachMedia();
+   *     this.attachMedia(media);   // ← 它自己也会重建 MediaSource
+   *   }
+   * }
+   * ```
+   *
+   * 也就是说复用**省不掉黑屏**：`detachMedia` + `attachMedia` 照样发生，
+   * 而"极短一黑"正是 MediaSource 重建造成的。复用真正省下的只有
+   * `destroy()` 的解绑与 `new Hls()` 的状态机初始化——这两项在实测里
+   * 都是亚毫秒到几毫秒级（见下方 `耗时=` 打点），而换来的是"实例跨集复用"
+   * 这种更难排查的状态耦合。
+   *
+   * 结论：收益不足以抵消风险。切集卡顿的真正大头是**开流解析**（已由预取修好，
+   * 实测 41~56ms）与**转码未就绪**，不是这里。
+   */
   detachSource(video);
   // 打点：这是整条起播链路上最关键的一处「此刻到底把什么交给了 <video>」。
   // 用户报的「一直加载」无法在开发机复现，只能靠这一行分辨当时走的是 VSR 转码
@@ -158,6 +241,19 @@ export async function attachSource(video: HTMLVideoElement, url: string): Promis
       return;
     }
     const hls = new Hls({
+      /**
+       * 起播点：**必须显式给**，不能让 hls.js 去读元素残留的 `currentTime`。
+       *
+       * `-1`（hls.js 默认）的语义是"用 `media.currentTime` 当起点"。播放器只有一块
+       * 常驻 `<video>`、换集不换元素，而 `detachSource` 里的 `removeAttribute('src')`
+       * 触发的位置归零是**异步**的（媒体加载算法在任务队列里跑）—— `loadSource`
+       * 在它之前同步执行，读到的还是上一集停下的位置。结果就是换集后进度条不从 0
+       * 开始、只播剩下那一小段（用户报告："进度条不会重置，回到之前的位置继续播"）。
+       *
+       * 传 0 就是"从这一集的开头拉流"，与"点下一集"的语义完全一致；需要续播时
+       * 由调用方传真实秒数。
+       */
+      startPosition: Number.isFinite(startPosition) && startPosition > 0 ? startPosition : 0,
       // 本地代理分片很小（0.6-2s），默认 30 分片缓冲对动漫分片粒度太保守。
       //
       // ⚠️ 这两个值必须按**倍速**放大，不能只看媒体时长（2026-10-21）。
@@ -408,6 +504,23 @@ export function detachSource(video: HTMLVideoElement): void {
   }
   // 换源即作废旧标记：留着会让下一次判死读到上一次的明细。
   clearHlsFatal(video);
+  /**
+   * 拆源时**顺手把播放位置归零**（2026-10-24）。
+   *
+   * `removeAttribute('src')` 按规范会让媒体加载算法把 `currentTime` 清 0，但那是
+   * 在任务队列里**异步**跑的；而紧接着的 `new Hls()` + `attachMedia` + `loadSource`
+   * 是同步的，读到的仍是旧值。hls.js 的 `startPosition` 默认 `-1` = "用
+   * `media.currentTime` 当起点"，于是新一集从上一集停下的位置开始播。
+   *
+   * `attachSource` 现在显式传 `startPosition` 已经把主路径堵住了；这里再同步归零，
+   * 是为了让**任何**绕过它的调用点（旧代码、将来新加的）也不会继承旧位置。
+   * 赋 0 在 `readyState === HAVE_NOTHING` 时可能抛，吞掉即可——那种状态下位置天然是 0。
+   */
+  try {
+    video.currentTime = 0;
+  } catch {
+    // 见上。
+  }
   video.removeAttribute('src');
 }
 

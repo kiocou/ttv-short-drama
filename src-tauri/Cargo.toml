@@ -10,6 +10,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 base64 = "0.22"
+# 注册报文的 gzip（红果 ss_app_log 信封要求 gzip 压缩后加密）
+flate2 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 regex = "1"

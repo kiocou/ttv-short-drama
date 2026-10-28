@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Sparkles, X, Download, CheckCircle2, Power } from 'lucide-react';
+import { StreamText } from './StreamText';
 import {
   cancelUpdateDownload,
   createDownloadJobId,
@@ -263,7 +264,7 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({ info, onClose }) => 
     >
       <div className="absolute inset-0 bg-slate-900/25" onClick={requestClose} />
       <div
-        className="relative w-full max-w-md rounded-2xl bg-white shadow-fluent-lg border border-slate-200/80 p-5 flex flex-col gap-3"
+        className="ttv-settle-in relative w-full max-w-md rounded-2xl bg-white shadow-fluent-lg border border-slate-200/80 p-5 flex flex-col gap-3"
         role="dialog"
         aria-modal="true"
         aria-label={`发现新版本 v${info.latestVersion}`}
@@ -290,9 +291,22 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({ info, onClose }) => 
         </div>
 
         {info.notes.trim() && (
-          <p className="text-[11px] text-slate-600 leading-relaxed whitespace-pre-wrap max-h-28 overflow-hidden">
-            {info.notes.trim()}
-          </p>
+          /* 更新说明用**流式打字**入场（逐字 blur(6px) → 清晰，单字 90ms、
+             相邻错开 30ms）。这是全应用最适合这条动效的位置：文本只出现一次、
+             内容值得逐句读、且用户此刻本来就在等（没有别的事可做）。
+
+             为什么延迟 180ms：弹窗本身有 `ttv-settle-in`（0.34s 过阻尼落定），
+             文字若同时开始，会和弹窗的缩放撞在一起显得乱。让弹窗先落到位、
+             文字再开始晕开，两个动作就有了先后。
+
+             为什么把 `max-h-28 overflow-hidden` 换成 `max-h-40 overflow-y-auto`：
+             旧的 `overflow-hidden` 会**静默截断**长说明（v0.2.31 的说明就有
+             十几行），用户看不到后半段也没有任何提示。逐字动画反而放大了这个
+             问题——字在慢慢出现，但出现到一半就被裁掉了。改成可滚动后，长说明
+             至少能读完。 */
+          <div className="text-[11px] text-slate-600 leading-relaxed max-h-40 overflow-y-auto pr-1">
+            <StreamText text={info.notes.trim()} delay={180} />
+          </div>
         )}
 
         {/* 下载前告知走的是加速通道，并说明会做完整性校验。
@@ -309,7 +323,7 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({ info, onClose }) => 
           <div className="flex flex-col gap-1.5">
             <div className="flex items-baseline justify-between">
               <span className="text-[11px] font-semibold text-slate-700">正在下载更新</span>
-              <span className="text-[11px] font-mono font-bold text-blue-600">{percent}%</span>
+              <span className="text-[11px] font-mono font-bold text-blue-600 tabular-nums">{percent}%</span>
             </div>
             <div
               className="h-2 w-full rounded-full bg-blue-200/60 overflow-hidden"
@@ -323,7 +337,7 @@ export const UpdateDialog: React.FC<UpdateDialogProps> = ({ info, onClose }) => 
                 style={{ width: `${percent}%` }}
               />
             </div>
-            <span className="text-[10px] font-mono text-slate-500">{progressLabel}</span>
+            <span className="text-[10px] font-mono text-slate-500 tabular-nums">{progressLabel}</span>
             {/* 走的是哪条通道：直连还是国内加速。用户有权知道。
                 预检还没回来时显示"正在检测网络"，避免这一行忽隐忽现。 */}
             <span className="text-[10px] text-slate-400">

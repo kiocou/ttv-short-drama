@@ -106,6 +106,17 @@ export async function attachAnimeSource(
   video: HTMLVideoElement,
   url: string,
   kind: AnimeStreamKind,
+  /**
+   * 这一集该从第几秒开始（默认 0 = 从头）。
+   *
+   * 与 `hlsAttach.attachSource` 的同名参数是同一个理由：hls.js 的 `startPosition`
+   * 默认 `-1` 表示"用 `media.currentTime` 当起点"，而换集时元素上残留的是**上一集**
+   * 的位置（`detachAnimeSource` 只拆实例、不清 `src`，位置根本不会归零）。
+   *
+   * 小窗的动漫链路与短剧链路走同一块常驻 `<video>`，两边都必须显式归位，否则
+   * "换集从上一集的位置接着播"会在两条链路上各出现一次。
+   */
+  startPosition = 0,
 ): Promise<AnimeAttachResult> {
   detachAnimeSource(video);
   const record = video as unknown as Record<string, unknown>;
@@ -123,7 +134,11 @@ export async function attachAnimeSource(
       record[KIND_KEY] = 'file';
       return { kind: 'file', codecs: [] };
     }
-    const hls = new Hls(animeHlsConfig()) as unknown as AnimeHlsInstance;
+    const hls = new Hls({
+      ...animeHlsConfig(),
+      // 起播点必须显式给：`-1`（默认）会去读元素残留的 `currentTime`。
+      startPosition: Number.isFinite(startPosition) && startPosition > 0 ? startPosition : 0,
+    }) as unknown as AnimeHlsInstance;
     record[HLS_KEY] = hls;
     record[KIND_KEY] = 'hls';
     hls.attachMedia(video);

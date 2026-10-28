@@ -537,28 +537,65 @@ mod ffi {
     /// 不出来（initialize / resourceSettings / saveResourceSettings / release /
     /// cancelRead 这类全局语义）回空串 = 全局片。
     ///
+    /// ## 封面单独再散一层（2026-10-24）
+    ///
+    /// 封面**不改任何共享状态**，与目录/详情之间没有必须串行的理由：guo-core 的
+    /// `nativeCoverCache` 自己有 `mu` + `pending` 去重 + `slots`（并发 4）三道闸，
+    /// 而 `catalog` / `detail` 走的是 `engine.mu` 与每源锁，两批锁互不相交。
+    ///
+    /// 原来封面与同源的 `catalog` / `detail` 共用一把锁，后果是**首屏封面排成一条队**：
+    /// 一页 30 张卡就是 30 次串行 FFI，而且它们还要和目录请求互相等。现在按
+    /// `(源, 剧 id)` 散到 [`COVER_SHARDS`] 个片上，同源封面彼此并行、也不再挡住目录。
+    ///
     /// 键只要求**一致**不要求规范：同一源两种写法顶多少并行一点，不会错。
     pub(super) fn bridge_lock_key(input: &Value) -> String {
         let non_empty = |value: Option<&str>| -> Option<String> {
             let trimmed = value?.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_owned())
         };
-        if let Some(source) = non_empty(input.get("source").and_then(Value::as_str)) {
+        let source_key =
+            if let Some(source) = non_empty(input.get("source").and_then(Value::as_str)) {
+                Some(source)
+            } else if let Some(drama) = input.get("drama") {
+                if let Some(source) = non_empty(drama.get("source").and_then(Value::as_str)) {
+                    Some(source)
+                } else {
+                    non_empty(
+                        drama
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .and_then(|id| id.split(':').next()),
+                    )
+                }
+            } else {
+                None
+            };
+        let source = source_key.unwrap_or_default();
+        if source.is_empty() {
             return source;
         }
-        let Some(drama) = input.get("drama") else {
-            return String::new();
-        };
-        if let Some(source) = non_empty(drama.get("source").and_then(Value::as_str)) {
-            return source;
-        }
-        non_empty(
-            drama
-                .get("id")
+        if input.get("action").and_then(Value::as_str) == Some("cover") {
+            // 散列只用来铺开并发，**不承载语义**：同一部剧的封面永远落同一片
+            // （同剧重复请求仍互相等待，guo-core 的 pending 去重才有意义）。
+            let id = input
+                .get("drama")
+                .and_then(|drama| drama.get("id"))
                 .and_then(Value::as_str)
-                .and_then(|id| id.split(':').next()),
-        )
-        .unwrap_or_default()
+                .unwrap_or_default();
+            return format!("cover:{source}:{}", stable_shard(id, super::COVER_SHARDS));
+        }
+        source
+    }
+
+    /// 把任意字符串折成一个稳定的 `[0, shards)` 下标。
+    ///
+    /// 用 `DefaultHasher`（SipHash，固定种子）而不是 `RandomState`：同一个剧 id
+    /// 在进程生命周期内必须永远落同一片，否则"同剧封面互相等待"这个前提就没了。
+    fn stable_shard(key: &str, shards: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish() % shards.max(1)
     }
 
     fn text(value: &Value, keys: &[&str]) -> String {
@@ -612,6 +649,15 @@ pub struct GuoProvider {
     /// 探测（那次会再跑一遍 detail + resolve）。开放时顺手把档位记下来，探测直接
     /// 命中，省掉一次站源往返，也少一次对同一站源的并发挤占。
     resolve_qualities: Mutex<HashMap<String, (Instant, Vec<VideoQualityOption>)>>,
+    /// 封面路径缓存（`series_id` → 本地文件路径，`None` = 确实没有可用封面）。
+    ///
+    /// **为什么需要这一层**：`cover()` 原来每次都直接发 FFI。guo-core 侧虽然有磁盘
+    /// 缓存（命中只要 1ms 级），但一次 FFI 仍要走 JSON 序列化 + 分片锁排队 + 返回
+    /// 解析；而列表一页 30 张卡就是 30 次。更糟的是同一部剧的封面会被重复请求——
+    /// App 的视图是常驻 DOM，同一张卡同时挂在发现页与「更多」页时各要一次。
+    ///
+    /// 命中这里直接返回，**一次 FFI 都不发**。
+    cover_cache: Mutex<HashMap<String, CoverEntry>>,
 }
 
 /// 详情缓存的一条记录。
@@ -648,6 +694,41 @@ const QUALITY_CACHE_LIMIT: usize = 64;
 /// 换清晰度后看到旧档位。
 const QUALITY_TTL: Duration = Duration::from_secs(120);
 
+/// 封面缓存的一条记录。
+///
+/// `path` 是 guo-core 落盘的**绝对路径**，同一部剧在进程生命周期内不会变（缓存
+/// 目录稳定、文件名按封面地址哈希）。所以命中即用，不必再校验文件是否存在——
+/// 真被清掉时 `<img>` 会走自己的 onError，那比每次 stat 一遍便宜。
+struct CoverEntry {
+    fetched: Instant,
+    path: Option<String>,
+}
+
+/// 有封面时的缓存 TTL：30 分钟。
+///
+/// 封面地址与文件内容都不以分钟为单位变化，长 TTL 的收益直接体现在"来回翻目录
+/// 不再重打 FFI"。30 分钟也足以覆盖一次完整的浏览会话。
+const COVER_TTL_HIT: Duration = Duration::from_secs(30 * 60);
+
+/// **没有**封面时的负缓存 TTL：60 秒。
+///
+/// 必须比命中短得多：站源抖动、单次超时、图片 CDN 临时 5xx 都会让一次请求失败，
+/// 而那次失败不代表这部剧没有封面。60 秒后自动重试，既挡住"同一页反复重打同一个
+/// 死链"，又不会把一次抖动记成永久结论（不变量 8：不把"这次没拿到"说成"没有"）。
+const COVER_TTL_MISS: Duration = Duration::from_secs(60);
+
+/// 封面缓存条目上限。
+///
+/// 每条只是一个路径字符串，512 条约几十 KB。取 512 是为了覆盖"首页 + 更多页 +
+/// 搜索 + 收藏"叠加后仍然有相当一部分能命中；满了按最早写入淘汰。
+const COVER_CACHE_LIMIT: usize = 512;
+
+/// 封面 FFI 调用散列出的片数。
+///
+/// 见 [`bridge_lock_key`]：封面走图片 CDN，与目录/详情用的 API 不同域，把它和
+/// `catalog` / `detail` 挤在同一把同源锁上，会让一页 30 张封面排成一条队。
+const COVER_SHARDS: u64 = 6;
+
 impl GuoProvider {
     pub fn new(resource_dir: &Path, data_dir: &Path) -> Result<Self, String> {
         let bridge = ffi::GuoBridge::load(&find_dll(resource_dir)?)?;
@@ -662,6 +743,7 @@ impl GuoProvider {
             revalidating: Mutex::new(HashSet::new()),
             detail_cache: Mutex::new(HashMap::new()),
             resolve_qualities: Mutex::new(HashMap::new()),
+            cover_cache: Mutex::new(HashMap::new()),
         };
         provider.bridge.request(&json!({
             "action": "initialize",
@@ -1005,13 +1087,41 @@ impl GuoProvider {
     /// （裸 `<img>` 实测 403），部分源封面还是加过密的（AES/XOR，前端拿到密文
     /// 解不出来）。guo-core 的 cover 通道自带源侧 Referer 与浏览器传输层，是
     /// 唯一能稳定拿到图的路。HEIC 封面（WebView2 显示不了）按"无封面"处理。
+    ///
+    /// 带两级缓存（见 [`COVER_TTL_HIT`] / [`COVER_TTL_MISS`]）：命中直接返回，
+    /// 一次 FFI 都不发。列表一页 30 张卡、同一张卡还可能同时挂在两个常驻视图上，
+    /// 这一层省掉的是成十上百次 JSON 序列化 + 分片锁排队。
     pub fn cover(&self, series_id: &str) -> Result<Option<String>, String> {
+        if let Some(hit) = self.cover_cached(series_id) {
+            return Ok(hit);
+        }
+        let path = self.cover_uncached(series_id)?;
+        self.remember_cover(series_id, path.clone());
+        Ok(path)
+    }
+
+    /// 查封面缓存。`Some` 表示命中（含"确实没有封面"的负缓存）。
+    fn cover_cached(&self, series_id: &str) -> Option<Option<String>> {
+        let cache = self.cover_cache.lock().ok()?;
+        let entry = cache.get(series_id)?;
+        let ttl = if entry.path.is_some() {
+            COVER_TTL_HIT
+        } else {
+            COVER_TTL_MISS
+        };
+        (entry.fetched.elapsed() < ttl).then(|| entry.path.clone())
+    }
+
+    /// 真走一次 FFI。失败**不入缓存**：那是"这次没拿到"，不是"没有封面"。
+    fn cover_uncached(&self, series_id: &str) -> Result<Option<String>, String> {
         let ids = parse_guo_series_id(series_id).ok_or_else(|| "剧集 ID 无效。".to_string())?;
         let data = self.bridge.request(&json!({
             "action": "cover",
             "drama": { "id": format!("{}:{}", ids.source, ids.raw_series_id), "source": ids.source },
             "force": false,
         }))?;
+        // HEIC 是"站源给了图但 WebView2 解不了"，属于**确定的**没有可用封面，
+        // 与网络失败不同，可以进负缓存。
         if data.get("heic").and_then(Value::as_bool) == Some(true) {
             return Ok(None);
         }
@@ -1020,6 +1130,50 @@ impl GuoProvider {
             return Ok(None);
         }
         Ok(Some(path))
+    }
+
+    /// 写封面缓存，超上界时丢掉最早写入的那几条。
+    fn remember_cover(&self, series_id: &str, path: Option<String>) {
+        let Ok(mut cache) = self.cover_cache.lock() else {
+            return;
+        };
+        if cache.len() >= COVER_CACHE_LIMIT && !cache.contains_key(series_id) {
+            // 条目少、结构简单：按 `fetched` 找最旧的一条丢，线性扫描足够。
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
+            series_id.to_owned(),
+            CoverEntry {
+                fetched: Instant::now(),
+                path,
+            },
+        );
+    }
+
+    /// 清空封面缓存。
+    ///
+    /// **必须在 18+ 总开关变化时调用**：缓存里存的是本地文件路径，关掉开关之后
+    /// 那些路径仍然指向盘上已下载的 18+ 缩略图 —— 前端只要还握着旧路径就能继续
+    /// 渲染（`guo_cover` 的门闩此时已被绕过，因为它根本没被调用）。门闩的语义是
+    /// "关掉就看不见"，那就必须连已经算出来的答案一起作废。
+    ///
+    /// 详情缓存同理（它带着剧名/简介/分集表）。两者一起清，不拆开。
+    pub fn clear_content_caches(&self) {
+        if let Ok(mut cache) = self.cover_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.detail_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.resolve_qualities.lock() {
+            cache.clear();
+        }
     }
 
     pub fn detail(&self, series_id: &str) -> Result<SeriesDetail, String> {
@@ -1697,15 +1851,19 @@ mod tests {
             "dsd"
         );
         // 兜底：drama.id 剥前缀（cover 的拼法没有单独的 source 字段时）。
-        assert_eq!(
-            bridge_lock_key(&json!({ "action": "cover", "drama": { "id": "huangdou:9" } })),
-            "huangdou"
-        );
-        // guo: 前缀的双冒号 id 剥出的键粗一点（"guo"），但**一致**——不会错，只会少并行。
-        assert_eq!(
-            bridge_lock_key(&json!({ "action": "cover", "drama": { "id": "guo:dsd:42" } })),
-            "guo"
-        );
+        //
+        // ⚠️ cover **不再返回裸源名**：它按 (源, 剧 id) 再散一层片（见
+        // `bridge_lock_key` 的「封面单独再散一层」）。判据只有两条：
+        //   ① 前缀必须是 `cover:<源>:`，不能落进目录/详情那一片；
+        //   ② 同一部剧永远落同一片（幂等），不同剧尽量分散。
+        let cover_key =
+            |id: &str| bridge_lock_key(&json!({ "action": "cover", "drama": { "id": id } }));
+        assert!(cover_key("huangdou:9").starts_with("cover:huangdou:"));
+        assert!(cover_key("guo:dsd:42").starts_with("cover:guo:"));
+        // 幂等：同一个 id 两次调用必须相同，否则"同剧封面互相等待"的前提就没了。
+        assert_eq!(cover_key("huangdou:9"), cover_key("huangdou:9"));
+        // 与目录/详情分开：封面的键绝不会等于裸源名。
+        assert_ne!(cover_key("huangdou:9"), "huangdou");
         // 空串 / 空白串 / 缺失一律全局片。
         assert_eq!(bridge_lock_key(&json!({ "action": "initialize" })), "");
         assert_eq!(
@@ -1715,6 +1873,31 @@ mod tests {
         assert_eq!(
             bridge_lock_key(&json!({ "action": "release", "session": "s1" })),
             ""
+        );
+    }
+
+    /// 封面散列必须真的散开：同一源下不同剧的封面不该全挤在一片。
+    ///
+    /// 这条是"首屏 30 张封面串成一条队"那类退化的护栏——如果 `stable_shard`
+    /// 恒返回 0（比如忘了取模），行为会静默退回改动前的串行状态，而界面只是
+    /// "慢一点"，没有任何错误可查。
+    #[test]
+    fn cover_shards_actually_spread() {
+        use super::ffi::bridge_lock_key;
+        use std::collections::HashSet;
+        let mut shards = HashSet::new();
+        for index in 0..64 {
+            let key = bridge_lock_key(&json!({
+                "action": "cover",
+                "drama": { "id": format!("huangdou:{index}") },
+            }));
+            shards.insert(key);
+        }
+        // 6 片、64 个 id：至少用到 4 片才算真的散开（留出哈希碰撞的余量）。
+        assert!(
+            shards.len() >= 4,
+            "封面散列退化：64 个剧 id 只落进 {} 片",
+            shards.len()
         );
     }
 

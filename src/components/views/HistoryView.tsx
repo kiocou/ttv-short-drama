@@ -8,6 +8,7 @@ import { BackToTop } from '../common/BackToTop';
 import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
 import { StatusBadge } from '../common/StatusBadge';
+import { coverResolver } from '../../services/ipc';
 import {
   History,
   Trash2,
@@ -106,7 +107,7 @@ export const HistoryView: React.FC = () => {
                 onChange={(e) => setFilterKeyword(e.target.value)}
                 placeholder="搜索看过的剧..."
                 aria-label="搜索历史记录"
-                className="w-full h-8 pl-8 pr-7 text-xs bg-white rounded-lg border border-slate-200/80 focus:outline-none focus:border-blue-500 shadow-xs"
+                className="ttv-input w-full h-8 pl-8 pr-7 text-xs bg-white rounded-lg border border-slate-200/80 shadow-xs"
               />
               {filterKeyword && (
                 <button
@@ -211,7 +212,8 @@ export const HistoryView: React.FC = () => {
                     fallbackChar="剧"
                     placeholderTextClassName="text-base"
                     loading="eager"
-                  />
+                  
+                resolveSrc={coverResolver(item.seriesId, item.seriesCover)}/>
                   <div className="absolute inset-0 bg-black/20 group-hover:bg-black/40 flex items-center justify-center transition-colors">
                     <Play className="w-5 h-5 text-white fill-current opacity-80 group-hover:opacity-100 transform group-hover:scale-110 transition-transform" />
                   </div>

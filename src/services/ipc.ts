@@ -131,6 +131,105 @@ const GUO_COVER_CACHE_LIMIT = 400;
 const guoCoverCache = new Map<string, string | null>();
 const guoCoverInflight = new Map<string, Promise<string | null>>();
 
+/**
+ * 封面批量队列：把"同一帧内出现的多次 `guoCover`"合并成一次 IPC。
+ *
+ * ## 为什么在 service 层做，而不是改各个调用点
+ *
+ * 调用方是 `CoverImage` 的 `resolveSrc`，它由每张卡各自的 IntersectionObserver
+ * 触发 —— 一屏 30 张卡几乎在同一帧里全部进入视口，于是同一帧会发起 30 次
+ * `guoCover`。每次都是一次 `invoke`（序列化 + 事件循环 + `spawn_blocking` 派发），
+ * 这些固定开销在首屏上比封面本身还显眼。
+ *
+ * 在 service 层收口的好处是**调用点一行都不用改**：`guoCover` 的签名与语义完全
+ * 不变（返回 `Promise<string | null>`），只是内部先把请求攒一攒。
+ *
+ * ## 攒多久
+ *
+ * 一个宏任务（`setTimeout(0)`）而不是 `queueMicrotask`：同一帧里各卡的 effect 是
+ * 分批跑的（React 提交 → layout effect → passive effect → IO 回调），microtask
+ * 只能合并"同一个 tick 内"的那几个，通常只有两三张。0ms 宏任务能把这一帧的
+ * passive effect 与紧随其后的 IO 回调都收进来，实测能合并到接近整屏。
+ *
+ * ## 为什么不无限攒
+ *
+ * 队列里有上限（`GUO_COVER_BATCH_LIMIT`）并且发车后立刻清空：上限是为了让"用户
+ * 快速滚动"时不会攒出一个几百条的巨型请求（后端是串行解析，那样第一条要等很久）；
+ * 滚动中每一批各自发车，先到先渲染。
+ */
+const GUO_COVER_BATCH_LIMIT = 24;
+/** 待发车的一批：id 顺序即请求顺序，`waiters` 按 id 收集所有等待者。 */
+let guoCoverBatch: {
+  ids: string[];
+  waiters: Map<string, Array<{ resolve: (path: string | null) => void; reject: (error: unknown) => void }>>;
+  timer: ReturnType<typeof setTimeout> | null;
+} | null = null;
+
+/** 把一次封面请求挂进队列，返回一个等结果的 Promise。 */
+function enqueueGuoCover(seriesId: string): Promise<string | null> {
+  if (!guoCoverBatch) {
+    guoCoverBatch = { ids: [], waiters: new Map(), timer: null };
+  }
+  const batch = guoCoverBatch;
+  const promise = new Promise<string | null>((resolve, reject) => {
+    const existing = batch.waiters.get(seriesId);
+    if (existing) existing.push({ resolve, reject });
+    else batch.waiters.set(seriesId, [{ resolve, reject }]);
+  });
+  // 同一部剧在一批里只占一个请求位，但它的所有等待者都要收到结果。
+  if (!batch.ids.includes(seriesId)) batch.ids.push(seriesId);
+  // 到量立刻发车，不等计时器：滚动中每攒够一批就走，先到的先出图。
+  if (batch.ids.length >= GUO_COVER_BATCH_LIMIT) {
+    flushGuoCoverBatch();
+    return promise;
+  }
+  if (!batch.timer) {
+    batch.timer = setTimeout(flushGuoCoverBatch, 0);
+  }
+  return promise;
+}
+
+/** 立刻发车（也供切 18+ 开关时冲掉队列用）。 */
+function flushGuoCoverBatch(): void {
+  const batch = guoCoverBatch;
+  guoCoverBatch = null;
+  if (!batch) return;
+  if (batch.timer) clearTimeout(batch.timer);
+  const ids = batch.ids;
+  if (ids.length === 0) return;
+
+  const resolveAll = (id: string, path: string | null) => {
+    rememberGuoCover(id, path);
+    for (const waiter of batch.waiters.get(id) ?? []) waiter.resolve(path);
+    guoCoverInflight.delete(id);
+  };
+  const rejectAll = (id: string, error: unknown) => {
+    // 失败**不写前端负缓存**：一次抖动不该被记成"这部剧没有封面"（后端有 60s
+    // 负缓存负责挡重复请求，前端只需把机会留给下一轮重试）。
+    for (const waiter of batch.waiters.get(id) ?? []) waiter.reject(error);
+    guoCoverInflight.delete(id);
+  };
+
+  // 单条：仍走原命令，保持"被门闩拒绝时能报错"的语义。
+  if (ids.length === 1) {
+    const only = ids[0];
+    invokeBackend<string | null>('guo_cover', { seriesId: only })
+      .then(path => resolveAll(only, path))
+      .catch(error => rejectAll(only, error));
+    return;
+  }
+
+  invokeBackend<Array<string | null>>('guo_cover_batch', { seriesIds: ids })
+    .then(paths => {
+      // 后端保证同序；长度对不上时按 null 兜底（宁可少一张图，不串封面）。
+      ids.forEach((id, index) => resolveAll(id, paths?.[index] ?? null));
+    })
+    .catch(error => {
+      // 整批失败：逐条 reject，让 `CoverImage` 走它自己的退避重试。
+      ids.forEach(id => rejectAll(id, error));
+    });
+}
+
 function rememberGuoCover(seriesId: string, path: string | null): void {
   guoCoverCache.set(seriesId, path);
   if (guoCoverCache.size <= GUO_COVER_CACHE_LIMIT) return;
@@ -459,20 +558,55 @@ async guoCover(seriesId: string): Promise<string | null> {
       const inflight = guoCoverInflight.get(seriesId);
       if (inflight) return inflight;
 
-      const request = invokeBackend<string | null>('guo_cover', { seriesId })
-        .then(path => {
-          rememberGuoCover(seriesId, path);
-          return path;
-        })
-        .catch(() => {
-          rememberGuoCover(seriesId, null);
-          return null;
-        })
-        .finally(() => {
-          guoCoverInflight.delete(seriesId);
-        });
+      // 同一帧内的多次请求合并成一次 IPC（见 `enqueueGuoCover` 的注释）。
+      //
+      // 契约保持不变：**失败也 resolve 成 `null`**（不 reject）。理由有两个：
+      // ① 调用方 `coverResolver` 的类型是 `() => Promise<string | null>`；
+      // ② 失败不写前端负缓存，但后端有 60 秒负缓存挡重复请求，所以这里吞掉错误
+      //    不会变成"每次渲染都重打一遍"。
+      const request = enqueueGuoCover(seriesId).catch(() => null);
       guoCoverInflight.set(seriesId, request);
       return request;
+    },
+    /**
+     * 预热一屏封面：一次 IPC 解析一批（不经过单条队列）。
+     *
+     * 与 `guoCover` 的分工：`guoCover` 服务"某张卡进入视口"这个**逐个到达**的
+     * 场景，靠 0ms 宏任务合并；本方法服务"这一屏有哪些剧"这个**已知集合**的场景
+     * —— 目录页落地时就知道要显示哪几十部剧，与其等每张卡各自进视口，不如一次
+     * 把整屏算完。
+     *
+     * 命中缓存的不重复请求；失败静默（封面是装饰，不影响列表可用性）。
+     */
+    async guoCoverPrefetch(seriesIds: string[]): Promise<void> {
+      if (!isTauriEnvironment()) return;
+      const pending: string[] = [];
+      for (const id of seriesIds) {
+        if (!id.startsWith('guo:')) continue;
+        if (guoCoverCache.has(id)) continue;
+        if (guoCoverInflight.has(id)) continue;
+        pending.push(id);
+      }
+      if (pending.length === 0) return;
+      // 分批发车：一屏 30 张一次性丢给后端会让第一条等很久（后端按序串行解析），
+      // 每批 12 条能让"前几张先出来"。批间不等待，全部并行发出。
+      const CHUNK = 12;
+      for (let index = 0; index < pending.length; index += CHUNK) {
+        const chunk = pending.slice(index, index + CHUNK);
+        const request = invokeBackend<Array<string | null>>('guo_cover_batch', { seriesIds: chunk })
+          .then(paths => {
+            chunk.forEach((id, offset) => rememberGuoCover(id, paths?.[offset] ?? null));
+          })
+          .catch(() => {
+            // 预热失败什么都不做：卡片的 `guoCover` 还会照常自己发一次。
+          })
+          .finally(() => {
+            for (const id of chunk) guoCoverInflight.delete(id);
+          });
+        // 登记在途：预热期间卡片自己进视口时，`guoCover` 会直接复用这一次请求，
+        // 而不是再排进批量队列发第二遍（一屏 30 张卡 = 省掉 30 次重复）。
+        for (const id of chunk) guoCoverInflight.set(id, request.then(() => guoCoverCache.get(id) ?? null));
+      }
     },
     /**
      * 逐源实时状态。取代 `guoSources.ts` 里手写的 `status`——那批判定是一次性

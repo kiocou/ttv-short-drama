@@ -54,6 +54,32 @@ export interface TailSnapshot {
   seeking: boolean;
   /** 已经派发过 `ended`：不再需要任何"补判播完"。 */
   ended?: boolean;
+  /**
+   * 当前播放速率（`video.playbackRate`）。缺省按 1 处理。
+   *
+   * ## 为什么末尾判定必须知道倍速（2026-10-22 修「长按倍速会误跳下一集」）
+   *
+   * `nearEndSeconds` 是**媒体时间**，而"用户是否真的快播完了"是**真实时间**的
+   * 体感。同一个 2.5 秒窗口在 3x 下只等于 0.83 秒真实时间——播放头一进入这个
+   * 区域，任何一次短暂 `waiting`（倍速切换、hls.js 换档重取分片）都会被读成
+   * "停在末尾了"，于是误判播完、跳下一集，并把进度按 100% 落盘（进度条直接
+   * 跳到结尾）。
+   *
+   * 按速率放大窗口，等于把判据统一到"真实时间里还剩多久"这个尺度上：
+   * 3x 时窗口变成 7.5 秒媒体时间（= 2.5 秒真实时间），与 1x 的体感一致。
+   */
+  playbackRate?: number;
+}
+
+/**
+ * 把"末尾窗口"从媒体时间换算成与倍速无关的真实时间尺度。
+ *
+ * 上限 4 倍：短剧单集 30~200 秒，3x 时窗口 7.5 秒已经覆盖到结尾的 1/4，
+ * 再放大就会把"中间某处缓冲"也当成末尾。4 倍是这个判据的安全边界。
+ */
+function scaleWindowForRate(seconds: number, rate: number | undefined): number {
+  if (!Number.isFinite(rate) || !rate || rate <= 1) return seconds;
+  return seconds * Math.min(rate, 4);
 }
 
 /**
@@ -64,18 +90,20 @@ export interface TailSnapshot {
  *
  * `nearEndSeconds` 允许调用方放宽窗口：看门狗已经在"时钟/帧/缓冲三信号都停滞"
  * 上等了 10 秒，那时把窗口放宽到 5 秒是安全的（确实没有数据再进来了）。
+ * 传入的窗口同样会按 `playbackRate` 缩放。
  */
 export function isPlayheadAtPlayableTail(
   snapshot: TailSnapshot,
   nearEndSeconds: number = NEAR_END_TOLERANCE_SECONDS,
 ): boolean {
-  const { currentTime, duration, bufferedEnd, paused, seeking, ended } = snapshot;
+  const { currentTime, duration, bufferedEnd, paused, seeking, ended, playbackRate } = snapshot;
   if (ended === true) return false;
   if (paused || seeking) return false;
   if (!Number.isFinite(duration) || duration <= 0) return false;
   if (!Number.isFinite(currentTime) || currentTime < 0) return false;
-  // 1) 已进入末尾区域
-  if (currentTime < duration - nearEndSeconds) return false;
+  // 1) 已进入末尾区域。窗口按倍速放大，理由见 `TailSnapshot.playbackRate`。
+  const effectiveWindow = scaleWindowForRate(nearEndSeconds, playbackRate);
+  if (currentTime < duration - effectiveWindow) return false;
   if (!Number.isFinite(bufferedEnd) || bufferedEnd <= 0) {
     // 没有缓冲信息时无法判断"贴住末端"，单帧快照下按未命中的保守处理。
     return false;
@@ -100,6 +128,48 @@ export function isPlayheadAtPlayableTail(
     bufferedEnd >= currentTime - TAIL_BUFFER_GAP_TOLERANCE_SECONDS;
   const bufferCoversEnd = bufferedEnd >= duration - PLAYHEAD_AT_TAIL_TOLERANCE_SECONDS;
   return bufferReachesPlayhead || bufferCoversEnd;
+}
+
+/**
+ * 数据是否已经**全部到齐**——到齐了就没什么可等的，可以立刻判播完。
+ *
+ * ## 为什么需要这个更严的判据（2026-10-23 修「每集末尾卡一下」）
+ *
+ * `isPlayheadAtPlayableTail` 回答的是"播放头是不是停在可播末端"，它把两种
+ * 情况都算命中：
+ *
+ *   A. 播放头追上了缓冲末端，但**后面还有分片没落地**（真该等一等）；
+ *   B. 缓冲已经覆盖到整集末尾，**不可能再有新数据**（等的意义为零）。
+ *
+ * 调用方（`handleWaiting`）此前不区分两者，一律预约 1.2 秒复核。实机日志里
+ * 5 次末尾停滞**全部是情况 B**：
+ *
+ *   current=43.19 duration=43.24 buffered=43.26
+ *   current=62.39 duration=62.44 buffered=62.46
+ *   current=46.41 duration=46.44 buffered=46.46
+ *   current=44.63 duration=44.84 buffered=44.86   ← 3x 倍速
+ *
+ * 每一行的 `buffered` 都 ≥ `duration`（甚至略超，是 MSE 时间基的正常误差）。
+ * 这种情况下 1.2 秒的等待是纯延迟：用户看到的是"这集明明播完了，画面却停在
+ * 最后一帧不动，过了 1 秒多才切下一集"——就是他说的"看见之后还会卡一下"。
+ *
+ * ## 为什么这个判据是安全的
+ *
+ * 情况 A 里 `buffered` 明显小于 `duration`（还差一整个分片的长度，实测
+ * 1~3 秒），不会命中。而"缓冲被 `recoverMediaError()` 清空"那种假象，
+ * `buffered` 会退到 0.x 秒，更不会命中。
+ *
+ * 判据要求 `bufferedEnd >= duration`：不是"差一点点也算"，而是**真的到顶了**。
+ * 上面 5 个样本全部满足，且都有 0.02~0.04 秒的余量。
+ */
+export function isBufferComplete(snapshot: TailSnapshot): boolean {
+  const { duration, bufferedEnd, paused, seeking, ended } = snapshot;
+  if (ended === true) return false;
+  if (paused || seeking) return false;
+  if (!Number.isFinite(duration) || duration <= 0) return false;
+  if (!Number.isFinite(bufferedEnd) || bufferedEnd <= 0) return false;
+  // 缓冲覆盖到整集末尾（容许 MSE 时间基的几十毫秒误差）。
+  return bufferedEnd >= duration - PLAYHEAD_AT_TAIL_TOLERANCE_SECONDS;
 }
 
 /**

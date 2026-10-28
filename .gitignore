@@ -46,6 +46,10 @@ short-drama-device.json
 .dsh/
 .cline-home/
 .har-analysis/
+# 智能体把用户粘贴的长文本落成的文件（设计规范原文、需求片段等）。它是**输入
+# 资料**而不是项目内容，混进来会让每次粘贴都在 `git status` 里冒出一个未跟踪
+# 目录，与上面那批工具工作区是同一类东西。
+pastes/
 
 # ---- 随包分发的第三方运行期资源 ----
 # 现已纳入版本控制，使仓库开箱即用。
@@ -79,3 +83,23 @@ npm-debug.log*
 *.swp
 .DS_Store
 Thumbs.db
+
+# ---- 0.2.42 发布前清理：本机调试/逆向材料，不属于项目内容 ----
+# probe*.py：逆向红果 App 时的临时探针脚本（agent 工作产物，仓库不留）
+src-tauri/resources/shortdrama-worker/probe*.py
+# mpv.7z：解包 mpv 目录后残留的压缩包原件，33 MB，不再需要
+src-tauri/resources/mpv/mpv.7z
+# 逆向分析工作区（50 MB：反编译、抓包样本、IDA 脚本）
+/re_analysis/
+# pelican 静态站试验目录（与本项目无关）
+/pelican-bike/
+# .commandcode 智能体工作区
+/.commandcode/
+# PowerShell 误生成的空文件（`> $null` 写法在 cmd 下会真的创建文件）
+/\$null
+# 测试样例视频
+/init.mp4
+# tools 的 Rust 构建产物
+tools/**/target/
+# 安装包体积分析文档（本机维护材料）
+/安装包体积分析-*.md

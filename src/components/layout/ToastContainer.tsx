@@ -24,7 +24,7 @@ export const ToastContainer: React.FC = () => {
           >
             <div className="flex items-center gap-2.5">
               {iconMap[toast.type]}
-              <span className="font-medium leading-relaxed">{toast.message}</span>
+              <span className="font-medium leading-relaxed text-pretty">{toast.message}</span>
             </div>
             <button
               onClick={() => removeToast(toast.id)}

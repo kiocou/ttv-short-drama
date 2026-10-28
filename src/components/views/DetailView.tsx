@@ -3,7 +3,7 @@ import { useAppStore } from '../../stores/useAppStore';
 import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useFavorites } from '../../stores/useFavoritesStore';
-import { ipcService } from '../../services/ipc';
+import { ipcService, coverResolver } from '../../services/ipc';
 import { SeriesDetail, EpisodeItem } from '../../types/series';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
@@ -362,7 +362,13 @@ export const DetailView: React.FC = () => {
           {/* 核心海报：3:4 比例，带 animate-fluent-hero-poster 硬件加速平滑入场 */}
           <div className="relative w-44 sm:w-52 aspect-[3/4] rounded-2xl overflow-hidden shadow-fluent-hud border-2 border-white flex-shrink-0 bg-white animate-fluent-hero-poster transition-transform duration-300 hover:scale-[1.02]">
             {/* 这里是封面缺失最刺眼的位置：源站脏数据（实测有指向已 404 的第三方
-                图床）会让整块海报变成白框，而列表卡片当时已经有首字兜底。 */}
+                图床）会让整块海报变成白框，而列表卡片当时已经有首字兜底。
+
+                `resolveSrc` 必须传（2026-10-24）：guo 源的封面直连在 WebView 里
+                不可靠（黄果视频有 Cloudflare 防护实测 403，部分源还是加密码），
+                唯一稳的路是 guo-core 带源侧 Referer 下载后给本地文件路径。列表
+                卡片一直有这一条、详情页 Hero 却漏了 —— 表现是"卡片上有图，点进
+                详情反而只剩首字"，而且每次进详情都要重新直连失败一轮。 */}
             <CoverImage
               src={detail.cover}
               title={detail.title}
@@ -370,6 +376,7 @@ export const DetailView: React.FC = () => {
               placeholderTextClassName="text-5xl"
               loading="eager"
               fetchPriority="high"
+              resolveSrc={coverResolver(detail.id, detail.cover)}
             />
           </div>
 
@@ -408,7 +415,11 @@ export const DetailView: React.FC = () => {
 
             {/* 剧情简介 */}
             <div className="text-xs text-slate-600 leading-relaxed max-w-2xl bg-white/60 backdrop-blur-md p-3.5 rounded-2xl border border-white/80 shadow-xs">
-              <p className={isDescExpanded ? '' : 'line-clamp-2'}>
+              {/* `text-pretty` 交给浏览器做孤字规避（`text-wrap: pretty`）。
+                  这里是最值得加的一处：简介是自由长度的中文正文，末行只剩一两个
+                  字时（"…被逐出家门。"）读起来像排版事故，而这一行又正好紧贴着
+                  「展开完整简介」按钮，孤字会与按钮挤在一起。 */}
+              <p className={`text-pretty ${isDescExpanded ? '' : 'line-clamp-2'}`}>
                 {detail.description}
               </p>
               <button
@@ -457,8 +468,10 @@ export const DetailView: React.FC = () => {
                 title="点击切换追剧状态：想看 → 在看 → 已看"
               >
                 <Heart
-                  className={`w-4 h-4 ${
-                    detail && markBySeriesId.get(detail.id) ? 'fill-current text-rose-500' : 'text-slate-500'
+                  className={`w-4 h-4 transition-transform ttv-spring-pop ${
+                    detail && markBySeriesId.get(detail.id)
+                      ? 'fill-current text-rose-500 scale-110'
+                      : 'text-slate-500 scale-100'
                   }`}
                 />
                 <span>
@@ -666,7 +679,7 @@ export const DetailView: React.FC = () => {
                     value={modalSearch}
                     onChange={(e) => setModalSearch(e.target.value)}
                     placeholder="输入集数直接定位..."
-                    className="w-full h-8 pl-8 pr-7 text-xs bg-white rounded-lg border border-slate-200/80 focus:outline-none focus:border-blue-500 shadow-xs"
+                    className="ttv-input w-full h-8 pl-8 pr-7 text-xs bg-white rounded-lg border border-slate-200/80 shadow-xs"
                   />
                   {modalSearch && (
                     <button

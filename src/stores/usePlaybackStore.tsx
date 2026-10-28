@@ -501,14 +501,27 @@ function bufferedEndSeconds(video: HTMLVideoElement): number {
  * 一律是 0，续播是保存的进度），偏移超过 0.5 秒时打点——这是该症状唯一的现场证据。
  */
 function alignPlayhead(video: HTMLVideoElement, startPosition: number, sessionId: number): void {
+  // ⚠️ 判断"起播点是否越界"必须用**权威时长**（源片真实长度），不能用 `video.duration`。
+  //
+  // 边转边播时 `video.duration` 只覆盖「已转码的那一段」——清单里还没有
+  // `#EXT-X-ENDLIST`，浏览器只能报已知部分。拿它当总长，会把完全合法的断点续播
+  // 误判成越界并强制归零。实测日志（ttv-playback.log）：
+  //
+  //   起播点越界（72.0s ≥ 时长 52.8s），改为从头播     ← 52.8s 只是当时的转码进度
+  //   起播点收敛 期望=0.00s 元素现值=3.23s（强制归位）
+  //   timeupdate 心跳 位置=76.73s                      ← 之后又跳回目标位置
+  //
+  // 用户看到的就是「点了播放／拖了进度条，画面在 0 与目标位置之间反复重播三四次」。
+  // 权威时长是源片的客观属性，与转码进度无关，用它判断才不会误伤。
+  const knownDuration = streamingSourceTotalSeconds > 0 ? streamingSourceTotalSeconds : video.duration;
   const resolved = resolveStartTarget({
     startPosition,
-    duration: video.duration,
+    duration: knownDuration,
     currentTime: video.currentTime,
   });
   if (resolved.clampedFromEnd) {
     tracePlayback(
-      `起播点越界（${startPosition.toFixed(1)}s ≥ 时长 ${video.duration.toFixed(1)}s），改为从头播 会话=${sessionId}`,
+      `起播点越界（${startPosition.toFixed(1)}s ≥ 时长 ${knownDuration.toFixed(1)}s），改为从头播 会话=${sessionId}`,
     );
   }
   if (resolved.drifted) {
@@ -1737,7 +1750,25 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
       // 同上：`src`/`load()` 之后再恢复倍速，避免换集后回到 1x。
       video.playbackRate = playbackRateRef.current;
-      alignPlayhead(video, startPosition, sessionId);
+      // ⚠️ **这里不再调 `alignPlayhead`**（2026-10-27 修「点进度条后画面反复 2-3 次」）。
+      //
+      // `attachSource(video, hlsUrl, startPosition)` 已经把起播点交给了 hls.js：
+      // `loadSource` 完成后它会自己把 `currentTime` 设到 startPosition，并加载对应分片。
+      // 紧接着再调一次 `alignPlayhead` 就是**对同一个位置设第二次** —— 浏览器会把
+      // 每一次 `currentTime` 赋值都当成一次新 seek（哪怕值没变），于是：
+      //
+      //   1578ms  SET 0 -> 53      ← hls.js 按 startPosition 定位
+      //   1652ms  SET 53 -> 53     ← alignPlayhead 又设一次（值相同！）
+      //   1660ms  seeking → waiting ← 因为这次重复赋值，重新发起一轮 seek/缓冲
+      //   1871ms  seeked → playing
+      //
+      // 用户看到的就是画面在起播点附近反复重播。实测用 CDP 抓 video 事件序列确认过。
+      //
+      // 保留兜底：若 hls.js 没把位置摆对（readyState 已就绪但偏差明显），
+      // 才纠正一次。判据用 `alignPlayhead` 自己的 drift 检测，避免无谓写入。
+      if (video.readyState >= 1 && Math.abs(video.currentTime - startPosition) > 1) {
+        alignPlayhead(video, startPosition, sessionId);
+      }
       const started = await startPlayback(video);
       if (started !== 'ok') return started;
       if (pauseIfStale(sessionId, video)) return 'stale';
@@ -1977,6 +2008,16 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       return startFull();
     }
     if (streaming && streaming.streamKind === 'hls') {
+      // ⚠️ **必须在起播之前**把权威时长写进模块变量。
+      //
+      // `playStreamingHls` 内部挂源时就会调 `alignPlayhead` 判断起播点；
+      // 若等到它返回后再赋值（原来就是这么做的），那一次判断拿到的是
+      // "已转码部分的时长"，续播点会被误判越界并归零 —— 画面随之反复。
+      const streamingTotalMs = streaming.durationMs ?? 0;
+      if (Number.isFinite(streamingTotalMs) && streamingTotalMs >= 1000) {
+        streamingSourceTotalSeconds = streamingTotalMs / 1000;
+        setDuration(streamingSourceTotalSeconds);
+      }
       const streamingOutcome = await playStreamingHls(
         streaming.playUrl, video, sessionId, startPosition, episodeId,
       );
@@ -3524,6 +3565,23 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
   };
 
+  /**
+   * 「连续点同一点」的去重窗口（毫秒）。
+   *
+   * 1.2 秒：比一次点击的视觉反馈长（用户点完会看一会儿），又短于"用户真的想
+   * 再跳一次"的间隔。窗口内点同一个位置只生效第一次。
+   */
+  const REPEAT_SEEK_WINDOW_MS = 1200;
+
+  /**
+   * 上一次「立即落位」的目标与时间戳。
+   *
+   * 用于识别"用户在同一个点反复点击"：这种重复点击不产生新的意图，却每次都
+   * 触发一轮 seek + 缓冲重建，画面看起来就是反复跳。`REPEAT_SEEK_WINDOW_MS`
+   * 内的同目标落位只认第一次。
+   */
+  const lastSeekTargetRef = useRef<{ target: number; at: number } | null>(null);
+
   const seek = (seconds: number, previewing = false) => {
     if (!videoRef.current) return;
     // 用户手动拖进度 = 接管播放：撤销"全剧播完自动返回首页"的安排（若有）。
@@ -3582,8 +3640,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       tracePlayback(
         `拖动到未转码区域 目标=${plan.target.toFixed(1)}s 可寻址末端=${plan.seekableEnd.toFixed(1)}s 会话=${activeSessionRef.current}（等待转码推进，播放头留在原处）`,
       );
-      // 上一次的"还没转好"提示先撤掉：这次是新目标，结果还没出来。
-      setSeekNotice(null);
+      // ⚠️ 2026-10-27：进入等待时**立刻**给出提示，而不是等超时才说。
+      //
+      // 原先这里是 `setSeekNotice(null)` —— 于是从用户点下去到转码追上（可能好几秒）
+      // 整段窗口是**完全静默**的：进度条读数是新的，画面却还在原地，看起来就是
+      // "点了进度条没反应"。用户的原话是「点转码后的进度条，等它转码完再跳」，
+      // 说明他要的不是立即跳（那不可能），而是**知道正在等**。
+      //
+      // 提示文案带上具体进度，并在轮询里持续刷新（见 `waitForSeekable`）。
+      setSeekNotice(
+        `正在加载到 ${Math.floor(plan.target)} 秒（已转 ${Math.floor(plan.seekableEnd)} 秒），转好后自动跳转`,
+      );
       // 进度条先显示用户点的位置：他要的是"那里"，不是"现在能播到的地方"。
       setPosition(plan.target);
       saveProgressThrottled(plan.target, duration, true);
@@ -3591,7 +3658,67 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       return;
     }
 
+    // ===== 已经在目标位置：跳过这次 seek（2026-10-27 修「连续点同一点，点几次反复几次」）=====
+    //
+    // 浏览器把**每一次 `currentTime` 赋值**都当作一次新 seek —— 即使赋值与当前值
+    // 完全相同（实测 `SET 34->34` 之后立刻 `seeking -> waiting`）。后果是播放头被
+    // 重置、时间不再前进：
+    //
+    //   连续点同一位置 5 次 → 10 次落位（down + up）→ 播放位置冻结在 34.0s
+    //   采样：+1s ct=34  +2s ct=34  ... +6s ct=34     ← 完全不前进
+    //   5 次点击 → 10 条 `立即落位 目标=34.0s`         ← 日志实证
+    //
+    // 用户感受就是"点多少次画面反复多少次"。
+    //
+    // 阈值 0.35 秒：大于 MSE 的分片对齐误差（几十毫秒），又小于"用户想微调"的
+    // 最小意图（拖动时每像素约 0.02~0.08 秒，正常微调会超过 0.35）。
+    // 顺带解决 down/up 重复：手指按下已落位，松手时位置差≈0，这一次也会被跳过。
+    const SAME_TARGET_EPSILON_SECONDS = 0.35;
+    const deltaFromPlayhead = Math.abs(video.currentTime - plan.target);
+    if (deltaFromPlayhead < SAME_TARGET_EPSILON_SECONDS) {
+      // 只同步 UI 读数，不碰播放头。
+      setPosition(plan.target);
+      setSeekNotice(null);
+      return;
+    }
+
+    // ===== 重复点同一个点：只认第一次（2026-10-27）=====
+    //
+    // 上面的位置差判断只能挡住同一时刻的 down/up 重复。但用户**连续点同一位置**时，
+    // 播放头在两次点击之间已经前进了几百毫秒，差值超过阈值，于是每次点击都会
+    // 再 seek 回该点一次 —— 观感就是"点几次画面跳几次"。
+    //
+    // 判据用"目标相同 + 间隔短"，而不是放宽位置阈值：放宽会让"想微调 1 秒"
+    // 这种真实意图失效，而目标去重只在"同一个点反复点"时才介入。
+    const nowMs = performance.now();
+    const lastSeek = lastSeekTargetRef.current;
+    if (
+      lastSeek &&
+      Math.abs(lastSeek.target - plan.target) < SAME_TARGET_EPSILON_SECONDS &&
+      nowMs - lastSeek.at < REPEAT_SEEK_WINDOW_MS
+    ) {
+      setPosition(plan.target);
+      setSeekNotice(null);
+      return;
+    }
+    lastSeekTargetRef.current = { target: plan.target, at: nowMs };
+
     // 可寻址范围内：正常落位。这一行是唯一会立即改变画面的路径。
+    //
+    // 打点：这条**成功路径此前完全静默**，导致排查「点进度条后画面反复」时
+    // 看不到"用户点了哪里、当时可寻址到哪"，只能靠猜。现在每次落位都留一行，
+    // 与 `拖动到未转码区域` / `转码已推进到` 一起构成完整的 seek 序列。
+    // 打点带上调用栈前 2 帧：这个字段直接定位过「一次点击触发几十次落位」
+    // ——正常应当是 `handlePointerDown` + `handlePointerUp` 各一次。
+    // 若日志里看到 `handlePointerMove` 反复出现，说明 `previewing` 传参退化了。
+    const stackHint = (new Error().stack || '')
+      .split(String.fromCharCode(10))
+      .slice(2, 4)
+      .map((line) => line.trim().replace(/^at\s+/, '').split(' ')[0])
+      .join(' <- ');
+    tracePlayback(
+      `立即落位 目标=${plan.target.toFixed(1)}s 可寻址末端=${seekableEnd.toFixed(1)}s 时长=${duration.toFixed(1)}s 会话=${activeSessionRef.current} 来源=${stackHint}`,
+    );
     video.currentTime = plan.target;
     setPosition(plan.target);
     saveProgressThrottled(plan.target, duration, true);
@@ -3716,8 +3843,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       } catch {
         // 读不到就当作还没就绪，下一拍再试。
       }
-      if (seekableReached(end, target)) {
+      // 每拍刷新"正在加载"的进度数字：用户能看见转码在推进，而不是干等。
+      // 只在确实还没追上时刷新（下面 reached 分支会清掉提示）。
+      if (!seekableReached(end, target, duration)) {
+        setSeekNotice(
+          `正在加载到 ${Math.floor(target)} 秒（已转 ${Math.floor(end)} 秒），转好后自动跳转`,
+        );
+      }
+      if (seekableReached(end, target, duration)) {
         tracePlayback(`转码已推进到 ${end.toFixed(1)}s，落位到 ${target.toFixed(1)}s`);
+        // 落位完成：撤掉"正在加载"提示。
+        setSeekNotice(null);
         // 已落位：读数交回真实播放头（否则 target 会一直压着 position）。
         seekWaitTargetRef.current = null;
         video.currentTime = target;

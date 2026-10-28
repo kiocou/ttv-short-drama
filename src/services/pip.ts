@@ -41,6 +41,18 @@ export const PIP_RETURNED_EVENT = 'pip://returned';
  */
 export const PIP_SHOWN_EVENT = 'pip://shown';
 
+/**
+ * 小窗 → 主窗口：小窗**显示失败**，主窗口必须保持可见。
+ *
+ * 与 `PIP_SHOWN_EVENT` 成对。存在的理由：`show()` 可能失败（窗口创建时 WebView2
+ * 参数不当、被系统拒绝显示等），而旧实现无论成败都广播 `shown`，主窗口于是照样
+ * 隐藏自己 —— 两个窗口一起消失，用户只能结束进程（2026-10-23 实测）。
+ *
+ * 收到这个事件时主窗口什么都不用做（它本来就还可见），只把它当作"这次交接失败"
+ * 的信号，用于清理正在进行的切换态。
+ */
+export const PIP_SHOW_FAILED_EVENT = 'pip://show-failed';
+
 /** 小窗用哪条解析链路：短剧/漫剧，或动漫专区。 */
 export type PipKind = 'drama' | 'anime';
 

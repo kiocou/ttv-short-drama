@@ -8,7 +8,7 @@ import {
   Sparkles,
   Star,
 } from 'lucide-react';
-import { ipcService } from '../../services/ipc';
+import { ipcService, coverResolver } from '../../services/ipc';
 import {
   formatHeatValue,
   getSeriesTeaser,
@@ -385,7 +385,10 @@ export const RandomWatchSection: React.FC<RandomWatchSectionProps> = ({
                 placeholderTextClassName="text-2xl"
                 className="transition-transform duration-300 group-hover/hero:scale-105"
                 loading="eager"
-                resolveSrc={hero.id.startsWith('guo:') ? () => ipcService.catalog.guoCover(hero.id) : undefined}
+                // ⚠️ 必须用 coverResolver：红果封面是 HEIC，WebView2 解不出来。
+                // 这里曾经只对 guo 源挂解析器，于是「猜你喜欢」抽到红果剧时封面
+                // 永远是空白（抽到 guo 就正常）—— 用户报的「有时有问题有时没问题」。
+                resolveSrc={coverResolver(hero.id, hero.cover)}
               />
             </div>
 
@@ -582,7 +585,7 @@ export const RandomWatchSection: React.FC<RandomWatchSectionProps> = ({
                 placeholderTextClassName="text-2xl"
                 className="transition-transform duration-300 group-hover/hero:scale-105"
                 loading="eager"
-                resolveSrc={hero.id.startsWith('guo:') ? () => ipcService.catalog.guoCover(hero.id) : undefined}
+                resolveSrc={coverResolver(hero.id, hero.cover)}
               />
               {hero.rating ? (
                 <span className="absolute top-1.5 right-1.5 inline-flex items-center gap-0.5 rounded-md bg-black/65 px-1.5 py-0.5 text-[10.5px] font-bold text-amber-400 shadow-xs backdrop-blur-xs">
@@ -699,7 +702,7 @@ export const RandomWatchSection: React.FC<RandomWatchSectionProps> = ({
                       placeholderTextClassName="text-xs"
                       className="transition-transform duration-200 group-hover/sub:scale-105"
                       loading="lazy"
-                      resolveSrc={item.id.startsWith('guo:') ? () => ipcService.catalog.guoCover(item.id) : undefined}
+                      resolveSrc={coverResolver(item.id, item.cover)}
                     />
                   </div>
 
