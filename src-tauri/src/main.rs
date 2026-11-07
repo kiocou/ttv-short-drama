@@ -1,28 +1,48 @@
 #![windows_subsystem = "windows"]
 
+mod agent_attach;
+mod agent_bridge;
+mod agent_dock;
 mod anime_provider;
 mod dmghg_bridge;
 mod guo_provider;
 // 红果短剧的原生客户端：完整替代原 Python worker 的签名、目录与播放解析链路。
 mod hls_proxy;
 mod hongguo;
+mod hongguo_api;
 mod hongguo_bridge;
 mod media_enhance;
 mod models;
+mod native_player;
 mod pip;
 mod provider;
 mod short_drama_app;
+// 视频源注册表：内置两源固定 + 插件源预留入口（本轮不加载插件代码）。
+mod source_registry;
 mod storage;
 // 播放链路的诊断日志（内存环形缓冲 + 落盘 ttv-playback.log + 接管原生 stderr）。
 mod trace;
 mod update;
 
+use crate::agent_attach::{agent_attach_all, agent_detach_all, agent_targets};
+use crate::agent_bridge::{agent_bridge_status, agent_test_call};
+use crate::agent_dock::{
+    agent_dock_action, agent_dock_drag, agent_dock_hide, agent_dock_ready, agent_dock_show,
+    agent_dock_state,
+};
+use crate::hongguo::catalog::SeriesHit;
+use crate::hongguo_api::{
+    hongguo_album, hongguo_discover, hongguo_new_releases, hongguo_person, hongguo_person_works,
+    hongguo_ranking, hongguo_search, hongguo_search_cues, hongguo_series_batch,
+    hongguo_series_detail, hongguo_series_recommend, hongguo_short_filter,
+    hongguo_short_filter_panel, hongguo_short_rank, hongguo_suggest,
+};
 use crate::models::{
     CacheClearResult, CatalogFilter, CatalogPage, FavoriteItem, PlaybackOpenInput, PlaybackSession,
     PlaybackSnapshot, PlaybackUiState, SeriesDetail, SeriesItem, UserSettings, WatchHistoryItem,
 };
 use crate::pip::{pip_close, pip_dismiss, pip_handoff, pip_is_open, pip_open, pip_report};
-use crate::provider::DramaProvider;
+use crate::provider::{DramaProvider, SeriesSeason};
 use crate::short_drama_app::{
     short_drama_app_album, short_drama_app_cache_clear, short_drama_app_cache_usage,
     short_drama_app_cover_proxy, short_drama_app_episode_counts, short_drama_app_open_stream,
@@ -256,6 +276,37 @@ fn suggest_cache_key(keyword: &str, channel: &str) -> String {
     format!("suggest|kw={keyword}|ch={channel}")
 }
 
+/// App 搜索接口一次取多少条。
+///
+/// 接口并不严格按 `count` 截断（实测 `count=10` 回了 13 条），所以这个值只是
+/// 上限提示；给 20 是为了让「烬九州」这类一搜就是一整组季的词尽量一次拿全，
+/// 少一次分页往返。
+const APP_SEARCH_LIMIT: usize = 20;
+
+/// `SeriesHit`（App 搜索接口的卡片）→ 前端 `SeriesItem`。
+///
+/// 与 `suggestion_to_item`（App 联想，走 Python worker 的 `search` 子命令）
+/// 分开的原因：两者 `origin` 文案必须不同。用户看到的卡片角标要能区分
+/// "搜索直连"与"联想补出来的"，排查搜索结果来源时才不会互相打架。
+pub(crate) fn app_search_hit_to_item(hit: SeriesHit, channel: &str) -> SeriesItem {
+    let intro = hit.intro.trim();
+    SeriesItem {
+        id: hit.id,
+        title: hit.title,
+        cover: hit.cover,
+        item_type: channel.to_owned(),
+        episodes_count: hit.episode_count,
+        latest_episode_title: None,
+        // App 搜索不给题材标签（`category_schema` 是结构描述、`rec_tags` 是
+        // 推荐位标签，都不是题材名）。宁可留空也不编：编出来的标签会污染
+        // 前端按题材筛选。
+        tags: Vec::new(),
+        origin: "红果 App 直连".into(),
+        brief: (!intro.is_empty()).then(|| intro.to_string()),
+        rating: None,
+    }
+}
+
 fn suggestion_to_item(
     suggestion: crate::short_drama_app::SearchSuggestion,
     channel: &str,
@@ -274,18 +325,118 @@ fn suggestion_to_item(
     }
 }
 
-/// 多源搜索的合并链：红果网页（结构化、带集数与题材）+ 动漫源，外加可选的
-/// App 联想（补齐分季条目）。
+/// App 搜索这一路是否适用于当前频道。
 ///
-/// 三个来源并发：串行会让搜索凭空多等一次往返，而三者互不依赖。
+/// 只有真人短剧档有 `tab_type=11`。漫剧/动漫**不能**接这一路：实测 aid=8662
+/// 的搜索索引是全局的，返回值里会混进 `content_type=1004/1007` 的漫剧条目，
+/// 硬接就会让「漫剧」频道搜出短剧卡片——串频道比搜不到更糟。
+fn app_search_applies(channel: &str) -> bool {
+    channel != "comic" && channel != "anime"
+}
+
+/// 四路搜索结果的合并结果。
+struct SearchMerge {
+    /// App 搜索 → 网页 → 动漫 → 联想，按 id 去重后的最终列表。
+    items: Vec<SeriesItem>,
+    /// App 搜索这一路是否失败：**唯一**决定 `degraded` 的信号。
+    app_failed: bool,
+    /// 动漫这一路是否失败：只影响 `source` 文案，不影响 `degraded`。
+    anime_failed: bool,
+}
+
+/// 把四路已取回的结果合并成最终列表。
+///
+/// 抽成纯函数是为了能单测：真正取数那层要 `AppHandle` / `AppState`，单测里造
+/// 不出来，而"位次、按 id 去重、未上架过滤"恰恰是这里最容易写错、又最该被
+/// 锁住的部分。
+///
+/// 位次含义：App 搜索是现在唯一能稳定返回结构化短剧卡片的来源，排第一；
+/// 网页是 SSR 恢复后的同位替代；动漫是补充来源；联想只补前面漏掉的分季条目。
+fn merge_search_results(
+    app_search: Result<Vec<SeriesHit>, String>,
+    web_items: Vec<SeriesItem>,
+    anime_items: Option<Vec<SeriesItem>>,
+    suggestions: Vec<crate::short_drama_app::SearchSuggestion>,
+    channel: &str,
+) -> SearchMerge {
+    let mut items: Vec<SeriesItem> = Vec::new();
+    let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut app_failed = false;
+
+    // 1) App 搜索（主结果来源）。
+    match app_search {
+        Ok(hits) => {
+            for hit in hits {
+                // 与网页那路同一条规则，但**各自独立**执行：`episode_cnt` 不足 1
+                // 的卡片一律丢——未上架的季点开是空详情，「盘点/合集」类内容卡
+                // 更是非线性剧集（实测 7661183456205947417 的详情回
+                // 101000 content_gone）。两路共用同一个判定函数会把两条不同
+                // 数据源的规则耦合在一起，改一边就悄悄改了另一边。
+                if hit.episode_count == 0 {
+                    continue;
+                }
+                if !existing.insert(hit.id.clone()) {
+                    continue;
+                }
+                items.push(app_search_hit_to_item(hit, channel));
+            }
+        }
+        Err(error) => {
+            app_failed = true;
+            // 只记日志不抛错：网页/动漫/联想仍可能给出结果，整次搜索不该因为它
+            // 失败而报错（用户会看到"搜索失败"而其实还有内容可看）。
+            crate::trace::log(format!("[搜索] App 搜索不可用：{error}"));
+        }
+    }
+
+    // 2) 网页（现在恒空，站点已 CSR；留着是为了 SSR 恢复时自动重新生效）。
+    for item in web_items {
+        if existing.insert(item.id.clone()) {
+            items.push(item);
+        }
+    }
+
+    // 3) 动漫。
+    let anime_failed = anime_items.is_none();
+    for item in anime_items.unwrap_or_default() {
+        if existing.insert(item.id.clone()) {
+            items.push(item);
+        }
+    }
+
+    // 4) App 联想（补齐前面漏掉的分季条目）。
+    for suggestion in suggestions {
+        let sid = suggestion.id.clone();
+        if existing.insert(sid) {
+            items.push(suggestion_to_item(suggestion, channel));
+        }
+    }
+
+    SearchMerge {
+        items,
+        app_failed,
+        anime_failed,
+    }
+}
+
+/// 多源搜索的合并链：红果 App 搜索（主）+ 红果网页（SSR 恢复即自动生效）
+/// + 动漫源 + 可选的 App 联想。
+///
+/// 四个来源并发：串行会让搜索凭空多等一次往返，而它们互不依赖。
 ///
 /// 为什么在后端合并：搜索页此前只搜红果（channel 硬编码 drama），动漫共和国
 /// 的视频永远搜不到。动漫源失败只跳过——它是补充来源，不该让红果结果陪葬；
 /// 但会在 `source` 里留一句说明，避免用户把残缺结果当成全集。
 ///
+/// 为什么网页那路留着：站点 2026-10 已改成纯 CSR——`/search/{keyword}` 返回的
+/// 只有 `<div id="root">` + 若干 `<script>`，`parse_router_data` 恒为 None，
+/// 这条路现在**恒返回 0 条**。但它没有删：站方哪天恢复 SSR / 重新塞回
+/// router data，这条路会自动复活且天然带题材与集数，比 App 接口信息更全。
+/// 删了就再也回不来了，成本只是一次并发的空请求。
+///
 /// `with_suggestions` 为什么是个开关：联想要冷启动一个 Python 进程（实测端到端
-/// 0.6-1.9s），而它只是补充。开着它，网页结果 0.3s 就绪也要在 join! 里陪等到
-/// 1s 以后——这正是"搜索慢"的主因。快速首屏传 false，联想由前端随后单独补齐。
+/// 0.6-1.9s），而它只是补充。开着它，App 搜索结果 0.3s 就绪也要在 join! 里陪等
+/// 到 1s 以后——这正是"搜索慢"的主因。快速首屏传 false，联想由前端随后单独补齐。
 async fn merge_search_sources(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -300,6 +451,18 @@ async fn merge_search_sources(
         category: "全部".into(),
         ..filter.clone()
     };
+    // App 搜索只有 `tab_type=11`（真人短剧）这一档，判定见 `app_search_applies`。
+    let app_channel = filter.channel.clone();
+    let app_search_fut = async move {
+        if !app_search_applies(&app_channel) {
+            return Ok(Vec::new());
+        }
+        let client = crate::hongguo_bridge::client().await?;
+        client
+            .search(keyword, APP_SEARCH_LIMIT, 0)
+            .await
+            .map_err(|error| error.to_string())
+    };
     let suggestions_fut = async {
         if with_suggestions {
             crate::short_drama_app::search_suggest(app, keyword, comic).await
@@ -307,59 +470,77 @@ async fn merge_search_sources(
             Vec::new()
         }
     };
-    let (web, suggestions, anime) =
-        tokio::join!(state.provider.catalog(filter), suggestions_fut, async {
-            state.anime_provider.catalog(&dmghg_filter).await
-        },);
-    let mut page = web?;
-    // 追加顺序 = 网页结果 → 动漫源 → App 联想：主关键词命中优先，动漫是补充
-    // 来源，而联想只用来补齐网页漏掉的分季条目，排在最后。
-    let mut existing: std::collections::HashSet<String> =
-        page.items.iter().map(|item| item.id.clone()).collect();
-    let mut added = 0usize;
-    // 降级说明只写"确实失败"的来源，且只写给用户看的话（不泄露内部信息，不变量 12）。
-    let mut anime_failed = false;
-    if let Ok(anime_page) = anime {
-        for item in anime_page.items {
-            if existing.contains(&item.id) {
-                continue;
+    let (web, suggestions, anime, app_search) = tokio::join!(
+        state.provider.catalog(filter),
+        suggestions_fut,
+        async { state.anime_provider.catalog(&dmghg_filter).await },
+        app_search_fut,
+    );
+    // 网页那一路失败**不能**拖垮整次搜索。
+    //
+    // 旧写法是 `let mut page = web?;` —— 站点一次 503/超时就让整页搜索变成红字
+    // 错误，而那时 App 搜索可能已经拿到了十几条结果。现在主结果来源是 App 搜索
+    // （网页恒空，站点已改 CSR），网页只是"SSR 恢复后自动复活"的备用同位替代，
+    // 它挂了不该有任何可见后果：记一条日志，按空页继续合并。
+    let mut page = match web {
+        Ok(page) => page,
+        Err(error) => {
+            crate::trace::log(format!("[搜索] 网页搜索不可用（不影响 App 搜索）：{error}"));
+            CatalogPage {
+                items: Vec::new(),
+                total: 0,
+                has_more: false,
+                page: filter.page,
+                categories: Vec::new(),
+                next_cursor: None,
+                source: String::new(),
+                degraded: false,
             }
-            existing.insert(item.id.clone());
-            page.items.push(item);
-            added += 1;
         }
-    } else {
-        anime_failed = true;
+    };
+    let web_count = page.items.len();
+    // 动漫那一路失败只降级成 `None`：它是补充来源，不该让整次搜索报错。
+    let anime_items = match anime {
+        Ok(anime_page) => Some(anime_page.items),
+        Err(_) => None,
+    };
+    let suggest_missing = with_suggestions && suggestions.is_empty();
+    let merged = merge_search_results(
+        app_search,
+        std::mem::take(&mut page.items),
+        anime_items,
+        suggestions,
+        filter.channel.as_str(),
+    );
+
+    // 降级说明只写"确实失败"的来源，且只写给用户看的话（不泄露内部信息，不变量 12）。
+    if merged.anime_failed {
         page.source = format!("{}；动漫来源暂不可用", page.source);
+    }
+    if merged.app_failed {
+        page.source = format!("{}；App 搜索暂不可用", page.source);
     }
     // App 联想的空列表**不作为降级信号**：联想失败与"这个词本来就没有联想"共用
     // 同一个 Vec（search_suggest 内部吞掉错误），而动漫关键词天生没有 App 联想
     // （联想恒走短剧档），照报就是纯噪音。只在已经有来源真的挂了、且手上确实留住了
     // 结果时补一句"可重试"，让用户知道结果可能不全。
-    let suggest_missing = with_suggestions && suggestions.is_empty();
-    for suggestion in suggestions {
-        let sid = suggestion.id.clone();
-        if existing.contains(&sid) {
-            continue;
-        }
-        page.items
-            .push(suggestion_to_item(suggestion, filter.channel.as_str()));
-        existing.insert(sid);
-        added += 1;
-    }
-    if anime_failed && suggest_missing && !page.items.is_empty() {
+    if (merged.app_failed || merged.anime_failed) && suggest_missing && !merged.items.is_empty() {
         page.source = format!("{}；部分来源暂不可用，可重试", page.source);
     }
+
     // 降级判定收敛成一个具名布尔，供机器读。`source` 里的文案仍然照旧输出
     // ——用户得知道"哪个来源不可用"，而 `degraded` 只回答"这次结果可不可信"，
     // 两者互补，不该合成一个字段让前端去猜。
     //
-    // 只认"来源真的挂了"，不认联想空列表：联想失败与"这个词本来就没有联想"
-    // 共用同一个 Vec（search_suggest 内部吞掉错误），把它算进来会把绝大多数
-    // 正常搜索标成降级。动漫关键词天生没有 App 联想，那更是恒假。
-    let degraded = anime_failed;
-    page.degraded = degraded;
-    page.total += added;
+    // 只认"来源真的挂了"：**App 搜索失败**（主结果来源，挂了等于用户看到残缺结果）
+    // **或动漫源失败**（它的条目整块缺席，同样是不全）。
+    // 网页那路恒空（站点已 CSR）**绝不能**算降级——算进去的话每次搜索都会亮
+    // 降级条，用户会学会无视它。联想空列表同理不算（失败与"本来就没有"不可分）。
+    page.degraded = merged.app_failed || merged.anime_failed;
+    // 网页那一路的条目已经计入 `page.total`，只把追加的部分加上去。
+    let added = merged.items.len().saturating_sub(web_count);
+    page.total = page.total.saturating_add(added);
+    page.items = merged.items;
     Ok(page)
 }
 
@@ -478,6 +659,64 @@ async fn catalog_suggest(
         .collect();
     suggest_cache().put(cache_key, items.clone());
     Ok(items)
+}
+
+/// 某部剧所属系列的**全部季**（App 里点开系列剧弹窗时的那份数据）。
+///
+/// 为什么必须单开一条命令：网页链路一次只露出「当前在推」的那一季，
+/// 《烬九州》35 季实测在搜索页只出 1 条；旧实现靠标题正则 + 每季一次回查，
+/// 上限 2 次（`SEARCH_SEASON_MAX_REQUESTS`），再多也补不出来。plan 接口
+/// 一次返回整组季，这才是"35 季全都在"的唯一来源。
+///
+/// 为什么不用先查 album_id：从该系列**任意一季**的 seriesId 进去，plan 都
+/// 返回整系列（实测从第 35 季的 id 进去同样拿到 35 条、index 1..35）。
+/// SDK 的 Go 版为了拿 related_album_id 多打了一次 GetSeries，我们省掉这一跳，
+/// 弹窗打开才够快。
+///
+/// 失败一律 `Err`，不吞成空数组：前端会退回旧链路，而吞空数组会把"网络/
+/// 设备挂了"伪装成"这剧只有一季"，用户就再也看不到其余季了。
+#[tauri::command]
+async fn catalog_series_seasons(series_id: String) -> Result<Vec<SeriesSeason>, String> {
+    let client = crate::hongguo_bridge::client().await?;
+    let seasons = client
+        .series_seasons(&series_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(seasons.into_iter().map(SeriesSeason::from).collect())
+}
+
+/// 搜索页的热搜（猜你想搜 + 各热搜榜）。
+///
+/// 只有 App 接口提供这组数据，网页源没有对应页面；失败返回 `Err` 让前端隐藏
+/// 该区块，而不是把"接口挂了"伪装成"今天没有热搜"。
+#[tauri::command]
+async fn hongguo_hot_search() -> Result<serde_json::Value, String> {
+    let client = crate::hongguo_bridge::client().await?;
+    let hot = client
+        .hot_search()
+        .await
+        .map_err(|error| error.to_string())?;
+    let item = |h: &crate::hongguo::catalog::HotItem| {
+        serde_json::json!({
+            "id": h.series.id,
+            "title": h.series.title,
+            "cover": h.series.cover,
+            "episodeCount": h.series.episode_count,
+            "heat": h.heat,
+        })
+    };
+    Ok(serde_json::json!({
+        "guesses": hot.guesses.iter().map(item).collect::<Vec<_>>(),
+        "boards": hot.boards.iter().map(|b| serde_json::json!({
+            "name": b.name,
+            "items": b.items.iter().map(item).collect::<Vec<_>>(),
+            "topics": b.topics.iter().filter(|t| !t.query.is_empty()).map(|t| serde_json::json!({
+                "title": t.title,
+                "heat": t.heat,
+                "query": t.query,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 /// 全站题材词表：题材栏的完整来源。
@@ -791,6 +1030,39 @@ pub(crate) fn frame_interp_stop() {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+// ── 原生播放器（mpv + LSFG 补帧，单窗口）─────────────────────────────────────
+//
+// 与 `frame_interp_*`（旧方案：LsfgDemo 无边框窗口盖在 WebView2 播放器上）的区别：
+// 新方案把视频渲染搬进播放器自己的 D3D11 swapchain，补帧在同一个窗口内完成，
+// 不再有第二个 HWND；同时直吃红果直链，整条 H.264 转码链路消失。
+
+/// 打开原生播放器播放一集（已在播则只换集）。
+#[tauri::command]
+async fn native_player_open<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    input: serde_json::Value,
+) -> Result<native_player::PlayerState, String> {
+    native_player::open(app, input).await
+}
+
+/// 给原生播放器下发控制命令（pause/play/seek/volume/speed/fg/quit）。
+#[tauri::command]
+fn native_player_send(command: serde_json::Value) -> Result<(), String> {
+    native_player::send(command)
+}
+
+/// 查询原生播放器状态（位置/时长/是否存活）。
+#[tauri::command]
+fn native_player_status() -> native_player::PlayerState {
+    native_player::status()
+}
+
+/// 关闭原生播放器窗口。
+#[tauri::command]
+fn native_player_close() {
+    native_player::stop();
 }
 
 /// 找补帧程序：优先随包资源，其次本地构建产物（开发态）。
@@ -1403,29 +1675,86 @@ fn favorites_remove(series_id: String, state: State<'_, AppState>) -> Result<(),
 
 #[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> Result<UserSettings, String> {
-    state.database.settings_get()
+    let mut settings = state.database.settings_get()?;
+    // 读取侧也做一次强制：磁盘上的列表可能是旧版本写的（19 个源里的任意组合、
+    // 甚至空列表）。"红果固定"必须对旧数据同样成立，不能只在新保存时生效。
+    settings.enabled_sources = normalize_enabled_sources(&settings.enabled_sources);
+    Ok(settings)
 }
 
-/// 清洗用户勾选的启用源列表：去空白、去重、丢弃未知 id，全空时回落到红果。
+/// 清洗启用源列表：**内置源恒定在列**，其余只接受已安装的插件源。
 ///
-/// 未知 id 必须丢掉：源表在前端（`services/guoSources.ts`），后端不认这些名字，
-/// 但脏 id 会一路存进 SQLite 并被前端当源发出去，最后变成一批永远失败的请求。
-/// 全空回落红果而不是存空列表——否则用户会得到一个"没有任何请求"的空目录。
-fn normalize_enabled_sources(input: &[String]) -> Vec<String> {
-    let mut known: Vec<String> = Vec::new();
-    for id in input {
-        let id = id.trim();
-        let exists = guo_provider::GUO_SOURCES
-            .iter()
-            .any(|source| source.id == id);
-        if exists && !known.iter().any(|seen| seen == id) {
-            known.push(id.to_owned());
-        }
-    }
-    if known.is_empty() {
-        known.push("hongguo".to_string());
-    }
-    known
+/// ## 2026-11-02 的语义变化
+///
+/// 旧实现按 `GUO_SOURCES`（19 个站源）白名单过滤。源收敛后语义反过来了：
+/// 列表的**基准**是内置源（红果），用户输入只能往里加"已安装的插件源"，
+/// 不能删掉内置源——用户要求红果前后端都固定。
+///
+/// 已下架的 18 个站源**不认**：它们留在历史设置里是事实，但重新进列表就会重新
+/// 参与聚合，等于把下架撤销了。它们仍然能被 `source_name` / `source_is_adult`
+/// 解析（历史记录要显示来源名、18+ 门闩不能失效）。
+///
+/// 2026-11-02 二次收敛：自定义源不再进这个列表——它们的启停由
+/// `custom-sources.json` 里的 `enabled` 自己管，塞进 `enabled_sources` 会变成
+/// 两处状态各写一半（删源后还留着幽灵 id）。这里只剩一个恒定的内置源。
+fn normalize_enabled_sources(_input: &[String]) -> Vec<String> {
+    vec![crate::source_registry::PINNED_SOURCE_ID.to_string()]
+}
+
+/// 视频源清单：内置两源（固定、不可移除）+ 用户自己添加的自定义源。
+///
+/// 前端"视频源"设置卡只渲染这一份数据，不再自己维护静态源表——源表一旦分两处，
+/// 收敛与下架就会漏一边（历史上 `guoSources.ts` 与 `GUO_SOURCES` 就是这么漂的）。
+#[tauri::command]
+fn source_list() -> Result<serde_json::Value, String> {
+    let builtin: Vec<serde_json::Value> = crate::source_registry::BUILTIN_SOURCES
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "id": source.id,
+                "name": source.name,
+                "kind": source.kind.as_str(),
+                "description": source.description,
+                "builtin": true,
+                "enabled": true,
+                "removable": false,
+            })
+        })
+        .collect();
+    let custom = crate::source_registry::load_custom_sources();
+    Ok(serde_json::json!({
+        "builtin": builtin,
+        "custom": custom,
+        "sourcesFile": crate::source_registry::custom_sources_path().to_string_lossy(),
+        // 格式规范文件在应用目录外（项目根的 `视频源格式.txt`），这里只给名字，
+        // 让设置页能提示"去哪看字段说明"，而不是把一大段说明塞进 IPC。
+        "formatDoc": "视频源格式.txt",
+    }))
+}
+
+/// 添加一条自定义源（苹果 CMS 接口定义）。校验失败会把原因原样回给前端。
+#[tauri::command]
+fn source_add(source: crate::source_registry::CustomSource) -> Result<serde_json::Value, String> {
+    let added = crate::source_registry::add_custom_source(source)?;
+    serde_json::to_value(added).map_err(|error| error.to_string())
+}
+
+/// 删除一条自定义源。返回 `true` 表示真的删掉了（不存在时返回 `false`）。
+#[tauri::command]
+fn source_remove(id: String) -> Result<bool, String> {
+    crate::source_registry::remove_custom_source(&id)
+}
+
+/// 启停一条自定义源。
+#[tauri::command]
+fn source_toggle(id: String, enabled: bool) -> Result<(), String> {
+    crate::source_registry::toggle_custom_source(&id, enabled)
+}
+
+/// 真实请求一次自定义源的列表接口（设置页「测试」按钮）。
+#[tauri::command]
+async fn source_probe(id: String) -> Result<crate::source_registry::ProbeResult, String> {
+    crate::source_registry::probe_custom_source(&id).await
 }
 
 /// 代理模式白名单归一。
@@ -1509,6 +1838,30 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
     // 代理模式：运行期即时生效。用户切到「直连」时立刻把代理判死，不必重启 ——
     // 这正是这个开关存在的意义：出现"目录加载失败"时，用户能自己一步绕过去。
     settings.proxy_mode = normalize_proxy_mode(&settings.proxy_mode);
+    // 弹幕观感（2026-11-07）：与播放器「弹幕设置」面板的滑条档位一致地夹取，
+    // 防止手改过的设置记录把渲染层（行高/透明度）推到离谱值。UI 本身已限定
+    // 范围，这里是同一套边界的第二道闸。
+    if settings.danmaku_area.is_finite() {
+        settings.danmaku_area = settings.danmaku_area.clamp(25.0, 100.0);
+    } else {
+        settings.danmaku_area = 25.0;
+    }
+    if settings.danmaku_opacity.is_finite() {
+        settings.danmaku_opacity = settings.danmaku_opacity.clamp(10.0, 100.0);
+    } else {
+        settings.danmaku_opacity = 100.0;
+    }
+    if settings.danmaku_font_scale.is_finite() {
+        settings.danmaku_font_scale = settings.danmaku_font_scale.clamp(50.0, 200.0);
+    } else {
+        settings.danmaku_font_scale = 100.0;
+    }
+    settings.danmaku_speed = settings.danmaku_speed.clamp(0, 2);
+    settings.danmaku_color = normalize_danmaku_color(&settings.danmaku_color);
+    settings.danmaku_stroke = match settings.danmaku_stroke.as_str() {
+        "outline" | "shadow" => settings.danmaku_stroke,
+        _ => "heavy".into(),
+    };
     crate::provider::apply_proxy_mode(&settings.proxy_mode);
     let saved = state.database.settings_save(&settings);
     if saved.is_ok() {
@@ -1516,6 +1869,21 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
         std::thread::spawn(short_drama_app::enforce_cache_budget_now);
     }
     saved
+}
+
+/// 弹幕颜色归一：只认 `#RGB` / `#RRGGBB`，其余（含手改过的脏值）回落白色。
+/// 与前端 `normalizeHexColor` 同一套判据，大小写统一成大写。
+fn normalize_danmaku_color(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    let valid = (bytes.len() == 7 || bytes.len() == 4)
+        && bytes[0] == b'#'
+        && bytes[1..].iter().all(|c| c.is_ascii_hexdigit());
+    if valid {
+        trimmed.to_ascii_uppercase()
+    } else {
+        "#FFFFFF".into()
+    }
 }
 
 /// 代理连通性自检（设置页「测试」按钮）。
@@ -1930,6 +2298,14 @@ fn main() {
 
             // 画中画小窗的交接状态：窗口按需创建，状态随进程存活。
             app.manage(crate::pip::PipState::default());
+            app.manage(crate::agent_dock::DockStateStore::default());
+
+            // 智能体联动桥：127.0.0.1 回环上的极简 HTTP 接收端（hook POST 进来、
+            // 转成 agent://event 广播给主窗口）。无论功能开关与否都启动——
+            // 监听本身零成本（一个空闲的 TcpListener），开关只由前端决定"要不要
+            // 响应事件"；这样用户在设置页拨开开关时立即生效，不用重启应用。
+            // 端口全被占时桥不存在，设置页会如实显示并禁用配置复制。
+            crate::agent_bridge::start(app.handle().clone());
 
             // 主窗口关闭 = 退出应用：小窗是同进程里的另一个窗口，不跟着收掉就会
             // 留下一个没有落点的悬浮窗（Tauri 要等最后一个窗口关闭才退出进程）。
@@ -1938,6 +2314,9 @@ fn main() {
                 main_window.on_window_event(move |event| {
                     if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                         crate::pip::dismiss_on_main_close(&handle);
+                        // 悬浮窗同样是同进程里的另一个窗口，主窗口关掉必须一起收掉，
+                        // 否则进程会留着一个没有落点的置顶窗不退出。
+                        crate::agent_dock::destroy(&handle);
                     }
                     // 主窗口重新拿到焦点 = 用户把主界面叫回来了。
                     //
@@ -2058,7 +2437,33 @@ fn main() {
             catalog_list,
             catalog_fast_search,
             catalog_suggest,
+            // 系列剧「全部季」：网页链路只出当前在推的那一季，这里补全。
+            catalog_series_seasons,
             catalog_categories,
+            // 搜索页热搜：只有 App 接口有，网页源没有。
+            hongguo_hot_search,
+            // ── 红果原生客户端的新增出口（hongguo_api.rs）────────────────────
+            // 搜索增强
+            hongguo_suggest,
+            hongguo_search_cues,
+            hongguo_search,
+            // 发现
+            hongguo_discover,
+            // 榜单与筛选
+            hongguo_short_rank,
+            hongguo_short_filter_panel,
+            hongguo_short_filter,
+            hongguo_ranking,
+            // 详情与推荐
+            hongguo_series_detail,
+            hongguo_series_batch,
+            hongguo_album,
+            hongguo_series_recommend,
+            // 演员
+            hongguo_person,
+            hongguo_person_works,
+            // 上新日历
+            hongguo_new_releases,
             guo_cover,
             guo_cover_batch,
             guo_source_status,
@@ -2071,6 +2476,10 @@ fn main() {
             playback_command,
             playback_snapshot,
             frame_interp_set,
+            native_player_open,
+            native_player_send,
+            native_player_status,
+            native_player_close,
             short_drama_app_status,
             short_drama_app_set_device,
             short_drama_app_resolve,
@@ -2085,6 +2494,8 @@ fn main() {
             short_drama_app_cache_usage,
             short_drama_app_stream,
             short_drama_app_qualities,
+            // 弹幕：按 30 秒时间窗拉取红果弹幕，走同一台匿名设备的签名。
+            crate::hongguo_bridge::short_drama_app_danmaku,
             short_drama_app_album,
             short_drama_app_prefetch_stream,
             short_drama_app_episode_counts,
@@ -2101,6 +2512,12 @@ fn main() {
             window_finish_fullscreen,
             settings_get,
             settings_save,
+            // 视频源：内置两源固定 + 用户自定义源（苹果 CMS 接口）。
+            source_list,
+            source_add,
+            source_remove,
+            source_toggle,
+            source_probe,
             proxy_diagnose,
             cache_clear,
             pip_open,
@@ -2109,6 +2526,17 @@ fn main() {
             pip_close,
             pip_dismiss,
             pip_is_open,
+            agent_bridge_status,
+            agent_test_call,
+            agent_targets,
+            agent_attach_all,
+            agent_detach_all,
+            agent_dock_show,
+            agent_dock_hide,
+            agent_dock_ready,
+            agent_dock_state,
+            agent_dock_action,
+            agent_dock_drag,
             update_check,
             update_probe_network,
             update_download,
@@ -2154,6 +2582,128 @@ mod tests {
             page_size: 24,
             cursor: None,
         }
+    }
+
+    /// 造一条"其它来源"的条目，只关心 id 与位次。
+    fn other_item(id: &str) -> SeriesItem {
+        SeriesItem {
+            id: id.into(),
+            title: format!("其它-{id}"),
+            cover: String::new(),
+            item_type: "drama".into(),
+            episodes_count: 1,
+            latest_episode_title: None,
+            tags: Vec::new(),
+            origin: "其它来源".into(),
+            brief: None,
+            rating: None,
+        }
+    }
+
+    /// 造一条 App 搜索命中的原始卡片。
+    fn app_hit(id: &str, episodes: u32) -> SeriesHit {
+        SeriesHit {
+            id: id.into(),
+            title: format!("直连-{id}"),
+            cover: format!("https://x/{id}.jpg"),
+            intro: "简介".into(),
+            episode_count: episodes,
+            content_type: None,
+        }
+    }
+
+    /// 造一条 App 联想的条目（走 Python worker 的那一路）。
+    fn suggestion_item(id: &str) -> crate::short_drama_app::SearchSuggestion {
+        crate::short_drama_app::SearchSuggestion {
+            id: id.into(),
+            title: format!("联想-{id}"),
+            cover: String::new(),
+            episode_count: 3,
+            tags: Vec::new(),
+        }
+    }
+
+    /// 四路合并：App 搜索排第一、按 id 去重（先到者胜）、`episode_cnt` 为 0 的
+    /// 卡被丢、联想留最后。
+    #[test]
+    fn app_search_merges_first_dedupes_and_drops_empty() {
+        let merged = merge_search_results(
+            Ok(vec![
+                app_hit("2", 115),
+                // 未上架 / 「盘点合集」类非剧集卡：点开必然空白，必须丢。
+                app_hit("9", 0),
+                // 与网页结果同 id：去重后只留 App 搜索这一条（位次在前）。
+                app_hit("3", 20),
+            ]),
+            vec![other_item("3"), other_item("7")],
+            Some(vec![other_item("7"), other_item("8")]),
+            vec![suggestion_item("8"), suggestion_item("10")],
+            "drama",
+        );
+
+        let ids: Vec<&str> = merged.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["2", "3", "7", "8", "10"],
+            "位次应为 App 搜索 → 网页 → 动漫 → 联想，且按 id 去重：{ids:?}"
+        );
+        // 未上架那条（episode_count = 0）不能出现。
+        assert!(!ids.contains(&"9"), "episode_cnt 为 0 的卡必须被丢弃");
+        // 映射字段：origin 要能和「红果 App 联想」区分，集数照搬。
+        assert_eq!(merged.items[0].origin, "红果 App 直连");
+        assert_eq!(merged.items[0].episodes_count, 115);
+        assert_eq!(merged.items[0].cover, "https://x/2.jpg");
+        // App 搜索不给题材，绝不能编。
+        assert!(merged.items[0].tags.is_empty());
+        assert!(!merged.app_failed);
+        assert!(!merged.anime_failed);
+    }
+
+    /// `degraded` 只认 App 搜索失败。
+    ///
+    /// 站点改 CSR 之后网页那一路恒空，如果"网页空"也算降级，每次搜索都会亮降级
+    /// 条，用户会很快学会无视它——那这个字段就等于没有。
+    #[test]
+    fn degraded_tracks_app_search_and_anime_failure() {
+        // 常态：网页空、动漫和联想都正常 → 不降级。
+        let normal = merge_search_results(
+            Ok(vec![app_hit("1", 10)]),
+            Vec::new(),
+            Some(Vec::new()),
+            Vec::new(),
+            "drama",
+        );
+        assert!(!normal.app_failed);
+        assert!(!normal.anime_failed);
+
+        // 动漫挂掉：它的条目整块缺席，结果同样不全 → 算降级。
+        //
+        // 这不与"网页恒空不算降级"矛盾：网页那路是**已知的常态失效**（站点改 CSR），
+        // 每次都空，报它等于每次都亮灯；而动漫源是**偶发故障**，挂了就是这一次真的少了东西。
+        let anime_down =
+            merge_search_results(Ok(Vec::new()), Vec::new(), None, Vec::new(), "drama");
+        assert!(!anime_down.app_failed, "动漫失败不该归因到 App 搜索");
+        assert!(anime_down.anime_failed, "动漫失败必须被记录下来");
+
+        // App 搜索挂掉：这才是降级。
+        let app_down = merge_search_results(
+            Err("network down".into()),
+            Vec::new(),
+            None,
+            Vec::new(),
+            "drama",
+        );
+        assert!(app_down.app_failed, "App 搜索失败必须置 degraded");
+        assert!(app_down.items.is_empty());
+    }
+
+    /// App 搜索只服务真人短剧档：漫剧/动漫频道不能接（否则串频道）。
+    #[test]
+    fn app_search_skips_comic_and_anime_channels() {
+        assert!(app_search_applies("drama"));
+        assert!(app_search_applies("short"));
+        assert!(!app_search_applies("comic"));
+        assert!(!app_search_applies("anime"));
     }
 
     #[test]
@@ -2211,15 +2761,18 @@ mod tests {
     fn enabled_sources_drop_unknown_ids_and_duplicates() {
         let input = vec![
             "hongguo".to_string(),
+            // 已下架的站源：留在历史设置里是事实，但**不能再进启用列表** ——
+            // 重新进列表就会重新参与聚合，等于把下架撤销了。
             " heguo ".to_string(),
             "hongguo".to_string(),
             "不存在的源".to_string(),
             "".to_string(),
         ];
-        // 顺序保留首个出现的位置；未知 id 与空白项直接丢弃。
+        // 2026-11-02 语义：列表基准是内置源（红果），用户输入只能往里补
+        // **已安装的插件源**。所以这里只剩 hongguo。
         assert_eq!(
             normalize_enabled_sources(&input),
-            vec!["hongguo".to_string(), "heguo".to_string()]
+            vec!["hongguo".to_string()]
         );
     }
 
@@ -2299,7 +2852,7 @@ mod tests {
     /// 拿不到任何内容。写死这条是为了防止下一个人看到"关着开关还启用着帝果"就
     /// 顺手加回剔除。
     #[test]
-    fn settings_save_normalizes_but_keeps_disabled_adult_sources() {
+    fn settings_save_keeps_only_builtin_sources() {
         let mixed = UserSettings {
             show_adult_sources: false,
             enabled_sources: vec![
@@ -2311,15 +2864,12 @@ mod tests {
             ],
             ..UserSettings::default()
         };
-        // 18+ 源原样保留；未知 id 被丢弃；顺序保持稳定（用户勾选的顺序即聚合顺序）。
+        // 2026-11-02：已下架的站源（dsd / heguo / huangguo-video）不再进启用列表——
+        // 保留它们等于让聚合继续打这些站点。内置源红果恒定在列。
+        // 旧断言是"18+ 源原样保留"，那是在这些源还内置的年代；语义已随之改变。
         assert_eq!(
             normalize_enabled_sources(&mixed.enabled_sources),
-            vec![
-                "dsd".to_string(),
-                "heguo".to_string(),
-                "huangguo-video".to_string(),
-                "hongguo".to_string()
-            ]
+            vec!["hongguo".to_string()]
         );
 
         // 全空（含全是被丢弃的未知 id）时回落红果：零可用源等于坏设置。

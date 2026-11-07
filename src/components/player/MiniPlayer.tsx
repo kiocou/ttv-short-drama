@@ -371,6 +371,26 @@ export const MiniPlayer: React.FC = () => {
           streamKindOf(opened.url, opened.streamKind),
           startPosition,
         );
+      } else if (plan.vsrEnabled === false) {
+        /**
+         * VSR 关闭：整集 mp4 是**唯一**链路，直接解析。
+         *
+         * 不再先试 `openStreamNative`：后端在 VSR 关时对它有硬门禁，必定回
+         * 「VSR 开关已关闭，使用旧播放链路」。实机日志里每集都白撞两次
+         * （会话 900000001 / 900000002 各 20ms），然后才落到这里 —— 而真正
+         * 让用户觉得"打不开下一集"的，是下面 `prefetchNextEpisode` 那边
+         * 同样空转、导致这一集没有任何预取，必须现场等 3~7 秒。
+         */
+        const resolved = await ipcService.playback.resolveNative(
+          plan.seriesId,
+          episodeId,
+          plan.contentType ?? 1,
+          plan.quality || 'auto',
+        );
+        if (sessionRef.current !== session) return;
+        const { convertFileSrc } = await import('@tauri-apps/api/core');
+        video.src = convertFileSrc(resolved.playUrl);
+        video.load();
       } else {
         /**
          * 短剧/漫剧：**优先走整集 HLS**，与主播放器同一条链路。
@@ -585,6 +605,23 @@ export const MiniPlayer: React.FC = () => {
     if (prefetchTimerRef.current !== null) window.clearTimeout(prefetchTimerRef.current);
     prefetchTimerRef.current = window.setTimeout(() => {
       prefetchTimerRef.current = null;
+      /**
+       * VSR 关闭时的预取产物必须是**整集 mp4**（2026-11-01 修「小窗连播切集卡死」）。
+       *
+       * `prewarmStreamNative` 在后端 `short_drama_app_prewarm_stream` 里有硬门禁：
+       * VSR 关时直接跳过、什么都不产。也就是说关闭增强期间，小窗此前**一次有效
+       * 预取都没有** —— 每次连播都要现场走 `resolveNative`（3~7 秒），用户看到
+       * 的就是"播完切下一集卡很久，像打不开"。
+       *
+       * 与 `playEpisode` 的分支保持一致：预取的产物必须就是播放要读的那一份，
+       * 否则预取等于白烧 worker（主窗口侧 `prewarmNextEpisode` 早就这么做了）。
+       */
+      if (plan.vsrEnabled === false) {
+        void ipcService.playback
+          .resolveNative(plan.seriesId, next.id, plan.contentType ?? 1, plan.quality || 'auto')
+          .catch(() => undefined);
+        return;
+      }
       void ipcService.playback.prewarmStreamNative(
         plan.seriesId,
         next.id,

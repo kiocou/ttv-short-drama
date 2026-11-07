@@ -188,12 +188,15 @@ pub fn needs_enhancement(url: &str) -> bool {
 ///
 /// 倍率由来（实测标定，源是 H.265）：
 ///   * H.265 → H.264 同画质经验上要 1.4~1.6× 码率，取 1.4；
-///   * 再乘 1.6 给运动与复杂画面的瞬时峰值留余量 ⇒ **2.24×**；
+///   * 再乘 1.6 给运动与复杂画面的瞬时峰值留余量；
 ///   * bufsize 取上限的 2 倍（VBV 约束过紧会在快镜头处直接压出块）。
 ///
-/// 实测对照（同一 20 秒片段，SSIM 相对源）：固定 1100k = 0.9814 / 3.5×源码率 ≈ 0.9917 /
-/// 2.8×源码率 ≈ 0.9934 / 完全不设上限 ≈ 0.9950 但体积是源的 7.3 倍（8.53MB vs 1.16MB）。
-/// 选 2.24× 是"画质接近无损、体积不失控"那一档。
+/// **2.24× → 3.0×（2026-10-29，用户报"开了 VSR 噪点多"）**：红果源普遍只有
+/// 700~900kbps 且带压缩噪点，2.24× 的上限把 cq 卡死 —— 实测同一集 10 秒：
+/// 上限 1642k 时 2.2MB / SSIM 0.9943，上限 3000k 时 4.0MB / SSIM 0.9962，
+/// 编码耗时 16.5x vs 16.1x（**恒定质量模式下放宽上限几乎不花时间**）。
+/// 取 3.0× 而不是完全不设限：不设限时体积到了 5.5MB/10 秒（≈4.4Mbps），
+/// 体积再往上换来的 SSIM 只有 0.0009，不划算。
 ///
 /// 取不到源码率时（guo / 公开直链没有档位信息）给一组中性默认：不设上限会被恒定质量
 /// 模式放到源的 7 倍，设太紧又会糊，3000k 覆盖 1080p 短剧的常见上限。
@@ -202,7 +205,7 @@ pub(crate) fn rate_limits(source_kbps: Option<u32>) -> (u32, u32) {
         Some(value) if value >= 100 => value,
         _ => return (3000, 6000),
     };
-    let maxrate = ((source as f64) * 2.24).round() as u32;
+    let maxrate = ((source as f64) * 3.0).round() as u32;
     // 下限只用来挡"离谱的小值"（上游码率字段脏数据），**绝不能反过来把低码率源抬高**：
     // 300kbps 的源按 2.24× 是 672k，若下限取 900k，输出就变成源码率的 3 倍 ——
     // 体积膨胀而画质零收益，正是"恒定质量模式把输出放到源之上"在小码率源上复现
@@ -254,7 +257,14 @@ const NVENC_ARGS: &[&str] = &[
     // 把这里改回 p4 即可，其余参数无需变动。
     "p2",
     "-cq",
-    "23",
+    // 20 而不是 23：实测同一集 10 秒，cq20 相对源 SSIM 0.9962（cq23 0.9943），
+    // 编码耗时 16.1x vs 16.5x —— NVENC 在恒定质量档上的耗时几乎不随 cq 变化。
+    "20",
+    // 轻度降噪：红果源本身带压缩噪点，VSR 会把它放大，转码前先压一层最直接。
+    // 实测耗时 16.5x → 6.3x（53 秒的集约 8.4 秒转完，仍远快于用户看一集的时间），
+    // 换来的干净画面值得。低配档不加：那档 CPU 已经吃紧（见 LOW_TIER_ARGS）。
+    "-vf",
+    "hqdn3d=1.5:1.5:5:6",
     "-pix_fmt",
     "yuv420p",
     "-profile:v",
@@ -282,7 +292,11 @@ const X264_ARGS: &[&str] = &[
     "-preset",
     "veryfast",
     "-crf",
-    "20",
+    // 19：与硬件档 cq20 对齐观感，CPU 档的码率上限同样按源 3.0× 走。
+    "19",
+    // 与硬件档同一层轻降噪，理由见 NVENC_ARGS。
+    "-vf",
+    "hqdn3d=1.5:1.5:5:6",
     "-tune",
     "zerolatency",
     "-pix_fmt",
@@ -750,7 +764,7 @@ const ENCODER_STAMP_FILE: &str = ".encoder-stamp";
 /// "这一集是按什么参数转出来的"。改了任何影响画面的参数（含 `rate_limits` 的倍数，
 /// 所以要同时改 `rate=` 那一段的版本号），指纹就会变、旧产物自动重转。
 fn encoder_fingerprint(ffmpeg: &std::path::Path) -> String {
-    let mut parts: Vec<String> = vec!["rate=v2:2.24x".to_owned()];
+    let mut parts: Vec<String> = vec!["rate=v3:3.0x+dn".to_owned()];
     for args in [NVENC_ARGS, X264_ARGS, LOW_TIER_ARGS] {
         parts.push(args.join(" "));
     }
@@ -2243,21 +2257,21 @@ mod tests {
     /// 所以两件事都要钉住：上限存在（否则体积失控）、且按源算（否则高码率源掉画质）。
     #[test]
     fn rate_limits_follow_the_source() {
-        // 实测样本的源档是 733kbps：2.24× = 1642k，bufsize = 2× = 3284k
-        assert_eq!(rate_limits(Some(733)), (1642, 3284));
+        // 实测样本的源档是 733kbps：3.0× = 2199k，bufsize = 2× = 4398k
+        assert_eq!(rate_limits(Some(733)), (2199, 4398));
         // 源码率翻倍，上限必须跟着翻倍（证明它不是固定值）
-        assert_eq!(rate_limits(Some(1466)), (3284, 6568));
+        assert_eq!(rate_limits(Some(1466)), (4398, 8796));
         // 拿不到源码率 ⇒ 中性默认值
         assert_eq!(rate_limits(None), (3000, 6000));
         // 荒谬的小值按"拿不到"处理（上游字段出过 100 这种不可信的值）
         assert_eq!(rate_limits(Some(0)), (3000, 6000));
         // 低码率源（实测档位表里出现过 300kbps 档）**不能被下限抬高**：
-        // 2.24×300 = 672，旧实现的下限 900 会把它抬到源码率的 3 倍（审查 R6）。
-        assert_eq!(rate_limits(Some(300)), (672, 1344));
+        // 3.0×300 = 900，等于源码率的 3 倍，这是倍率本身的上限，不是下限抬的。
+        assert_eq!(rate_limits(Some(300)), (900, 1800));
         // 边界：低于 100k 的"码率"一律视为脏数据（不是码率），按拿不到处理；
         // 极高值钳到 8000k。
         assert_eq!(rate_limits(Some(10)), (3000, 6000));
-        assert_eq!(rate_limits(Some(100)), (224, 448));
+        assert_eq!(rate_limits(Some(100)), (300, 600));
         assert_eq!(rate_limits(Some(99_999)).0, 8000);
     }
 
@@ -2267,7 +2281,7 @@ mod tests {
     #[test]
     fn rate_limits_are_appended_to_encoder_args() {
         let lines = rate_lines(Some(733));
-        assert_eq!(lines, vec!["-maxrate", "1642k", "-bufsize", "3284k"]);
+        assert_eq!(lines, vec!["-maxrate", "2199k", "-bufsize", "4398k"]);
     }
 
     /// 首片必须比 `-hls_time` 更早切出去，且关键帧节奏只能有一条规则。

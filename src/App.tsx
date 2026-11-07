@@ -6,6 +6,7 @@ import { AnimePlayerProvider, useAnimePlayer } from './stores/useAnimePlayerStor
 import { HistoryProvider } from './stores/useHistoryStore';
 import { FavoritesProvider } from './stores/useFavoritesStore';
 import { SettingsProvider } from './stores/useSettingsStore';
+import { AgentWatchProvider } from './stores/useAgentWatchStore';
 import { leaveFullscreen } from './services/windowFx';
 
 import { TitleBar } from './components/layout/TitleBar';
@@ -20,9 +21,11 @@ import { FavoritesView } from './components/views/FavoritesView';
 import { SettingsView } from './components/views/SettingsView';
 import { SearchView } from './components/views/SearchView';
 import { ShelfMoreView } from './components/views/ShelfMoreView';
+import { SpotlightView } from './components/views/SpotlightView';
 import { VideoSurface } from './components/player/VideoSurface';
 import { AnimeVideoSurface } from './components/player/AnimeVideoSurface';
 import { PipReturnBridge } from './components/player/PipReturnBridge';
+import { AgentCallCard } from './components/player/AgentCallCard';
 import { LaunchAnimation } from './components/layout/LaunchAnimation';
 
 const AppContent: React.FC = () => {
@@ -240,6 +243,20 @@ const AppContent: React.FC = () => {
             >
               <ShelfMoreView />
             </div>
+            {/*
+              首页顶部三档的落地页（综合推荐 / 最新上线 / 热度榜单）。
+
+              与「更多」页同样**不给 key**：`SpotlightView` 自己在 `spotlight`
+              上下文变化时复位滚动与游标（见 useSpotlightFeed 的依赖），
+              给 key 反而每次切换都重挂一遍分页状态。
+
+              视图常驻 DOM 是项目既有约定（隐藏 ≠ 卸载），这里保持一致。
+            */}
+            <div
+              className={`h-full w-full ${currentView === 'spotlight' ? 'block animate-fluent-page-in' : 'hidden'}`}
+            >
+              <SpotlightView />
+            </div>
           </main>
         </div>
       </div>
@@ -248,6 +265,13 @@ const AppContent: React.FC = () => {
 
       {/* 画中画小窗回流：小窗关闭时接回播放/落历史（不渲染任何界面） */}
       <PipReturnBridge />
+
+      {/*
+        智能体联动：呼叫卡（播放中收到事件时浮出）。
+        收起后的常驻卡片**不在这里**——它是独立的置顶窗口（agent_dock.rs），
+        必须能在用户切到智能体工具之后仍然浮在桌面上。
+      */}
+      <AgentCallCard />
       <ToastContainer />
 
       {/*
@@ -270,7 +294,9 @@ export const App: React.FC = () => {
             <HistoryProvider>
               <FavoritesProvider>
                 <AnimePlayerProvider>
-                  <AppContent />
+                  <AgentWatchProvider>
+                    <AppContent />
+                  </AgentWatchProvider>
                 </AnimePlayerProvider>
               </FavoritesProvider>
             </HistoryProvider>

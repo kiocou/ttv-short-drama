@@ -11,6 +11,10 @@ dist-ssr/
 # ---- Rust / Tauri 构建产物 ----
 src-tauri/target/
 src-tauri/gen/schemas/
+src-tauri/native-player/bin/
+src-tauri/native-player/obj/
+src-tauri/native-player/**/bin/
+src-tauri/native-player/**/obj/
 
 # ---- 运行期数据（设备凭据 / SQLite / WebView2 缓存，绝不入库）----
 src-tauri/.app-data/

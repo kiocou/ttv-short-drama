@@ -59,55 +59,25 @@ export interface GuoSource {
 }
 
 /**
- * 19 个 guo 站源的静态清单。
+ * 内置源清单：**只有红果一个**（2026-11-02 源收敛）。
  *
- * 只描述**结构性的、源侧决定的**属性（kind / adult），不描述运行期健康度——
- * 后者一律现查 guo-core（`ipcService.catalog.guoSourceStatus`）。下面每条
- * `实测` 注释记录的是 2026-09-29 拉目录时的内容特征，用来支撑 kind / adult
- * 的分类依据；它们证明的是"这个源里装的是什么内容"，不是"这个源现在通不通"。
+ * 其余 18 个 guo 站源已全部下架，后续来源改由插件系统加载（后端 `source_registry`，
+ * 设置页「添加视频源」）。所以这里不再需要手工同步一份 19 项清单——那正是
+ * 「前后端各存一份、迟早漂」的根源。
+ *
+ * 旧的 18 个源在后端 `LEGACY_GUO_SOURCES` 里留了名字与 adult 标记，用于兼容
+ * 历史 id 的显示与 18+ 门闩；前端不需要它们：删掉就是真的从选择器与聚合里消失。
  */
 export const GUO_SOURCES: GuoSource[] = [
-  // 实测：2044 条全为真人短剧（都市/逆袭/爱情/年代，有剧情简介、几十至上百集）；
-  // 红果是唯一"频道参数真的生效"的源——短剧与漫剧走两条不同的官方接口。
+  // 唯一内置源：红果短剧 / 漫剧。
+  //
+  // 2026-11-02 源收敛：其余 18 个站源全部下架；后续来源改由插件系统加载
+  // （后端 `source_registry`，设置页「添加视频源」）。红果在**两端都固定**：
+  // 前端不给取消入口，后端 `normalize_enabled_sources` 也会把它补回。
+  //
+  // 旧的 18 个源只在后端 `LEGACY_GUO_SOURCES` 里留了一份名字/adult 表用于
+  // 兼容历史 id，前端不再需要它们：这里删掉就是真的从选择器与聚合里消失。
   { id: 'hongguo', name: '红果短剧 / 漫剧', kind: 'both' },
-  // 实测 30 条：多数"黄豆原创"（真人成人），但含"国漫"分类的少量动漫条目。
-  { id: 'huangdou', name: '黄豆', kind: 'both', adult: true },
-  // 实测 20 条：分类恒为"短剧"，标题为成人真人条目。
-  { id: 'huangju', name: '剧果', kind: 'live', adult: true },
-  // 实测 20 条：分类恒为"短剧"，标签为成人题材；集数全部为 0。
-  // 2026-10-19 两轮体检：直连 25s 超时，挂代理（127.0.0.1:10808）仍 25s 超时，
-  // 站方线路侧不可用；留成可选只会让用户在「神秘小窝」里点一排必挂的卡。
-  { id: 'yeguo', name: '野果', kind: 'live', adult: true, retired: true },
-  // 实测 72 条：真人成人向内容（无码中字 / 无码破解）。
-  { id: 'dsd', name: '帝果', kind: 'live', adult: true },
-  // 实测 96 条：分类恒为 "AI 短剧"（AI 生成、真人外形），有集数。
-  { id: 'huangguoai', name: '黄果 AI', kind: 'live', adult: true },
-  // 实测 40 条：分类为 series/video 的混合条目，真人。
-  { id: 'huangguo-video', name: '黄果视频', kind: 'live', adult: true },
-  // 实测失败："芽果未返回有效的访问令牌"，内容未验证，暂按真人登记。
-  { id: 'yaguo', name: '芽果', kind: 'live' },
-  // 实测 66 条：都市情感真人短剧，33~70 集。
-  { id: 'maoguo', name: '猫果', kind: 'live' },
-  // 实测 10 条：分类恒为"都市"，真人，30~90 集。
-  { id: 'fanguo', name: '饭果', kind: 'live' },
-  // 实测 30 条：玄幻仙侠/都市爱情/逆袭/甜宠，真人。
-  { id: 'guanguo', name: '观果', kind: 'live', retired: true },
-  // 实测 63 条：都市/古风/复仇真人短剧，部分条目集数为 0。
-  { id: 'heguo', name: '河果', kind: 'live' },
-  // 实测 10 条：真人短剧，20~91 集。
-  { id: 'xingguo', name: '星果', kind: 'live' },
-  // 实测 36 条：标题带题材后缀的真人短剧，但含《工资真相-动漫合集》这一漫剧条目。
-  { id: 'huaguo', name: '花果', kind: 'both' },
-  // 实测 12 条：穿越/修仙/剑仙，集数全为 0；无简介，按真人登记。
-  { id: 'niuguo', name: '牛果', kind: 'live', retired: true },
-  // 实测 403（站点要求浏览器验证）。
-  { id: 'wangguo', name: '网果', kind: 'live' },
-  // 实测 444。
-  { id: 'faguo', name: '发果', kind: 'live', retired: true },
-  // 实测 492，且两次探测结果不一致（一次 10 条、一次报错），链路不稳。
-  { id: 'piguo', name: '皮果', kind: 'live', retired: true },
-  // 实测 30 条：古代宅斗/宫斗真人短剧，集数恒为 1。
-  { id: 'wuguo', name: '伍果', kind: 'live' },
 ];
 
 /**

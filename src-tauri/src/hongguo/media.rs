@@ -40,11 +40,108 @@ pub struct Playback {
     pub key_material: String,
 }
 
+/// 该编码能否被 WebView2 直接解码（不需要额外解码器）。
+///
+/// 只认 H.264 与 HEVC：Windows 自带 H.264，HEVC 由 HEVC Video Extension 提供
+/// （应用已在 WebView2 启动参数里打开 `PlatformHEVCDecoderSupport`）。
+/// `bytevc1` / `bytevc2` 是字节自有编码，系统没有对应解码器 —— 硬解不可能命中，
+/// 播放时只能软解，表现就是"画面不流畅、发飘"。
+fn is_decodable_codec(codec: &str) -> bool {
+    let value = codec.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        // 未知编码不算可直接播放，但也不在这里排除 —— 由调用方的"别无选择"兜底。
+        return false;
+    }
+    value.contains("h264")
+        || value.contains("avc")
+        || value.contains("hevc")
+        || value.contains("h265")
+        || value.contains("hvc1")
+        || value.contains("hev1")
+}
+
 impl Playback {
     /// 最高档位（按高度取最大；同高度取码率高者）。
     pub fn best_stream(&self) -> Option<&Stream> {
         self.streams.iter().max_by_key(|s| (s.height, s.bitrate))
     }
+
+    /// 选一路 **WebView2 能直接解码**的最高档（预签名直链专用）。
+    ///
+    /// ## 为什么不能直接用 `best_stream`
+    ///
+    /// `best_stream` 只按 `(高度, 码率)` 取最大，而同分辨率下 **bytevc1** 那一路
+    /// 的码率通常最高 —— 预签名于是把 BVC 地址交给 worker。BVC 是字节自有编码，
+    /// Windows 只装了 HEVC / H.264 的系统解码器；整集 copy 出来的 BVC 文件
+    /// 播放器只能软解，用户看到的就是「关了增强以后画面不流畅、发飘」。
+    ///
+    /// 实机日志（2026-11-01，预签名刚接入时）对比得很清楚：
+    ///   预签名选中：`编码=bytevc1，1080p` → 4.1MB 下 14 秒，播放发卡
+    ///   现场签名选中：`编码=h265_hvc1，1080p` → 3.0MB 下 2.7 秒，播放流畅
+    ///
+    /// ## 过滤规则
+    ///
+    /// H.264 / HEVC 算可直接播放；其余编码（bytevc1 / bytevc2 / 未知）只在
+    /// 「别无选择」时才退回 —— 给一个可能发卡的源，也好过整集没有可用地址。
+    pub fn best_playable_stream(&self) -> Option<&Stream> {
+        let pick = |playable_only: bool| {
+            self.streams
+                .iter()
+                .filter(|s| !s.url.trim().is_empty())
+                .filter(|s| !playable_only || is_decodable_codec(&s.codec))
+                .max_by_key(|s| (s.height, s.bitrate))
+        };
+        pick(true).or_else(|| pick(false))
+    }
+
+    /// 按档位选一路可播放的码流，语义与 Go 的 `Playback.Select` 一致。
+    ///
+    /// - `""` / `"best"`：最高分辨率，同分辨率取最高码率。
+    /// - `"worst"`：最低分辨率。
+    /// - 其它值：依次匹配分辨率标签（`720p`）、画质标签（`normal`）或编码名，不区分大小写。
+    ///
+    /// 没有 URL 的流永远不参与选择，否则会选中一条无法播放的记录。
+    pub fn select(&self, quality: &str) -> Result<&Stream, String> {
+        let mut usable: Vec<&Stream> = self
+            .streams
+            .iter()
+            .filter(|s| !s.url.trim().is_empty())
+            .collect();
+        if usable.is_empty() {
+            return Err("播放模型没有可用的码流地址".into());
+        }
+        usable.sort_by_key(|s| (stream_height_rank(s), s.bitrate));
+
+        match quality.trim().to_ascii_lowercase().as_str() {
+            "" | "best" => Ok(usable[usable.len() - 1]),
+            "worst" => Ok(usable[0]),
+            _ => usable
+                .iter()
+                .copied()
+                .find(|s| {
+                    s.definition.eq_ignore_ascii_case(quality)
+                        || s.quality.eq_ignore_ascii_case(quality)
+                        || s.codec.eq_ignore_ascii_case(quality)
+                })
+                .ok_or_else(|| {
+                    let offered: Vec<&str> = usable.iter().map(|s| s.definition.as_str()).collect();
+                    format!("档位 {quality} 不可用（可选：{}）", offered.join(" "))
+                }),
+        }
+    }
+}
+
+/// 排序用的分辨率：显式高度优先，否则取分辨率标签开头的数字（`1080p` → 1080）。
+fn stream_height_rank(s: &Stream) -> i64 {
+    if s.height > 0 {
+        return s.height as i64;
+    }
+    let digits: String = s
+        .definition
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<i64>().unwrap_or(0)
 }
 
 /// 取字符串：字符串原样返回，数字转文本，其余空串。
@@ -414,5 +511,73 @@ mod tests {
     fn empty_body_is_reported_as_anonymous_limited_shape() {
         // 空 body 在 client 层会被识别为静默拒绝，这里只保证解析器不 panic
         assert!(parse_playback(b"", "ep1").is_err());
+    }
+
+    fn stream(definition: &str, height: i32, bitrate: i64, url: &str) -> Stream {
+        Stream {
+            definition: definition.into(),
+            height,
+            bitrate,
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    fn playback(streams: Vec<Stream>) -> Playback {
+        Playback {
+            streams,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn select_defaults_to_highest_resolution_then_bitrate() {
+        let pb = playback(vec![
+            stream("720p", 720, 900_000, "u720"),
+            stream("1080p", 1080, 1_200_000, "u1080a"),
+            stream("1080p", 1080, 2_000_000, "u1080b"),
+        ]);
+        assert_eq!(pb.select("").unwrap().url, "u1080b");
+        assert_eq!(pb.select("best").unwrap().url, "u1080b");
+    }
+
+    #[test]
+    fn select_worst_picks_lowest_resolution() {
+        let pb = playback(vec![
+            stream("1080p", 1080, 2_000_000, "u1080"),
+            stream("480p", 480, 400_000, "u480"),
+        ]);
+        assert_eq!(pb.select("worst").unwrap().url, "u480");
+    }
+
+    #[test]
+    fn select_matches_definition_case_insensitively() {
+        let pb = playback(vec![
+            stream("720p", 720, 900_000, "u720"),
+            stream("1080p", 1080, 2_000_000, "u1080"),
+        ]);
+        assert_eq!(pb.select("720P").unwrap().url, "u720");
+    }
+
+    #[test]
+    fn select_skips_streams_without_url() {
+        let pb = playback(vec![
+            stream("1080p", 1080, 2_000_000, ""),
+            stream("720p", 720, 900_000, "u720"),
+        ]);
+        assert_eq!(pb.select("").unwrap().url, "u720");
+    }
+
+    #[test]
+    fn select_unknown_quality_lists_available() {
+        let pb = playback(vec![stream("720p", 720, 900_000, "u720")]);
+        let err = pb.select("4k").unwrap_err();
+        assert!(err.contains("4k") && err.contains("720p"), "{err}");
+    }
+
+    #[test]
+    fn select_errors_when_no_stream_has_url() {
+        let pb = playback(vec![stream("720p", 720, 900_000, "  ")]);
+        assert!(pb.select("").is_err());
     }
 }

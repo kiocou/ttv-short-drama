@@ -14,6 +14,18 @@ interface SettingsContextType {
 
 const SettingsContext = createContext<SettingsContextType | null>(null);
 
+/** 数值设置的归一：非法/缺失回落 `fallback`，合法值夹进 `[min, max]`。 */
+function normalizeRange(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+/** 弹幕颜色归一：只认 #RGB / #RRGGBB，其余（含 undefined）回落白色。 */
+function normalizeHexColor(value: unknown, fallback = '#FFFFFF'): string {
+  if (typeof value !== 'string') return fallback;
+  return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value.trim()) ? value.trim() : fallback;
+}
+
 export const SettingsProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
   const [cacheUsage, setCacheUsage] = useState<{ files: number; bytes: number }>({ files: 0, bytes: 0 });
@@ -34,6 +46,23 @@ export const SettingsProvider: React.FC<{ children: ReactNode }> = ({ children }
           // undefined，若原样透传，设置页的开关与 Rust 侧的默认值会各说各话。
           // 与 launchSound 同样的 `!== false` 判定——默认开，只有显式 false 才关。
           vsrEnabled: saved.vsrEnabled !== false,
+          // 弹幕与 VSR 同一套归一：旧记录没有这个字段，默认开。
+          danmakuEnabled: saved.danmakuEnabled !== false,
+          // 弹幕观感（2026-11-07 新增）：旧记录缺字段时展开后是 undefined，
+          // 滑条会渲染成空值——逐项归一到默认，与 Rust 侧 serde default 对齐。
+          // 速度档与描边类型同时做非法值回落，防止手改过的记录把面板卡死。
+          danmakuArea: normalizeRange(saved.danmakuArea, 25, 25, 100),
+          danmakuOpacity: normalizeRange(saved.danmakuOpacity, 100, 10, 100),
+          danmakuFontScale: normalizeRange(saved.danmakuFontScale, 100, 50, 200),
+          danmakuSpeed: [0, 1, 2].includes(saved.danmakuSpeed) ? saved.danmakuSpeed : 1,
+          danmakuFont: typeof saved.danmakuFont === 'string' && saved.danmakuFont
+            ? saved.danmakuFont
+            : 'Microsoft YaHei',
+          danmakuColor: normalizeHexColor(saved.danmakuColor),
+          danmakuBold: saved.danmakuBold !== false,
+          danmakuStroke: ['heavy', 'outline', 'shadow'].includes(saved.danmakuStroke)
+            ? saved.danmakuStroke
+            : 'heavy',
           // 代理模式同样要归一：旧记录没有这个字段（展开后是 undefined），
           // 直接透传会让设置页的分段控件没有任何一项被选中 —— 看起来像坏了。
           // 未知值也一并回落到 auto，与 Rust 侧 `normalize_proxy_mode` 一致。

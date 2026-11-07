@@ -1,9 +1,9 @@
 import React from 'react';
-import { Bookmark, Play, Star } from 'lucide-react';
+import { Bookmark, Layers3, Play, Star } from 'lucide-react';
 import { coverResolver } from '../../services/ipc';
 import { SeriesItem } from '../../types/catalog';
 import { FAVORITE_MARK_LABEL, type FavoriteMark } from '../../types/favorite';
-import { useFavoriteMark } from '../../stores/useFavoritesStore';
+import { useFavoriteActions, useFavoriteMark } from '../../stores/useFavoritesStore';
 import { CoverImage } from './CoverImage';
 import { MicaCard } from './MicaCard';
 
@@ -21,6 +21,11 @@ import { MicaCard } from './MicaCard';
  * 追剧角标同理：三页共用一份实现，所以角标也三页同时生效。收藏是跨页状态
  * （`useFavoritesStore.markBySeriesId`），发现页看到的"在看"和收藏页看到的是
  * 同一条记录，不会出现两处打架。
+ *
+ * 追剧**按钮**（2026-11-07）：海报右上角的圆形半透明书签，参考红果 App 的海报
+ * 角标。此前卡片只有只读角标，加入追剧必须先点进详情页——货架/目录里"扫到想
+ * 看的顺手标记一下"这条最短路径是断的。按钮做在 SeriesCard 一处，目录网格、
+ * 货架、榜单、搜索、详情页推荐全部同时生效，与角标同一条理由。
  */
 
 /** 追剧角标配色：与右上角评分角标同一族（黑底 + 彩色文字），避免和左上角的源标签撞色。 */
@@ -28,6 +33,13 @@ const MARK_CHIP_CLASS: Record<FavoriteMark, string> = {
   want: 'bg-black/65 text-sky-300',
   watching: 'bg-black/65 text-emerald-300',
   done: 'bg-black/65 text-slate-300',
+};
+
+/** 已追剧集的实心书签填色：与常驻角标同色系，扫一眼能把"标的是哪一态"对上号。 */
+const MARK_ICON_COLOR: Record<FavoriteMark, string> = {
+  want: 'text-sky-300',
+  watching: 'text-emerald-300',
+  done: 'text-slate-300',
 };
 
 /** 网格列宽。2xl 六列是三处一致后的结果，搜索页曾少一列。 */
@@ -98,6 +110,9 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
    * 整张表，改任意一部剧的收藏都会重渲染这一张卡；首页上百张卡时这是纯粹的浪费。
    */
   const mark = useFavoriteMark(series.id);
+  // 动作专线（`useFavoriteActions`）：只拿 setMark、不订阅收藏列表。订阅整张表的
+  // 话，任何人收藏任何一部剧都会把这里上百张卡全部重渲染一遍。
+  const setMark = useFavoriteActions();
 
   return (
     <MicaCard
@@ -184,12 +199,26 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
           </div>
         )}
 
-        {/* 右上角徽章列：评分在上、追剧角标在下。
-            评分原本独占 `top-2 right-2`，追剧角标接在它下面而不是塞进左上角
+        {/* 右上角徽章列：季数在上、评分在中、追剧角标在下。
+            评分原本独占 `top-2 right-2`，其余角标接在它下面而不是塞进左上角
             那组 `flex gap-1`——那样会把 tags[0] 往右挤，两张标签并排时在
-            2xl 窄卡上会互相压边。竖排则两条边各自互不干扰。 */}
-        {(series.rating || mark) && (
-          <div className="absolute top-2 right-2 flex flex-col items-end gap-1">
+            2xl 窄卡上会互相压边。竖排则两条边各自互不干扰。
+
+            季数胶囊（2026-10-29 从封面底部挪到这里）：底部那一行要同时装集数与来源，
+            再塞「115 集全 · 共 35 季」在窄卡上必然压边。右上角是"这部剧的属性"区，
+            一个小图标 + 数字就把"这是系列"说清楚，且与评分/追剧同一族（黑底彩字）。
+            只有 `seasonCount > 1` 才渲染 —— 「共 1 季」是噪音。
+
+            悬停淡出（2026-11-07）：右上角同一位置还驻着追剧按钮（见下方按钮的
+            注释），两者叠加会互相压住，悬停时角标列让位给动作按钮。 */}
+        {(series.rating || mark || (series.seasonCount ?? 0) > 1) && (
+          <div className="absolute top-2 right-2 flex flex-col items-end gap-1 transition-opacity duration-200 group-hover:opacity-0">
+            {(series.seasonCount ?? 0) > 1 && (
+              <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-black/65 text-violet-300 tabular-nums">
+                <Layers3 className="w-2.5 h-2.5" />
+                <span>{series.seasonCount} 季</span>
+              </span>
+            )}
             {series.rating && (
               <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-bold bg-black/65 text-amber-300 tabular-nums">
                 <Star className="w-2.5 h-2.5 fill-current" />
@@ -206,6 +235,46 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
             )}
           </div>
         )}
+
+        {/*
+          追剧按钮：右上角的圆形半透明书签（参考红果 App 海报角标，2026-11-07）。
+
+          三条不显眼但要紧的约束：
+
+            1. **与角标列互换而不是叠加。** 两者都钉在 `top-2 right-2`，评分/季数
+               角标不让位的话，按钮会半透明地压在角标上，两边都看不清。悬停时
+               角标列淡出、按钮淡入——右上角在"动手"的时刻让位给动作；未悬停时
+               追剧状态仍由常驻的 mark 角标传达，不丢信息。键盘聚焦同样要能看见
+               （`focus-visible:opacity-100`），否则 Tab 导航会停在一个隐形按钮上。
+
+            2. **不许用 backdrop-blur。** 卡片是成批重复的高频元素（首屏 24 张、
+               无限流后上百张），每个 backdrop-filter 都会强制合成器单独截取并模糊
+               其背后内容——MicaCard 里那段实测：79 个模糊元素时滚动 p95 帧
+               164.8ms。`bg-black/65` 与角标同族，视觉上等价且零合成开销。
+
+            3. **点击必须 `stopPropagation`。** 按钮嵌在整卡可点的 MicaCard 里，
+               不拦住冒泡，"想追这部"会直接变成"进详情页"。
+
+          状态语义与详情页的主按钮**刻意不同**：详情页是三态轮转（想看→在看→已看
+          →取消），按钮上有文案看得见当前态；这里是 32px 的小圆钮，误触一下就悄悄
+          跳一档。所以收敛成最直白的开关——未收藏点一下记「想看」，已收藏点一下
+          移出；在看/已看的粒度交给详情页（mark 角标会把那两态如实标出来）。
+        */}
+        <button
+          type="button"
+          aria-label={mark ? '移出追剧' : '加入追剧'}
+          aria-pressed={Boolean(mark)}
+          title={mark ? `移出追剧（当前：${FAVORITE_MARK_LABEL[mark]}）` : '加入追剧'}
+          onClick={e => {
+            e.stopPropagation();
+            void setMark(series.id, series.title, series.cover, mark ? null : 'want', series.type);
+          }}
+          className="absolute top-2 right-2 z-20 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-black/65 text-white shadow-xs ring-1 ring-inset ring-white/25 opacity-0 scale-90 transition-all duration-200 group-hover:opacity-100 group-hover:scale-100 hover:bg-black/80 active:scale-90 focus:outline-none focus-visible:opacity-100 focus-visible:scale-100 focus-visible:ring-2 focus-visible:ring-blue-400"
+        >
+          <Bookmark
+            className={`w-4 h-4 transition-colors duration-200 ${mark ? `${MARK_ICON_COLOR[mark]} fill-current` : ''}`}
+          />
+        </button>
 
         {/* 悬停快捷播放图标 (实体凸出的立体浮雕圆盘) */}
         <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-black/20">
@@ -229,27 +298,39 @@ export const SeriesCard: React.FC<SeriesCardProps> = React.memo(({ series, index
         </div>
 
         {/* 底部集数与来源：动漫的集数备注多是「已完结」这类无数字文本，所以优先
-            集名、其次原文；短剧/漫剧只有集数。 */}
-        <div className="absolute bottom-2 inset-x-2 flex items-center justify-between text-[11px] text-white/95">
-          {isAnime ? (
-            series.episodesCount > 0 ? (
-              <span className="font-semibold">{series.latestEpisodeTitle || `${series.episodesCount} 集`}</span>
-            ) : series.brief ? (
-              <span className="font-semibold text-white/80">{series.brief}</span>
+            集名、其次原文；短剧/漫剧只有集数。
+            2026-10-29 起这一行**只装集数与来源**（与普通卡完全一致）：季数角标移到
+            右上角，否则「115 集全 · 共 35 季」+ 来源在 2xl 六列（约 150px）必然压边。
+            折叠卡（`seriesFoldedCount > 1`）的来源前面加「系列 · 」：不覆盖真实来源
+            （代表卡确实来自红果/系列列表），只把"这张卡代表一个系列"说明白。 */}
+        <div className="absolute bottom-2 inset-x-2 flex items-center justify-between gap-2 text-[11px] text-white/95">
+          <span className="min-w-0 whitespace-nowrap">
+            {isAnime ? (
+              series.episodesCount > 0 ? (
+                <span className="font-semibold">{series.latestEpisodeTitle || `${series.episodesCount} 集`}</span>
+              ) : series.brief ? (
+                <span className="font-semibold text-white/80">{series.brief}</span>
+              ) : (
+                <span className="font-semibold text-white/60">集数未知</span>
+              )
+            ) : series.episodesCount > 1 ? (
+              // 阈值 >1 而非 >0：花果/无果的目录模板把未填集数的剧填成 1（2026-09-30
+              // 实测：花果 36 部里 19 部 episodes="1"、无果 30 部里 29 部，而《暗潮涌动》
+              // 目录写 1、详情实测 60 章）——"1 集全"十有八九是假的，显示出来就是误导。
+              // 真只有 1 集的短剧几乎不存在，且此时"集数未知"也是实话；其余源
+              // （毛果/盒果/饭果/芽果）的目录集数实测可信，>=2 照常显示。
+              <span className="font-semibold">{series.episodesCount} 集全</span>
             ) : (
               <span className="font-semibold text-white/60">集数未知</span>
-            )
-          ) : series.episodesCount > 1 ? (
-            // 阈值 >1 而非 >0：花果/无果的目录模板把未填集数的剧填成 1（2026-09-30
-            // 实测：花果 36 部里 19 部 episodes="1"、无果 30 部里 29 部，而《暗潮涌动》
-            // 目录写 1、详情实测 60 章）——"1 集全"十有八九是假的，显示出来就是误导。
-            // 真只有 1 集的短剧几乎不存在，且此时"集数未知"也是实话；其余源
-            // （毛果/盒果/饭果/芽果）的目录集数实测可信，>=2 照常显示。
-            <span className="font-semibold">{series.episodesCount} 集全</span>
-          ) : (
-            <span className="font-semibold text-white/60">集数未知</span>
-          )}
-          <span className="text-[10px] text-white/75 truncate max-w-[80px]">{series.origin}</span>
+            )}
+          </span>
+          <span className="shrink-0 text-[10px] text-white/75 truncate max-w-[80px]">
+            {(series.seriesFoldedCount ?? 0) > 1
+              ? series.origin
+                ? `系列 · ${series.origin}`
+                : '系列'
+              : series.origin}
+          </span>
         </div>
       </div>
 

@@ -1,10 +1,20 @@
 import React from 'react';
+import type { LucideIcon } from 'lucide-react';
 import { HomeShelf } from './HomeShelf';
 import { useShelfFeed } from '../../stores/useShelfFeed';
-import type { ChannelType, ShelfKind } from '../../types/catalog';
+import type { ChannelType, ShelfKind, SeriesItem } from '../../types/catalog';
 
-/** 货架预览展示几条。完整列表在「更多」页。 */
-const PREVIEW_COUNT = 6;
+/**
+ * 货架预览展示几条。完整列表在「更多」页。
+ *
+ * 从 6 提到 12：货架改成「平铺 + 只占一行 + 横向滚动」之后，一屏只露 5–6 张，
+ * 剩下 6 张正好是"继续往右滑"的那一段。继续只给 6 条的话，横滚轴基本没有
+ * 可滚的余量，用户会以为那一栏就这么点东西。
+ *
+ * 12 约等于后端一页（10–18 条）的量，不再多取：翻页要另一次 Python 冷启动，
+ * 首屏不该为"可能没人右滑"的那一段付这笔钱。
+ */
+const PREVIEW_COUNT = 12;
 
 interface HomeShelfSectionProps {
   kind: ShelfKind;
@@ -12,8 +22,19 @@ interface HomeShelfSectionProps {
   title: string;
   subtitle: string;
   accent?: 'rose' | 'blue';
+  /** 标题徽章图标，透传给 `HomeShelf`（见那边注释）。 */
+  icon?: LucideIcon;
+  iconTone?: 'rose' | 'blue' | 'violet' | 'amber' | 'teal' | 'indigo';
   onMore: () => void;
   onClick: (seriesId: string) => void;
+  /**
+   * 排布形态，透传给 `HomeShelf`。
+   *
+   * 默认 `row`：首页这两栏是"热播榜 / 最新上架"，平铺成一行卡片、其余横向滚动，
+   * 顺序即名次。动漫专区等仍用网格的地方显式传 `grid`。
+   */
+  variant?: 'grid' | 'row' | 'rank';
+  metricOf?: (series: SeriesItem, index: number) => string | undefined;
 }
 
 /**
@@ -38,32 +59,24 @@ export const HomeShelfSection: React.FC<HomeShelfSectionProps> = ({
   title,
   subtitle,
   accent,
+  icon,
+  iconTone,
   onMore,
   onClick,
+  variant = 'row',
+  metricOf,
 }) => {
   const feed = useShelfFeed(kind, channel);
-
-  // 诊断打点：货架封面全丢时最需要知道的就是"前端到底收到了什么地址"。
-  // `coverResolver` 只在地址像 heic 时才挂解析器，地址为空/被改写时它会静默
-  // 返回 undefined，界面表现与"代理失败"完全一样，光看 UI 分不出来。
-  React.useEffect(() => {
-    const preview = feed.items.slice(0, 3);
-    console.info(
-      `[shelf] ${kind}/${channel} 条目=${feed.items.length}`,
-      preview.map(item => ({
-        id: item.id,
-        title: (item.title || '').slice(0, 14),
-        coverLen: (item.cover || '').length,
-        coverHead: (item.cover || '').slice(0, 72),
-      })),
-    );
-  }, [feed.items, kind, channel]);
 
   return (
     <HomeShelf
       title={title}
       subtitle={subtitle}
       accent={accent}
+      icon={icon}
+      iconTone={iconTone}
+      variant={variant}
+      metricOf={metricOf}
       items={feed.items.slice(0, PREVIEW_COUNT)}
       loading={feed.isLoading}
       onMore={onMore}

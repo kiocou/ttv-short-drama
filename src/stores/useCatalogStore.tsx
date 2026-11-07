@@ -134,7 +134,18 @@ export const CatalogProvider: React.FC<CatalogProviderProps> = ({
   initialCategory,
 }) => {
   const { settings } = useSettingsStore();
-  const [channel, setChannelState] = useState<ChannelType>(initialChannel ?? 'comic');
+  /**
+   * 发现页的起手频道是**短剧**，不是漫剧。
+   *
+   * 旧默认值是 `comic`，而左侧导航那一项写的是「短剧发现」——打开应用看到的
+   * 第一屏因此是漫剧频道的目录，入口名称却写着"短剧发现"。叠上「红果短剧榜」
+   * 当时拿的是全站榜（后端没收到 content 参数），用户的实际体验就是
+   * "短剧专区里全是漫画 / 真人剧混在一起"（用户报告）。
+   * 默认值与入口名称必须一致，否则后面再修多少处筛选都救不回来。
+   *
+   * 「更多」页（`ShelfMoreView`）自己传 `initialChannel`，不受这里影响。
+   */
+  const [channel, setChannelState] = useState<ChannelType>(initialChannel ?? 'drama');
 
   /**
    * 本次目录要聚合的源：按当前 tab（短剧/漫剧）从用户的启用集合里筛出来。

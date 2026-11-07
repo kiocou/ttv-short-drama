@@ -26,6 +26,25 @@ interface FavoritesContextType {
 const FavoritesContext = createContext<FavoritesContextType | null>(null);
 
 /**
+ * 动作专线：只暴露 `setMark`，给「只发不读」的消费方——卡片上的追剧按钮。
+ *
+ * 为什么不让按钮直接 `useFavorites()`：那会订阅整个 context value，任何人收藏
+ * 任何一部剧都会把所有订阅方重渲染一遍。卡片是本应用最大的渲染面（首屏 24 张、
+ * 无限流后上百张），这正是引入 `useFavoriteMark` 逐条订阅要防的事，不能在动作
+ * 这头又把口子撕开。
+ *
+ * `setMark` 是 `useCallback([])` 的**恒定引用**，单独放进一个 context 后，订阅它
+ * 永远不会引发重渲染——读写两条线各走各的。
+ */
+const FavoriteActionsContext = createContext<FavoritesContextType['setMark'] | null>(null);
+
+export function useFavoriteActions(): FavoritesContextType['setMark'] {
+  const setMark = useContext(FavoriteActionsContext);
+  if (!setMark) throw new Error('useFavoriteActions must be used within FavoritesProvider');
+  return setMark;
+}
+
+/**
  * 按 seriesId 的**单条订阅表**。
  *
  * 为什么不让卡片直接订阅整张 `markBySeriesId`：改一处收藏会让 Map 换引用，于是**首页
@@ -196,7 +215,9 @@ export const FavoritesProvider: React.FC<{ children: ReactNode }> = ({ children 
 
   return (
     <FavoritesContext.Provider value={value}>
-      {children}
+      <FavoriteActionsContext.Provider value={setMark}>
+        {children}
+      </FavoriteActionsContext.Provider>
     </FavoritesContext.Provider>
   );
 };

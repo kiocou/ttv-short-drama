@@ -218,10 +218,155 @@ pub(crate) fn system_proxy_address() -> Option<String> {
     system_proxy_server().and_then(|server| parse_proxy_server(&server, "http"))
 }
 
+/// 本机可能存在的 HTTP 代理地址候选，按「最可能是用户此刻在用的那个」排序。
+///
+/// 三档来源，顺序即优先级：
+///   1. 环境变量——用户显式设过，同时也正是 reqwest 自己会读的那几个；
+///   2. 注册表残留的 `ProxyServer`——端口**可能**还在听，但不可信（本机实测它指着
+///      已经退出进程的 `10808`），所以排在环境变量之后、默认端口之前；
+///   3. 各家客户端默认端口——Clash Verge `7897`、Clash `7890`、v2rayN `10808/10809`、
+///      通用 `1080/2080/8889`。这一档存在的唯一理由就是「用户关了系统代理但代理还在跑」。
+fn local_proxy_candidates() -> Vec<String> {
+    /// 去掉 scheme 与末尾斜杠后入列，重复的只留第一次出现的位置。
+    fn push(list: &mut Vec<String>, value: &str) {
+        let mut trimmed = value.trim();
+        for scheme in [
+            "http://",
+            "https://",
+            "socks5h://",
+            "socks5://",
+            "socks4://",
+        ] {
+            if let Some(rest) = trimmed.strip_prefix(scheme) {
+                trimmed = rest;
+            }
+        }
+        let trimmed = trimmed.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return;
+        }
+        if !list.iter().any(|existing| existing == trimmed) {
+            list.push(trimmed.to_string());
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            push(&mut candidates, &value);
+        }
+    }
+    if let Some(server) = registry_proxy_server_any() {
+        if let Some(http) = parse_proxy_server(&server, "http") {
+            push(&mut candidates, &http);
+        }
+    }
+    for port in [
+        7897u16, 7890, 10808, 10809, 1080, 2080, 8889, 7891, 10801, 33210,
+    ] {
+        push(&mut candidates, &format!("127.0.0.1:{port}"));
+    }
+    candidates
+}
+
+/// 探测本机可用的 HTTP 代理，**进程内只探一次**（成功与失败都缓存）。
+///
+/// ## 为什么必须真验证，不能只看端口有没有人监听
+///
+/// `1080`、`2080` 这类端口可能被别的本地服务占着（下载器、调试端口，甚至另一个
+/// 应用的 SOCKS 端口）。只看 TCP 能不能连，会把它们误当成 HTTP 代理挂上去，
+/// 结果所有请求都撞在「这个服务根本不懂 CONNECT」上，比直连还糟。
+/// 所以这里在 connect 之后**真发一次 `CONNECT`**，只认回 `HTTP/1.x 200` 的端口。
+///
+/// 单个候选最坏 1.5 秒（connect 300ms + 读 1200ms），但本地回环上没人监听的端口
+/// 会立刻 RST，实际只在真有服务的那一两个端口上花时间。调用方只在「默认链路已经
+/// 失败」之后才调用它（见 `anime_provider::AnimeProvider::local_proxy_client`），
+/// 健康路径上不该出现。
+pub(crate) fn detect_local_http_proxy() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let found = local_proxy_candidates()
+                .into_iter()
+                .find(|address| is_http_proxy(address));
+            match found.as_deref() {
+                Some(address) => {
+                    crate::trace::log(format!("[proxy] 自动探测到本地 HTTP 代理：{address}"))
+                }
+                None => crate::trace::log("[proxy] 未探测到可用的本地 HTTP 代理"),
+            }
+            found
+        })
+        .clone()
+}
+
+/// `host:port` 是不是一个**能用**的 HTTP 代理（能对公网 443 建隧道）。
+fn is_http_proxy(address: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let Ok(mut resolved) = address.to_socket_addrs() else {
+        return false;
+    };
+    let Some(target) = resolved.next() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&target, std::time::Duration::from_millis(300))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1200)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(1200)));
+    // 探哪个主机：就用暴风源自己的域名。它既是本次故障的目标，又挂在境外 CDN 上，
+    // 代理对它都能建起隧道，说明这条链路是真的能出网，而不是只回了一个 200 假象。
+    const PROBE_HOST: &str = "bfzyapi.com";
+    let request = format!(
+        "CONNECT {PROBE_HOST}:443 HTTP/1.1\r\nHost: {PROBE_HOST}:443\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buffer = [0u8; 128];
+    let Ok(read) = stream.read(&mut buffer) else {
+        return false;
+    };
+    if read == 0 {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&buffer[..read]);
+    head.starts_with("HTTP/1.") && head.contains(" 200")
+}
+
 /// 读注册表里的 `ProxyServer`（**仅在 `ProxyEnable` 为真时**返回）。
 fn system_proxy_server() -> Option<String> {
+    registry_proxy_server(true)
+}
+
+/// 读注册表里的 `ProxyServer`，**不看 `ProxyEnable`**。
+///
+/// `ProxyEnable=0` 只说明「系统级 HTTP 代理没开」，不代表那个端口没人监听：
+/// Clash / v2rayN 关掉「系统代理」之后进程仍在跑、端口仍在听，应用照样能借它出网。
+/// 本机实测（2026-11-02）：`ProxyEnable=0`，残留的 `127.0.0.1:10808` 已经没人监听，
+/// 而真正在用的是 Clash Verge 的 `127.0.0.1:7897` —— 只认 `ProxyEnable` 的结果就是
+/// 「浏览器打得开、应用只能直连」，而直连这条源被限速到约 690 B/s（见
+/// `detect_local_http_proxy`）。
+fn registry_proxy_server_any() -> Option<String> {
+    registry_proxy_server(false)
+}
+
+/// `require_enabled=false` 时忽略 `ProxyEnable`，只要求 `ProxyServer` 有值。
+fn registry_proxy_server(require_enabled: bool) -> Option<String> {
     #[cfg(not(windows))]
     {
+        // 非 Windows 没有注册表代理，调用方据此回落到环境变量那一档。
+        let _ = require_enabled;
         None
     }
     #[cfg(windows)]
@@ -297,7 +442,7 @@ fn system_proxy_server() -> Option<String> {
             })
             .unwrap_or_default();
         unsafe { RegCloseKey(key) };
-        if !enabled || server.trim().is_empty() {
+        if (require_enabled && !enabled) || server.trim().is_empty() {
             return None;
         }
         Some(server)
@@ -316,6 +461,42 @@ pub(crate) fn with_system_proxy(builder: reqwest::ClientBuilder) -> reqwest::Cli
     proxies
         .into_iter()
         .fold(builder, |builder, proxy| builder.proxy(proxy))
+}
+
+/// 给**境外链路**用的代理构造：系统代理优先，没配就用本机探测到的代理。
+///
+/// ## 为什么不能直接改 `with_system_proxy`
+///
+/// 那个函数还服务红果目录（`provider::build_client(true)`）——红果是境内站，
+/// 挂代理反而可能被站方按出口 IP 拒掉（`guo_provider` 的历史注释记录过 403）。
+/// 所以"探测兜底"必须由调用方按**目标地理位置**选择，而不是在公共函数里一刀切。
+///
+/// ## 覆盖哪些链路
+///
+/// GitHub（`api.github.com` / `objects.githubusercontent.com`）、暴风动漫源与其
+/// 封面/播放 CDN、HLS 转发。这些域名直连在部分网络下会被限速到几百字节每秒
+/// （实测 `bfzyapi.com` 64 KB 要 94 秒），而同一台机器上走本地代理只要 1.4 秒。
+pub(crate) fn with_local_proxy_fallback(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    if let Some(proxies) = system_proxy() {
+        return proxies
+            .into_iter()
+            .fold(builder, |builder, proxy| builder.proxy(proxy));
+    }
+    let Some(address) = detect_local_http_proxy() else {
+        return builder;
+    };
+    match reqwest::Proxy::all(format!("http://{address}")) {
+        Ok(proxy) => {
+            crate::trace::log(format!(
+                "[proxy] 系统代理未启用，改走自动探测到的本机代理 {address}"
+            ));
+            builder.proxy(proxy)
+        }
+        Err(error) => {
+            crate::trace::log(format!("[proxy] 本机代理 {address} 无法构造：{error}"));
+            builder
+        }
+    }
 }
 
 /// 本机是否配了可用的系统代理。
@@ -408,7 +589,7 @@ pub struct DownloadProgress {
 }
 
 fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    with_local_proxy_fallback(reqwest::Client::builder())
         .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(8))
         // 单次查询的兜底超时。下载不走这个（大文件必然超过），见 download。
@@ -641,7 +822,7 @@ const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8)
 async fn probe_network(asset_url: &str) -> NetworkProbe {
     use std::time::Instant;
 
-    let client = match reqwest::Client::builder()
+    let client = match with_local_proxy_fallback(reqwest::Client::builder())
         .user_agent(USER_AGENT)
         .timeout(PREFLIGHT_TIMEOUT)
         .connect_timeout(std::time::Duration::from_secs(4))
@@ -1081,7 +1262,7 @@ async fn fetch_chunk(
     use std::sync::atomic::Ordering as AtomicOrdering;
     use tokio::io::AsyncWriteExt;
 
-    let client = reqwest::Client::builder()
+    let client = with_local_proxy_fallback(reqwest::Client::builder())
         .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(20))
         // github.com 的资产地址是 302 → objects.githubusercontent.com，必须跟随。
@@ -1559,16 +1740,13 @@ async fn download_to(
 /// `Content-Range: bytes 0-0/51038598`（总长）和 `206`（支持分片）两个事实，
 /// 比先 HEAD 再 GET 少一次往返。服务端忽略 Range 时退回 `Content-Length`。
 async fn probe_length(url: &str) -> Result<(u64, bool), String> {
-    let mut builder = reqwest::Client::builder()
+    let builder = with_local_proxy_fallback(reqwest::Client::builder())
         .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(20))
         // github.com 的资产地址是 302，不跟随就永远拿不到 Content-Range。
         .redirect(reqwest::redirect::Policy::limited(5));
-    if let Some(proxies) = system_proxy() {
-        for proxy in proxies {
-            builder = builder.proxy(proxy);
-        }
-    }
+    // 代理在上一行已经挂好：`with_local_proxy_fallback` 覆盖"系统代理可用 →
+    // 本机探测代理 → 直连"三档，这里不再重复挂一次（重复挂会让后者覆盖前者）。
     let client = builder
         .build()
         .map_err(|error| format!("无法创建下载客户端：{error}"))?;
@@ -1621,16 +1799,13 @@ async fn download_single(
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut builder = reqwest::Client::builder()
+    let builder = with_local_proxy_fallback(reqwest::Client::builder())
         .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(20))
         // github.com 的资产地址是 302，必须跟随才能取到内容。
         .redirect(reqwest::redirect::Policy::limited(5));
-    if let Some(proxies) = system_proxy() {
-        for proxy in proxies {
-            builder = builder.proxy(proxy);
-        }
-    }
+    // 代理在上一行已经挂好：`with_local_proxy_fallback` 覆盖"系统代理可用 →
+    // 本机探测代理 → 直连"三档，这里不再重复挂一次（重复挂会让后者覆盖前者）。
     let client = builder
         .build()
         .map_err(|error| format!("无法创建下载客户端：{error}"))?;

@@ -108,7 +108,7 @@ async fn live_search_and_series() {
     eprintln!(
         "[live] 详情 {}ms：{} / {} 集",
         started.elapsed().as_millis(),
-        series.title,
+        series.hit.title,
         episodes.len()
     );
     assert!(!eps_is_empty(&episodes), "详情必须带分集列表");

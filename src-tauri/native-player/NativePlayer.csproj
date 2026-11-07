@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- TTV Short Drama 原生播放器（单窗口 + LSFG 补帧 + mpv 内核）。
+
+       架构：
+         * WebView2 无法被补帧引擎捕获（DXGI/WGC 全黑、GDI 崩溃，TTV main.rs 有实测记录），
+           视频渲染在 D3D11 swapchain 内完成，补帧在同一个窗口 —— 不叠加第二个 HWND。
+         * mpv 内核（mpv.exe 直接导出 libmpv API）：解复用 + CENC 解密 + d3d11va 硬解 +
+           音频/时钟全部由 mpv 负责；render API(D3D11) 把帧画到我们的纹理，再送补帧链。
+         * 控制条 = WebView2（加载 TTV 前端的控制条路由，样式与原播放页一致）。
+         * 与 Tauri 主程序（Rust）通过命名管道 JSON 行协议通信。 -->
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>NativePlayer</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- LsfgPipeline 的源码只能通过 ProjectReference 编进类库，不能让主项目重复编译。 -->
+    <Compile Remove="LsfgPipeline\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="LsfgPipeline\LsfgPipeline.csproj" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
+    <!-- WebView2 SDK 的 NuGet 包只有 net462 资产（Compile 解析为空），
+         但同一程序集官方支持 .NET Core 3.0+。直接引用 DLL，跳过 NuGet 解析。 -->
+    <Reference Include="Microsoft.Web.WebView2.Core">
+      <HintPath>$(USERPROFILE)\.nuget\packages\microsoft.web.webview2\1.0.2903.40\lib\net462\Microsoft.Web.WebView2.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Web.WebView2.WinForms">
+      <HintPath>$(USERPROFILE)\.nuget\packages\microsoft.web.webview2\1.0.2903.40\lib\net462\Microsoft.Web.WebView2.WinForms.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <!-- 补帧 shader（202 个 DXBC，逆向 LSFG 提取）与 blockmatch.hlsl 随构建复制到输出目录，
+       运行时按 exe 相对路径解析 —— 打包时把整个目录拷走即可，不依赖绝对路径。 -->
+  <ItemGroup>
+    <None Include="shaders\**\*" CopyToOutputDirectory="PreserveNewest" Link="shaders\%(RecursiveDir)%(Filename)%(Extension)" />
+    <None Include="LsfgPipeline\blockmatch.hlsl" CopyToOutputDirectory="PreserveNewest" Link="LsfgPipeline\blockmatch.hlsl" />
+    <!-- libmpv：mpv.exe 的导出表是 EXE 构建副产物，mpv_create 直接调用会 0xC0000005
+         （CRT/TLS 未初始化）。必须用专门的 DLL 构建 libmpv-2.dll（shinchiro mpv-dev 包）。 -->
+    <None Include="libmpv-2.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

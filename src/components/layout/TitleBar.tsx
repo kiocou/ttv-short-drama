@@ -345,7 +345,7 @@ export const TitleBar: React.FC = () => {
         <div 
           onClick={() => navigateTo('explore')}
           className="flex items-center gap-2.5 cursor-pointer group py-1 px-1.5 rounded-xl hover:bg-black/[0.03] active:scale-95 transition-all focus:outline-none"
-          title="TTV 短剧 - 返回发现精选"
+          title="TTV 短剧 - 返回短剧精选"
         >
           {/* VidCom 品牌图标（透明底 PNG，来自图标库正方形主图标） */}
           <img

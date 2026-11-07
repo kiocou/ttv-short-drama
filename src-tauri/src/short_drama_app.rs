@@ -577,6 +577,16 @@ fn resolve_data_dir() -> PathBuf {
     };
     let current = base.join("com.ttv.shortdrama");
     migrate_legacy_data_dir(&base.join("com.ttv.player"), &current);
+    // 这里**不做**「不可写就换目录」的兜底（2026-11-03 回退）。
+    //
+    // 曾经加过一版：探测不可写就退到可执行文件旁的 `.app-data`。它解决了 worker
+    // 的 `Permission denied`，却引入了更隐蔽的故障 —— tauri.conf 的
+    // assetProtocol.scope 只允许 APPLOCALDATA 等固定根，`.app-data` 不在白名单内，
+    // 于是 `convertFileSrc` 生成的地址被拒，`<video>` 在 `loadstart` 后 2 毫秒就报
+    // `MEDIA_LOAD_FAILED`：**文件能下能转，播放器却打不开。**
+    //
+    // 结论：数据目录必须留在 asset 协议覆盖的范围内。写不进去要在启动环境层面解决
+    //（别用受限令牌启动应用），而不是把缓存搬出白名单。
     current
 }
 
@@ -683,7 +693,29 @@ pub(crate) fn worker_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     Ok((python, worker, ffmpeg))
 }
 
+/// worker 使用的那台设备凭据。
+///
+/// ## 为什么优先复用原生档案（2026-11-03）
+///
+/// 工程里长期并存**两套匿名设备**：Rust 原生客户端用 `hongguo-device.json`，
+/// Python worker 用 `short-drama-device.json`。两者的命运并不相同 —— 原生客户端
+/// 会换设备重试，worker 那份是写死的旧设备。实测（同一集 7701227783569034264）：
+///
+/// ```text
+/// 原生设备 1817967758198560 → 200，5 路码流，129 秒
+/// worker 设备 1736103130756785779 → 静默拒绝（HTTP 200 空响应）
+/// ```
+///
+/// 于是原生解析正常、worker 一碰就失败，而 `resolve` 走的是 worker —— 用户看到
+/// 的就是「本地解析结局=error」。让 worker 直接复用原生档案，两边同进同退，
+/// 不会再出现「一台健康、一台已死」的分裂状态。
+///
+/// 原生档案不存在时才回落到旧的 `short-drama-device.json`：老装机仍能用，
+/// 不会因为这次改动失去凭据。
 fn load_credentials() -> Result<DeviceCredentials, String> {
+    if let Some(native) = load_native_credentials() {
+        return Ok(native);
+    }
     let path = device_config_path();
     let text = std::fs::read_to_string(&path)
         .map_err(|error| format!("短剧设备凭据读取失败（{}：{error}）。", path.display()))?;
@@ -704,6 +736,26 @@ fn load_credentials() -> Result<DeviceCredentials, String> {
         ),
         cdid: json_string_field(&value, &["cdid"]),
         openudid: json_string_field(&value, &["openudid", "openUdid"]),
+    })
+}
+
+/// 从原生客户端的设备档案里取凭据（字段名是 `device_id_str` / `install_id_str`）。
+/// 档案缺失、解析失败或关键字段为空时返回 `None`，由调用方回落到旧凭据文件。
+fn load_native_credentials() -> Option<DeviceCredentials> {
+    let path = crate::hongguo_bridge::profile_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let device_id = json_string_field(&value, &["device_id_str", "deviceId"]);
+    let install_id = json_string_field(&value, &["install_id_str", "installId"]);
+    if device_id.is_empty() || install_id.is_empty() {
+        return None;
+    }
+    Some(DeviceCredentials {
+        device_id,
+        install_id,
+        device_token: json_string_field(&value, &["device_token", "deviceToken"]),
+        cdid: json_string_field(&value, &["cdid"]),
+        openudid: json_string_field(&value, &["openudid"]),
     })
 }
 
@@ -955,6 +1007,17 @@ fn touch_hls_directory(directory: &std::path::Path) {
 /// 淘汰只看 mtime，而正在播放的文件 mtime 很新，因此不会被选中。
 const CACHE_EVICT_GRACE_SECONDS: u64 = 900;
 
+/// 已经**超过**预算时使用的宽限期（秒）。
+///
+/// 正常态用 15 分钟保护"刚下载 / 刚从这一集切走"的产物；但占用一旦越线，
+/// 这些刚写进去的文件恰恰就是要回收的对象 —— 用同一个 15 分钟门槛，清理会
+/// 一直清不到它们，用户看到的就是"占用长期卡在上限之上、怎么都不降"
+/// （实测 1041.09 MB / 1024 MB 持续不回落）。
+///
+/// 5 分钟是折中：一个正常观看片段（短剧一集 40–90 秒）远小于它，
+/// 正在播放的那一集既被 `keep` 保护、mtime 又是最新，不会被选中。
+const CACHE_EVICT_RECLAIM_GRACE_SECONDS: u64 = 300;
+
 /// 按 LRU 把频道缓存压回预算内。
 ///
 /// `keep` 是本次即将写入/刚命中的那一集，绝不淘汰——否则会出现"刚下载完
@@ -970,7 +1033,12 @@ fn last_eviction() -> &'static Mutex<Option<std::time::Instant>> {
 }
 
 /// 两次全量淘汰之间的最小间隔。
-const EVICTION_MIN_INTERVAL: Duration = Duration::from_secs(90);
+///
+/// 90 秒 → 20 秒（2026-11-05）。用户报告"达到上限后并没有自动清理"：短剧一集
+/// 40–90 秒，原来这个节流正好落在"看完一集"的边界上 —— 第二集解析时被节流
+/// 挡住、第三集才轮到，占用在两次收敛之间可以多涨一两百 MB。淘汰本身只遍历两个
+/// 目录做 stat + 排序，20 秒一次的开销远小于"用户设的上限形同虚设"的代价。
+const EVICTION_MIN_INTERVAL: Duration = Duration::from_secs(20);
 
 fn enforce_cache_budget(keep: &std::path::Path) {
     // 节流。
@@ -1105,6 +1173,14 @@ fn evict_channels_to_budget(
     }
 
     let mut report = CacheSweepReport::default();
+    // 越线时收紧宽限期（见 CACHE_EVICT_RECLAIM_GRACE_SECONDS）。
+    // 只在"超预算"这一种情况下生效：没越线时 15 分钟的宽厚保护原样保留，
+    // 避免把刚打开过的那一集删掉（正在播放由 `keep` + 最新 mtime 双重保护）。
+    let grace = if total > budget_bytes {
+        std::time::Duration::from_secs(CACHE_EVICT_RECLAIM_GRACE_SECONDS)
+    } else {
+        grace
+    };
     // 宽限期内的文件（正在下载/刚播放）不参与任何清理。
     let is_protected = |path: &std::path::Path, stamp: std::time::SystemTime| -> bool {
         if path == keep {
@@ -1354,14 +1430,39 @@ fn normalize_requested_quality(raw: &str) -> String {
     }
 }
 
-/// sidecar 标记里的内容是否代表"这已经是转码后的 H.264"。
+/// 诊断/测试用：标记文件是否写着「已转成 H.264」。
 ///
-/// 只有 `h264` 算数：`skip`（用户关着 VSR 时跳过的 HEVC）与空/损坏内容都不算。
-/// 旧版标记文件也是 `h264\n`，所以历史记录继续有效。
+/// 注意它**不再参与播放判定** —— 标记可能是假的（见 `ensure_h264_cache` 里的说明）。
+#[allow(dead_code)]
 fn marker_content_is_h264(marker: &std::path::Path) -> bool {
     std::fs::read_to_string(marker)
         .map(|value| value.trim() == "h264")
         .unwrap_or(false)
+}
+
+/// 缓存文件的实际视频编码是不是 H.264。
+///
+/// **必须看文件，不能看标记**：标记是历史结论，而文件可能被重新下载覆盖过
+/// （实测 2026-11-03：标记写着 `h264`，文件其实是 `hevc (Main) (hvc1)`）。
+/// 判定方式是用随包 ffmpeg 读一次头部，读不到就当作「不是 H.264」——
+/// 宁可多转一次，也不要把 HEVC 交给解不了它的播放器。
+async fn cache_file_is_h264(ffmpeg: &std::path::Path, path: &std::path::Path) -> bool {
+    let mut command = tokio::process::Command::new(ffmpeg);
+    command.args(["-hide_banner", "-i"]).arg(path);
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    match command.output().await {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stderr);
+            // ffmpeg 把流信息写在 stderr：`Stream #0:0: Video: h264 ...`
+            text.contains("Video: h264")
+        }
+        Err(_) => false,
+    }
 }
 
 /// 把历史缓存补齐成 H.264。旧版本会把 bytevc1/HEVC 原样留下；没有这个迁移，
@@ -1373,16 +1474,15 @@ async fn ensure_h264_cache(
     enabled: bool,
 ) -> Result<(), String> {
     let marker = path.with_extension("h264");
-    // 标记**必须连同内容一起判**，不能只看文件存在。
+    // 不再用标记当短路条件（2026-11-03）。
     //
-    // 历史坑：VSR 关闭分支曾经也写下 `h264\n`，与"转码成功"的标记一字不差。
-    // 于是关掉 VSR 看一集 HEVC 旧缓存之后，那集就被永久打上"已是 H.264"的假标记；
-    // 用户重新打开 VSR 时这一集被这里直接短路，HEVC 文件照原样播出去，
-    // 视觉增强静默失效（不变量 25：VSR 的硬条件是 H.264）。
-    // 现在关闭分支写的是 `skip\n`，只认 `h264` 才算真转码过。
-    if marker_content_is_h264(&marker) {
-        return Ok(());
-    }
+    // 标记是**历史结论**，文件却可能被重新下载覆盖过：实测这一集的标记写着
+    // `h264`，而 `ffmpeg -i` 读出来是 `hevc (Main) (hvc1)`。只要还认这个标记，
+    // 这集就永远跳过转码、永远播不了，重试多少次都一样。
+    //
+    // 现在只认文件本身（见下方 `cache_file_is_h264` 探测），标记退化为
+    // 「这集处理过」的旁证，不再参与判断。`marker_content_is_h264` 保留给
+    // 诊断面板/其他调用点使用。
     // 用户关掉了 RTX VSR：不再把整集重编一遍。
     //
     // 这不是"省一点 CPU"——旧缓存迁移是在**起播路径上同步跑**的：一集 1920×1080
@@ -1394,8 +1494,27 @@ async fn ensure_h264_cache(
     // 写 `h264` 会造成"假标记"：用户之后重新打开 VSR 时，上面那道
     // `marker_content_is_h264` 判定会把这一集的 HEVC 当成已迁移，直接放行 ——
     // 视觉增强永久静默失效，而且现象是"有些集有 VSR、有些集没有"，极难排查。
+    // ⚠️ 不能再按 VSR 开关跳过转码（2026-11-03 修正）。
+    //
+    // 旧逻辑：`!enabled` 时写 `skip` 直接返回，把 HEVC 原样交给播放器 ——
+    // 前提是"播放器能解 HEVC"。实测不成立：这台机器的 WebView2 解不了 hvc1，
+    // 于是 VSR 一关，**所有 HEVC 分集都变成 MEDIA_LOAD_FAILED**，而解析环节
+    // 的日志一切正常（`resolve 返回 缓存=true 字节=13.1MB`），极难归因。
+    //
+    // ⚠️ 已回退「与 VSR 无关、永远转码」的改法（2026-11-03 二次修正）。
+    //
+    // 当时把「HEVC 播不了」当成病因，实测是错的：17:11 那两集能正常起播的缓存
+    // 文件用 ffprobe 读出来就是 `hevc (Main)` —— 这台机器的 WebView2 解得动 hvc1。
+    // 强制转码的代价很实在：同一集从 13.7MB 涨到 49MB、首次播放多等十几秒。
+    // 所以恢复原语义：VSR 关着就不转（写 `skip`），要增强时才转 H.264。
     if !enabled {
         let _ = std::fs::write(&marker, b"skip\n");
+        return Ok(());
+    }
+    // 但「标记短路」保留修正后的版本：先看文件真实编码，已是 H.264 就只补标记，
+    // 避免被历史假标记误导再转一遍。
+    if cache_file_is_h264(ffmpeg, path).await {
+        let _ = std::fs::write(&marker, b"h264\n");
         return Ok(());
     }
     let partial = path.with_file_name(format!(
@@ -1610,6 +1729,43 @@ pub async fn short_drama_app_resolve<R: Runtime>(
     // 解析这一段通常是首开时间里最长的一段：worker 要把整集下载、解密、再转存成
     // 本地 H.264。把它单独计时并记下"是否已有缓存 / 是否复用预签名直链"，因为
     // 这两点直接决定后面要等几秒还是几十秒。
+    // ===== 解析前主动走一次原生签名，把直链与密钥放进 stream 缓存 =====
+    //
+    // ## 为什么必须有这一步（2026-11-01 修「关 VSR 后整集解析全灭」）
+    //
+    // worker 自己签名那条路上**没有任何设备重置能力**：它的请求一旦被服务端
+    // 风控（HTTP 200 空响应），整条链路就注定失败，前端重试只是把同一台坏设备
+    // 再打一遍。实机日志里第 17 集连续 5 次全灭，一次设备重置都没发生：
+    //
+    //   928.527s resolve 失败 vid=7701567955452054553 耗时=4937ms 原因=静默拒绝
+    //   933.359s resolve 失败 耗时=4458ms 同因
+    //   938.937s / 943.590s / 948.797s … 全灭
+    //   950.296s 打开集数失败：本地解析结局=error；公开网页兜底也失败
+    //
+    // 而 Rust 原生 `fetch_stream_payload` 走 `resolve_playback`，那条路径在设备
+    // 被拒时**自动换设备重试**（实测 0.56 秒恢复：`设备被拒，重置后重试` →
+    // `已换新设备` → `原生解析命中`），且一次往返 150~250ms 就拿到全部码流地址
+    // 与 CENC 密钥 —— 比 worker 自己签（两次往返、固定 2.2 秒）还快。
+    //
+    // 收益是三重的：
+    //   1. 设备被风控时不再死循环（原生层会换设备）；
+    //   2. worker 跳过 sign/model 两趟往返，整集解析从 5.9~7.1 秒降到 3~4 秒；
+    //   3. 预取窗口因此变宽，连播才可能真的"秒加载"。
+    //
+    // 只在 `auto` 时做：指定档位必须让 worker 按 `preferred_quality_height`
+    // 现场选流，而这份缓存里存的是默认最高档那一条（与下方注入 TTV_SD_DIRECT_*
+    // 的条件完全一致）。
+    if requested_quality == "auto" && peek_stream(&vid).is_none() {
+        match crate::hongguo_bridge::fetch_stream_payload(&vid).await {
+            Ok(payload) => {
+                store_stream(&vid, &payload);
+                crate::trace::log(format!("[红果] 解析前预签名成功 vid={vid}"));
+            }
+            Err(error) => crate::trace::log(format!(
+                "[红果] 解析前预签名失败，改由 worker 自行签名 vid={vid} 原因={error}"
+            )),
+        }
+    }
     crate::trace::log(format!(
         "[红果] resolve 开始 vid={vid} 档位={requested_quality} 复用预签名={} 产物路径={}",
         requested_quality == "auto" && peek_stream(&vid).is_some(),
@@ -1652,8 +1808,15 @@ pub async fn short_drama_app_resolve<R: Runtime>(
         )),
     }
     if result.is_ok() {
-        // worker 新产物已是 H.264，只补标记，不再把刚生成的文件重转一遍。
-        let _ = std::fs::write(out_path.with_extension("h264"), b"h264\n");
+        // 这里不再写 `h264` 标记（2026-11-03 二次修正）。
+        //
+        // worker 走的是「重封装（保留源编码）」，产物可能是 HEVC —— 旧实现照样写
+        // `h264` 标记，等于撒谎：之后 `ensure_h264_cache` 会短路，这一集永远轮不到
+        // VSR 需要的 H.264 转码。
+        //
+        // 但**也不要**在这里主动转码：实测 HEVC 能正常起播（17:11 两集即 hevc），
+        // 强制转码只会把 13.7MB 撑到 49MB 并让首次播放多等十几秒。
+        // 交给 `ensure_h264_cache` 在缓存命中时按 VSR 开关决定，这里什么都不做。
     }
     {
         let map = resolve_inflight();
@@ -2322,8 +2485,14 @@ pub fn short_drama_app_cache_clear() -> Result<CacheSweepReport, String> {
 }
 
 /// 查询当前缓存占用（供设置页显示真实数字）。
+///
+/// 这里**顺带收敛一次**（走 `enforce_cache_budget` 的节流）：
+/// 用户打开设置页看到的就是"当前真实占用"，而"真实占用"里不该包含那些
+/// 早该被淘汰、却因为这段代码只在解析路径上而被漏掉的条目。清理是幂等的，
+/// 节流保证不会每次进设置页都扫盘。
 #[tauri::command]
 pub fn short_drama_app_cache_usage() -> CacheSweepReport {
+    enforce_cache_budget(&cache_dir().join("__usage_probe__"));
     cache_usage()
 }
 
@@ -2556,6 +2725,19 @@ fn shelf_feed_item(entry: &serde_json::Value, channel: &str) -> Option<SeriesIte
     if id.is_empty() || title.is_empty() {
         return None;
     }
+    // 条目级内容类型兜底（2026-11-07，用户报告"短剧专区看到漫画、漫剧次元看到
+    // 真人剧"）：landpage 的 genre 参数与漫剧榜的 cell 本应隔离两种内容，但榜单
+    // 类接口是天然混合流，服务端偶发串味行必须逐条拦。worker 已透传
+    // `contentType`（1=真人 / 1004=漫剧），与频道不符的条目直接丢弃；
+    // 缺标记（None/0）放行——过滤只拦"确证串味"，不惩罚没标记的源。
+    let content_type = entry
+        .get("contentType")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|v| *v > 0)
+        .map(|v| v as u32);
+    if !crate::hongguo::catalog::channel_accepts(channel, content_type) {
+        return None;
+    }
     // 评分源给的是字符串（"9.4"），解析不了就当"源没给"。**绝不能填 0**：
     // 前端是 `{series.rating && …}`，0 既会渲染成"0.0 分"角标，也是凭空造分
     // （不变量 8：不要把不存在的东西显示成存在）。
@@ -2632,7 +2814,10 @@ pub async fn shelf_feed<R: Runtime>(
     // 过期策略：10 分钟。红果自己的榜单缓存是 30 分钟，这里取更短一档 ——
     // 首页内容陈旧比多等一秒更伤。
     const SHELF_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-    let cache_key = format!("shelf-{kind}-{channel}-first");
+    // `v2`：条目级 content_type 过滤（2026-11-07）上线后的缓存版本戳。旧版本
+    // 缓存的是**过滤前**抓的混合页面（真人榜里夹漫剧、反之亦然），它们绕过
+    // `shelf_feed_item` 直接回给前端 —— 版本不匹配就不读，让旧文件自然失联。
+    let cache_key = format!("shelf-v2-{kind}-{channel}-first");
     let is_first_page = cursor
         .map(str::trim)
         .map(|value| value.is_empty())
@@ -3906,9 +4091,31 @@ pub async fn short_drama_app_album<R: Runtime>(
 mod tests {
     use super::{
         cover_to_data_url, marker_content_is_h264, normalize_cache_budget_mb,
-        normalize_requested_quality, HongguoAppProfile,
+        normalize_requested_quality, shelf_feed_item, HongguoAppProfile,
     };
     use base64::Engine;
+
+    // 货架条目的内容类型逐条兜底（2026-11-07）：landpage 的 genre 参数理论上
+    // 已隔离两种内容，但榜单类源（漫剧热播榜走 cell）是混合流，服务端串味行
+    // 必须在这里被拦 —— 这是「短剧专区混进漫剧」报告的第二道闸门。
+    #[test]
+    fn shelf_feed_drops_entries_that_clash_with_channel() {
+        let entry = |ct: serde_json::Value| {
+            serde_json::json!({
+                "id": "1234567890", "title": "某剧", "cover": "c",
+                "contentType": ct
+            })
+        };
+        // 真人频道：放行 1 / 缺标记，拦下漫剧。
+        assert!(shelf_feed_item(&entry(serde_json::json!(1)), "drama").is_some());
+        assert!(shelf_feed_item(&entry(serde_json::json!(null)), "drama").is_some());
+        assert!(shelf_feed_item(&entry(serde_json::json!(0)), "drama").is_some());
+        assert!(shelf_feed_item(&entry(serde_json::json!(1004)), "drama").is_none());
+        // 漫剧频道：放行 1004 / 缺标记，拦下真人。
+        assert!(shelf_feed_item(&entry(serde_json::json!(1004)), "comic").is_some());
+        assert!(shelf_feed_item(&entry(serde_json::json!(null)), "comic").is_some());
+        assert!(shelf_feed_item(&entry(serde_json::json!(1)), "comic").is_none());
+    }
 
     // 只有内容为 h264 的 sidecar 才算「已迁移」。
     //

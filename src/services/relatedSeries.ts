@@ -1,6 +1,12 @@
 import { ipcService } from './ipc';
-import { normalizeTitle, parseSeasonLabel, seasonOrder, type SeasonLabel } from './seasonLabel';
-import type { CatalogFilter, SeriesItem } from '../types/catalog';
+import {
+  normalizeTitle,
+  parseSeasonLabel,
+  seasonOrder,
+  seasonUnitGroup,
+  type SeasonLabel,
+} from './seasonLabel';
+import type { CatalogFilter, ChannelType, SeasonApiEntry, SeriesItem } from '../types/catalog';
 import type { SeriesDetail } from '../types/series';
 
 /**
@@ -23,19 +29,18 @@ import type { SeriesDetail } from '../types/series';
  * 拆分还有一个副作用是好事：猜你喜欢不再发那两次搜索请求（网页搜索 + App 联想），
  * 打开详情页少两次往返；搜索只在用户真的点开「系列剧」时才发生。
  *
- * ## 为什么不新增一条后端命令
+ * ## 为什么不新增一条后端命令（2026-10-21 的判断，2026-10-29 已反转）
  *
- * 分季能力后端**已经全有了**，只是藏在搜索链路里：
- * - `catalog_fast_search` 走红果网页搜索，会把同名系列的各季一起捞回来；
- * - `catalog_suggest` 走红果 App 联想（全局索引），补的正是网页搜索只返回前
- *   10 条时漏掉的分季条目；
- * - 两者在 `provider.rs` 里已经带着「同系列按季号排序」「中文数字变体回查」
- *   这套逻辑（`search_season` / `season_fill_plan`）。
+ * 当时的结论是：分季能力后端**已经全有了**，只是藏在搜索链路里 ——
+ * `catalog_fast_search` 走红果网页搜索、`catalog_suggest` 走红果 App 联想，两者在
+ * `provider.rs` 里已带「同系列按季号排序」「中文数字变体回查」，再开一条命令等于重写一遍。
  *
- * 再开一条 `series_related` 命令，等于把上面那条调好的链路重写一遍，还要新增
- * 一个只有详情页用的 Rust 命令与 IPC 契约。所以这里反过来做：**前端拿剧名当
- * 关键词复用搜索链路，再在本地按「同系列」精确筛选**。筛选规则与 `provider.rs`
- * 逐条对齐（见 `seasonLabel.ts`），两边判出来的"同一系列"必须一致。
+ * 实测把这条判断推翻了：搜索是**按相关度截断**的（只给前 10 条），《烬九州》35 季
+ * 怎么加锚点都补不全；而季号只能从标题里猜，遇到「第三十五期」这种量词变体直接失效；
+ * 用户搜错一个字（镜/烬）连 base 都比不上。于是后端新增权威命令
+ * **`catalog_series_seasons`**（`{ seriesId }` → 全部季，季号结构化），
+ * `fetchSeriesSeasons` 现在优先走它，搜索链路降级为回退（细节见该函数注释）。
+ * 上面的搜索链路与筛选规则一条没删 —— 老后端、Web 演示模式、命令失败时仍然要靠它。
  *
  * ## 不臆造
  *
@@ -86,6 +91,20 @@ export interface SeasonPick {
   season: number;
   /** 与当前季的关系：往后接 / 前面的季。角标配色据此区分。 */
   relation: 'next' | 'previous';
+  /**
+   * 这一季**能不能点开看**（2026-10-29）。
+   *
+   * 站上有"先建条目、后上架"的做法：季卡存在，但 `episodeCount === 0`，
+   * 点进去只有一个空选集。用户反馈过"列表里出现还没上架、点开没内容"的剧，
+   * 弹窗里必须把这类季卡置灰，而不是让用户白点一次。
+   *
+   * 两个来源的判定口径不同，**但含义一致**：
+   * - 权威链路（`catalog_series_seasons`）：`!disablePlay && episodeCount > 0`，
+   *   站方明确禁播的也算不可用；
+   * - 搜索回退链路：只能看到集数，取 `episodesCount > 0` 这一条保守判法
+   *   （宁可让用户点进去发现是空的，也不要把本来能看的季误置灰）。
+   */
+  available: boolean;
 }
 
 /** 「猜你喜欢」的候选池：只有同频道其它剧，**不含同系列**。 */
@@ -150,8 +169,10 @@ export function currentSeasonLabel(detail: SeriesDetail): SeasonLabel | null {
  *
  * 三重比对缺一不可：
  * - **base 归一后相等** —— 站点同一部剧的剧名在不同来源里带不同标点/全角空格；
- * - **量词一致** —— 「第一季」与「第一部」是两种分卷习惯，混在一组里会让"第2部"
- *   排到"第2季"旁边，用户看到的是两套编号撞在一起；
+ * - **量词组一致** —— 「季」与「期」是同一套编号（站方对同一系列会混用，实测
+ *   《烬九州》第 32~35 季写作「第N期」），归一成同组；而「第一季」与「第一部」是
+ *   两种分卷习惯，混在一组里会让"第2部"排到"第2季"旁边，用户看到的是两套编号
+ *   撞在一起，所以「部」独立成组（见 `seasonUnitGroup`）；
  * - **季号不等于当前季** —— 同一季可能有另一个 id 的条目（不同来源），推荐它
  *   等于把用户正在看的这部剧再推一遍。**这也是「新窗口不显示当前季」的实现点**：
  *   弹窗只渲染本函数的返回值，第 4 季从数据层就不在里面。
@@ -196,7 +217,8 @@ export function pickSeasons(
       continue;
     }
 
-    if (itemLabel.unit !== label.unit) continue;
+    // 量词组比较：`季` 与 `期` 同组（同义混用），`部` 自成一组。
+    if (seasonUnitGroup(itemLabel.unit) !== seasonUnitGroup(label.unit)) continue;
     if (normalizeTitle(itemLabel.base) !== baseKey) continue;
     if (itemLabel.season === label.season) continue;
     if (bySeason.has(itemLabel.season)) continue;
@@ -211,13 +233,114 @@ export function pickSeasons(
       item,
       season,
       relation: season > label.season ? 'next' : 'previous',
+      // 搜索条目只有集数这一个可判信号：0 集就是还没上架。保守判法 —— 见
+      // `SeasonPick.available` 的注释（宁可点进去发现是空的，也不误置灰）。
+      available: item.episodesCount > 0,
     }));
+}
+
+/**
+ * 后端权威季表的一次探测（2026-10-29）。
+ *
+ * ## 为什么写成"可选探测"而不是直接调 `ipcService.catalog.seriesSeasons`
+ *
+ * `scripts/verify-*.mjs` 用 esbuild 把 `./ipc` 整体替换成一个只含
+ * `searchFast / searchSuggest / list` 的假实现（见 `scripts/verify-related-pick.mjs`
+ * 里的 ipc-stub），那里没有 `seriesSeasons`。直接调用会抛 TypeError，而这几组用例
+ * 断言的恰恰是**回退链路**的行为 —— 探测不到就当作"后端不支持"，原样走回退，
+ * 两边的契约都不动。
+ *
+ * 任何异常都吞成空数组：它是增量来源，绝不能把详情页弄红（`ipc.ts` 里那一层已经
+ * 收口过一次，这里是第二道保险）。
+ */
+async function lookupSeasonEntries(seriesId: string): Promise<SeasonApiEntry[]> {
+  const lookup: ((id: string) => Promise<SeasonApiEntry[]>) | undefined =
+    ipcService.catalog.seriesSeasons;
+  if (typeof lookup !== 'function') return [];
+  try {
+    const entries = await lookup(seriesId);
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 后端全季列表 → 弹窗季卡。
+ *
+ * ## 季号只取 `seasonIndex`，不再解析标题
+ *
+ * 回退链路只能从标题里猜季号，而标题写法并不统一：`第7季` / `第七季` / `第七期` /
+ * `第七部` 都见过（《烬九州》第 32~35 季就是「第N期」）。猜错一次，排序与角标会一起
+ * 错成"排序按第2季、角标显示第3季"。后端给了结构化季号就以它为唯一来源，
+ * `seasonIndex === 0`（服务端没给）才退回数组位次 —— 接口按季号升序返回，位次即
+ * 1-based 季序。
+ *
+ * ## 排除规则与 `pickSeasons` 一致
+ *
+ * 同 id、同季号的条目都不出卡：同一季在站上可能有来自不同来源的两个 id，按 id
+ * 排除的话当前季会以另一张卡的身份重新冒出来 —— 那正是用户说"不要"的东西。
+ *
+ * ## 为什么这里**不**截断到 `SEASON_POOL_LIMIT`
+ *
+ * `pickSeasons` 有 48 季上限兜底，因为搜索候选池本就不完整、50 条以上多半是
+ * 「第1080集」被误读成季号。权威链路是站方真实的季表：实测《烬九州》35 季一次
+ * 返回、index 连续 1..35，而用户点开弹窗就是为了看全 —— 没有理由替他切掉后半段。
+ */
+function seasonsFromApi(
+  entries: readonly SeasonApiEntry[],
+  currentId: string,
+  currentIndex: number,
+  channel: SeriesDetail['type'],
+): SeasonPick[] {
+  const picks: SeasonPick[] = [];
+  /** 当前季先占位：同季号的其它 id 也不进池（与 `pickSeasons` 的 `label.season` 对齐）。 */
+  const seenSeasons = new Set<number>([currentIndex]);
+
+  entries.forEach((entry, index) => {
+    if (!entry?.seriesId) return;
+    if (entry.seriesId === currentId) return;
+    const season = entry.seasonIndex > 0 ? entry.seasonIndex : index + 1;
+    if (seenSeasons.has(season)) return;
+    seenSeasons.add(season);
+
+    picks.push({
+      item: {
+        id: entry.seriesId,
+        title: entry.title,
+        cover: entry.cover,
+        type: channel,
+        episodesCount: entry.episodeCount,
+        // 后端季表只有"这是哪一季"，没有题材/来源。tags 留空而不是补一个「短剧」：
+        // `SeriesCard` 对空 tags 直接不渲染那一行，补默认值等于替源数据编造断言
+        // （同 `SeriesCard` 里关于假标签的那段注释）。
+        tags: [],
+        // 来源标成后端季表，不冒称「官网直链」。
+        origin: '系列列表',
+      },
+      season,
+      relation: season > currentIndex ? 'next' : 'previous',
+      available: !entry.disablePlay && entry.episodeCount > 0,
+    });
+  });
+
+  return picks.sort(
+    (left, right) => seasonOrder(left.season, currentIndex) - seasonOrder(right.season, currentIndex),
+  );
 }
 
 /**
  * 拉取「系列剧」弹窗的内容：同系列其它季，按接续顺序排好（后续季在前、越近越前）。
  *
- * 两路并行、`allSettled` 收口：
+ * ## 两条链路，权威优先（2026-10-29）
+ *
+ * 1. **后端权威季表**（`catalog_series_seasons`）：按 series id 一次给出该系列全部季
+ *    （含未上架季），季号结构化。这是《烬九州》35 季只出一条 / 弹窗空白的正解，
+ *    也是常态路径 —— 命中时**不发任何搜索请求**，打开弹窗从"最多 4 次往返"降到 1 次。
+ * 2. **搜索回退**（下面的两轮）：后端不支持该命令、或季表里除当前季外没有别的季时
+ *    才走。它是增量兜底，行为与判定口径完全保持原样。
+ *
+ * 两路并行、`allSettled` 收口（回退链路）：
  * - 网页搜索快（实测 0.3–0.6s）但只返回前 10 条，分季条目常常跳着出现；
  * - App 联想慢（冷启动 Python，0.6–1.9s）却是全局索引，补的正是漏掉的季。
  * 串联会让总耗时相加，并行只取最大值。任何一路失败都只丢它自己的条目。
@@ -232,6 +355,25 @@ export async function fetchSeriesSeasons(detail: SeriesDetail): Promise<SeasonPi
   // 处理，否则《聚宝盆》这种命名连入口都进不来。
   const label = currentSeasonLabel(detail);
   if (!label) return [];
+
+  /**
+   * ===== 权威链路：后端结构化全季列表 =====
+   *
+   * 当前的季号优先取后端那条自己（`seriesId === detail.id`）的 `seasonIndex`：
+   * 标题里的季号可能与站方季表不一致（《烬九州》标题写「第三十五期」，而季表说
+   * index=35），以季表为准，两者的结论才对得上。后端没给（0）或没有自己那条时，
+   * 退回标题解析出来的季号。
+   *
+   * 命中条件：除当前季外**至少还有一季**。只有当前季（或空表）时不能当成"没有
+   * 其它季"直接返回 —— 那可能是后端只认出了当前剧，此时该让搜索回退再尽力补一次。
+   */
+  const entries = await lookupSeasonEntries(detail.id);
+  if (entries.length > 0) {
+    const self = entries.find(entry => entry.seriesId === detail.id);
+    const currentIndex = self && self.seasonIndex > 0 ? self.seasonIndex : label.season;
+    const fromApi = seasonsFromApi(entries, detail.id, currentIndex, detail.type);
+    if (fromApi.length > 0) return fromApi;
+  }
 
   const keyword = label.base;
   const candidates: SeriesItem[] = [];
@@ -333,7 +475,144 @@ export async function fetchSeriesSeasons(detail: SeriesDetail): Promise<SeasonPi
     }
   }
 
+  // 回退结果的 `available` 已在 `pickSeasons` 里按 `episodesCount > 0` 补好：
+  // 搜索链路看不到 `disablePlay`，只能给这条保守判法（见 `SeasonPick.available`）。
   return pickSeasons(candidates, label, detail.id);
+}
+
+/**
+ * 后端全季列表 → 季卡，**一条都不排除**（搜索页「选季」弹窗用）。
+ *
+ * 与 `seasonsFromApi` 的差别只有两点，但两点都不能混：
+ * - 不排除"当前季"（搜索页没有当前季的概念，见 `fetchAllSeriesSeasons`）；
+ * - 排序是**季号升序**而不是 `seasonOrder`。后者是"后续季优先、越近越前"的接续
+ *   顺序，用在详情页的推荐语境里；选季窗口要的是"从第 1 季顺着往下看"。
+ *
+ * 同季号仍只留一条：同一季在站上可能有来自不同来源的两个 id，铺两张一模一样的
+ * 季卡只会让用户以为列表出错。
+ */
+function allSeasonsFromApi(
+  entries: readonly SeasonApiEntry[],
+  channel: SeriesDetail['type'],
+): SeasonPick[] {
+  const picks: SeasonPick[] = [];
+  const seenSeasons = new Set<number>();
+
+  entries.forEach((entry, index) => {
+    if (!entry?.seriesId) return;
+    // 季号只取后端结构化值，0 才退回位次（接口按季号升序返回，位次即 1-based 季序）。
+    const season = entry.seasonIndex > 0 ? entry.seasonIndex : index + 1;
+    if (seenSeasons.has(season)) return;
+    seenSeasons.add(season);
+
+    picks.push({
+      item: {
+        id: entry.seriesId,
+        title: entry.title,
+        cover: entry.cover,
+        type: channel,
+        episodesCount: entry.episodeCount,
+        // 后端季表没有题材/来源；tags 留空，`SeriesCard` 对空 tags 直接不渲染那一行。
+        tags: [],
+        origin: '系列列表',
+      },
+      season,
+      // 没有当前季做参照，所有季统一按"后续季"的强调色渲染。
+      relation: 'next',
+      available: !entry.disablePlay && entry.episodeCount > 0,
+    });
+  });
+
+  return picks.sort((left, right) => left.season - right.season);
+}
+
+/**
+ * 搜索页「选季」弹窗的数据源：**该系列全部季，含折叠卡代表的那一季**（2026-10-29）。
+ *
+ * ## 为什么不能复用 `fetchSeriesSeasons`
+ *
+ * 那个函数的语义是"我在看第 N 季，给我**别的**季"——它排除当前季（详情页的系列剧
+ * 弹窗要的正是这个）。搜索页没有"当前季"：用户点的是折叠后的代表卡，他想知道的是
+ * "这个系列一共有哪几季"，把第 1 季排掉会让他以为少了第一季。
+ *
+ * 两者语义相反，所以是两个函数而不是一个 `includeCurrent` 开关：调用点只有两处，
+ * 开关只会让"哪边排除了什么"更难读，也更容易在将来被误改。
+ *
+ * ## 数据来源的优先级与 `fetchSeriesSeasons` 一致
+ *
+ * 1. 后端权威季表 —— 一次给全，季号结构化；
+ * 2. 拿不到（空表 / 异常 / 旧后端）时回退搜索链路：直接复用 `fetchSeriesSeasons`
+ *    的结果（同系列筛选、排序、`available` 判定都已做完），再**补回代表那一季**。
+ *    这样不必重写第四套筛选规则，也就不会出现"选季窗口和详情页弹窗判得不一样"。
+ *
+ * 失败一律返回 `[]`，不抛：它是弹窗的增量内容，不该把搜索页弄红。
+ */
+export async function fetchAllSeriesSeasons(
+  seriesId: string,
+  title: string,
+  channel: ChannelType,
+): Promise<SeasonPick[]> {
+  if (!seriesId || !title?.trim()) return [];
+
+  const entries = await lookupSeasonEntries(seriesId);
+  if (entries.length > 0) return allSeasonsFromApi(entries, channel);
+
+  /**
+   * 回退：`fetchSeriesSeasons` 只接受 `SeriesDetail`，而搜索页手上只有一个
+   * `SeriesItem`（没有选集/清晰度/播放源）。这里补一个只含**判定真正需要的那三个字段**
+   * 的最小对象 —— `canLookupSeasons` 与 `currentSeasonLabel` 只读 id / title / type，
+   * 其余字段填空值即可，不伪造任何数据。
+   */
+  const detailLike: SeriesDetail = {
+    id: seriesId,
+    title,
+    cover: '',
+    type: channel,
+    tags: [],
+    origin: '',
+    episodesCount: 0,
+    description: '',
+    episodes: [],
+    availableQualities: [],
+    sources: [],
+  };
+
+  if (!canLookupSeasons(detailLike)) return [];
+  const label = currentSeasonLabel(detailLike);
+  if (!label) return [];
+
+  let others: SeasonPick[] = [];
+  try {
+    others = await fetchSeriesSeasons(detailLike);
+  } catch {
+    others = [];
+  }
+
+  /**
+   * 补回代表季本身。
+   *
+   * `available: true`：这一季就是用户刚刚在列表里看到、并据此点开弹窗的那张卡 ——
+   * 它能出现在搜索结果里，说明站上有内容。搜索回退链路拿不到 `disablePlay` / 集数，
+   * 与其置灰一张用户刚点过的卡，不如放行；真没内容时详情页自己会给空选集。
+   */
+  const selfPick: SeasonPick = {
+    item: {
+      id: seriesId,
+      title,
+      cover: '',
+      type: channel,
+      episodesCount: 0,
+      tags: [],
+      origin: '',
+    },
+    season: label.season,
+    relation: 'next',
+    available: true,
+  };
+
+  return [selfPick, ...others.filter(pick => pick.item.id !== seriesId)].sort(
+    (left, right) => left.season - right.season,
+  );
 }
 
 export interface FetchRelatedOptions {
@@ -386,7 +665,9 @@ export async function fetchRelatedSeries(
    *
    * ⚠️ **这里刻意不比量词**，与 `pickSeasons` 不同。两处的目的不一样：
    * - `pickSeasons` 要给季卡编号并排序，「第一季」和「第一部」混在一组会让两套
-   *   编号撞车（第2部排到第2季旁边），所以量词必须一致才算同组；
+   *   编号撞车（第2部排到第2季旁边），所以量词必须同组才算同组（`seasonUnitGroup`
+   *   里把「期」与「季」并成一族 —— 站方对同一系列会混用，实测《烬九州》第 32~35 季
+   *   写作「第N期」；不并的话这几季会被当成"无季号条目"而漏掉）；
    * - 这里只回答"这一条是不是同一部剧"，而「聚宝仙盆第一部」与「聚宝仙盆第14季」
    *   在用户眼里就是同一部剧 —— 漏掉它，猜你喜欢里就会出现一部用户正在看的剧的
    *   另一个分卷版本，正是用户要求移除的东西。
@@ -403,6 +684,30 @@ export async function fetchRelatedSeries(
   };
 
   const others: SeriesItem[] = [];
+
+  /**
+   * App 原生推荐优先（`series_recommend`，走红果的 plan feed）。
+   *
+   * 这一路是**真正的"相关推荐"**：服务端按当前剧给出的相关视频 cell，而下面那段
+   * 目录兜底只是"同频道的其它剧"，与当前剧没有关系。所以顺序是：先放原生推荐，
+   * 不够 `POOL_LIMIT` 再用目录补齐。
+   *
+   * 失败静默：这一栏是增量信息，接口挂了就退回原来的目录逻辑，不弹错。
+   * 同系列过滤照常走 `sameSeries`——推荐里同样可能混进本剧的其它季。
+   */
+  try {
+    const rec = await ipcService.hongguo.seriesRecommend(detail.id, detail.type);
+    for (const item of rec?.items ?? []) {
+      if (others.length >= POOL_LIMIT) break;
+      if (!item?.id || !item.title || seen.has(item.id)) continue;
+      if (sameSeries(item)) continue;
+      seen.add(item.id);
+      others.push(item);
+    }
+  } catch {
+    // 原生推荐不可用：继续走目录兜底。
+  }
+
   try {
     const page = await ipcService.catalog.list({
       channel: detail.type,

@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useAppStore } from '../../stores/useAppStore';
 import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useFavorites } from '../../stores/useFavoritesStore';
 import { ipcService, coverResolver } from '../../services/ipc';
 import { SeriesDetail, EpisodeItem } from '../../types/series';
+import type { WatchHistoryItem } from '../../types/history';
 import { MicaCard } from '../common/MicaCard';
 import { FluentButton } from '../common/FluentButton';
 import { CoverImage } from '../common/CoverImage';
@@ -27,6 +28,118 @@ import {
   Heart
 } from 'lucide-react';
 
+/** 秒 → `mm:ss`（超出一小时才会出现 `h:mm:ss`，短剧几乎用不到）。 */
+function formatClock(totalSeconds: number): string {
+  const total = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const mm = String(minutes).padStart(hours > 0 ? 2 : 1, '0');
+  const ss = String(seconds).padStart(2, '0');
+  return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+/** 「还剩 8 分 20 秒」——续播时比"已看 62%"更有用的那个数字。 */
+function formatRemaining(totalSeconds: number): string {
+  const total = Math.max(0, Math.round(totalSeconds));
+  if (total < 60) return `还剩 ${total} 秒`;
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  if (minutes < 60) return rest > 0 ? `还剩 ${minutes} 分 ${rest} 秒` : `还剩 ${minutes} 分钟`;
+  return `还剩 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+/**
+ * 选集面板每页的集数。
+ *
+ * 与规范一致的三档策略，全部落在这一条常量上：
+ *   - 1–30 集：一页装完，不分页；
+ *   - 31–100 集：默认第一页 50 集，其余靠翻页；
+ *   - 100 集以上：翻页 + 集数跳转。
+ *
+ * **不要**改成"一次渲染全部"：一部 300 集的短剧会同时挂 300 个按钮，
+ * 每个按钮还各带 hover 预签名回调，滚动帧耗时直接翻倍。
+ */
+const EPISODE_PAGE_SIZE = 50;
+
+/**
+ * 单颗集数按钮。
+ *
+ * 抽出来之前，"选集播放"网格与「全部选集」弹窗各抄了一份一模一样的 JSX（含三档
+ * 状态色、勾选图标、进度小条、预签名回调）。两份一旦有一处改了配色，另一处就
+ * 静默留在旧样式上 —— 详情页与弹窗里的同一集会长得不一样，而它们本来就该是
+ * 同一个东西。
+ *
+ * ## 状态层级（规范里的六态，这里一一对应）
+ *
+ * | 状态 | 视觉 |
+ * | --- | --- |
+ * | 当前播放 | 蓝底白字 + 播放图标 + 外圈 ring |
+ * | 已观看 | 淡蓝底 + 右上勾 |
+ * | 看到一半 | 白底 + 底部蓝色进度条 |
+ * | 未观看 | 白底 + 灰边 |
+ * | 悬停 | 浅蓝底 + 蓝边 |
+ * | 键盘焦点 | `focus-visible` 蓝色外描边 |
+ *
+ * 前三种状态**互斥不叠加**：当前播放不画勾、也不画进度条 —— 一整格蓝底已经是最强
+ * 的那一档，再往上叠细节只会让它看起来像"又脏又重要"。
+ */
+interface EpisodeButtonProps {
+  ep: EpisodeItem;
+  /** 这一集是不是"上次看到的那一集"（详情页的锚点集）。 */
+  isCurrent: boolean;
+  onPlay: (ep: EpisodeItem) => void;
+  onPrewarm: (episodeId: string) => void;
+}
+
+const EpisodeButton: React.FC<EpisodeButtonProps> = ({ ep, isCurrent, onPlay, onPrewarm }) => {
+  const hasProgress = (ep.watchedSeconds || 0) > 0;
+  const isWatched = ep.isFinished || hasProgress;
+  const title = isCurrent
+    ? `当前播放：第 ${ep.episodeNumber} 集 · ${ep.title}`
+    : `第 ${ep.episodeNumber} 集 · ${ep.title}${ep.isFinished ? ' (已看完)' : hasProgress ? ' (看到一半)' : ''}`;
+
+  return (
+    <button
+      key={ep.id}
+      type="button"
+      onMouseEnter={() => onPrewarm(ep.id)}
+      onFocus={() => onPrewarm(ep.id)}
+      onClick={() => onPlay(ep)}
+      title={title}
+      aria-current={isCurrent ? 'true' : undefined}
+      className={`group relative h-10 rounded-xl flex items-center justify-center font-bold text-xs shadow-xs active:scale-95 transition-all duration-150 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 focus-visible:ring-offset-1 ${
+        isCurrent
+          ? 'bg-blue-600 text-white border border-blue-600 shadow-md shadow-blue-500/25 ring-2 ring-blue-400/40'
+          : isWatched
+          ? 'bg-blue-50/70 hover:bg-blue-50 border border-blue-200/70 hover:border-blue-400 text-blue-700 hover:text-blue-700'
+          : 'bg-white hover:bg-blue-50/80 border border-slate-200/80 hover:border-blue-400 text-slate-700 hover:text-blue-600'
+      }`}
+    >
+      {isCurrent ? (
+        <span className="flex items-center gap-1">
+          <Play className="w-2.5 h-2.5 fill-current shrink-0" />
+          <span>{ep.episodeNumber}</span>
+        </span>
+      ) : (
+        <span>{ep.episodeNumber}</span>
+      )}
+
+      {/* 已看完：右上角勾。看到一半则不画勾 —— 它还没看完，勾会骗人。 */}
+      {ep.isFinished && !isCurrent && (
+        <span className="absolute top-1 right-1 text-blue-500/70" title="已看完">
+          <Check className="w-2.5 h-2.5 stroke-[2.5]" />
+        </span>
+      )}
+
+      {/* 看到一半：底部进度小条，与上面的筛选项共用同一判定（hasProgress） */}
+      {hasProgress && !ep.isFinished && !isCurrent && (
+        <span className="absolute bottom-1 inset-x-2 h-0.5 bg-blue-500 rounded-full" />
+      )}
+    </button>
+  );
+};
+
 export const DetailView: React.FC = () => {
   const { selectedSeriesId, navigateTo, goBack, showToast, currentView } = useAppStore();
   // 详情页挂在常驻 DOM 上：走低频动作专线，整表订阅会让选集网格跟着播放进度重渲染。
@@ -41,9 +154,92 @@ export const DetailView: React.FC = () => {
   prewarmEpisodeRef.current = prewarmEpisode;
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [detail, setDetail] = useState<SeriesDetail | null>(null);
+  const [rawDetail, setRawDetail] = useState<SeriesDetail | null>(null);
+
+  /**
+   * 把观看历史回填到集数里。
+   *
+   * 后端 `series_detail` 返回的 `EpisodeItem` 只有 id / 集号 / 时长，从来不带
+   * `watchedSeconds`（Rust 侧 `models.rs::EpisodeItem` 根本没有这个字段）——
+   * 也就是说详情页的「继续播放第 N 集」「已观看 N 集」「上次观看进度条」在真实
+   * 链路里永远拿不到数据，只有浏览器 mock 才有。观看进度实际落在
+   * `ipcService.history.list()` 的 `WatchHistoryItem` 上（首页「继续观看」用的就是它）。
+   *
+   * 这里在进入详情页时拉一次历史，把当前这一部剧的记录合并进 episodes：优先按
+   * episodeId 匹配、其次按集号；只克隆匹配到的那一集，其余保持原引用，不污染
+   * `ipcService` 的详情缓存对象。`currentView` 进依赖是为了从播放器返回时刷新。
+   */
+  const [historyRecord, setHistoryRecord] = useState<WatchHistoryItem | null>(null);
+  useEffect(() => {
+    if (!rawDetail?.id) {
+      setHistoryRecord(null);
+      return;
+    }
+    let alive = true;
+    void ipcService.history
+      .list()
+      .then(list => {
+        if (alive) setHistoryRecord(list.find(item => item.seriesId === rawDetail.id) || null);
+      })
+      .catch(() => {
+        if (alive) setHistoryRecord(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [rawDetail?.id, currentView]);
+
+  const detail = useMemo<SeriesDetail | null>(() => {
+    if (!rawDetail) return null;
+    if (!historyRecord) return rawDetail;
+    let matched = false;
+    const episodes = rawDetail.episodes.map(ep => {
+      const hit =
+        ep.id === historyRecord.episodeId || ep.episodeNumber === historyRecord.episodeNumber;
+      if (!hit) return ep;
+      matched = true;
+      return {
+        ...ep,
+        watchedSeconds: Math.max(0, historyRecord.positionSeconds || 0),
+        durationSeconds:
+          historyRecord.durationSeconds > 0 ? historyRecord.durationSeconds : ep.durationSeconds,
+        isFinished: historyRecord.isFinished,
+      };
+    });
+    return matched ? { ...rawDetail, episodes } : rawDetail;
+  }, [rawDetail, historyRecord]);
+
+
+  /**
+   * 红果 App 的详情扩展字段（`hongguo_series_detail`）。
+   *
+   * 详情页本身的数据来自 provider 链路（网页/App 混源），它只有集数与简介；
+   * 「更新至N集 / 全N集」这种角标、发布状态、总播放/关注数只有 App 的
+   * `video_detail` 才有。这里作为**增量**补充：拿不到就整块不显示，
+   * 已有的集数徽标与来源文案照旧。
+   *
+   * 只对红果的数字 id 取（`guo:`/`dmghg:` 前缀与动漫 id 在那边不存在）。
+   */
+  const [hongguoMeta, setHongguoMeta] = useState<{
+    rightText: string;
+    status: number;
+    playCount: number;
+    followCount: number;
+  } | null>(null);
   const [isDescExpanded, setIsDescExpanded] = useState(false);
   const [showAllEpisodesModal, setShowAllEpisodesModal] = useState(false);
+  /**
+   * 选集筛选与翻页。
+   *
+   * 状态放在这里而不是 `EpisodeSelector` 子组件里：详情页是常驻 DOM 的，用户在
+   * 选集里翻到第 3 页、切到播放器、再返回——筛选与页码必须还在原处，否则"我刚
+   * 才翻到的那一页"每次回来都要重翻。子组件内的 state 在视图切换时不会丢，
+   * 但换一部剧时必须重置，所以重置逻辑跟着 `selectedSeriesId` 走（见下面的 effect）。
+   */
+  const [episodeFilter, setEpisodeFilter] = useState<'all' | 'unwatched' | 'watched'>('all');
+  const [episodePage, setEpisodePage] = useState(0);
+  /** 集数跳转输入框。 */
+  const [episodeJump, setEpisodeJump] = useState('');
   /**
    * 「系列剧」弹窗。
    *
@@ -52,6 +248,40 @@ export const DetailView: React.FC = () => {
    * 让它和选集面板共用同一套弹窗外壳与 Esc/遮罩关闭行为。
    */
   const [showSeasonsDialog, setShowSeasonsDialog] = useState(false);
+
+  /**
+   * 拉取 App 详情扩展字段。失败静默——它只是把「共 N 集全」升级成
+   * 「更新至 N 集」，拿不到时页面照旧可用。
+   */
+  useEffect(() => {
+    if (!detail) {
+      setHongguoMeta(null);
+      return;
+    }
+    const numeric = /^\d{4,25}$/.test(detail.id);
+    if (!numeric || detail.type === 'anime' || detail.type === 'adult') {
+      setHongguoMeta(null);
+      return;
+    }
+    let alive = true;
+    void ipcService.hongguo
+      .seriesDetail(detail.id, detail.type)
+      .then(data => {
+        if (!alive) return;
+        setHongguoMeta({
+          rightText: data.rightText ?? '',
+          status: data.status ?? 0,
+          playCount: data.playCount ?? 0,
+          followCount: data.followCount ?? 0,
+        });
+      })
+      .catch(() => {
+        if (alive) setHongguoMeta(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [detail]);
 
   // 打开详情页只预热**最可能被点开的那一集**。
   //
@@ -137,18 +367,18 @@ export const DetailView: React.FC = () => {
   // 详情和可播放集数始终以当前项目后端返回的数据为准。
   useEffect(() => {
     if (!selectedSeriesId) {
-      setDetail(null);
+      setRawDetail(null);
       return;
     }
 
     const cached = detailCacheRef.current[selectedSeriesId];
     if (cached) {
-      setDetail(cached);
+      setRawDetail(cached);
       return;
     }
 
     let active = true;
-    setDetail(null);
+    setRawDetail(null);
 
     // 失败自动重试一次：详情页是单次网络往返，抖动一次就白屏一整页。
     // 重试仍失败才提示，且保留"重试"入口（点刷新重新拉）。
@@ -157,7 +387,7 @@ export const DetailView: React.FC = () => {
         .then((res) => {
           if (!active) return;
           detailCacheRef.current[selectedSeriesId] = res;
-          setDetail(res);
+          setRawDetail(res);
         })
         .catch(() => {
           if (!active) return;
@@ -174,6 +404,18 @@ export const DetailView: React.FC = () => {
       active = false;
     };
   }, [selectedSeriesId, showToast]);
+
+  /**
+   * 换一部剧就把选集筛选与页码归零。
+   *
+   * 不重置的话：上一部剧筛成"已观看"、翻到第 4 页，新剧进来继承这两个值，
+   * 用户看到的是"选集面板空了"或"只有最后几集"——像是数据没取到。
+   */
+  useEffect(() => {
+    setEpisodeFilter('all');
+    setEpisodePage(0);
+    setEpisodeJump('');
+  }, [selectedSeriesId]);
 
   // 详情到手就预热"最可能被点开"的那一集（断点续播集，没有则第一集）。
   //
@@ -249,12 +491,12 @@ export const DetailView: React.FC = () => {
       <div className="flex-1 h-full overflow-hidden select-none pb-12" aria-busy="true">
         {/* 占位块统一用 .shimmer-loading（扫光 + 凹槽），与列表骨架同一套材质；
             原先的 animate-pulse 是整体呼吸，和别的页面对不上。 */}
-        <div className="max-w-6xl mx-auto px-6 sm:px-8 pt-5 flex flex-col gap-6">
+        <div className="max-w-7xl mx-auto px-6 sm:px-8 pt-5 flex flex-col gap-6">
           <div className="flex items-center justify-between">
             <button
               onClick={goBack}
               className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-white/85 hover:bg-white text-slate-700 hover:text-blue-600 shadow-xs border border-slate-200/70 text-xs font-semibold cursor-pointer active:scale-95 transition-all"
-              title="返回发现精选"
+              title="返回短剧精选"
             >
               <ArrowLeft className="w-4 h-4" />
               <span>返回发现</span>
@@ -262,7 +504,7 @@ export const DetailView: React.FC = () => {
             <div className="h-3 w-40 rounded-full shimmer-loading" />
           </div>
           <div className="flex flex-col md:flex-row gap-7 items-start">
-            <div className="w-44 sm:w-52 aspect-[3/4] rounded-2xl shimmer-loading flex-shrink-0" />
+            <div className="w-52 sm:w-60 aspect-[3/4] rounded-2xl shimmer-loading flex-shrink-0" />
             <div className="flex-1 flex flex-col gap-3 pt-0.5">
               <div className="h-3 w-24 rounded-full shimmer-loading" />
               <div className="h-7 w-64 rounded-xl shimmer-loading" />
@@ -283,9 +525,36 @@ export const DetailView: React.FC = () => {
 
   const episodes = detail.episodes;
   const totalEpisodes = detail.episodesCount || episodes.length;
-  // 前面直接紧凑列出前50集
-  const upfrontEpisodes = episodes.slice(0, 50);
-  const hasMoreThan50 = totalEpisodes > 50;
+
+  /** 已看（看完，或有一段进度）的集数。选集头部那句「已观看 N 集」用它。 */
+  const watchedCount = episodes.filter(
+    ep => ep.isFinished || (ep.watchedSeconds || 0) > 0,
+  ).length;
+
+  /**
+   * 筛选后的集数。
+   *
+   * 三个档位与规范里的"全部 / 未观看 / 已观看"一致。判定门槛**与集数按钮的
+   * 状态色共用同一个表达式**（`isFinished || watchedSeconds > 0`）：两处各写
+   * 一份，必然漂移成"筛进来说已观看、显示却是未观看"的白底按钮。
+   */
+  const filteredEpisodes = episodes.filter(ep => {
+    const watched = ep.isFinished || (ep.watchedSeconds || 0) > 0;
+    if (episodeFilter === 'watched') return watched;
+    if (episodeFilter === 'unwatched') return !watched;
+    return true;
+  });
+
+  const episodePageCount = Math.max(1, Math.ceil(filteredEpisodes.length / EPISODE_PAGE_SIZE));
+  /**
+   * 页码夹紧。换筛选 / 数据刷新后总页数会变小，`episodePage` 可能已经越界；
+   * 直接切片会得到空数组，用户看到的是"选集空了"。夹到最后一页即可。
+   */
+  const safeEpisodePage = Math.min(episodePage, episodePageCount - 1);
+  const pageStart = safeEpisodePage * EPISODE_PAGE_SIZE;
+  const upfrontEpisodes = filteredEpisodes.slice(pageStart, pageStart + EPISODE_PAGE_SIZE);
+  /** 一页装不下才需要翻页控件（1–30 集、31–50 集这类直接全展示）。 */
+  const hasEpisodePager = filteredEpisodes.length > EPISODE_PAGE_SIZE;
 
   // 弹窗快速过滤
   const filteredModalEpisodes = modalSearch.trim()
@@ -319,7 +588,56 @@ export const DetailView: React.FC = () => {
     episodes[0] ||
     null;
 
-  const handleStartPlay = (ep: EpisodeItem) => {
+  /**
+   * 「上次看到哪儿」的全部数字。
+   *
+   * 只有**真的有进度**才返回；`watchedSeconds` 为 0（或没有历史）时返回 null，
+   * Hero 里那条进度条整块不渲染 —— 不显示"已看 0%"这种占位。
+   */
+  const watchProgress = (() => {
+    const ep = lastWatchedEp;
+    const watched = Math.max(0, Math.round(ep?.watchedSeconds || 0));
+    if (!ep || watched <= 0) return null;
+    const duration = Math.max(0, Math.round(ep.durationSeconds || 0));
+    const percent = duration > 0 ? Math.min(100, (watched / duration) * 100) : 0;
+    const remaining = duration > 0 ? Math.max(0, duration - watched) : 0;
+    return {
+      episode: ep,
+      watched,
+      duration,
+      percent,
+      remaining,
+      /** 进播放器要用的起点；`isFinished` 时归零（重新播放不该停在那 3 秒上）。 */
+      startAt: ep.isFinished ? 0 : watched,
+    };
+  })();
+
+  /**
+   * 集数跳转：输入框里是**集号**（`episodeNumber`），不是数组下标。
+   *
+   * 服务端的集号不保证与下标相等（预告集、下架集都会让两者错开），所以按集号
+   * 找对应条目，找不到就什么都不做 —— 而不是 `episodes[n]` 那样悄悄播错一集。
+   */
+  const handleJumpToEpisode = () => {
+    const target = Number.parseInt(episodeJump.trim(), 10);
+    if (!Number.isFinite(target)) return;
+    const ep = episodes.find(item => item.episodeNumber === target);
+    if (!ep) {
+      showToast(`没有第 ${target} 集`, 'error');
+      return;
+    }
+    setEpisodeJump('');
+    handleStartPlay(ep);
+  };
+
+  /**
+   * 播放某一集。`startAt` 不给时用这一集自己的进度。
+   *
+   * 单独一个入参是为了「已看完」的那种情况：此时用户的意图是"重看"，而不是
+   * "从片尾 3 秒处接着播"。判定在调用方（Hero 的 `watchProgress.startAt`），
+   * 这里只负责把数字交给播放链路。
+   */
+  const handleStartPlay = (ep: EpisodeItem, startAt?: number) => {
     setShowAllEpisodesModal(false);
     // 动漫专区走**独立播放器**（AnimeVideoSurface + useAnimePlayerStore）。
     //
@@ -328,39 +646,69 @@ export const DetailView: React.FC = () => {
     // 照它判就会把 m3u8 交给原生 <video>（15 秒后仍无画面，只有声音）；
     // ③ dmghg 的档位里混着 HEVC。这套判定与看门狗只对动漫有意义，短剧/漫剧
     // 继续走原来的链路，互不影响。
+    const resumeAt = startAt ?? (ep.watchedSeconds || 0);
     if (detail.type === 'anime') {
-      void openAnimeEpisode(detail.id, ep.id, ep.watchedSeconds || 0);
+      void openAnimeEpisode(detail.id, ep.id, resumeAt);
       return;
     }
     navigateTo('player', detail.id);
-    openEpisode(detail.id, ep.id, ep.watchedSeconds || 0);
+    openEpisode(detail.id, ep.id, resumeAt);
   };
 
   return (
     <div className="flex-1 h-full overflow-y-auto select-none pb-12">
-      <div className="max-w-6xl mx-auto px-6 sm:px-8 pt-5 flex flex-col gap-6">
+      <div className="max-w-7xl mx-auto px-6 sm:px-8 pt-5 flex flex-col gap-6">
         {/* 顶部导航行：返回按钮与面包屑路径 */}
         <div className="flex items-center justify-between">
           <button
             onClick={goBack}
             className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-white/85 hover:bg-white text-slate-700 hover:text-blue-600 shadow-xs border border-slate-200/70 backdrop-blur-md transition-all text-xs font-semibold cursor-pointer active:scale-95"
-            title="返回发现精选"
+              title="返回短剧精选"
           >
             <ArrowLeft className="w-4 h-4" />
             <span>返回发现</span>
           </button>
 
           <div className="flex items-center gap-2 text-xs text-slate-400">
-            <span>发现精选</span>
+            <span>短剧精选</span>
             <span>/</span>
             <span className="text-slate-700 font-semibold truncate max-w-xs sm:max-w-md">{detail.title}</span>
           </div>
         </div>
 
-        {/* Hero 主展示区：3:4 核心海报 (带 GPU 硬件加速缩放就位动效) + 详细资料与操作区 */}
-        <div className="flex flex-col md:flex-row gap-7 items-start">
+        {/*
+          Hero 主展示区。
+
+          ## 光源氛围为什么这样做
+
+          规范里建议"从海报提取主色生成低透明度渐变光晕"。取主色需要把封面画进
+          canvas 再读像素，而封面来源有三种（红果 HEIC 转码后的本地缓存、guo-core
+          下载的本地文件、直连 CDN），`asset:` / `http:` 混在一起，跨域策略随时可能
+          让 `getImageData` 抛 SecurityError —— 那会让整个 Hero 白屏。
+
+          这里改用**同一张封面的模糊副本**叠在 Hero 背后：`blur-3xl` + 缩放 +
+          极低不透明度，取色问题自然消失（模糊后的像素就是这张海报的平均色）。
+          关键是**不铺满整页**：它被限制在 Hero 这一块 320px 高的区域内，正文
+          始终落在白底上，所以不会出现"模糊海报铺满背景导致文字读不清"。
+        */}
+        <div className="relative">
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute -top-8 left-0 h-[280px] w-[min(100%,640px)] overflow-hidden opacity-[0.16] blur-3xl"
+            style={{
+              backgroundImage: detail.cover ? `url("${detail.cover}")` : undefined,
+              backgroundSize: 'cover',
+              backgroundPosition: 'center',
+              // 取色失败（HEIC / 跨域 / 404）时这层就是空的 —— 兜底一层同色系
+              // 的冷光，保证 Hero 在任何封面条件下都有层次，而不是纯白。
+              backgroundColor: 'rgba(59, 130, 246, 0.10)',
+              maskImage: 'radial-gradient(ellipse at 20% 40%, black 0%, transparent 72%)',
+              WebkitMaskImage: 'radial-gradient(ellipse at 20% 40%, black 0%, transparent 72%)',
+            }}
+          />
+        <div className="relative flex flex-col md:flex-row gap-7 items-start">
           {/* 核心海报：3:4 比例，带 animate-fluent-hero-poster 硬件加速平滑入场 */}
-          <div className="relative w-44 sm:w-52 aspect-[3/4] rounded-2xl overflow-hidden shadow-fluent-hud border-2 border-white flex-shrink-0 bg-white animate-fluent-hero-poster transition-transform duration-300 hover:scale-[1.02]">
+          <div className="relative w-52 sm:w-60 aspect-[3/4] rounded-2xl overflow-hidden shadow-fluent-hud border-2 border-white flex-shrink-0 bg-white animate-fluent-hero-poster transition-transform duration-300 hover:scale-[1.02]">
             {/* 这里是封面缺失最刺眼的位置：源站脏数据（实测有指向已 404 的第三方
                 图床）会让整块海报变成白框，而列表卡片当时已经有首字兜底。
 
@@ -390,14 +738,40 @@ export const DetailView: React.FC = () => {
                 dot
               />
               <span className="text-xs text-slate-600 font-semibold bg-white/85 px-2.5 py-0.5 rounded-lg border border-slate-200/60 shadow-xs">
-                {detail.type === 'anime' && detail.episodesCount === 0 ? '单集/已完结' : `共 ${detail.episodesCount} 集全`}
+                {detail.type === 'anime' && detail.episodesCount === 0
+                  ? '单集/已完结'
+                  : // App 给了集数角标就用它：「更新至 12 集」比「共 12 集全」准确得多，
+                    // 后者会把连载中的剧说成已完结。拿不到才退回集数。
+                    hongguoMeta?.rightText
+                    ? hongguoMeta.rightText
+                    : `共 ${detail.episodesCount} 集全`}
               </span>
+              {/* 连载状态：只有 App 详情明确给了状态才显示（0 更新中 / 1 已完结）。
+                  与上面的集数角标是两条信息，不合并——「更新至12集」+「连载中」才完整。 */}
+              {hongguoMeta && hongguoMeta.status === 1 && (
+                <span className="text-xs font-semibold bg-emerald-50 text-emerald-700 px-2.5 py-0.5 rounded-lg border border-emerald-200/70 shadow-xs">
+                  已完结
+                </span>
+              )}
+              {hongguoMeta && hongguoMeta.status === 0 && (
+                <span className="text-xs font-semibold bg-sky-50 text-sky-700 px-2.5 py-0.5 rounded-lg border border-sky-200/70 shadow-xs">
+                  连载中
+                </span>
+              )}
+              {/* 热度：原文案（"4102万热度"）由服务端给，不在这里换算。 */}
+              {hongguoMeta && hongguoMeta.playCount > 0 && (
+                <span className="text-xs font-medium text-slate-500 bg-white/85 px-2.5 py-0.5 rounded-lg border border-slate-200/60 shadow-xs">
+                  {hongguoMeta.playCount >= 10000
+                    ? `${Math.round(hongguoMeta.playCount / 10000)} 万播放`
+                    : `${hongguoMeta.playCount} 播放`}
+                </span>
+              )}
               <span className="text-xs text-slate-300">|</span>
               <span className="text-xs text-slate-500 font-medium">{detail.origin}</span>
             </div>
 
             {/* 剧集主标题 */}
-            <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight leading-snug">
+            <h1 className="text-[26px] sm:text-[30px] font-black text-slate-900 tracking-tight leading-[1.28]">
               {detail.title}
             </h1>
 
@@ -419,7 +793,7 @@ export const DetailView: React.FC = () => {
                   这里是最值得加的一处：简介是自由长度的中文正文，末行只剩一两个
                   字时（"…被逐出家门。"）读起来像排版事故，而这一行又正好紧贴着
                   「展开完整简介」按钮，孤字会与按钮挤在一起。 */}
-              <p className={`text-pretty ${isDescExpanded ? '' : 'line-clamp-2'}`}>
+              <p className={`text-pretty ${isDescExpanded ? '' : 'line-clamp-3'}`}>
                 {detail.description}
               </p>
               <button
@@ -435,18 +809,58 @@ export const DetailView: React.FC = () => {
               </button>
             </div>
 
+            {/* 上次观看：把「看到哪一集 / 看到哪一秒 / 还剩多久」串成一条可点的进度线。
+                只有真的有进度才渲染，没有历史时整块不出现（不显示「已看 0%」这种占位）。 */}
+            {watchProgress && (
+              <button
+                type="button"
+                onClick={() => handleStartPlay(watchProgress.episode, watchProgress.startAt)}
+                className="group mt-1 flex w-full max-w-2xl items-center gap-3 rounded-2xl border border-blue-100/80 bg-gradient-to-r from-blue-50/90 to-white/70 px-3.5 py-2.5 text-left shadow-xs transition-all hover:border-blue-300 hover:shadow-sm active:scale-[0.995] cursor-pointer"
+              >
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white shadow-sm shadow-blue-500/25">
+                  <Play className="h-3.5 w-3.5 fill-current" />
+                </span>
+                <span className="flex min-w-0 flex-1 flex-col gap-1.5">
+                  <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] font-semibold text-slate-600">
+                    <span className="truncate">上次观看 · 第 {watchProgress.episode.episodeNumber} 集</span>
+                    <span className="shrink-0 tabular-nums text-slate-400">
+                      {formatClock(watchProgress.watched)} / {formatClock(watchProgress.duration)}
+                    </span>
+                    {watchProgress.remaining > 0 && (
+                      <span className="shrink-0 text-blue-500">{formatRemaining(watchProgress.remaining)}</span>
+                    )}
+                  </span>
+                  <span className="h-1.5 w-full overflow-hidden rounded-full bg-blue-100/80">
+                    <span
+                      className="block h-full rounded-full bg-blue-600 transition-[width] duration-500"
+                      style={{ width: `${Math.max(2, watchProgress.percent)}%` }}
+                    />
+                  </span>
+                </span>
+                <span className="shrink-0 text-[11px] font-bold text-blue-600 opacity-0 transition-opacity group-hover:opacity-100">
+                  继续观看 →
+                </span>
+              </button>
+            )}
+
             {/* 主操作按键行 */}
             <div className="flex items-center gap-3 mt-1">
               <button
-                  onClick={() => lastWatchedEp && handleStartPlay(lastWatchedEp)}
+                  onClick={() =>
+                    lastWatchedEp &&
+                    handleStartPlay(
+                      lastWatchedEp,
+                      watchProgress?.episode.id === lastWatchedEp.id ? watchProgress.startAt : undefined,
+                    )
+                  }
                   disabled={!lastWatchedEp}
                 className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold shadow-md shadow-blue-500/25 active:scale-95 transition-all cursor-pointer"
               >
                 <Play className="w-4 h-4 fill-current" />
                 <span>
-                  {lastWatchedEp?.watchedSeconds
-                    ? `继续观看 (第 ${lastWatchedEp.episodeNumber} 集)`
-                    : '立即播放第 1 集'}
+                  {watchProgress
+                    ? `继续播放 第 ${watchProgress.episode.episodeNumber} 集`
+                    : '播放第 1 集'}
                 </span>
               </button>
 
@@ -531,20 +945,20 @@ export const DetailView: React.FC = () => {
             </div>
           </div>
         </div>
+        </div>
 
-        {/* 选集面板：平整通透的现代化网格 (彻底告别深灰色沉重凹槽) */}
+        {/* 选集播放：保留原来的网格，把「状态 / 筛选 / 跳转 / 分页」补齐。
+            面板与「全部选集」弹窗共用同一颗 EpisodeButton，配色与状态判定不会漂移。 */}
         <MicaCard className="p-5 flex flex-col gap-4">
-          <div className="flex items-center justify-between pb-3 border-b border-black/[0.04]">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-black/[0.04]">
             <div className="flex items-center gap-2.5">
-              <h2 className="text-sm font-bold text-slate-800">
-                选集播放
-              </h2>
+              <h2 className="text-sm font-bold text-slate-800">选集播放</h2>
               <span className="text-xs text-slate-400">
-                {hasMoreThan50 ? `(展示 1-50 集 · 全剧共 ${totalEpisodes} 集)` : `(共 ${totalEpisodes} 集全)`}
+                共 {totalEpisodes} 集 · 已观看 {watchedCount} 集
               </span>
             </div>
 
-            {/* 状态图例：清晰指示“当前播放”与“已看完” */}
+            {/* 状态图例 */}
             <div className="flex items-center gap-3 text-[11px] text-slate-400">
               <span className="inline-flex items-center gap-1">
                 <span className="w-3.5 h-3.5 rounded bg-blue-600 flex items-center justify-center text-white shadow-xs">
@@ -553,7 +967,7 @@ export const DetailView: React.FC = () => {
                 <span className="text-slate-600 font-medium">当前播放</span>
               </span>
               <span className="inline-flex items-center gap-1">
-                <span className="w-3.5 h-3.5 rounded bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-400">
+                <span className="w-3.5 h-3.5 rounded bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-500">
                   <Check className="w-2.5 h-2.5 stroke-[2.5]" />
                 </span>
                 <span>已看完</span>
@@ -561,70 +975,114 @@ export const DetailView: React.FC = () => {
             </div>
           </div>
 
-          {/* 平整清晰的剧集数字方块网格 (自适应 5~10 列，纯净无内陷灰槽) */}
+          {/* 筛选 / 集号跳转 / 全部选集入口，合成一条控制条 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-1 rounded-xl border border-slate-200/70 bg-slate-100/90 p-1">
+              {([['all', '全部'], ['unwatched', '未观看'], ['watched', '已观看']] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => { setEpisodeFilter(key); setEpisodePage(0); }}
+                  className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition-all cursor-pointer ${
+                    episodeFilter === key
+                      ? 'bg-white text-blue-600 shadow-xs'
+                      : 'text-slate-500 hover:bg-white/60 hover:text-slate-800'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            <div className="relative w-32">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+              <input
+                type="text"
+                inputMode="numeric"
+                value={episodeJump}
+                onChange={(e) => setEpisodeJump(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleJumpToEpisode(); }}
+                placeholder="跳到第 N 集"
+                className="ttv-input w-full h-8 pl-8 pr-2 text-xs bg-white rounded-lg border border-slate-200/80 shadow-xs"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={handleJumpToEpisode}
+              className="h-8 px-2.5 rounded-lg bg-white hover:bg-blue-50 text-slate-600 hover:text-blue-600 border border-slate-200/80 text-[11px] font-semibold shadow-xs active:scale-95 transition-all cursor-pointer"
+            >
+              跳转
+            </button>
+
+            <span className="flex-1" />
+
+            <button
+              type="button"
+              onClick={() => setShowAllEpisodesModal(true)}
+              title="在弹窗里搜索全部集数"
+              className="inline-flex h-8 items-center gap-1 rounded-lg border border-slate-200/80 bg-white px-2.5 text-[11px] font-semibold text-slate-500 shadow-xs transition-colors hover:text-blue-600 active:scale-95 cursor-pointer"
+            >
+              <MoreHorizontal className="w-3.5 h-3.5" />
+              全部选集
+            </button>
+          </div>
+
           {episodes.length === 0 ? (
             <div className="py-8 text-center text-xs text-slate-500">
               当前剧集暂未返回可播放集数，后端可能仅开放红果 App 播放。
             </div>
-          ) : (
-          <div className="grid grid-cols-5 sm:grid-cols-8 md:grid-cols-10 gap-2">
-            {upfrontEpisodes.map((ep) => {
-              const hasProgress = (ep.watchedSeconds || 0) > 0;
-              const isCurrent = lastWatchedEp.id === ep.id;
-
-              return (
-                <button
-                  key={ep.id}
-                  type="button"
-                  onMouseEnter={() => schedulePrewarm(ep.id)}
-                  onFocus={() => schedulePrewarm(ep.id)}
-                  onClick={() => handleStartPlay(ep)}
-                  title={isCurrent ? `当前播放：第 ${ep.episodeNumber} 集 · ${ep.title}` : `第 ${ep.episodeNumber} 集 · ${ep.title}${ep.isFinished ? ' (已看完)' : ''}`}
-                  className={`group relative h-10 rounded-xl flex items-center justify-center font-bold text-xs shadow-xs active:scale-95 transition-all duration-150 cursor-pointer ${
-                    isCurrent
-                      ? 'bg-blue-600 text-white border border-blue-600 shadow-md shadow-blue-500/25 ring-2 ring-blue-400/40'
-                      : ep.isFinished
-                      ? 'bg-slate-50 hover:bg-blue-50/80 border border-slate-200/70 hover:border-blue-400 text-slate-500 hover:text-blue-600'
-                      : 'bg-white hover:bg-blue-50/80 border border-slate-200/80 hover:border-blue-400 text-slate-700 hover:text-blue-600'
-                  }`}
-                >
-                  {/* 当前播放集：明确显示播放图标与数字 */}
-                  {isCurrent ? (
-                    <span className="flex items-center gap-1">
-                      <Play className="w-2.5 h-2.5 fill-current shrink-0" />
-                      <span>{ep.episodeNumber}</span>
-                    </span>
-                  ) : (
-                    <span>{ep.episodeNumber}</span>
-                  )}
-
-                  {/* 已看完：右上角清晰勾选小图标 (告别易混淆的绿点) */}
-                  {ep.isFinished && !isCurrent && (
-                    <span className="absolute top-1 right-1 text-slate-400" title="已看完">
-                      <Check className="w-2.5 h-2.5 stroke-[2.5]" />
-                    </span>
-                  )}
-
-                  {/* 观看中：底部蓝色小进度条 */}
-                  {hasProgress && !ep.isFinished && !isCurrent && (
-                    <span className="absolute bottom-1 inset-x-2 h-0.5 bg-blue-500 rounded-full" />
-                  )}
-                </button>
-              );
-            })}
-
-            {/* 第 51 个快捷更多按钮 */}
-            {hasMoreThan50 && (
+          ) : filteredEpisodes.length === 0 ? (
+            <div className="py-8 text-center text-xs text-slate-500">
+              这个筛选下没有集数。
               <button
                 type="button"
-                onClick={() => setShowAllEpisodesModal(true)}
-                title={`查看剩余 ${totalEpisodes - 50} 集，共 ${totalEpisodes} 集`}
-                className="group relative h-10 rounded-xl bg-blue-50/90 hover:bg-blue-100 border border-dashed border-blue-300 hover:border-blue-500 text-blue-600 flex items-center justify-center text-xs font-bold gap-1 shadow-xs active:scale-95 transition-all cursor-pointer"
+                onClick={() => { setEpisodeFilter('all'); setEpisodePage(0); }}
+                className="ml-1 font-semibold text-blue-600 hover:text-blue-700 cursor-pointer"
               >
-                <MoreHorizontal className="w-4 h-4 group-hover:scale-110 transition-transform" />
+                看全部
               </button>
-            )}
-          </div>
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-5 sm:grid-cols-8 md:grid-cols-10 gap-2">
+                {upfrontEpisodes.map((ep) => (
+                  <EpisodeButton
+                    key={ep.id}
+                    ep={ep}
+                    isCurrent={lastWatchedEp?.id === ep.id}
+                    onPlay={handleStartPlay}
+                    onPrewarm={schedulePrewarm}
+                  />
+                ))}
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+                <span>
+                  显示 {pageStart + 1}–{pageStart + upfrontEpisodes.length} 集 · 本筛选共 {filteredEpisodes.length} 集
+                </span>
+                {hasEpisodePager && (
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={safeEpisodePage === 0}
+                      onClick={() => setEpisodePage((page) => Math.max(0, page - 1))}
+                      className="rounded-lg border border-slate-200/80 bg-white px-2 py-1 font-semibold text-slate-500 shadow-xs transition-colors hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
+                    >
+                      ← 上一页
+                    </button>
+                    <span className="tabular-nums">{safeEpisodePage + 1} / {episodePageCount} 页</span>
+                    <button
+                      type="button"
+                      disabled={safeEpisodePage >= episodePageCount - 1}
+                      onClick={() => setEpisodePage((page) => Math.min(episodePageCount - 1, page + 1))}
+                      className="rounded-lg border border-slate-200/80 bg-white px-2 py-1 font-semibold text-slate-500 shadow-xs transition-colors hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
+                    >
+                      下一页 →
+                    </button>
+                  </div>
+                )}
+              </div>
+            </>
           )}
         </MicaCard>
 
@@ -705,50 +1163,15 @@ export const DetailView: React.FC = () => {
             {/* 弹窗内容：所有集数的数字方块网格 (平整、纯净) */}
             <div className="flex-1 overflow-y-auto p-6">
               <div className="grid grid-cols-5 sm:grid-cols-8 md:grid-cols-10 gap-2 content-start">
-                {filteredModalEpisodes.map((ep) => {
-                  const hasProgress = (ep.watchedSeconds || 0) > 0;
-                  const isCurrent = lastWatchedEp.id === ep.id;
-
-                  return (
-                    <button
-                      key={ep.id}
-                      type="button"
-                      onMouseEnter={() => schedulePrewarm(ep.id)}
-                  onFocus={() => schedulePrewarm(ep.id)}
-                  onClick={() => handleStartPlay(ep)}
-                      title={isCurrent ? `当前播放：第 ${ep.episodeNumber} 集 · ${ep.title}` : `第 ${ep.episodeNumber} 集 · ${ep.title}${ep.isFinished ? ' (已看完)' : ''}`}
-                      className={`group relative h-10 rounded-xl flex items-center justify-center font-bold text-xs shadow-xs active:scale-95 transition-all duration-150 cursor-pointer ${
-                        isCurrent
-                          ? 'bg-blue-600 text-white border border-blue-600 shadow-md shadow-blue-500/25 ring-2 ring-blue-400/40'
-                          : ep.isFinished
-                          ? 'bg-slate-50 hover:bg-blue-50/80 border border-slate-200/70 hover:border-blue-400 text-slate-500 hover:text-blue-600'
-                          : 'bg-white hover:bg-blue-50/80 border border-slate-200/80 hover:border-blue-400 text-slate-700 hover:text-blue-600'
-                      }`}
-                    >
-                      {/* 当前播放集：明确显示播放图标与数字 */}
-                      {isCurrent ? (
-                        <span className="flex items-center gap-1">
-                          <Play className="w-2.5 h-2.5 fill-current shrink-0" />
-                          <span>{ep.episodeNumber}</span>
-                        </span>
-                      ) : (
-                        <span>{ep.episodeNumber}</span>
-                      )}
-
-                      {/* 已看完：右上角清晰勾选小图标 */}
-                      {ep.isFinished && !isCurrent && (
-                        <span className="absolute top-1 right-1 text-slate-400" title="已看完">
-                          <Check className="w-2.5 h-2.5 stroke-[2.5]" />
-                        </span>
-                      )}
-
-                      {/* 观看中：底部蓝色小进度条 */}
-                      {hasProgress && !ep.isFinished && !isCurrent && (
-                        <span className="absolute bottom-1 inset-x-2 h-0.5 bg-blue-500 rounded-full" />
-                      )}
-                    </button>
-                  );
-                })}
+                {filteredModalEpisodes.map((ep) => (
+                  <EpisodeButton
+                    key={ep.id}
+                    ep={ep}
+                    isCurrent={lastWatchedEp?.id === ep.id}
+                    onPlay={handleStartPlay}
+                    onPrewarm={schedulePrewarm}
+                  />
+                ))}
               </div>
             </div>
           </div>

@@ -1137,10 +1137,12 @@ def probe_duration_ms(ffmpeg: str, url: str, key_hex: str | None) -> int:
 #
 # 预设也跟着上调：`ultrafast` 是画质最差的一档（实测 SSIM 只有 0.9431），
 # 换成 `veryfast` 之后 0.9907，体积反而更小 —— 之前那一档是"又慢又糊"。
-_X264_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+_X264_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+              "-vf", "hqdn3d=1.5:1.5:5:6",
               "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-profile:v", "high",
               "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
-_NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p2", "-cq", "23",
+_NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p2", "-cq", "20",
+               "-vf", "hqdn3d=1.5:1.5:5:6",
                "-pix_fmt", "yuv420p", "-profile:v", "high",
                "-g", "48", "-keyint_min", "48", "-sc_threshold", "0"]
 # 低配档：降分辨率（理由见 video_encoder_args 末尾分支）。crf 放宽一档，
@@ -2006,6 +2008,9 @@ def _feed_item(entry) -> dict | None:
         "copyright": str(entry.get("copyright") or "").strip(),
         "brief": str(entry.get("video_desc") or "").strip()[:120],
         "tags": tags[:3],
+        # 条目级内容类型（1=真人短剧 / 1004=漫剧，AI 剧同 1004）。Rust 侧靠它
+        # 做"短剧专区混进漫剧"的逐条兜底过滤（2026-11-07）；缺失时不编造。
+        "contentType": _feed_int(entry.get("content_type"), 0) or None,
         # 短剧的 landpage 有真"今日上新"标记，漫剧/AI 没有（官方也没有更细粒度）。
         "today": "今日上新" in subs,
     }

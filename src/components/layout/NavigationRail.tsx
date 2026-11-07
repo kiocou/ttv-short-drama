@@ -25,7 +25,7 @@ export const NavigationRail: React.FC = () => {
     // Clapperboard = 动漫专区（与该页页头同一个图标）；
     // Bookmark = 追剧收藏（Heart 是"喜欢"，对应的是详情页的点赞语义，不是追更）；
     // History / Settings 本来就准确，不动。
-    { id: 'explore', label: '短剧发现', icon: Flame },
+    { id: 'explore', label: '短剧精选', icon: Flame },
     { id: 'anime', label: '动漫专区', icon: Clapperboard },
     { id: 'favorites', label: '我的追剧', icon: Bookmark },
     { id: 'history', label: '观看历史', icon: History },

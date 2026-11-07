@@ -205,8 +205,13 @@ export const RelatedSeriesSection: React.FC<RelatedSeriesSectionProps> = ({ deta
   const subtitle = useMemo(() => {
     if (isLoading) return '正在按当前剧集找同频道好剧…';
     if (isSwitching) return '正在换一批…';
-    return '同频道的其它热门 · 已排除同系列';
-  }, [isLoading, isSwitching]);
+    // 推荐理由只写数据里真实存在的关联：同频道 + 当前剧的首个题材标签。
+    // 「同演员 / 相似度 98%」这类后端没有给过的结论不编。
+    const tag = detail.tags?.[0]?.trim();
+    return tag
+      ? `同频道热门 · 同题材「${tag}」· 已排除同系列`
+      : '同频道热门 · 已排除同系列';
+  }, [isLoading, isSwitching, detail]);
 
   // 加载中：骨架占住版面（与真实卡片同构），数据到达时布局不跳。
   if (isLoading && !pool) {

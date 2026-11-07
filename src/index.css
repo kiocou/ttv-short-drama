@@ -479,3 +479,59 @@ html[data-theme='dark'] .ttv-input:focus-visible {
    低于 1% 的亮度差在低端显示器上看不出；高于 4% 会变成"贴纸"而不是"浮起"。
    暗色刻意**不用纯黑**（`#000` 在 OLED 上会让整个界面像断电）。
    ========================================================================== */
+
+
+/* ==========================================================================
+   首页货架横滚条（2026-11-05）
+   --------------------------------------------------------------------------
+   首页五块货架改成「平铺卡片 + 只占一行 + 横向滚动」之后，唯一的交互提示就是
+   这条轴。全局滚动条（mica.css）是 6px 深灰，放在内容区里太重；这里只把**横向**
+   那一根压淡一档，纵向滚动条不动。
+
+   scroll-behavior: smooth 只影响程序化滚动（如 rerender 后 scrollTo），
+   鼠标滚轮/触摸板仍然是原生的即时反馈。
+   ========================================================================== */
+.ttv-shelf-rail {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(15, 23, 42, 0.16) transparent;
+  scroll-behavior: smooth;
+}
+
+.ttv-shelf-rail::-webkit-scrollbar {
+  height: 6px;
+}
+
+.ttv-shelf-rail::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.ttv-shelf-rail::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.16);
+  border-radius: 9999px;
+}
+
+.ttv-shelf-rail::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.3);
+}
+
+/* ==========================================================================
+   完全收掉滚动条（常驻题材条，2026-11-07）
+   --------------------------------------------------------------------------
+   与 `.ttv-shelf-rail` 的区别：那边是"压淡但仍可见"（货架横滚需要一根轴提示
+   还能滑），这边是"一根都不留"——题材条只有 32px 高，压在里面的一条 6px 灰线
+   会直接破坏那条的水平基线，而它两侧的箭头已经承担了"还有更多"的提示。
+
+   `scrollbar-width: none`（Firefox）与 `::-webkit-scrollbar{display:none}`
+   （Chromium/WebView2，本项目实际运行环境）两条都要写：Tauri 用的是
+   Chromium，WebView2 走的是后者，但打包脚本里也有非 Chromium 的预览路径。
+   ========================================================================== */
+.ttv-no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.ttv-no-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}

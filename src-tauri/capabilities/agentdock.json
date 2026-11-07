@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "agentdock",
+  "description": "智能体联动悬浮窗（label: agentdock）的能力：无边框透明置顶窗，自己拖动、自己显示，并把点击动作回传主窗口。",
+  "windows": ["agentdock"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus"
+  ]
+}

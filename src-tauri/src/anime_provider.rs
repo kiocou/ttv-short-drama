@@ -48,6 +48,12 @@ fn strip_bfzy_prefix(series_id: &str) -> &str {
 
 pub struct AnimeProvider {
     client: reqwest::Client,
+    /// 「系统代理 / 直连」那条路失败后，用自动探测到的本地代理再走一次的客户端。
+    ///
+    /// 惰性构建、进程内只建一次：健康网络（系统代理开着或直连够快）上一辈子不会
+    /// 初始化，只有真失败过才会去探测端口——探测要挨个连一串本地端口，不该出现在
+    /// 启动路径上。
+    local_proxy: tokio::sync::OnceCell<Option<reqwest::Client>>,
 }
 
 impl AnimeProvider {
@@ -58,7 +64,10 @@ impl AnimeProvider {
         let client = crate::update::with_system_proxy(reqwest::Client::builder())
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36")
             .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(20))
+            // 15 秒而不是 20 秒：这条链路失败后要留出「探测本地代理 + 重试」的预算，
+            // 而直连被限速时（实测约 690 B/s，64 KB 的目录页要 94 秒）等再久也是白等。
+            // 系统代理正常时实测 1.4 秒就够，15 秒的余量对慢速但可用的线路同样够。
+            .timeout(Duration::from_secs(15))
             .pool_idle_timeout(Duration::from_secs(600))
             .pool_max_idle_per_host(4)
             .tcp_nodelay(true)
@@ -90,7 +99,10 @@ impl AnimeProvider {
                 }
             }
         });
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            local_proxy: tokio::sync::OnceCell::new(),
+        })
     }
 
     async fn get_json(&self, query: &str) -> Result<Value, String> {
@@ -125,13 +137,100 @@ impl AnimeProvider {
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             crate::trace::log(format!("[anime-url] {url}"));
         }
-        let response = self
-            .client
-            .get(&url)
+        // 两条链路按「哪条更可能快」排顺序，而不是一味先默认客户端：
+        //
+        //   - 系统代理没开时，本机在跑的代理端口（如果有）排第一。直连这条路对本源
+        //     实测只有约 690 B/s，等它超时要 15 秒；探测 + 走代理是 2 秒级。
+        //   - 系统代理开着时反过来：默认客户端只可能被「代理软件已退出、注册表还留着」
+        //     这种状态坑到，而那种失败是**立刻**返回的（os error 10061），再退到本地端口。
+        let system_proxy_configured = crate::update::system_proxy_address().is_some();
+        if !system_proxy_configured {
+            if let Some(local) = self.local_proxy_client().await {
+                match self.fetch_json_once(local, &url).await {
+                    Ok(json) => return Ok(json),
+                    // 本地代理这一跳失败不覆盖主错误：用户更关心「直连为什么不行」，
+                    // 探到的端口只是旁路尝试。失败原因写进日志备查。
+                    Err(error) => {
+                        crate::trace::log(format!("[anime] 本地代理请求失败: {error}"));
+                    }
+                }
+            }
+        }
+        let primary_error = match self.fetch_json_once(&self.client, &url).await {
+            Ok(json) => return Ok(json),
+            Err(error) => error,
+        };
+        if system_proxy_configured {
+            if let Some(local) = self.local_proxy_client().await {
+                if let Ok(json) = self.fetch_json_once(local, &url).await {
+                    crate::trace::log("[anime] 系统代理不可用，已切换到自动探测的本地代理");
+                    return Ok(json);
+                }
+            }
+        }
+        Err(primary_error)
+    }
+
+    /// 自动探测到的本地代理客户端（惰性、进程内只建一次）。
+    ///
+    /// ## 为什么需要它（2026-11-02 现场）
+    ///
+    /// `new()` 挂代理的唯一依据是注册表 `ProxyEnable`，而用户机器上：
+    ///   - `ProxyEnable = 0`（Clash Verge 的「系统代理」开关是关的）；
+    ///   - 但 `127.0.0.1:7897` 正在监听，走它请求同一个接口 **1.36 秒**完成；
+    ///   - 直连同一个接口：`64700` 字节用了 **94 秒**（约 690 B/s，被限速）。
+    /// 于是任何正常超时都先到，界面报 `error sending request for url (...)`。
+    ///
+    /// 探测放在**失败之后**而不是启动时：健康网络永远走不到这里，也就不为一台
+    /// 不需要代理的机器多付一次端口探测的时间。
+    async fn local_proxy_client(&self) -> Option<&reqwest::Client> {
+        self.local_proxy
+            .get_or_init(|| async {
+                let address = tokio::task::spawn_blocking(crate::update::detect_local_http_proxy)
+                    .await
+                    .ok()
+                    .flatten()?;
+                let proxy = reqwest::Proxy::all(format!("http://{address}")).ok()?;
+                let client = reqwest::Client::builder()
+                    .proxy(proxy)
+                    .user_agent(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+                    )
+                    .connect_timeout(Duration::from_secs(8))
+                    // 比主客户端宽松：代理可能绕远路，但只要通就比被限速的直连快。
+                    .timeout(Duration::from_secs(30))
+                    .pool_idle_timeout(Duration::from_secs(600))
+                    .pool_max_idle_per_host(4)
+                    .tcp_nodelay(true)
+                    .build()
+                    .map_err(|error| {
+                        crate::trace::log(format!("[anime] 本地代理客户端创建失败: {error}"));
+                    })
+                    .ok()?;
+                Some(client)
+            })
+            .await
+            .as_ref()
+    }
+
+    /// 一次「请求 + 解压 + 解析」。`client` 由调用方给：同一条 URL 要能先后试两条链路。
+    async fn fetch_json_once(&self, client: &reqwest::Client, url: &str) -> Result<Value, String> {
+        let response = client
+            .get(url)
             .header("Referer", "https://bfzyapi.com/")
             .send()
             .await
-            .map_err(|error| format!("动漫源请求失败: {error}"))?;
+            .map_err(|error| {
+                // reqwest 原文是 `error sending request for url (...)`：既没说是超时还是
+                // 连不上，也没说是哪条链路。分三档写清楚，用户截图就能定位。
+                if error.is_timeout() {
+                    format!("动漫源请求超时（{url}）")
+                } else if error.is_connect() {
+                    format!("动漫源连接失败（{url}）: {error}")
+                } else {
+                    format!("动漫源请求失败（{url}）: {error}")
+                }
+            })?;
         if !response.status().is_success() {
             return Err(format!("动漫源响应异常: HTTP {}", response.status()));
         }
@@ -656,6 +755,38 @@ mod tests {
         .expect("应解析出列表项");
         assert_eq!(item.id, "bfzy:44871");
         assert_eq!(item.episodes_count, 6);
+    }
+
+    /// 联调：真实请求一次暴风目录，验证「系统代理没开时会自动走本机代理」这条链路。
+    ///
+    /// 默认 `#[ignore]`：它要联网、还要本机真有一个能用的代理端口，放进常规测试集会红。
+    /// 排障时手动跑：
+    ///   cargo test --bin ttv-short-drama anime_catalog_reaches_source -- --ignored --nocapture
+    ///
+    /// 2026-11-02 用它钉死过现场：`ProxyEnable=0` 时直连该接口 64 KB 要 94 秒，
+    /// 走自动探测到的 `127.0.0.1:7897` 只要 1.36 秒。
+    #[tokio::test]
+    #[ignore = "需要联网 + 本机可用的代理端口，只在排障时手动跑"]
+    async fn anime_catalog_reaches_source() {
+        // 强制走兜底源：dmghg DLL 可用时 `catalog` 会走正式源，就测不到这条链路了。
+        std::env::set_var("TTV_ANIME_SOURCE", "bfzy");
+        let provider = AnimeProvider::new().expect("客户端创建失败");
+        let page = provider
+            .catalog(&CatalogFilter {
+                channel: "anime".into(),
+                source: None,
+                category: "全部".into(),
+                audience: "全部".into(),
+                sort: "recommend".into(),
+                keyword: None,
+                page: 1,
+                page_size: 30,
+                cursor: None,
+            })
+            .await
+            .expect("目录请求失败");
+        assert!(page.total > 0, "目录总数应为正数");
+        assert!(!page.items.is_empty(), "第一页不应为空");
     }
 
     /// 暴风源没有评分位，卡片必须给 `None` 而不是 0。

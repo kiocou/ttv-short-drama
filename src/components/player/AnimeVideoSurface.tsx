@@ -3,7 +3,7 @@ import { useAnimePlayer } from '../../stores/useAnimePlayerStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { useSettingsStore } from '../../stores/useSettingsStore';
 import { enterFullscreen, leaveFullscreen } from '../../services/windowFx';
-import { isTauriEnvironment } from '../../services/ipc';
+import { isTauriEnvironment, DANMAKU_APPEARANCE_DEFAULTS } from '../../services/ipc';
 import { PlayerHud } from './PlayerHud';
 import { useBoostKeys } from './useBoostKeys';
 import { BoostToast } from './BoostToast';
@@ -641,6 +641,13 @@ export const AnimeVideoSurface: React.FC = () => {
         title={series?.title ?? '动漫专区'}
         episodeLabel={episodeLabel}
         backTitle="返回详情（Esc）"
+        // 动漫源没有红果弹幕（接口以红果 vid 为键），按钮整块不渲染。
+        // 观感 prop 是必填契约：给默认值 + 空操作占位，面板反正不会渲染。
+        danmakuEnabled={false}
+        onToggleDanmaku={() => undefined}
+        danmakuAvailable={false}
+        danmakuAppearance={DANMAKU_APPEARANCE_DEFAULTS}
+        onDanmakuAppearanceChange={() => undefined}
         position={position}
         duration={duration}
         buffered={buffered}

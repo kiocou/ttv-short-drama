@@ -1,3 +1,4 @@
+use crate::hongguo::catalog::SeasonHit;
 use crate::models::{
     CatalogFilter, CatalogPage, EpisodeItem, PlaybackSession, SeriesDetail, SeriesItem,
     VideoQualityOption,
@@ -5,6 +6,7 @@ use crate::models::{
 use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -801,7 +803,9 @@ impl DramaProvider {
                 let belongs = match search_season(&item.title) {
                     Some((base, season, unit)) => {
                         season == plan.season
-                            && unit == plan.unit
+                            // 比组别而不是字面量：补查「第32季」时，站方可能把结果
+                            // 写成「第三十二期」（同一套编号换了个字）。
+                            && season_unit_group(&unit) == season_unit_group(&plan.unit)
                             && search_text(&base) == plan.base_key
                     }
                     None => false,
@@ -1191,6 +1195,9 @@ fn parse_search_items(data: &Value, channel: &str) -> Vec<SeriesItem> {
     };
     let mut seen = HashSet::new();
     let mut items = Vec::new();
+    // 被「无集数」规则丢掉的卡片数。只在这一轮真的丢过时才记一条日志：
+    // 用户反馈"某部剧搜不到"时，能一眼看出是不是被这条规则误杀。
+    let mut skipped_without_episodes = 0usize;
     for entry in list {
         let Some(video) = entry
             .get("video_data")
@@ -1207,6 +1214,23 @@ fn parse_search_items(data: &Value, channel: &str) -> Vec<SeriesItem> {
         }
         let title = string_field(video, &["series_title", "title", "name"]);
         if title.trim().is_empty() {
+            continue;
+        }
+        // 红果搜索卡片一律要求 `episode_cnt >= 1`，两种不合格形态都丢：
+        //
+        // - 字段存在但 <= 0：还没上架的季。点开是一集都没有的空详情，
+        //   用户只会觉得"页面坏了"；
+        // - 字段缺失：**根本不是剧集卡**，而是「盘点/合集」类内容卡。
+        //   实测 7661183456205947417（「盘点超燃穿越漫剧，烬九州系列太上头了」，
+        //   搜索结果第 2 条）的详情与分集接口都回 `101000 content_gone`，
+        //   点进去必然空白——这正是"未上架点开没内容"的另一半真实来源。
+        //
+        // 正常短剧卡片实测 100% 带 `episode_cnt`（三个页面抓取样本里没有 0 值、
+        // 也没有缺键），所以"缺失即非剧集"在真实数据上成立。动漫源（dmghg）
+        // 走的是另一条 provider 路径，不经过这个函数，不会被误杀。
+        let episode_count = number_field(video, &["episode_cnt"]).unwrap_or(0);
+        if episode_count == 0 {
+            skipped_without_episodes += 1;
             continue;
         }
         let tags = video
@@ -1232,7 +1256,7 @@ fn parse_search_items(data: &Value, channel: &str) -> Vec<SeriesItem> {
             } else {
                 "drama".into()
             },
-            episodes_count: number_field(video, &["episode_cnt", "episode_total_cnt"]).unwrap_or(0),
+            episodes_count: episode_count,
             latest_episode_title: None,
             tags,
             origin: "红果官网搜索".into(),
@@ -1242,11 +1266,57 @@ fn parse_search_items(data: &Value, channel: &str) -> Vec<SeriesItem> {
             rating: parse_rating(video),
         });
     }
+    // 只在真的丢过时记一条：用户反馈"某部剧搜不到"时，能一眼看出是不是被
+    // 这条规则误杀。逐条记录会把日志刷满，反而看不出结论。
+    if skipped_without_episodes > 0 {
+        crate::trace::log(format!(
+            "[搜索] 丢弃 {skipped_without_episodes} 条无集数卡片（未上架 / 非剧集）"
+        ));
+    }
     items
 }
 
-/// 分季补齐的硬上限：每补一季是一次真实的 HTTP 回查。
+/// `catalog_series_seasons` 命令的返回项：系列剧里的一季。
 ///
+/// 为什么单独定义而不是直接序列化 `hongguo::catalog::SeasonHit`：
+/// 后端内部类型带的是接口原样字段，而前端要的是"拿到就能画"的形态
+/// （`seriesId` / `seasonIndex` / `disablePlay`），且这份契约要被前端
+/// TypeScript 稳定依赖，不能随着内部字段调整而抖动。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesSeason {
+    pub series_id: String,
+    pub title: String,
+    pub cover: String,
+    /// 季号，**只**来自接口的 `season_index`。
+    ///
+    /// 绝不能从标题解析：同一系列的标题写法并不统一（实测《烬九州》第 35 季
+    /// 写作「烬九州第三十五期」，尾部是「期」不是「季」），按标题猜号必然漏季。
+    pub season_index: i64,
+    /// 原始集数，不做任何兜底，供前端出"未上架 / 共 N 集"这类置灰文案。
+    pub episode_count: u32,
+    /// 是否不可播 = 接口 `disable_play` **或** 未上架（集数为 0）。
+    ///
+    /// 为什么合并：对用户而言"剧方锁了"和"还没上架"是同一个结果——点开没有
+    /// 内容。区分信息由 `episode_count == 0` 保留，文案照样写得细。
+    pub disable_play: bool,
+}
+
+impl From<SeasonHit> for SeriesSeason {
+    fn from(hit: SeasonHit) -> Self {
+        let unpublished = hit.episode_count == 0;
+        Self {
+            series_id: hit.series_id,
+            title: hit.title,
+            cover: hit.cover,
+            season_index: hit.season_index,
+            episode_count: hit.episode_count,
+            disable_play: hit.disable_play || unpublished,
+        }
+    }
+}
+
+/// 分季补齐的硬上限：每补一季是一次真实的 HTTP 回查。///
 /// 参考实现那边一次搜索最多回查 32 次（`hongguoSearchSeasonQueries`），因为它是
 /// 常驻进程、有单飞去重和 5 分钟结果缓存，回查几乎不花钱；这里的搜索是用户在
 /// 搜索框敲完字就干等的主链路，一个来回就是页面转圈。这里先按 2 次封顶，
@@ -1357,17 +1427,43 @@ fn compare_season_order(left: &str, right: &str) -> Ordering {
     else {
         return Ordering::Equal;
     };
-    if left_unit != right_unit || search_text(&left_base) != search_text(&right_base) {
+    if season_unit_group(&left_unit) != season_unit_group(&right_unit)
+        || search_text(&left_base) != search_text(&right_base)
+    {
         return Ordering::Equal;
     }
     left_season.cmp(&right_season)
 }
 
-/// 解析标题尾部的「第N季 / 第N部」，返回 `(base, 季号, 量词)`。
+/// 量词的**组别**：同组的季号才互相可比、可补查。
+///
+/// 与前端 `seasonLabel.ts::seasonUnitGroup` 逐字对齐（两处的"同系列"判定必须
+/// 一致，否则会出现"后端补了那一季、前端认不出来"的错位）。
+///
+/// 为什么「季」与「期」同组：站方对同一系列会混用两个字 —— 实测《烬九州》第 1~31
+/// 季写作「第N季」，第 32~35 季写作「第三十二期」…「第三十五期」，但它们就是连续
+/// 的第 32~35 季（plan 接口的 `season_index` 也确实是 32..35）。分成两组的话，
+/// 「第三十五期」永远排不进「第N季」那一串。
+///
+/// 为什么「部」单独一组：「部」是另一种分卷习惯（《镇世无双第三部》），与「季」是
+/// 两套独立编号。并组会让「第2部」排到「第2季」旁边，用户看到两套编号撞在一起。
+fn season_unit_group(unit: &str) -> &'static str {
+    if unit == "部" {
+        "volume"
+    } else {
+        "season"
+    }
+}
+
+/// 解析标题尾部的「第N季 / 第N部 / 第N期」，返回 `(base, 季号, 量词)`。
 ///
 /// 只认**尾部**后缀：「第三季」这种本身就叫这个名字的片子没有 base，不构成系列，
 /// 认下来只会造出一个 base 为空的组把补齐带偏。base 两端的空白与标点要摘掉
 /// （实测有「《聚宝仙盆》第二季」这类写法），base 才等于用户会输入的剧名。
+///
+/// 「期」是第三种量词（2026-10-29，实测《烬九州》第 32~35 季写作「第N期」）。
+/// 认得它只影响**回退链路**（搜索排序与分季补查）；权威链路走
+/// `catalog_series_seasons` 拿结构化 `season_index`，根本不解析标题。
 fn search_season(title: &str) -> Option<(String, u32, String)> {
     let chars: Vec<char> = title
         .trim()
@@ -1376,7 +1472,9 @@ fn search_season(title: &str) -> Option<(String, u32, String)> {
         .chars()
         .collect();
     let unit = chars.last().copied()?;
-    if unit != '季' && unit != '部' {
+    // 「期」与「季」同义，见 `season_unit_group`：实测《烬九州》第 32~35 季就写作
+    // 「第三十二期」…「第三十五期」。不认它，那几季在搜索链路上等于不存在。
+    if unit != '季' && unit != '部' && unit != '期' {
         return None;
     }
     let mut label_end = chars.len() - 1;
@@ -1392,19 +1490,35 @@ fn search_season(title: &str) -> Option<(String, u32, String)> {
         return None;
     }
     let mut marker = start;
+    // 回跳空白时记一笔：**空白本身就是一种分隔符**（「烬九州 三十四季」），
+    // 回跳之后 `chars[marker - 1]` 已经指向数字前面的字，否则会误判成"没有分隔"。
+    let mut spaced = false;
     while marker > 0 && chars[marker - 1].is_whitespace() {
         marker -= 1;
+        spaced = true;
     }
-    if marker == 0 || chars[marker - 1] != '第' {
+    // 季号前缀「第」：有它是最常见的写法，没有也认 —— 但要收边界。
+    //
+    // 站方确实存在漏「第」的标题（实测《烬九州》系列里「烬九州：三十四季」，
+    // id 7700456247924886553）。不认它，这条在详情页会被 `currentSeasonLabel`
+    // 兜底成"第 1 季 + base=整个标题"，系列剧弹窗的排除与接续排序全错。
+    //
+    // 放过它的条件只有一个：数字紧邻的**前一个字符是分隔符**（或隔了空白）。
+    // 这条闸门挡住的是「三十四季」（base 为空）与「第二季的逆袭」（尾部不是量词）
+    // 这类本该被拒的标题 —— 放宽成"任意位置出现数字+量词"就会把无关剧并进系列。
+    let has_di = marker > 0 && chars[marker - 1] == '第';
+    if !has_di && !(spaced || marker > 0 && is_season_separator(chars[marker - 1])) {
         return None;
     }
     let number = parse_season_number(&chars[start..label_end])?;
     if !(1..=SEARCH_SEASON_LIMIT).contains(&number) {
         return None;
     }
+    // base 到「第」之前；没有「第」时到数字之前（分隔符由下面的 trim 摘掉）。
+    let base_end = if has_di { marker - 1 } else { marker };
     // base 两端的标点都摘掉（实测有「《聚宝仙盆》第二季」这类写法）：《》是版式装饰
     // 不属于剧名，留在 base 里会让分季补齐拼出「《聚宝仙盆第四季」」这种查询词。
-    let base: String = chars[..marker - 1]
+    let base: String = chars[..base_end]
         .iter()
         .collect::<String>()
         .trim_matches(|c: char| !c.is_alphanumeric())
@@ -1413,6 +1527,17 @@ fn search_season(title: &str) -> Option<(String, u32, String)> {
         return None;
     }
     Some((base, number, unit.to_string()))
+}
+
+/// 季号与剧名之间可以出现的分隔符（缺「第」时用来判定"这是后缀不是剧名的一部分"）。
+///
+/// **与前端 `seasonLabel.ts::SEASON_SEPARATORS` 逐字对齐**：两处判出来的"同系列"
+/// 必须一致，否则会出现"后端补了那一季、前端认不出来"的错位。
+/// 空白不在此表里 —— 它由 `search_season` 的回跳逻辑单独处理（`spaced`）。
+const SEASON_SEPARATORS: [char; 9] = ['：', ':', '·', '-', '—', '｜', '|', '/', '、'];
+
+fn is_season_separator(ch: char) -> bool {
+    SEASON_SEPARATORS.contains(&ch)
 }
 
 fn is_season_digit(ch: char) -> bool {
@@ -1570,7 +1695,12 @@ fn season_fill_plan(items: &[SeriesItem], keyword: &str) -> Vec<SeasonFill> {
         if !key.contains(&query_key) {
             continue;
         }
-        let position = match groups.iter().position(|g| g.key == key && g.unit == unit) {
+        // 按**量词组别**归组（季/期同组、部独立）：混用「第N季」与「第N期」的
+        // 同一系列必须进同一个组，否则两边的 known 各自不成串，补查序号全乱。
+        let position = match groups
+            .iter()
+            .position(|g| g.key == key && season_unit_group(&g.unit) == season_unit_group(&unit))
+        {
             Some(position) => position,
             None => {
                 groups.push(SeasonGroup {
@@ -2153,9 +2283,10 @@ mod tests {
     use super::{
         cached_theme_page, catalog_page_path, detect_total_pages, find_pagination_value,
         next_season_to_fill, normalize_playback_url, paginate_filtered, parse_catalog_cards,
-        parse_rating, parse_router_script, parse_season_number, parse_theme_routes,
-        rank_search_items, search_season, search_text, season_fill_plan, store_theme_page,
-        title_search_rank, DramaProvider, SeriesItem, Value,
+        parse_rating, parse_router_script, parse_search_items, parse_season_number,
+        parse_theme_routes, rank_search_items, search_season, search_text, season_fill_plan,
+        season_unit_group, store_theme_page, title_search_rank, DramaProvider, SeasonHit,
+        SeriesItem, SeriesSeason, Value,
     };
     use crate::models::CatalogFilter;
     use std::collections::HashSet;
@@ -2293,6 +2424,53 @@ mod tests {
         assert_eq!(search_season("某剧第十十季"), None);
         assert_eq!(search_season("第三季"), None);
         assert_eq!(search_season("聚宝仙盆"), None);
+    }
+
+    /// 「期」是第三种量词，且与「季」同组。
+    ///
+    /// 实测数据（plan 接口《烬九州》第 32~35 季）：标题写作「第三十二期」…
+    /// 「第三十五期」，`season_index` 却是 32..35 —— 同一套连续编号换了个字。
+    /// 旧实现只认「季/部」，这 4 季在搜索链路上会被当成"无季号条目"，
+    /// 既排不进同系列、也补不到，35 季的系列只能露出 31 季。
+    #[test]
+    fn season_unit_groups_qi_with_ji_but_not_bu() {
+        assert_eq!(
+            search_season("烬九州第三十五期"),
+            Some(("烬九州".to_string(), 35, "期".to_string()))
+        );
+        // 「烬九州二十六季」是 plan 接口 index=26 的**真实标题**：它连「第」字都漏了。
+        // 这里刻意不认这种写法 —— 要认它就得放宽"必须有第"这条边界，而那条边界正是
+        // 把《第三季》这类以量词结尾的真剧名挡在外面的东西（下一条断言）。这类变体
+        // 交给权威链路（`catalog_series_seasons` 的 `season_index`）兜，回退链路认不出
+        // 只是少补一季，不会补错季。
+        assert_eq!(search_season("烬九州二十六季"), None);
+        assert_eq!(season_unit_group("季"), season_unit_group("期"));
+        assert_ne!(season_unit_group("季"), season_unit_group("部"));
+    }
+
+    /// 缺「第」但带分隔符的写法要认；没有分隔符的仍然拒绝。
+    ///
+    /// 「烬九州：三十四季」是站方真实标题（id 7700456247924886553）。不认它，
+    /// 详情页 `currentSeasonLabel` 会把它兜底成"第 1 季 + base=整个标题"，
+    /// 系列剧弹窗的排除与接续排序全错。边界靠分隔符闸门守住：
+    /// 「三十四季」base 为空、没有分隔符的同样为 None。
+    #[test]
+    fn search_season_accepts_separator_without_di() {
+        assert_eq!(
+            search_season("烬九州：三十四季"),
+            Some(("烬九州".to_string(), 34, "季".to_string()))
+        );
+        assert_eq!(
+            search_season("烬九州 三十四季"),
+            Some(("烬九州".to_string(), 34, "季".to_string()))
+        );
+        assert_eq!(
+            search_season("烬九州·三十四期"),
+            Some(("烬九州".to_string(), 34, "期".to_string()))
+        );
+        // 闸门：没有「第」也没有分隔符 → 不认（否则"剧名里恰好带数字+季"会被并进系列）。
+        assert_eq!(search_season("三十四季"), None);
+        assert_eq!(search_season("第二季的逆袭"), None);
     }
 
     /// `parse_season_number` 的"拒绝而不是凑"：畸形写法必须返回 `None`，
@@ -2999,5 +3177,63 @@ mod tests {
             !json.contains("rating"),
             "rating 为 None 时不该输出占位 0：{json}"
         );
+    }
+
+    /// 搜索卡片过滤：红果列表一律要求 `episode_cnt >= 1`。
+    ///
+    /// 三条断言对应两条真实根因（都实测过）：
+    /// - `episode_cnt: 0` → 未上架的季，点开是一集都没有的空详情；
+    /// - **缺** `episode_cnt` → 根本不是剧集卡，而是「盘点/合集」类内容卡
+    ///   （实测 7661183456205947417「盘点超燃穿越漫剧，烬九州系列太上头了」
+    ///   详情/分集都回 101000 content_gone）；
+    /// - `episode_cnt: 115` → 正常剧集卡，必须留着。
+    #[test]
+    fn search_items_requires_positive_episode_count() {
+        let data: Value = serde_json::from_str(
+            r#"{"searchList":[
+                {"video_data":{"series_id":"1","series_title":"未上架季","episode_cnt":0}},
+                {"video_data":{"series_id":"2","series_title":"盘点合集"}},
+                {"video_data":{"series_id":"3","series_title":"正常剧","episode_cnt":115}}
+            ]}"#,
+        )
+        .unwrap();
+        let items = parse_search_items(&data, "drama");
+        assert_eq!(items.len(), 1, "只有正常剧该留下：{items:?}");
+        assert_eq!(items[0].id, "3");
+        assert_eq!(items[0].episodes_count, 115);
+    }
+
+    /// `disablePlay` 的合并语义：接口锁播 **或** 未上架（集数 0）都算不可播，
+    /// 而原始集数照旧带出去，前端才能写出"未上架"与"暂不可播"两种文案。
+    #[test]
+    fn series_season_merges_unpublished_into_disable_play() {
+        let normal = SeriesSeason::from(SeasonHit {
+            series_id: "1".into(),
+            episode_count: 12,
+            disable_play: false,
+            season_index: 1,
+            ..Default::default()
+        });
+        assert!(!normal.disable_play, "正常季不该被置灰");
+        assert_eq!(normal.season_index, 1);
+
+        let locked = SeriesSeason::from(SeasonHit {
+            series_id: "2".into(),
+            episode_count: 12,
+            disable_play: true,
+            season_index: 2,
+            ..Default::default()
+        });
+        assert!(locked.disable_play, "接口锁播要透传");
+
+        let unpublished = SeriesSeason::from(SeasonHit {
+            series_id: "3".into(),
+            episode_count: 0,
+            disable_play: false,
+            season_index: 3,
+            ..Default::default()
+        });
+        assert!(unpublished.disable_play, "未上架也算不可播");
+        assert_eq!(unpublished.episode_count, 0, "原始集数必须保留");
     }
 }

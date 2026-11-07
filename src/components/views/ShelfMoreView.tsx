@@ -122,14 +122,14 @@ const ShelfShell: React.FC<{
           type="button"
           onClick={onBack}
           className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-white/85 hover:bg-white text-slate-700 hover:text-blue-600 shadow-xs border border-slate-200/70 backdrop-blur-md transition-all text-xs font-semibold cursor-pointer active:scale-95"
-          title="返回发现精选"
+          title="返回短剧精选"
         >
           <ArrowLeft className="w-4 h-4" />
-          <span>返回发现</span>
+          <span>返回精选</span>
         </button>
 
         <span className="truncate text-xs text-slate-400">
-          发现精选 <span className="mx-1.5 text-slate-300">/</span>
+          短剧精选 <span className="mx-1.5 text-slate-300">/</span>
           <span className="font-semibold text-slate-700">{meta.title} · 更多</span>
         </span>
       </div>

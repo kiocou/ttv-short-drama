@@ -103,13 +103,25 @@ pub struct GuoSource {
     pub adult: bool,
 }
 
-pub const GUO_SOURCES: &[GuoSource] = &[
-    // 实测：2044 条全为真人短剧（都市/逆袭/爱情/年代，有剧情简介、几十至上百集）。
-    GuoSource {
-        id: "hongguo",
-        name: "红果短剧 / 漫剧",
-        adult: false,
-    },
+pub const GUO_SOURCES: &[GuoSource] = &[GuoSource {
+    id: "hongguo",
+    name: "红果短剧 / 漫剧",
+    adult: false,
+}];
+
+/// 已下架的 18 个站源，**只用于兼容旧数据**：显示名与 18+ 门闩。
+///
+/// ## 为什么不物理删除（2026-11-02）
+///
+/// 产品决策：除红果与动漫之外的来源全部移除，后续来源改由插件系统加载
+/// （见 `source_registry`）。但历史/收藏里仍可能存着 `guo:<源>:<id>` 形式的旧 id：
+///   - 没有名字表，界面只能显示"外部站源"，用户看不出这条记录原来是什么；
+///   - 18+ 门闩按 id 判定，删掉 adult 标记等于给那些旧 id **开后门**
+///     （`source_is_adult` 认不出 → 当成普通源放行）。
+/// 这两项兼容职责留在这一张表里；`GUO_SOURCES` 收敛为唯一内置源。
+///
+/// 这些 id **不再**出现在源选择器、目录聚合、搜索合并与体检里。
+pub const LEGACY_GUO_SOURCES: &[GuoSource] = &[
     // 实测 30 条：多数"黄豆原创"（真人成人），但含"国漫"分类的少量动漫条目。
     GuoSource {
         id: "huangdou",
@@ -229,6 +241,7 @@ pub const GUO_SOURCES: &[GuoSource] = &[
 pub fn source_is_adult(source: &str) -> bool {
     GUO_SOURCES
         .iter()
+        .chain(LEGACY_GUO_SOURCES)
         .find(|item| item.id == source)
         .map(|item| item.adult)
         .unwrap_or(false)
@@ -1627,6 +1640,7 @@ fn data_qualities(value: &Value) -> Vec<VideoQualityOption> {
 fn source_name(source: &str) -> &'static str {
     GUO_SOURCES
         .iter()
+        .chain(LEGACY_GUO_SOURCES)
         .find(|item| item.id == source)
         .map(|item| item.name)
         .unwrap_or("外部站源")
@@ -1714,7 +1728,18 @@ mod tests {
             );
         }
         // 两条必须同时成立：既没有漏标 18+ 源，也没有把常规源标进去。
-        assert_eq!(super::GUO_SOURCES.len(), 19);
+        //
+        // 2026-11-02：内置源收敛为红果一个，其余 18 个只在兼容表里做「旧 id 显示名
+        // + 18+ 门闩」两件事。所以这里断言的是两表之和——下架不等于把登记抹掉，
+        // 少一项都意味着历史 id 解析不出名字、或者旧 18+ id 从此绕开门闩。
+        assert_eq!(super::GUO_SOURCES.len(), 1);
+        assert_eq!(super::GUO_SOURCES[0].id, "hongguo");
+        assert_eq!(super::LEGACY_GUO_SOURCES.len(), 18);
+        assert_eq!(
+            super::GUO_SOURCES.len() + super::LEGACY_GUO_SOURCES.len(),
+            19,
+            "旧清单总数为 19，少一个说明下架时误删"
+        );
     }
 
     /// 未知 id 与空串都不是 18+ 源（见 `source_is_adult` 的方向性注释）。

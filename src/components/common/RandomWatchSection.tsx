@@ -9,6 +9,7 @@ import {
   Star,
 } from 'lucide-react';
 import { ipcService, coverResolver } from '../../services/ipc';
+import { ShelfBadge } from './ShelfBadge';
 import {
   formatHeatValue,
   getSeriesTeaser,
@@ -501,9 +502,8 @@ export const RandomWatchSection: React.FC<RandomWatchSectionProps> = ({
       {/* 顶部 Header：标题、副标题、换一批操作 */}
       <div className="flex items-center justify-between gap-2.5 pl-2">
         <div className="flex items-center gap-2">
-          <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-violet-500/10 text-violet-600">
-            <Sparkles className="h-3.5 w-3.5" />
-          </span>
+          {/* 与首页货架标题同一套渐变徽章（ShelfBadge）：紫色 = 随机推荐语义 */}
+          <ShelfBadge icon={Sparkles} tone="violet" />
           <span className="text-sm font-extrabold tracking-tight text-slate-800 sm:text-base">
             猜你喜欢
           </span>

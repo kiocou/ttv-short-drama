@@ -211,12 +211,27 @@ pub const PATH_SERIES_BATCH: &str = "/novel/player/multi_video_detail/player/v1"
 pub const PATH_PLAYBACK: &str = "/novel/player/video_model/v1/";
 pub const PATH_ALBUM: &str = "/novel/player/album_detail/v1/";
 pub const PATH_SUGGEST: &str = "/reading/bookapi/search/suggest/v1/";
+/// 「同系列各季」聚合接口（App 里点开系列剧弹窗时用的那一条）。
+///
+/// 为什么必须是它：搜索页与详情页一次只给**当前在推**的那一季，
+/// 一部 35 季的剧在网页链路上只会露出 1 条，靠标题正则回查既慢又会漏
+/// （`SEARCH_SEASON_MAX_REQUESTS` 只给 2 次）。这个接口一次返回整组季。
+pub const PATH_PLAN: &str = "/reading/bookapi/plan/v1/";
+/// `PATH_PLAN` 的 `from` 取值：单列「同一 IP 系列」（系列剧弹窗的入口）。
+pub const PLAN_FROM_SERIES_SEASONS: &str = "single_col_same_ip_series";
 pub const PATH_CUE: &str = "/reading/bookapi/search/cue/v1/";
 pub const PATH_RANK: &str = "/reading/ugc/rank_book/get/v1/";
 pub const PATH_SUBSCRIBE_LIST: &str = "/reading/user/subscribe/list/v1/";
 pub const PATH_REGISTER: &str = "/service/2/device_register/";
 pub const PATH_SHORT_FILTER: &str = "/reading/distribution/category/landpage/v1/";
-pub const PATH_RANK_CELLS: &str = "/reading/bookapi/bookmall/cell/change/v1/";
+pub const PATH_RANK_ACTIVITY: &str = "/novel/reading/activity_api/get_rank_activity/v1/";
+pub const PATH_PROFILE: &str = "/reading/user/profile/get/v1/";
+/// 某人作品页的路径模板，`{}` 处填用户 id（与 Go 的 `PathUserWorks` 一致）。
+pub const PATH_USER_WORKS_TEMPLATE: &str = "/novel/commentapi/user/profile/{}/v1";
+
+/// 随 app 发布的星粉榜默认活动与榜单 id（与 Go 的 `DefaultRankActivity` 一致）。
+pub const DEFAULT_RANK_ACTIVITY: &str = "hongguo_actor_fans_ranklist_activity";
+pub const DEFAULT_RANK_LIST: &str = "hongguo_actor_fans_ranklist";
 
 /// 短剧排行榜所在的 bookmall cell。
 pub const SHORT_RANK_CELL: &str = "7470092475068071998";

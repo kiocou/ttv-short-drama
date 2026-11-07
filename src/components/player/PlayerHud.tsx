@@ -18,8 +18,47 @@ import {
   Layers,
   Lock,
   LockOpen,
+  SlidersHorizontal,
   Sparkles,
+  Subtitles,
 } from 'lucide-react';
+import { DANMAKU_APPEARANCE_DEFAULTS } from '../../services/ipc';
+
+/**
+ * 弹幕观感设置（渲染层 `DanmakuOverlay` 消费的子集）。
+ *
+ * 类型定义放这里而不是 types/：它是 PlayerControls → PlayerHud → DanmakuOverlay
+ * 这条**呈现链**的内部契约，`UserSettings` 才是跨页面的持久化契约——面板读写
+ * 的永远是 `updateSettings`，这里只收拢渲染需要的字段。
+ */
+export interface DanmakuSettings {
+  danmakuArea: number;
+  danmakuOpacity: number;
+  danmakuFontScale: number;
+  danmakuSpeed: number;
+  danmakuFont: string;
+  danmakuColor: string;
+  danmakuBold: boolean;
+  danmakuStroke: 'heavy' | 'outline' | 'shadow';
+}
+
+/**
+ * 弹幕颜色预设（面板色板，最后第 10 格是自定义取色器）。
+ *
+ * 白是默认（与引入设置前的观感一致）；其余取自经典弹幕色板（红/橙/金/绿/青/
+ * 蓝/紫/粉），视频画面上这些饱和色都能压住底色。
+ */
+const DANMAKU_COLOR_PRESETS: ReadonlyArray<{ label: string; value: string }> = [
+  { label: '白色', value: '#FFFFFF' },
+  { label: '红色', value: '#FE0302' },
+  { label: '橙色', value: '#FF7204' },
+  { label: '金色', value: '#FFD302' },
+  { label: '绿色', value: '#00CD00' },
+  { label: '青色', value: '#00E5E5' },
+  { label: '蓝色', value: '#00A1FF' },
+  { label: '紫色', value: '#B388FF' },
+  { label: '粉色', value: '#FF80AB' },
+];
 
 /**
  * 播放进度条。
@@ -147,6 +186,36 @@ export interface PlayerHudProps {
    */
   vsrEnabled: boolean;
   /**
+   * 弹幕开关的当前状态（唯一真相是 `settings.danmakuEnabled`）。
+   *
+   * 与 `vsrEnabled` 同理：HUD 是纯 props 层，不读 store。
+   */
+  danmakuEnabled: boolean;
+  /** 用户拨动弹幕开关。写设置由调用方负责（`updateSettings`）。 */
+  onToggleDanmaku: (enabled: boolean) => void;
+  /**
+   * 当前播放源是否支持弹幕。
+   *
+   * 红果弹幕接口以**红果 vid** 为键（`group_id` 必须是那集的数字 id），
+   * 动漫源是另一套 id 体系，接不进来。传 `false` 时按钮整块不渲染 ——
+   * 显示一个点了没反应的按钮，比没有这个按钮更糟。
+   *
+   * 默认 `true`（短剧/漫剧）。
+   */
+  danmakuAvailable?: boolean;
+  /**
+   * 弹幕观感设置（显示区域/不透明度/字号/速度/字体/粗体/描边）。
+   *
+   * 由 `PlayerControls` 从设置仓读好传入——HUD 不读 store（文件头边界），
+   * 面板的每一根滑条都渲染这份值的当下快照。
+   */
+  danmakuAppearance: DanmakuSettings;
+  /**
+   * 面板改观感。**传 Partial 就行**：调用方（`PlayerControls`）接到后走
+   * `updateSettings` 落库，滑条拖到哪、弹幕立刻按新值重排。
+   */
+  onDanmakuAppearanceChange: (partial: Partial<DanmakuSettings>) => void;
+  /**
    * 用户拨动 VSR 开关。
    *
    * 调用方负责真正的写设置与"让当前这一集立即走新链路"：短剧侧是
@@ -205,6 +274,11 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   qualityOptions,
   vsrEnabled,
   onToggleVsr,
+  danmakuEnabled,
+  onToggleDanmaku,
+  danmakuAvailable = true,
+  danmakuAppearance,
+  onDanmakuAppearanceChange,
   vsrAppliesToSource = true,
   onToggleLock,
   onEnterPip,
@@ -228,6 +302,8 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
   const [showEnhanceMenu, setShowEnhanceMenu] = useState(false);
+  // 弹幕设置面板：与增强面板同一套"浮层对话"模式（点按钮开、点外面/Esc 关）。
+  const [showDanmakuSettings, setShowDanmakuSettings] = useState(false);
 
   const controlsRef = useRef<HTMLDivElement | null>(null);
 
@@ -239,6 +315,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
         setShowSpeedMenu(false);
         setShowVolumeSlider(false);
         setShowEnhanceMenu(false);
+        setShowDanmakuSettings(false);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
@@ -252,8 +329,19 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
       setShowSpeedMenu(false);
       setShowVolumeSlider(false);
       setShowEnhanceMenu(false);
+      setShowDanmakuSettings(false);
     }
   }, [isLocked]);
+
+  // Esc 收起弹幕设置面板（它是 role="dialog"，用户会预期 Esc 能退出）。
+  useEffect(() => {
+    if (!showDanmakuSettings) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowDanmakuSettings(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showDanmakuSettings]);
 
   /**
    * Esc 收起增强浮层。
@@ -460,6 +548,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                     // 四个浮层必须互斥：增强浮层宽 292px，叠在倍速/清晰度之上时
                     // 会把对方整个盖住（同 z-index 50，DOM 靠后者在上）。
                     setShowEnhanceMenu(false);
+                    setShowDanmakuSettings(false);
                   }}
                   onToggleMute={onToggleMute}
                   onVolumeChange={(v) => onVolumeChange(v)}
@@ -477,6 +566,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowSpeedMenu(false);
                       setShowVolumeSlider(false);
                       setShowEnhanceMenu(false);
+                      setShowDanmakuSettings(false);
                     }}
                     title={qualitySelectable ? '切换清晰度' : '当前播放源仅提供单一画质'}
                     className="btn-text-action"
@@ -487,7 +577,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                   </button>
 
                   {qualitySelectable && (
-                    <div className={`crystal-flyout crystal-surface${showQualityMenu ? ' open' : ''}`}>
+                    <div className={`crystal-flyout crystal-surface ttv-flyout-fixed${showQualityMenu ? ' open' : ''}`}>
                       {resolvedQualities.map((opt, index) => (
                         <button
                           key={`${opt.value}-${index}`}
@@ -515,6 +605,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowQualityMenu(false);
                       setShowVolumeSlider(false);
                       setShowEnhanceMenu(false);
+                      setShowDanmakuSettings(false);
                     }}
                     className={`btn-text-action${effectivePlaybackRate !== null ? ' is-boosting' : ''}`}
                     title="切换播放倍速（长按 ← / → 临时加速，加速中按 ↑ / ↓ 换档）"
@@ -526,7 +617,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                         : `${playbackRate}x`}
                   </button>
 
-                  <div className={`crystal-flyout crystal-surface${showSpeedMenu ? ' open' : ''}`}>
+                  <div className={`crystal-flyout crystal-surface ttv-flyout-fixed${showSpeedMenu ? ' open' : ''}`}>
                     {SPEED_OPTIONS.map((rate) => (
                       <button
                         key={rate}
@@ -565,6 +656,221 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                   关掉（crystal.css 第 122 行那条规则），所以这里不会把视频拉进
                   合成器、也不会再次踩到"增强失效"那个坑（不变量 26）。
                 */}
+                {/* 弹幕开关。
+                    做成一次点击即切换的按钮（而不是再开一个浮层）：它是一个
+                    二元开关，没有"档位"可调，套一层浮层只是多两次点击。
+                    视觉沿用「增强」那套 `btn-text-action` + `is-on`，
+                    开启态与增强按钮完全一致，用户不用学第二套状态语言。 */}
+                {danmakuAvailable && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onToggleDanmaku(!danmakuEnabled);
+                      // 关弹幕 = 观感面板失去存在意义：跟着收起，避免悬空面板。
+                      if (danmakuEnabled) setShowDanmakuSettings(false);
+                    }}
+                    className={`btn-text-action${danmakuEnabled ? ' is-on' : ''}`}
+                    title={danmakuEnabled ? '关闭弹幕' : '开启弹幕（红果真实弹幕）'}
+                    aria-pressed={danmakuEnabled}
+                  >
+                    <Subtitles className="w-3.5 h-3.5" />
+                    <span>弹幕</span>
+                  </button>
+                )}
+
+                {/*
+                  弹幕设置入口：**只在弹幕开启时渲染**（关掉弹幕连面板一起消失，
+                  按钮序列回到原样）。滑条/字体/描边实时写设置仓，弹幕层按新值
+                  当下重排，不需要确认按钮。
+                */}
+                {danmakuAvailable && danmakuEnabled && (
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowDanmakuSettings(prev => !prev);
+                        setShowQualityMenu(false);
+                        setShowSpeedMenu(false);
+                        setShowEnhanceMenu(false);
+                        setShowVolumeSlider(false);
+                      }}
+                      className={`btn-text-action${showDanmakuSettings ? ' is-on' : ''}`}
+                      title="弹幕设置"
+                      aria-haspopup="dialog"
+                      aria-expanded={showDanmakuSettings}
+                      aria-controls="ttv-danmaku-settings"
+                    >
+                      <SlidersHorizontal className="w-3.5 h-3.5" />
+                    </button>
+
+                    <div
+                      id="ttv-danmaku-settings"
+                      // 与增强面板同一套材质与开合约定：hudShown 一起判，避免
+                      // HUD 淡出后浮层仍吃点击（见增强面板那条长注释）。
+                      className={`crystal-flyout crystal-surface ttv-danmaku-flyout${showDanmakuSettings && hudShown ? ' open' : ''}`}
+                      role="dialog"
+                      aria-label="弹幕设置"
+                      inert={!showDanmakuSettings || !hudShown}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="ttv-enhance-head">
+                        <span className="ttv-enhance-head-title">弹幕设置</span>
+                        <span className="ttv-enhance-head-hint">实时生效</span>
+                      </div>
+
+                      <div className="ttv-danmaku-row">
+                        <span className="ttv-danmaku-label">显示区域</span>
+                        <input
+                          type="range" min={25} max={100} step={25}
+                          value={danmakuAppearance.danmakuArea}
+                          onChange={(e) => onDanmakuAppearanceChange({ danmakuArea: Number(e.target.value) })}
+                          className="ttv-danmaku-slider"
+                          aria-label="弹幕显示区域（占播放器高度）"
+                          tabIndex={showDanmakuSettings ? 0 : -1}
+                        />
+                        <span className="ttv-danmaku-value">{danmakuAppearance.danmakuArea}%</span>
+                      </div>
+
+                      <div className="ttv-danmaku-row">
+                        <span className="ttv-danmaku-label">不透明度</span>
+                        <input
+                          type="range" min={10} max={100} step={1}
+                          value={danmakuAppearance.danmakuOpacity}
+                          onChange={(e) => onDanmakuAppearanceChange({ danmakuOpacity: Number(e.target.value) })}
+                          className="ttv-danmaku-slider"
+                          aria-label="弹幕不透明度"
+                          tabIndex={showDanmakuSettings ? 0 : -1}
+                        />
+                        <span className="ttv-danmaku-value">{danmakuAppearance.danmakuOpacity}%</span>
+                      </div>
+
+                      <div className="ttv-danmaku-row">
+                        <span className="ttv-danmaku-label">弹幕字号</span>
+                        <input
+                          type="range" min={50} max={200} step={5}
+                          value={danmakuAppearance.danmakuFontScale}
+                          onChange={(e) => onDanmakuAppearanceChange({ danmakuFontScale: Number(e.target.value) })}
+                          className="ttv-danmaku-slider"
+                          aria-label="弹幕字号缩放"
+                          tabIndex={showDanmakuSettings ? 0 : -1}
+                        />
+                        <span className="ttv-danmaku-value">{danmakuAppearance.danmakuFontScale}%</span>
+                      </div>
+
+                      <div className="ttv-danmaku-row">
+                        <span className="ttv-danmaku-label">弹幕速度</span>
+                        <input
+                          type="range" min={0} max={2} step={1}
+                          value={danmakuAppearance.danmakuSpeed}
+                          onChange={(e) => onDanmakuAppearanceChange({ danmakuSpeed: Number(e.target.value) })}
+                          className="ttv-danmaku-slider"
+                          aria-label="弹幕速度：慢 / 适中 / 快"
+                          tabIndex={showDanmakuSettings ? 0 : -1}
+                        />
+                        <span className="ttv-danmaku-value">
+                          {['慢', '适中', '快'][danmakuAppearance.danmakuSpeed] ?? '适中'}
+                        </span>
+                      </div>
+
+                      <div className="ttv-danmaku-divider" />
+
+                      <div className="ttv-danmaku-row">
+                        <span className="ttv-danmaku-label">弹幕字体</span>
+                        <select
+                          value={danmakuAppearance.danmakuFont}
+                          onChange={(e) => onDanmakuAppearanceChange({ danmakuFont: e.target.value })}
+                          className="ttv-danmaku-select"
+                          aria-label="弹幕字体"
+                          tabIndex={showDanmakuSettings ? 0 : -1}
+                        >
+                          <option value="Microsoft YaHei">黑体</option>
+                          <option value="SimSun">宋体</option>
+                          <option value="KaiTi">楷体</option>
+                          <option value="YouYuan">幼圆</option>
+                        </select>
+                        <label className="ttv-danmaku-check">
+                          <input
+                            type="checkbox"
+                            checked={danmakuAppearance.danmakuBold}
+                            onChange={(e) => onDanmakuAppearanceChange({ danmakuBold: e.target.checked })}
+                            tabIndex={showDanmakuSettings ? 0 : -1}
+                          />
+                          粗体
+                        </label>
+                      </div>
+
+                      <div className="ttv-danmaku-row">
+                        <span className="ttv-danmaku-label">弹幕颜色</span>
+                        <div className="ttv-danmaku-swatches" role="group" aria-label="弹幕颜色">
+                          {DANMAKU_COLOR_PRESETS.map(preset => (
+                            <button
+                              key={preset.value}
+                              type="button"
+                              title={preset.label}
+                              aria-label={`弹幕颜色：${preset.label}`}
+                              aria-pressed={danmakuAppearance.danmakuColor.toUpperCase() === preset.value}
+                              onClick={() => onDanmakuAppearanceChange({ danmakuColor: preset.value })}
+                              className={`ttv-danmaku-swatch${danmakuAppearance.danmakuColor.toUpperCase() === preset.value ? ' is-active' : ''}`}
+                              style={{ background: preset.value }}
+                              tabIndex={showDanmakuSettings ? 0 : -1}
+                            />
+                          ))}
+                          {/* 自定义取色器：原生 color input 包进彩虹圆点，点击弹出系统取色盘 */}
+                          <label
+                            className="ttv-danmaku-swatch ttv-danmaku-swatch-custom"
+                            title="自定义颜色"
+                          >
+                            <input
+                              type="color"
+                              value={/^#[0-9a-fA-F]{6}$/.test(danmakuAppearance.danmakuColor)
+                                ? danmakuAppearance.danmakuColor
+                                : '#FFFFFF'}
+                              onChange={(e) => onDanmakuAppearanceChange({ danmakuColor: e.target.value })}
+                              aria-label="自定义弹幕颜色"
+                              tabIndex={showDanmakuSettings ? 0 : -1}
+                            />
+                          </label>
+                        </div>
+                      </div>
+
+                      <div className="ttv-danmaku-row">
+                        <span className="ttv-danmaku-label">描边类型</span>
+                        <div className="ttv-danmaku-strokes" role="group" aria-label="描边类型">
+                          {(
+                            [
+                              ['heavy', '重墨'],
+                              ['outline', '描边'],
+                              ['shadow', '45°投影'],
+                            ] as const
+                          ).map(([value, label]) => (
+                            <button
+                              key={value}
+                              type="button"
+                              onClick={() => onDanmakuAppearanceChange({ danmakuStroke: value })}
+                              className={`ttv-danmaku-stroke${danmakuAppearance.danmakuStroke === value ? ' is-active' : ''}`}
+                              tabIndex={showDanmakuSettings ? 0 : -1}
+                              aria-pressed={danmakuAppearance.danmakuStroke === value}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => onDanmakuAppearanceChange({ ...DANMAKU_APPEARANCE_DEFAULTS })}
+                        className="ttv-danmaku-reset"
+                        tabIndex={showDanmakuSettings ? 0 : -1}
+                      >
+                        恢复默认设置
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="relative">
                   <button
                     type="button"
@@ -574,6 +880,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowQualityMenu(false);
                       setShowSpeedMenu(false);
                       setShowVolumeSlider(false);
+                      setShowDanmakuSettings(false);
                     }}
                     className={`btn-text-action${vsrEnabled ? ' is-on' : ''}`}
                     title="视频增强：VSR 超分（实时生效）"
@@ -592,7 +899,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                     // 只看 showEnhanceMenu 的话，用户读文案时不动鼠标，浮层淡出到
                     // 看不见，却仍有一块 292×~220px 在吃点击，误触直接切 VSR 并
                     // 重载本集。视频画面上的透明可点区域是这里最不能接受的东西。
-                    className={`crystal-flyout crystal-surface ttv-enhance-flyout${showEnhanceMenu && hudShown ? ' open' : ''}`}
+                    className={`crystal-flyout crystal-surface ttv-enhance-flyout ttv-flyout-fixed${showEnhanceMenu && hudShown ? ' open' : ''}`}
                     role="dialog"
                     aria-label="视频增强"
                     // 收起时整块 `inert`：既不可交互也不可聚焦。只靠 opacity:0 +

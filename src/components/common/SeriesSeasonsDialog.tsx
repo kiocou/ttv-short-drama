@@ -35,6 +35,15 @@ function prefetchDetail(seriesId: string): void {
 }
 
 /**
+ * 置灰季卡的点击占位。
+ *
+ * `SeriesCard` 的 `onClick` 是**必填**的（它自己不知道宿主允不允许跳转），而未上线的
+ * 季不该有任何动作。真实拦截靠外层容器的 `pointer-events-none` + 不传 `onPrefetch`：
+ * 这里只是让"万一被触发"也什么都不发生，而不是用条件函数在卡片里分叉。
+ */
+const ignoreSeasonClick = (): void => {};
+
+/**
  * 「系列剧」弹窗：把当前这部剧**其它所有季**铺成卡片网格。
  *
  * ## 为什么是弹窗而不是详情页里的第三栏
@@ -42,7 +51,14 @@ function prefetchDetail(seriesId: string): void {
  * 用户提的两条要求是配套的：猜你喜欢里**不要**再出现同系列（那一栏回答"下一部看
  * 什么"），同系列要能**完整**看到。完整看到意味着不能是"一屏 6 张 + 换一批"——
  * 一个 14 季的系列得点三次才看得全。弹窗能一次铺开、又不占详情页的常驻版面，
- * 点开才拉数据（两次搜索往返），关掉就没了。
+ * 点开才拉数据（2026-10-29 起常态是**一次** `catalog_series_seasons`，命中就不再
+ * 打搜索；后端不支持时才退回两次搜索往返），关掉就没了。
+ *
+ * ## 未上架的季也占位（2026-10-29）
+ *
+ * 后端季表带 `episodeCount` / `disablePlay`，所以"这一季存在但现在看不了"是可判的。
+ * 这类卡保留占位、置灰、不给动作 —— 删掉会让用户以为系列只有 31 季（而实际是 35 季、
+ * 后 4 季待上架）。判定在数据层（`SeasonPick.available`），组件只负责呈现。
  *
  * ## 当前季为什么不在里面（用户明确要求）
  *
@@ -128,6 +144,8 @@ export const SeriesSeasonsDialog: React.FC<SeriesSeasonsDialogProps> = ({
 
   const nextCount = seasons?.filter(pick => pick.relation === 'next').length ?? 0;
   const prevCount = seasons?.filter(pick => pick.relation === 'previous').length ?? 0;
+  /** 还没上架的季数：只用于底部那句说明，不影响卡片渲染（渲染按 `pick.available` 逐张判）。 */
+  const unavailableCount = seasons?.filter(pick => !pick.available).length ?? 0;
 
   const subtitle = useMemo(() => {
     if (!seasons) return '正在整理这个系列的各季…';
@@ -207,17 +225,66 @@ export const SeriesSeasonsDialog: React.FC<SeriesSeasonsDialogProps> = ({
             </div>
           ) : (
             <div className={`${SEASON_GRID_CLASS} ttv-grid-in`}>
-              {seasons.map((pick, index) => (
-                <SeriesCard
-                  key={pick.item.id}
-                  series={pick.item}
-                  index={index}
-                  seasonBadge={`第${pick.season}${currentLabel?.unit ?? '季'}`}
-                  seasonBadgeTone={pick.relation}
-                  onClick={handleOpen}
-                  onPrefetch={prefetchDetail}
-                />
-              ))}
+              {seasons.map((pick, index) => {
+                /**
+                 * 季号角标：`currentLabel.unit` 沿用头部的量词（「季」/「期」/「部」），
+                 * 这样头部写着「正在看第31季」、网格里写着「第32期」时，两者是同一套
+                 * 编号 —— 量词是站方原文，替它统一改写成「季」反而失真。
+                 */
+                const badge = `第${pick.season}${currentLabel?.unit ?? '季'}`;
+
+                /**
+                 * 未上线的季（2026-10-29）：站上有"先建条目、后上架"的做法，这类季卡
+                 * `available === false` —— 点进去只有一个空选集（用户反馈过"列表里
+                 * 出现还没上架的剧，点开没内容"）。
+                 *
+                 * 处理方式是**保留卡位、置灰、不给动作**，而不是从列表里删掉：
+                 * - 删掉会让用户以为站上只有 31 季，而实际是 35 季、后 4 季待上架；
+                 * - 置灰则同时表达"这一季存在"与"现在还看不了"。
+                 *
+                 * 三个细节：
+                 * ① 外层包一层 `pointer-events-none` + 不传 `onPrefetch`：既不触发
+                 *    `onOpen`，也不去打那一发注定用不上的详情预取；
+                 * ② 季号角标照常显示（它回答"这是第几季"，与可不可看无关），
+                 *    另叠一个「未上线」胶囊把状态说清楚；
+                 * ③ `grayscale` + 降透明度是"不可用"的通用语汇，比改文案更省认知。
+                 */
+                if (!pick.available) {
+                  return (
+                    <div
+                      key={pick.item.id}
+                      role="group"
+                      aria-label={`${badge} 尚未上架`}
+                      className="relative"
+                    >
+                      <div className="pointer-events-none select-none opacity-55 grayscale">
+                        <SeriesCard
+                          series={pick.item}
+                          index={index}
+                          seasonBadge={badge}
+                          seasonBadgeTone="previous"
+                          onClick={ignoreSeasonClick}
+                        />
+                      </div>
+                      <span className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-slate-900/75 px-2.5 py-1 text-[11px] font-bold text-white shadow-sm">
+                        未上线
+                      </span>
+                    </div>
+                  );
+                }
+
+                return (
+                  <SeriesCard
+                    key={pick.item.id}
+                    series={pick.item}
+                    index={index}
+                    seasonBadge={badge}
+                    seasonBadgeTone={pick.relation}
+                    onClick={handleOpen}
+                    onPrefetch={prefetchDetail}
+                  />
+                );
+              })}
             </div>
           )}
         </div>
@@ -227,8 +294,11 @@ export const SeriesSeasonsDialog: React.FC<SeriesSeasonsDialogProps> = ({
           <div className="h-10 shrink-0 border-t border-black/[0.05] bg-slate-50/60 px-6 flex items-center justify-between">
             <span className="text-[11px] text-slate-400">
               已排除正在观看的这一季 · 共 {seasons.length} 季
+              {unavailableCount > 0 && ` · ${unavailableCount} 季尚未上架`}
             </span>
-            <span className="text-[11px] text-slate-400">点击卡片切换到那一季</span>
+            <span className="text-[11px] text-slate-400">
+              {unavailableCount > 0 ? '灰色卡尚未上架，暂时不能播放' : '点击卡片切换到那一季'}
+            </span>
           </div>
         )}
       </div>

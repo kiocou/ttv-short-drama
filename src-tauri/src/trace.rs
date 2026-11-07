@@ -70,7 +70,21 @@ pub fn mark_process_start() {
     origin();
 }
 
+/// 日志落盘位置：**跟随应用真实的数据根**。
+///
+/// 历史坑（2026-11-03 排查播放失败时踩到）：这里原本取 `cache_dir().parent()`，
+/// 也就是 `dirs::data_local_dir()/com.ttv.shortdrama`；而 cargo 构建的实际数据根
+/// 是 `src-tauri/.app-data`（`app_storage_root()`，SQLite 与设备档案都在那里）。
+/// 两者不是同一处，于是应用在跑、设备在换，日志文件却几个小时不动 —— 排障时
+/// 拿不到任何运行证据，只能靠猜。
+///
+/// 现在优先用 `app_storage_root()`：它和 SQLite / 设备档案同源，日志一定能落地。
+/// 非 cargo 构建（安装版）返回 `None`，退回原来的 `data_dir()` 路径，行为不变。
 fn log_path() -> PathBuf {
+    if let Some(root) = crate::app_storage_root() {
+        let _ = std::fs::create_dir_all(&root);
+        return root.join("ttv-playback.log");
+    }
     crate::short_drama_app::cache_dir()
         .parent()
         .map(|dir| dir.join("ttv-playback.log"))

@@ -164,7 +164,7 @@ export const HistoryView: React.FC = () => {
               onClick={() => navigateTo('explore')}
               className="shadow-sm"
             >
-              前往发现精选
+              前往短剧精选
             </FluentButton>
           </div>
         </div>
@@ -185,7 +185,7 @@ export const HistoryView: React.FC = () => {
                 onClick={() => navigateTo('explore')}
                 className="shadow-sm"
               >
-                前往发现精选
+                前往短剧精选
               </FluentButton>
             </div>
           )}

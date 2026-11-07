@@ -23,7 +23,11 @@ fn slot() -> &'static tokio::sync::Mutex<Option<std::sync::Arc<HongguoClient>>> 
     CLIENT.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
-fn profile_path() -> PathBuf {
+/// 原生客户端的设备档案路径。
+///
+/// `pub(crate)` 是因为 worker 也要读它：`short_drama_app::load_native_credentials`
+/// 复用同一台设备，避免出现「原生一台、worker 另一台」的分裂（见那里的说明）。
+pub(crate) fn profile_path() -> PathBuf {
     crate::app_storage_root()
         .unwrap_or_else(std::env::temp_dir)
         .join("hongguo-device.json")
@@ -52,9 +56,13 @@ pub async fn fetch_stream_payload(vid: &str) -> Result<serde_json::Value, String
         .await
         .map_err(|e| e.to_string())?;
 
+    // 必须用 `best_playable_stream` 而不是 `best_stream`：后者只按
+    // (高度, 码率) 取最大，会选中同分辨率下码率最高的 **bytevc1** 那一路，
+    // 而 Windows 没有 BVC 解码器 —— 整集 copy 出来只能软解，用户看到的就是
+    // "关掉增强后画面不流畅"。详见 media.rs 里这个方法的注释。
     let best = resolved
         .playback
-        .best_stream()
+        .best_playable_stream()
         .ok_or_else(|| "原生解析没有可用码流".to_string())?;
 
     // worker 侧 duration_ms 是毫秒，原生模型给的是秒
@@ -102,4 +110,44 @@ pub async fn fetch_stream_payload(vid: &str) -> Result<serde_json::Value, String
         "download_ua": "com.phoenix.read/71332",
         "download_referer": "https://novel.snssdk.com/",
     }))
+}
+
+/// 取一页弹幕。
+///
+/// 走的是**同一台匿名设备**的签名（`hongguo::danmaku` 内部复用 `client.request`），
+/// 因此不需要额外的鉴权；账号态接进来之后这条路径也会自动跟着走账号凭据。
+pub async fn fetch_danmaku(
+    video_id: &str,
+    series_id: &str,
+    start_ms: i64,
+    duration_ms: i64,
+) -> Result<serde_json::Value, String> {
+    let client = client().await?;
+    crate::hongguo::danmaku::fetch_danmaku(&client, series_id, video_id, start_ms, duration_ms)
+        .await
+}
+
+/// 弹幕请求入参（前端 `ipcService.playback.danmaku`）。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DanmakuInput {
+    /// 当前分集 vid（红果纯数字）。
+    pub vid: String,
+    /// 所属剧集 id（红果纯数字）。协议里的 `book_id`。
+    pub series_id: String,
+    /// 窗口起点（毫秒）。
+    pub start_ms: i64,
+    /// 窗口终点（毫秒，绝对时间）。协议里的 `playlet_item_duration` 收的是终点。
+    pub duration_ms: i64,
+}
+
+#[tauri::command]
+pub async fn short_drama_app_danmaku(input: DanmakuInput) -> Result<serde_json::Value, String> {
+    fetch_danmaku(
+        &input.vid,
+        &input.series_id,
+        input.start_ms,
+        input.duration_ms,
+    )
+    .await
 }

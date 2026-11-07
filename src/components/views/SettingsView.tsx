@@ -15,7 +15,17 @@ import {
   type DownloadProgress,
   type UpdateInfo,
 } from '../../services/updater';
-import { isTauriEnvironment, ipcService, type GuoSourceCheck, type GuoSourceStatus } from '../../services/ipc';
+import {
+  isTauriEnvironment,
+  ipcService,
+  type GuoSourceCheck,
+  type GuoSourceStatus,
+  type SourceCatalog,
+  type CustomSource,
+  type SourceProbeResult,
+} from '../../services/ipc';
+// 智能体联动：本机桥事件驱动「暂停短剧 → 呼叫 → 收起 → 原位续播」。
+import { agentAttachAll, agentBridgePort, agentDetachAll, agentTargets } from '../../services/agentWatch';
 // 播放诊断日志面板：放在「客户端信息与诊断」卡片里，与已有的导出按钮同一处——
 // 用户诉求是「根据日志一步一步优化」，日志必须能在应用里直接看到。
 import { PlaybackLogPanel } from '../common/PlaybackLogPanel';
@@ -38,6 +48,11 @@ import {
   Palette,
   Sun,
   Moon,
+  Bot,
+  Copy,
+  Lock,
+  Plus,
+  Send,
   MonitorSmartphone,
   Wifi,
 } from 'lucide-react';
@@ -288,6 +303,119 @@ hint?: React.ReactNode;
  *
  * ③ 是最终判据：它成立就说明"关掉代理就能用"，用户据此改上面的开关即可。
  */
+/**
+ * 智能体联动设置区。
+ *
+ * ## 只留一个开关（2026-10-29 重做）
+ *
+ * 上一版把「选工具 → 复制 JSON → 粘到某个文件」整块摊在设置页里。那既不是用户
+ * 要的，也解决不了问题：本机装着的智能体工具远不止列出来的那几家，靠用户手工
+ * 粘贴永远覆盖不全，还容易把配置改坏。
+ *
+ * 现在这里是**一个开关 + 一行状态**：
+ * - 打开 → 程序自己识别本机已安装的智能体工具，把上报 hook 合并写进它们各自的
+ *   配置文件（写前备份、幂等、不覆盖用户已有条目），然后启动本机桥；
+ * - 关闭 → 把本程序写进去的条目摘干净，桥不再响应。
+ *
+ * 技术细节（端口、文件路径、事件名）一律不展示。用户只需要知道"接上了几个"。
+ */
+const AgentWatchSection: React.FC = () => {
+  const { settings, updateSettings } = useSettingsStore();
+  const { showToast } = useAppStore();
+  const [port, setPort] = useState(0);
+  const [busy, setBusy] = useState(false);
+  /** 已接入的智能体数量（null = 还没探测）。 */
+  const [connected, setConnected] = useState<number | null>(null);
+  const [installed, setInstalled] = useState(0);
+
+  // 挂载时查一次桥端口；开关打开时再核对一次接入状态。
+  useEffect(() => {
+    void agentBridgePort().then(async p => {
+      setPort(p);
+      if (p > 0) {
+        const list = await agentTargets(p);
+        setConnected(list.filter(t => t.connected).length);
+        setInstalled(list.filter(t => t.installed).length);
+      }
+    });
+  }, [settings.agentWatchEnabled]);
+
+  const enabled = settings.agentWatchEnabled === true;
+
+  /**
+   * 拨开关：打开时同步做"自动接入"，关闭时同步做"断开"。
+   *
+   * 顺序很重要：**先接好再开**。反过来的话，开关一打开、用户立刻去用智能体，
+   * 而配置还没写进去，那一次事件就丢了（用户会以为功能没生效）。
+   */
+  const toggle = async (next: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (next) {
+        const bridge = port || (await agentBridgePort());
+        setPort(bridge);
+        if (bridge > 0) {
+          const report = await agentAttachAll(bridge);
+          if (report) {
+            setConnected(report.targets.filter(t => t.connected).length);
+            setInstalled(report.targets.filter(t => t.installed).length);
+            if (report.attached.length > 0) {
+              showToast(`已自动接入 ${report.attached.length} 个智能体工具`, 'success');
+            } else if (report.targets.some(t => t.installed)) {
+              showToast('已接入，但需要重启对应的智能体工具才生效', 'info');
+            } else {
+              showToast('未检测到已安装的智能体工具', 'warning');
+            }
+            report.failed.forEach(([id, reason]) => console.warn(`[agent] ${id} 接入失败：${reason}`));
+          }
+        } else {
+          showToast('本机桥未启动，联动不可用（端口被占用？）', 'error');
+        }
+      } else {
+        await agentDetachAll();
+        showToast('已断开智能体联动', 'info');
+      }
+      updateSettings({ agentWatchEnabled: next });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <SettingRow
+        title="智能体联动"
+        hint="本机智能体工具（Claude Code、Codex、Gemini、Cursor 等）完成任务、需要你操作或做决定时，自动暂停正在播放的短剧，并在桌面上浮出一张卡片；点卡片即可回到原来的位置继续看。开启后会自动完成接入，无需配置。"
+      >
+        <Toggle
+          checked={enabled}
+          onChange={value => void toggle(value)}
+          label="智能体联动"
+          disabled={busy}
+        />
+      </SettingRow>
+
+      {enabled && (
+        <div className="flex items-center gap-2 text-[11px] text-slate-500">
+          <span className={`h-1.5 w-1.5 rounded-full ${port ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+          {busy ? (
+            <span>正在接入本机智能体工具…</span>
+          ) : port ? (
+            <span>
+              已接入 {connected ?? 0} 个智能体工具
+              {installed > (connected ?? 0) && `（检测到 ${installed} 个已安装）`}
+              <span className="text-slate-400"> · 重启对应的工具后生效</span>
+            </span>
+          ) : (
+            <span>本机服务未就绪，重启应用试试</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const ProxyDiagnose: React.FC = () => {
   const [state, setState] = useState<
     | { kind: 'idle' }
@@ -414,6 +542,315 @@ const SourceGroup: React.FC<{
         })}
       </div>
     </SubSection>
+  );
+};
+
+/**
+ * 视频源：**内置两源固定** + 用户自己添加的自定义源。
+ *
+ * ## 边界（2026-11-02 定稿）
+ *
+ * 插件系统那条路放弃了：它要沙箱、要 IPC 契约、要执行用户代码，而真正需要的
+ * 只是"再接一个苹果 CMS 站点"。现在添加一个源就是填一张表，字段与校验规则
+ * 写在项目根的 `视频源格式.txt`，后端 `source_registry` 逐条照做。
+ *
+ * 内置源永远在最上面且**没有取消入口**（`removable: false`）——用户要求固定。
+ */
+const VideoSourceSection: React.FC<{ showCustom: boolean }> = ({ showCustom }) => {
+  const emptyDraft: CustomSource = {
+    id: '',
+    name: '',
+    api: '',
+    enabled: true,
+    adult: false,
+    kind: 'both',
+    category: '',
+    typeId: '',
+    note: '',
+  };
+  const [catalog, setCatalog] = useState<SourceCatalog | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState<CustomSource>(emptyDraft);
+  /** 每个源的测试结果：成功给 ProbeResult，失败给一句话。 */
+  const [probes, setProbes] = useState<Record<string, SourceProbeResult | { error: string }>>({});
+
+  const reload = async () => {
+    try {
+      setCatalog(await ipcService.sources.list());
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  useEffect(() => {
+    void reload();
+  }, []);
+
+  const submit = async () => {
+    setBusy(true);
+    try {
+      await ipcService.sources.add(draft);
+      setDraft(emptyDraft);
+      setAdding(false);
+      await reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (id: string) => {
+    setBusy(true);
+    try {
+      await ipcService.sources.remove(id);
+      await reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggle = async (id: string, enabled: boolean) => {
+    try {
+      await ipcService.sources.toggle(id, enabled);
+      await reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const probe = async (id: string) => {
+    setProbes(prev => ({ ...prev, [id]: { error: '正在连接…' } }));
+    try {
+      const result = await ipcService.sources.probe(id);
+      setProbes(prev => ({ ...prev, [id]: result }));
+    } catch (err) {
+      setProbes(prev => ({
+        ...prev,
+        [id]: { error: err instanceof Error ? err.message : String(err) },
+      }));
+    }
+  };
+
+  const builtin = catalog?.builtin ?? [];
+  const custom = catalog?.custom ?? [];
+  const inputClass =
+    'w-full px-2.5 py-1.5 rounded-lg text-xs bg-white border border-slate-200 focus:outline-none focus:border-blue-400';
+
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        {builtin.map(source => (
+          <div
+            key={source.id}
+            className="flex items-start gap-3 px-3 py-2.5 rounded-xl bg-white/70 border border-black/[0.05]"
+          >
+            <span className="w-8 h-8 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center flex-shrink-0">
+              {source.kind === 'anime' ? <Sparkles className="w-4 h-4" /> : <Tv className="w-4 h-4" />}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-slate-800">{source.name}</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-slate-100 text-slate-500">
+                  内置 · 固定
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 leading-relaxed mt-0.5">{source.description}</p>
+            </div>
+            <Lock className="w-3.5 h-3.5 text-slate-300 flex-shrink-0" />
+          </div>
+        ))}
+        {builtin.length === 0 && <p className={HINT_CLS}>正在读取内置源…</p>}
+      </div>
+
+      {showCustom && (
+        <div className="pt-3 border-t border-black/[0.04] space-y-2">
+          <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-slate-800">自定义源</div>
+            <p className={HINT_CLS}>
+              走苹果 CMS 接口。字段说明见项目根 <span className="font-mono">视频源格式.txt</span>。
+              <span className="text-slate-500">添加后点「测试」会真实拉一次列表，确认源可用。</span>
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setAdding(value => !value)}
+            className="flex items-center gap-1 flex-shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 border border-blue-100 transition-colors cursor-pointer"
+          >
+            <Plus className="w-3 h-3" />
+            添加视频源
+          </button>
+        </div>
+
+        {custom.length === 0 ? (
+          <p className="text-[11px] text-slate-400">还没有添加过源。</p>
+        ) : (
+          <div className="space-y-2">
+            {custom.map(source => {
+              const result = probes[source.id];
+              return (
+                <div
+                  key={source.id}
+                  className="px-3 py-2.5 rounded-xl bg-white/70 border border-black/[0.05] space-y-1.5"
+                >
+                  <div className="flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-slate-800 truncate">{source.name}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-slate-100 text-slate-500 font-mono">
+                          {source.id}
+                        </span>
+                        {source.adult && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-rose-50 text-rose-500">18+</span>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-slate-400 font-mono truncate mt-0.5">{source.api}</p>
+                    </div>
+                    <div className="flex items-center gap-1 flex-shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => void probe(source.id)}
+                        className="px-2 py-1 rounded-md text-[10px] font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 cursor-pointer"
+                      >
+                        测试
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void remove(source.id)}
+                        className="px-2 py-1 rounded-md text-[10px] font-semibold text-rose-600 bg-rose-50 hover:bg-rose-100 disabled:opacity-50 cursor-pointer"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Toggle
+                      checked={source.enabled}
+                      onChange={value => void toggle(source.id, value)}
+                      label="启用"
+                    />
+                    {source.typeId && (
+                      <span className="text-[10px] text-slate-400">分类 t={source.typeId}</span>
+                    )}
+                  </div>
+                  {result && (
+                    <p
+                      className={`text-[10px] leading-relaxed break-all ${
+                        'error' in result ? 'text-rose-600' : 'text-slate-500'
+                      }`}
+                    >
+                      {'error' in result
+                        ? result.error
+                        : `${result.ok ? '✓ 可用' : '✕ 拉到 0 条'} · 共 ${result.total} 条 / 本页 ${result.count} 条 · ${result.elapsedMs} ms` +
+                          (result.samples.length > 0 ? ` · 示例：${result.samples.join('、')}` : '')}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {adding && (
+          <div className="mt-2 p-3 rounded-xl bg-slate-50/80 border border-slate-200/70 space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              <label className={HINT_CLS}>
+                标识（id）
+                <input
+                  className={inputClass}
+                  value={draft.id}
+                  placeholder="如 my-source"
+                  onChange={event => setDraft({ ...draft, id: event.target.value })}
+                />
+              </label>
+              <label className={HINT_CLS}>
+                名称
+                <input
+                  className={inputClass}
+                  value={draft.name}
+                  placeholder="如 我的影视"
+                  onChange={event => setDraft({ ...draft, name: event.target.value })}
+                />
+              </label>
+            </div>
+            <label className={HINT_CLS}>
+              接口地址（苹果 CMS）
+              <input
+                className={inputClass}
+                value={draft.api}
+                placeholder="https://example.com/api.php/provide/vod/"
+                onChange={event => setDraft({ ...draft, api: event.target.value })}
+              />
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <label className={HINT_CLS}>
+                分类 t（可选）
+                <input
+                  className={inputClass}
+                  value={draft.typeId ?? ''}
+                  placeholder="如 39"
+                  onChange={event => setDraft({ ...draft, typeId: event.target.value })}
+                />
+              </label>
+              <label className={HINT_CLS}>
+                内容形态
+                <select
+                  className={inputClass}
+                  value={draft.kind}
+                  onChange={event => setDraft({ ...draft, kind: event.target.value as CustomSource['kind'] })}
+                >
+                  <option value="both">真人 + 漫剧</option>
+                  <option value="live">真人</option>
+                  <option value="comic">漫剧</option>
+                </select>
+              </label>
+            </div>
+            <div className="flex items-center gap-3">
+              <Toggle
+                checked={draft.enabled}
+                onChange={value => setDraft({ ...draft, enabled: value })}
+                label="启用"
+              />
+              <Toggle
+                checked={draft.adult}
+                onChange={value => setDraft({ ...draft, adult: value })}
+                label="18+"
+              />
+            </div>
+            <div className="flex items-center gap-2 pt-1">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void submit()}
+                className="px-3 py-1.5 rounded-lg text-[11px] font-semibold text-white bg-blue-500 hover:bg-blue-600 disabled:opacity-50 cursor-pointer"
+              >
+                {busy ? '保存中…' : '保存源'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setAdding(false)}
+                className="px-3 py-1.5 rounded-lg text-[11px] font-semibold text-slate-600 bg-white border border-slate-200 cursor-pointer"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+
+        {catalog?.sourcesFile && (
+          <p className="text-[10px] text-slate-400 break-all">源文件：{catalog.sourcesFile}</p>
+        )}
+        {error && <p className="text-[11px] text-rose-600 leading-relaxed break-all">{error}</p>}
+        </div>
+      )}
+    </div>
   );
 };
 
@@ -792,7 +1229,6 @@ export const SettingsView: React.FC = () => {
    * 它由下面的 effect 跟随系统事件更新；固定主题下不参与任何判断。
    */
   const [systemIsDark, setSystemIsDark] = useState<boolean>(systemPrefersDark);
-  const enabledSources = settings.enabledSources;
 
   /**
    * 系统配色变化的本地订阅。
@@ -815,22 +1251,6 @@ export const SettingsView: React.FC = () => {
     media.addEventListener('change', onChange);
     return () => media.removeEventListener('change', onChange);
   }, []);
-
-  /**
-   * 勾选/取消一个源。
-   *
-   * 存的是 id 全集而不是"禁用集"：源表在前端，后端不认识这些 id，勾选结果直接
-   * 落库即可。18+ 总开关关闭时不在这里拦——那样会让用户之前的选择被静默清空，
-   * 而"置灰不可点 + 重新勾选"更符合预期（真正的生效判断在 `enabledSourceIds`）。
-   */
-  const toggleSource = (id: string) => {
-    const current = settings.enabledSources;
-    updateSettings({
-      enabledSources: current.includes(id)
-        ? current.filter(item => item !== id)
-        : [...current, id],
-    });
-  };
 
   /**
    * 检查更新的状态机。
@@ -984,14 +1404,25 @@ export const SettingsView: React.FC = () => {
     void refreshCacheUsage();
   }, [currentView, refreshCacheUsage]);
 
-  const cacheMb = cacheUsage.bytes / 1024 / 1024;
-  const cacheLabel = cacheMb >= 1024 ? (cacheMb / 1024).toFixed(2) + ' GB' : cacheMb.toFixed(1) + ' MB';
+  // 缓存占用统一走 `formatBytes`（GB 保留两位、MB 保留一位）。
+  //
+  // 旧实现自己算 MB，清理提示更是把接口返回的浮点原值直接拼进文案 ——
+  // 用户截图里那句「已成功释放 1041.099250793457 MB 缓存」就是这么来的。
+  // 以 GB 为标准显示，0 字节给一个明确的「0 MB」而不是"未知大小"。
+  const cacheLabel = cacheUsage.bytes > 0 ? formatBytes(cacheUsage.bytes) : '0 MB';
 
   const handleClearCache = async () => {
     setIsCleaning(true);
     try {
       const freed = await clearCache();
-      showToast(freed > 0 ? `已成功释放 ${freed} MB 缓存` : '缓存已清理（后端未提供容量统计）', 'success');
+      // `clearCache()` 返回的是 MB（浮点）。换算回字节再交给同一个格式化函数，
+      // 保证提示与页面上的占用值用同一套量纲，不会出现"1.02 GB"与"1041.09 MB"
+      // 同时出现在一个界面上。
+      const freedLabel = freed > 0 ? formatBytes(freed * 1024 * 1024) : '';
+      showToast(
+        freed > 0 ? `已成功释放 ${freedLabel} 缓存` : '缓存已清理（后端未提供容量统计）',
+        'success',
+      );
     } catch {
       showToast('缓存清理失败', 'error');
     } finally {
@@ -1168,6 +1599,13 @@ export const SettingsView: React.FC = () => {
           </div>
         </SectionCard>
 
+        {/* 智能体联动：本地 AI 智能体工具的 hook 事件 → 自动暂停短剧 →
+            呼叫卡 → 收起播放器 → 悬浮卡一键回原位续播。
+            默认关（联动会打断播放，必须用户显式开启）。 */}
+        <SectionCard icon={<Bot className="w-4 h-4 text-blue-600" />} title="智能体联动">
+          <AgentWatchSection />
+        </SectionCard>
+
         {/* 3. 网络与代理
             单独成卡而不是塞进「视频源」：这张卡管的是**红果官网链路**
             （provider.rs 抓 /category），而「视频源」管的是 guo 那 19 个站。
@@ -1199,65 +1637,31 @@ export const SettingsView: React.FC = () => {
           </div>
         </SectionCard>
 
-        {/* 4. 视频源（按真人/漫剧归纳，18+ 总开关就在该组顶部） */}
+        {/* 4. 视频源：内置两源固定；自定义源灰度中（默认隐藏） */}
         <SectionCard icon={<Server className="w-4 h-4 text-blue-600" />} title="视频源">
-          {/* 这段说明此前混着实现细节（"2026-09-29 拉每个源的前 12 条看标题"），
-              那是给维护者看的溯源信息，不是用户决策需要的东西。用户只需知道
-              三件事：勾了会去哪、开多了会怎样、默认为什么这么少。
-              长度从 4 行压到 2 行，卡片首屏就能看到第一个可点的源。 */}
           <p className={HINT_CLS}>
-            勾选的源会一起汇入发现页：前两组进「短剧专区」与「漫剧次元」，18+ 那组在打开开关后独占「神秘小窝」。
-            <span className="text-slate-500">勾得越多，首屏要并发等待的站点也越多</span>，最慢的那个决定首屏时间。
+            内置来源固定为红果与动漫两个，不可移除、也不给关闭开关。
+            <span className="text-slate-500">其它来源尚未接进发现页，先按需打开下面的灰度开关</span>。
           </p>
 
-          <GuoNetworkRow />
+          <VideoSourceSection showCustom={settings.customSourcesEnabled} />
 
-          {/* 分组必须与 `sourceMatchesTab` 同一套判据：18+ 源归「神秘小窝」独占，
-              这里两个组都要排除，否则设置页显示它属于短剧专区、点进去却找不到。 */}
-          <SourceGroup
-            title="真人短剧"
-            hint="实拍短剧，条目有剧情简介、几十至上百集。汇入发现页的「短剧专区」。"
-            sources={GUO_SOURCES.filter(item => item.kind === 'live' && !item.adult && !item.retired)}
-            enabled={enabledSources}
-            locked={false}
-            onToggle={toggleSource}
-          />
-          <SourceGroup
-            title="真人 + 漫剧"
-            hint="同一个源里两种内容都有。汇入「短剧专区」与「漫剧次元」。"
-            sources={GUO_SOURCES.filter(item => item.kind === 'both' && !item.adult && !item.retired)}
-            enabled={enabledSources}
-            locked={false}
-            onToggle={toggleSource}
-          />
-          <SourceGroup
-            title="18+ 成人内容"
-            /* 不再列举具体片名：那是维护期逐源核对的产物，对用户没有决策价值，
-               而且把几个露骨片名直接印在设置页上，也超出了这一行的用途。
-               用户只需要知道「它归哪个专区、受哪个开关管辖」。 */
-            hint="逐源确认含成人条目。只汇入发现页的「神秘小窝」专区，不进短剧专区与漫剧次元。"
-            sources={GUO_SOURCES.filter(item => item.adult && !item.retired)}
-            enabled={enabledSources}
-            locked={!settings.showAdultSources}
-            onToggle={toggleSource}
-            /* 总开关就放在它管辖的那一组顶部，而不是另开一张卡片：分开时用户
-               要在两张卡之间来回找"这个开关管的是上面那几行"，而它其实就是
-               这一组的门闩。关闭时该组置灰不可点，但**不取消已勾选项**——静默
-               清空会让用户回来开开关时发现自己的选择没了。 */
-            header={
-              <Toggle
-                checked={settings.showAdultSources}
-                onChange={value => updateSettings({ showAdultSources: value })}
-                label="显示 18+ 内容源"
-              />
-            }
-          />
-
-          {enabledSources.length === 0 && (
-            <p className="text-[11px] text-amber-600 leading-relaxed">
-              一个源都没勾：发现页会临时回落到红果，不会变成空目录。
+          {/* 灰度开关：默认关。关着时上面那整块「自定义源」都不渲染 —— 一个
+              只能添加、不能看的入口，摆在主界面上只会制造困惑。 */}
+          <div className="pt-4 border-t border-black/[0.04]">
+            <Toggle
+              checked={settings.customSourcesEnabled}
+              onChange={value => updateSettings({ customSourcesEnabled: value })}
+              label="自定义源（灰度）"
+            />
+            <p className={HINT_CLS}>
+              可添加苹果 CMS 接口的第三方源。目前只能添加与测试，还不会汇入发现页。
             </p>
-          )}
+          </div>
+
+          <div className="pt-4 border-t border-black/[0.04]">
+            <GuoNetworkRow />
+          </div>
 
           <div className="pt-4 border-t border-black/[0.04]">
             <SourceStatusPanel />

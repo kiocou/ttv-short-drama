@@ -1,4 +1,5 @@
 import { isPipWindow } from './services/pip';
+import { isAgentDockWindow } from './services/agentWatch';
 import { applyTheme, readTheme, watchSystemTheme } from './services/theme';
 import './index.css';
 
@@ -26,6 +27,9 @@ if (rootElement) {
    */
   if (isPipWindow()) {
     void import('./bootPip').then(({ mountPip }) => mountPip(rootElement));
+  } else if (isAgentDockWindow()) {
+    // 智能体悬浮窗：独立置顶窗，同样只加载自己那一小份模块图。
+    void import('./bootAgentDock').then(({ mountAgentDock }) => mountAgentDock(rootElement));
   } else {
     void import('./bootApp').then(({ mountApp }) => mountApp(rootElement));
   }

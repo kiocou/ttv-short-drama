@@ -51,6 +51,45 @@ export interface UserSettings {
    */
   vsrEnabled: boolean;
   /**
+   * 是否显示弹幕。
+   *
+   * 数据来自红果真实的弹幕接口（按 30 秒时间窗分页拉），渲染在
+   * `components/player/DanmakuOverlay.tsx`。关闭时**不发起任何请求**，
+   * 因此关掉它也能省掉一轮网络往返。
+   *
+   * 与 `vsrEnabled` 同款：旧记录缺字段时按 `!== false` 判定，默认开。
+   */
+  danmakuEnabled: boolean;
+  /**
+   * 弹幕显示区域：占播放器高度的百分比（25 / 50 / 75 / 100 四档）。
+   *
+   * 播放器内是「弹幕设置」面板的第一根滑条（2026-11-07）。轨道数不再写死 4，
+   * 而是按实际层高 ÷ 行高推导——窗口化时 25% 恰好等于旧的 4 行观感，
+   * 全屏时随画面高度自动获得更多轨道。
+   */
+  danmakuArea: number;
+  /** 弹幕层不透明度（10–100%），默认 100。 */
+  danmakuOpacity: number;
+  /** 弹幕字号缩放（50–200%），基准 20px，默认 100。 */
+  danmakuFontScale: number;
+  /**
+   * 弹幕速度档：0 = 慢（12s 飞完全程）/ 1 = 适中（8s，即移植自真果鉴的
+   * `DANMAKU_LIFETIME_MS` 原值）/ 2 = 快（5s）。默认 1。
+   */
+  danmakuSpeed: number;
+  /** 弹幕字体（CSS font-family 的首选族名），默认「黑体」。 */
+  danmakuFont: string;
+  /**
+   * 弹幕文字颜色（#RRGGBB，默认 #FFFFFF 白）。
+   *
+   * 面板给 9 个预设色板 + 自定义取色器；旧记录缺字段或格式非法时回落白色。
+   */
+  danmakuColor: string;
+  /** 弹幕加粗。默认开（与引入设置前的 fontWeight 700 一致）。 */
+  danmakuBold: boolean;
+  /** 描边类型：重墨（默认，四向粗黑边+投影）/ 描边（细黑边）/ 45°投影。 */
+  danmakuStroke: 'heavy' | 'outline' | 'shadow';
+  /**
    * 红果官网链路走不走系统代理。
    *
    * 自动判断在代理软件退出后必然判错（启动时固化的代理与运行时读到的注册表
@@ -59,4 +98,26 @@ export interface UserSettings {
    * 旧设置记录没有这个字段，读取时按 `'auto'` 处理。
    */
   proxyMode: 'auto' | 'direct' | 'proxy';
+  /**
+   * 是否启用「智能体联动」。
+   *
+   * 开：本地智能体工具（Claude Code / Codex / Gemini / Cursor 等，凡是能在
+   * 事件发生时执行命令的工具都支持）的 hook 事件经本机桥转发过来时——
+   * 正在播放则自动暂停，并弹「智能体呼叫卡」；点「前往」后播放器收起为
+   * 悬浮卡片，点击卡片回到播放器**原位置**续播。
+   * 关：桥不响应事件，播放不受任何影响。
+   *
+   * 默认关：联动会打断播放，必须用户显式开启（与 Rust 侧 `#[serde(default)]`
+   /// 的 false 一致，理由见 models.rs 的字段注释）。
+   */
+  agentWatchEnabled: boolean;
+  /**
+   * 「自定义源」灰度开关（默认关）。
+   *
+   * 自定义源（用户自填苹果 CMS 接口）目前只做到「登记 + 测试」，还没接进
+   * 发现页的目录/详情/播放。灰度期默认隐藏整块入口——否则用户加完源会
+   * 发现首页什么都没变。接进聚合后再把默认值改成 true（Rust 侧
+   * `models.rs` 的同名字段与这里必须同步）。
+   */
+  customSourcesEnabled: boolean;
 }

@@ -5,11 +5,30 @@ import type { ChannelType, ShelfKind } from '../types/catalog';
 // `import { ShelfKind } from '../../stores/useAppStore'` 保持有效。
 export type { ShelfKind };
 
-export type AppView = 'explore' | 'anime' | 'detail' | 'player' | 'history' | 'favorites' | 'settings' | 'search' | 'shelf';
+export type AppView = 'explore' | 'anime' | 'detail' | 'player' | 'history' | 'favorites' | 'settings' | 'search' | 'shelf' | 'spotlight';
 
 /** 进入「更多」页时冻结下来的上下文：哪个分区、从哪个频道点进来的。 */
 export interface ShelfViewState {
   kind: ShelfKind;
+  channel: ChannelType;
+}
+
+/**
+ * 首页顶部那三档的落地页。
+ *
+ * 它们是**三个独立页面**，不是首页里的一个排序开关。
+ *
+ * 旧实现把 `综合推荐 / 最新上线 / 热度榜单` 当成 `CatalogFilter.sort` 的三个值，
+ * 而目录接口的网页链路只认频道段（`/category/real-drama`），`sort` 在整条链路上
+ * 只影响返回值里的一句中文描述（见 Rust 侧 `provider.rs` 的 `sort_label`）——
+ * 于是点哪个都拿到同一批卡片，观感就是"点了没反应"（用户报告）。
+ *
+ * 现在点进去是各自的数据源与各自的排布：推荐流、最新上架、热播榜。
+ */
+export type SpotlightKind = 'recommend' | 'latest' | 'heat';
+
+export interface SpotlightState {
+  kind: SpotlightKind;
   channel: ChannelType;
 }
 
@@ -69,6 +88,12 @@ interface AppContextType {
    */
   shelfView: ShelfViewState | null;
   openShelf: (kind: ShelfKind, channel: ChannelType) => void;
+  /**
+   * 三档落地页的进入上下文。null 表示当前不在那个视图（该视图仍常驻 DOM，
+   * 只被 display:none 隐藏，与其它视图一致）。
+   */
+  spotlight: SpotlightState | null;
+  openSpotlight: (kind: SpotlightKind, channel: ChannelType) => void;
   navigateTo: (view: AppView, seriesId?: string) => void;
   goBack: () => void;
   setSearchKeyword: (kw: string) => void;
@@ -94,6 +119,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [shelfView, setShelfView] = useState<ShelfViewState | null>(null);
+  const [spotlight, setSpotlight] = useState<SpotlightState | null>(null);
 
   /**
    * 所有 action 都用 `useCallback` + ref 读最新 state，而不是直接从闭包里取。
@@ -146,6 +172,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
     setShelfView({ kind, channel });
     setCurrentView('shelf');
+  }, []);
+
+  /**
+   * 进入三档之一（综合推荐 / 最新上线 / 热度榜单）。
+   *
+   * 与 `openShelf` 同构：频道只能在这一刻由调用方交出，页面自己读不到发现页的
+   * 频道状态。`previousView` 只在首次离开非 spotlight 视图时写入，避免在三个
+   * 页面之间来回点时把返回目标覆盖成自己。
+   */
+  const openSpotlight = useCallback((kind: SpotlightKind, channel: ChannelType) => {
+    if (currentViewRef.current !== 'spotlight') {
+      setPreviousView(currentViewRef.current);
+    }
+    setSpotlight({ kind, channel });
+    setCurrentView('spotlight');
   }, []);
 
   const persistSearchHistory = useCallback((next: string[]) => {
@@ -210,6 +251,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     toasts,
     shelfView,
     openShelf,
+    spotlight,
+    openSpotlight,
     navigateTo,
     goBack,
     setSearchKeyword,
@@ -223,7 +266,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }), [
     clearSearchHistory, currentView, goBack, isFullscreen,
     isNavCollapsed, navigateTo, openShelf, previousView, removeSearchHistory, removeToast,
-    rememberSearch, searchHistory, searchKeyword, selectedSeriesId, shelfView, showToast,
+    rememberSearch, searchHistory, searchKeyword, selectedSeriesId, shelfView, showToast, spotlight, openSpotlight,
     toasts, toggleNavCollapsed,
   ]);
 

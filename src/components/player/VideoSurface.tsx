@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { useAppStore } from '../../stores/useAppStore';
 import { isTauriEnvironment } from '../../services/ipc';
+import { useSettingsStore } from '../../stores/useSettingsStore';
 import { enterFullscreen, leaveFullscreen, queryFullscreen } from '../../services/windowFx';
 // 起播链路的媒体事件打点：用户报的「一直在加载等待」只有在事件时间线上才看得出
 // 卡在哪一段（清单未就绪 / 首个分片未到 / 解码器没起）。这些事件都不密集，
@@ -15,6 +16,7 @@ import { PlayerToast } from './PlayerToast';
 import { usePlayerToast, formatClock } from './usePlayerToast';
 import { EpisodeDrawer } from './EpisodeDrawer';
 import { DiagnosticsModal } from './DiagnosticsModal';
+import { DanmakuOverlay } from './DanmakuOverlay';
 import {
   Loader2,
   AlertCircle,
@@ -59,8 +61,12 @@ export const VideoSurface: React.FC = () => {
     finishedAll,
     sessionId,
     vsrEnabled,
+    danmakuEnabled,
     registerVideoElement,
   } = usePlaybackStore();
+  // 弹幕观感（区域/透明度/字号/速度/字体/描边）——只有设置仓持有真相，
+  // 「弹幕设置」面板写它，这里读它喂给渲染层。
+  const { settings } = useSettingsStore();
 
   /**
    * 画面中央的操作提示（形态照 B 站播放器）。
@@ -548,6 +554,33 @@ export const VideoSurface: React.FC = () => {
         onPlaying={() => tracePlayback('媒体 playing 开始播放')}
         onWaiting={() => tracePlayback('媒体 waiting 缓冲等待（这是「一直在加载」的关键证据）')}
         onStalled={() => tracePlayback('媒体 stalled 拉流停滞')}
+      />
+
+      {/*
+        弹幕层。
+
+        `z-[25]` 是刻意的：压过 `<video>`、但低于 HUD 的 `z-30`。弹幕不能盖住
+        控制条，否则鼠标一移过去文字就压在最上面；也不能低于 video，否则整层
+        被画面遮掉。
+
+        `pointer-events-none` 在组件内部已设：弹幕是纯展示，任何点击都该落到
+        video 上（单击暂停、双击全屏）。
+      */}
+      <DanmakuOverlay
+        videoRef={videoRef}
+        seriesId={currentSeries?.id ?? ''}
+        episodeId={currentEpisode?.id ?? ''}
+        enabled={danmakuEnabled}
+        appearance={{
+          danmakuArea: settings.danmakuArea,
+          danmakuOpacity: settings.danmakuOpacity,
+          danmakuFontScale: settings.danmakuFontScale,
+          danmakuSpeed: settings.danmakuSpeed,
+          danmakuFont: settings.danmakuFont,
+          danmakuColor: settings.danmakuColor,
+          danmakuBold: settings.danmakuBold,
+          danmakuStroke: settings.danmakuStroke,
+        }}
       />
 
       {/*

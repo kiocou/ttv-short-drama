@@ -298,6 +298,46 @@ pub struct UserSettings {
     /// `#[serde(default)]` 对 bool 只会给 `false`，所以走 `default_true`。
     #[serde(default = "default_true")]
     pub vsr_enabled: bool,
+    /// 是否显示弹幕（红果 `/novel/commentapi/comment/list/` 的真实弹幕）。
+    ///
+    /// 纯前端渲染开关：后端只负责按时间窗取数据，是否显示、显示多大的密度
+    /// 全在 `components/player/DanmakuOverlay.tsx` 里决定。
+    ///
+    /// 默认**开**：既然做了这个功能，装好就该看到弹幕，而不是让用户先去设置页
+    /// 找一个开关才发现有这回事。旧设置记录没有这个字段，`default_true` 保证
+    /// 升级后不会被静默关掉。
+    #[serde(default = "default_true")]
+    pub danmaku_enabled: bool,
+    /// 弹幕观感设置（2026-11-07，播放器「弹幕设置」面板）。
+    ///
+    /// 这些值**只影响前端渲染**（`DanmakuOverlay`），后端既不解读也不参与播放
+    /// 链路——存在这里是因为设置落库走的是强类型 `UserSettings`，前端新增的
+    /// 可持久化字段必须在这张表上占位，否则 `settings_save` 反序列化时会把
+    /// 未知字段静默丢弃，用户拖完滑条一重启就回到默认值。
+    ///
+    /// 默认值与 `src/services/ipc.ts` 的 `DEFAULT_SETTINGS` 一一对应：
+    /// 区域 25%（窗口化播放器里等于旧的写死 4 行观感）、不透明度 100、
+    /// 字号 100、速度 1（适中 = 8s，即移植自真果鉴的原始飞行时长）。
+    #[serde(default = "default_danmaku_area")]
+    pub danmaku_area: f64,
+    #[serde(default = "default_danmaku_opacity")]
+    pub danmaku_opacity: f64,
+    #[serde(default = "default_danmaku_font_scale")]
+    pub danmaku_font_scale: f64,
+    #[serde(default = "default_danmaku_speed")]
+    pub danmaku_speed: i64,
+    #[serde(default = "default_danmaku_font")]
+    pub danmaku_font: String,
+    /// 弹幕文字颜色（#RRGGBB）。面板给色板 + 自定义取色器；非法值在
+    /// `settings_save` 归一回白色。
+    #[serde(default = "default_danmaku_color")]
+    pub danmaku_color: String,
+    /// 默认开：与引入设置前的 `fontWeight: 700` 一致，旧观感不变。
+    #[serde(default = "default_true")]
+    pub danmaku_bold: bool,
+    /// 重墨（默认）/ 描边 / 45°投影。非法值在 `settings_save` 归一回 heavy。
+    #[serde(default = "default_danmaku_stroke")]
+    pub danmaku_stroke: String,
     /// 红果官网链路（`provider.rs` 的 `/category` 抓取）走不走系统代理。
     ///
     /// ## 为什么要做成用户可选项，而不是"自动判断"
@@ -316,11 +356,55 @@ pub struct UserSettings {
     /// 旧设置记录没有这个字段，serde default 给 `auto`，与修复前行为一致。
     #[serde(default = "default_proxy_mode")]
     pub proxy_mode: String,
+    /// 是否启用「智能体联动」：本地智能体工具（Claude Code / Codex / Gemini 等）
+    /// 的 hook 事件经本机桥（agent_bridge.rs）转发过来时，自动暂停正在播的
+    /// 短剧并弹呼叫卡片。
+    ///
+    /// 旧设置记录没有这个字段：默认必须是**关**——联动会暂停播放，属于用户必须
+    /// 显式选择的行为，默认开等于"装完应用剧就被暂停了"。与 launchSound /
+    /// vsrEnabled 的 default_true 正好相反，两者都各有注释说明理由。
+    #[serde(default)]
+    pub agent_watch_enabled: bool,
+    /// 「自定义源」灰度开关（默认关）。
+    ///
+    /// ## 为什么默认关
+    ///
+    /// 自定义源（用户自填苹果 CMS 接口）目前只做到「登记 + 测试」：
+    /// `source_add` / `source_probe` 能跑，但发现页的目录、详情、播放都还没接。
+    /// 如果默认展示「添加视频源」，用户加完一堆源会发现首页什么都没多——
+    /// 那比不展示更糟。所以灰度期把它藏在设置页一行灰色开关后面。
+    ///
+    /// 接进目录聚合之后再把默认值改成 true（届时这条注释要一起改）。
+    #[serde(default)]
+    pub custom_sources_enabled: bool,
 }
 
 /// `proxy_mode` 的默认值。抽成函数是因为 `#[serde(default = "...")]` 只接受路径。
 fn default_proxy_mode() -> String {
     "auto".into()
+}
+
+/// 弹幕观感默认值（与前端 `DEFAULT_SETTINGS` 对齐，理由见字段注释）。
+fn default_danmaku_area() -> f64 {
+    25.0
+}
+fn default_danmaku_opacity() -> f64 {
+    100.0
+}
+fn default_danmaku_font_scale() -> f64 {
+    100.0
+}
+fn default_danmaku_speed() -> i64 {
+    1
+}
+fn default_danmaku_font() -> String {
+    "Microsoft YaHei".into()
+}
+fn default_danmaku_color() -> String {
+    "#FFFFFF".into()
+}
+fn default_danmaku_stroke() -> String {
+    "heavy".into()
 }
 
 /// `#[serde(default)]` 对 bool 只会给 `false`；需要默认为真的字段走这个。
@@ -342,7 +426,18 @@ impl Default for UserSettings {
             enabled_sources: vec!["hongguo".to_string()],
             launch_sound: true,
             vsr_enabled: true,
+            danmaku_enabled: true,
+            danmaku_area: 25.0,
+            danmaku_opacity: 100.0,
+            danmaku_font_scale: 100.0,
+            danmaku_speed: 1,
+            danmaku_font: "Microsoft YaHei".into(),
+            danmaku_color: "#FFFFFF".into(),
+            danmaku_bold: true,
+            danmaku_stroke: "heavy".into(),
             proxy_mode: "auto".into(),
+            agent_watch_enabled: false,
+            custom_sources_enabled: false,
         }
     }
 }

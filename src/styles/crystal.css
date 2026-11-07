@@ -1708,3 +1708,231 @@
     display: none;
   }
 }
+
+
+/* ==========================================================================
+   10c. 播放器三浮层统一量宽（2026-11-05）
+   --------------------------------------------------------------------------
+   问题：清晰度 / 倍速 / 增强三个浮层的宽度各算各的 ——
+     - `.crystal-flyout` 只有 min-width: 112px，宽度由内容撑开：清晰度菜单
+       （"1080P 蓝光"这类短文本）窄，倍速菜单被底部那行长提示撑宽；
+     - 增强浮层单独写死 min-width: 262px / max-width: 292px。
+   同一排按钮弹出的三个面板宽度全不一样，用户的原话是"有的长、有的宽、有的小"。
+
+   现在三处共用 248px 一条宽度：档位文本短、居中偏移一致，面板边界在三次点击
+   之间不再跳动。倍速菜单底部那行说明改成可换行（原来 nowrap 会硬撑宽度）。
+
+   ⚠️ 依旧不引入 backdrop-filter / filter：`.ttv-video-stage` 内的模糊会把视频
+   拉进合成器，直接让 RTX VSR 失效（见本文件顶部第 2 节与不变量 26）。
+   ========================================================================== */
+.crystal-flyout.ttv-flyout-fixed {
+  width: 248px;
+  min-width: 0;
+  max-width: 248px;
+}
+
+/* 增强浮层保留自己右对齐的定位，只把宽度并入同一条规格 */
+.crystal-flyout.ttv-enhance-flyout.ttv-flyout-fixed {
+  width: 248px;
+  min-width: 0;
+  max-width: 248px;
+}
+
+.ttv-flyout-fixed .crystal-menu-item {
+  white-space: normal;
+  text-align: left;
+}
+
+.ttv-flyout-fixed .crystal-menu-note {
+  white-space: normal;
+  line-height: 1.45;
+}
+
+/* ==========================================================================
+   10d. 弹幕设置面板（2026-11-07）
+
+   与清晰度/倍速/增强同一套 `.crystal-flyout` 材质，但**不并入 ttv-flyout-fixed
+   的 248px 规格**：面板里有「标签 + 滑条 + 读数」三列，248px 会把滑条压到
+   不足 120px、拖动分辨率太差。300px 是三列都能呼吸的下限，右对齐定位沿用
+   增强浮层的锚点（right: -6px）。
+
+   面板只在弹幕开启时渲染（PlayerHud 按条件挂载），关闭后按钮序列自动回到
+   原样——这里不需要 display:none 的隐藏态。
+   ========================================================================== */
+.crystal-flyout.ttv-danmaku-flyout {
+  left: auto;
+  right: -6px;
+  bottom: calc(100% + 6px);
+  transform: translateY(8px) scale(0.96);
+  width: 300px;
+  min-width: 0;
+  max-width: 300px;
+  padding: 8px;
+  gap: 2px;
+}
+
+.crystal-flyout.ttv-danmaku-flyout.open {
+  transform: translateY(0) scale(1);
+}
+
+.ttv-danmaku-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 6px;
+}
+
+.ttv-danmaku-label {
+  flex: none;
+  width: 56px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
+  white-space: nowrap;
+}
+
+/* 滑条走原生 input[type=range] + accent-color：与 MiniPlayer 音量条同一方案，
+   不自己画轨道（自绘要在 .ttv-video-stage 里避开 backdrop-filter 陷阱，不值）。 */
+.ttv-danmaku-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 4px;
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+.ttv-danmaku-value {
+  flex: none;
+  width: 38px;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.ttv-danmaku-divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.ttv-danmaku-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(15, 23, 42, 0.9);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ttv-danmaku-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ttv-danmaku-check input {
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+.ttv-danmaku-strokes {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ttv-danmaku-stroke {
+  flex: 1 1 0;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.ttv-danmaku-stroke:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.ttv-danmaku-stroke.is-active {
+  background: #38bdf8;
+  border-color: #38bdf8;
+  color: #0b1220;
+  font-weight: 700;
+}
+
+.ttv-danmaku-reset {
+  display: block;
+  width: calc(100% - 12px);
+  height: 30px;
+  margin: 6px 6px 2px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.ttv-danmaku-reset:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* 弹幕颜色色板：9 个预设圆点 + 1 个彩虹自定义取色器（原生 color input 包皮）。 */
+.ttv-danmaku-swatches {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ttv-danmaku-swatch {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.28);
+  padding: 0;
+  cursor: pointer;
+  position: relative;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ttv-danmaku-swatch:hover {
+  border-color: rgba(255, 255, 255, 0.6);
+}
+
+.ttv-danmaku-swatch.is-active {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.35);
+}
+
+.ttv-danmaku-swatch-custom {
+  background: conic-gradient(#f43f5e, #f59e0b, #22c55e, #3b82f6, #a855f7, #f43f5e);
+  overflow: hidden;
+}
+
+.ttv-danmaku-swatch-custom input {
+  position: absolute;
+  inset: -4px;
+  width: calc(100% + 8px);
+  height: calc(100% + 8px);
+  opacity: 0;
+  cursor: pointer;
+}

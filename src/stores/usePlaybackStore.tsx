@@ -108,6 +108,12 @@ interface PlaybackContextType {
    */
   vsrEnabled: boolean;
   /**
+   * 弹幕是否显示。只读；写入口是 `PlayerHud` 的「弹幕」按钮（落 `settings`）。
+   */
+  danmakuEnabled: boolean;
+  /** 拨动弹幕开关（写设置，不重载播放会话）。 */
+  setDanmakuEnabled: (enabled: boolean) => void;
+  /**
    * 用户在本播放页拨动 VSR 开关。
    *
    * 这里**只写设置**：让当前这一集立即重走新链路的动作统一由 Provider 内那个
@@ -214,6 +220,9 @@ type PlaybackActionsContextType = Omit<PlaybackContextType,
   // 会让"拨一下开关"重建 `actionsValue` 并广播给发现页/详情页/历史页，
   // 而它们一个都用不上。写入函数 `setVsrEnabled` 仍留在专线上（引用稳定）。
   | 'vsrEnabled'
+  // `danmakuEnabled` 同理：只有播放页的 HUD 与弹幕层需要它。写入函数
+  // `setDanmakuEnabled` 保留在专线上。
+  | 'danmakuEnabled'
 >;
 
 /** 原生解析 worker 上报的进度（Rust 转发的 `shortdrama://app-resolve` 事件）。 */
@@ -300,6 +309,30 @@ const STREAMING_WINDOW_MAX_MS = 90_000;
  * 转完之后 `start_video_cache` 会把产物按 vid 缓存下来，换集回来也不用再转。
  */
 const STREAMING_TRANSCODE_SETTLE_MS = 6_000;
+
+/**
+ * 连播预取失败后的重试次数与间隔。
+ *
+ * 红果匿名接口会偶发「静默拒绝（HTTP 200 空响应）」，实测日志里下一集预取第一次
+ * 就撞上它，而同一时刻主解析刚触发过「设备被拒 → 换新设备」——隔几秒重试就能用上
+ * 新凭据。不重试等于没预取，用户切过去要现场等 10 秒（实测 10626ms）。
+ */
+const PREWARM_RETRIES = 2;
+/**
+ * 预取重试间隔。
+ *
+ * 曾在 4 秒：那时假设"失败是签名过期，要等一会儿"。实机日志（2026-11-01）显示
+ * 失败原因是**当前匿名设备被风控**（HTTP 200 空响应），而 Rust 侧在同一个失败
+ * 信号上 0.5 秒内就换好了新设备：
+ *
+ *   564.848s 设备被拒，重置后重试
+ *   565.409s 已换新设备 device_id=2750352839687408
+ *   565.409s 原生解析命中（新设备立即可用）
+ *
+ * 也就是说等 4 秒拿不到任何额外信息，只是把本来就紧的预取窗口又啃掉 4 秒。
+ * 3 倍速下一集 42 秒只播 14 秒，这 4 秒足以让预取彻底赶不上（实测切集 14233ms）。
+ */
+const PREWARM_RETRY_DELAY_MS = 1_200;
 let streamingWindowTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 进入流式转码窗口：占用 CPU 期间暂停整集预取。 */
@@ -883,6 +916,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
    * 这个字段时展开是 `undefined`，必须落到"开"（Rust 侧 `AtomicBool` 初值也是开）。
    */
   const vsrEnabled = settings.vsrEnabled !== false;
+  /**
+   * 弹幕开关（唯一真相仍是 `settings.danmakuEnabled`）。
+   *
+   * 与 `vsrEnabled` 同一套归一：旧设置记录缺字段时落到"开"。播放页只读它，
+   * 写入口是 `PlayerHud` 的那个按钮 → `updateSettings`。
+   */
+  const danmakuEnabled = settings.danmakuEnabled !== false;
   /**
    * VSR 开关的即时镜像。
    *
@@ -1981,20 +2021,30 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     // 转码速度是 16 倍实时，两段式省不下任何东西，只带来切源观感
     // （日志实证 `整集切换完成 位置=8.0s`）与两倍磁盘占用。
     const streamingStarted = performance.now();
-    beginStreamingWindow();
+    /**
+     * VSR 关时直接跳过 `open_stream`：后端门禁会让它确定性失败（见下方
+     * `streamingWindowReleased` 的历史注释）。省掉这次注定失败的往返，更重要的是
+     * 不再让它触发设备重置——实测日志里那次重置紧接着就把同一时刻在跑的
+     * 「下一集预取」拖成了 `静默拒绝`，下一集只能现场重下。
+     */
+    const wantStreaming = vsrEnabledRef.current;
+    if (wantStreaming) beginStreamingWindow();
     // 这一次 `beginStreamingWindow()` 有没有被配对释放。
     //
     // 为什么需要显式记账：`openStreamNative` 抛错（后端直接 Err —— **VSR 开关关闭时
     // 是确定性触发**）时不会进入下面任何一条分支的释放点，窗口记账就永久多出一次，
     // 之后的整集 mp4 预热会在 90 秒内全被拒（VSR 关的用户唯一能播的就是整集 mp4，
     // 于是每次换集都现场等 7 秒多，审查 F2）。
-    let streamingWindowReleased = false;
-    const streaming = await ipcService.playback
-      .openStreamNative(seriesId, episodeId, sessionId, contentType)
-      .catch((error: unknown) => {
-        tracePlayback(`整集 HLS 未命中（回退整集文件） ${describeError(error)}`);
-        return null;
-      });
+    // 没开窗（wantStreaming=false）时一开始就记为"已释放"，末尾那次补释放不会误减。
+    let streamingWindowReleased = !wantStreaming;
+    const streaming = wantStreaming
+      ? await ipcService.playback
+          .openStreamNative(seriesId, episodeId, sessionId, contentType)
+          .catch((error: unknown) => {
+            tracePlayback(`整集 HLS 未命中（回退整集文件） ${describeError(error)}`);
+            return null;
+          })
+      : null;
     if (activeSessionRef.current !== sessionId) {
       endStreamingWindow();
       streamingWindowReleased = true;
@@ -2550,13 +2600,30 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
        */
       if (!vsrEnabledRef.current) {
         const quality = handlerCtxRef.current.currentQuality || 'auto';
-        void ipcService.playback
-          .resolveNative(series.id, next.id, contentType, quality)
-          .catch(() => undefined);
+        // 失败要重试：红果匿名接口偶发静默拒绝，而用户还在看本集，时间足够。
+        // `prewarmedNextRef` 一变（用户切走/换片）就停，避免为不看的集白烧 worker。
+        const attempt = (remaining: number) => {
+          void ipcService.playback
+            .resolveNative(series.id, next.id, contentType, quality)
+            .catch(() => {
+              if (remaining === 0 || prewarmedNextRef.current !== key) return;
+              window.setTimeout(() => attempt(remaining - 1), PREWARM_RETRY_DELAY_MS);
+            });
+        };
+        attempt(PREWARM_RETRIES);
         tracePlayback(`连播预取（整集） 下一集=${next.id} 档位=${quality}`);
         return;
       }
-      void ipcService.playback.prewarmStreamNative(series.id, next.id, contentType);
+      // 同 VSR 关那条：签名阶段会被红果偶发静默拒绝，预转没起来就隔几秒重试。
+      const attemptStream = (remaining: number) => {
+        void ipcService.playback
+          .prewarmStreamNative(series.id, next.id, contentType)
+          .then(started => {
+            if (started || remaining === 0 || prewarmedNextRef.current !== key) return;
+            window.setTimeout(() => attemptStream(remaining - 1), PREWARM_RETRY_DELAY_MS);
+          });
+      };
+      attemptStream(PREWARM_RETRIES);
       tracePlayback(`连播预取 下一集=${next.id} 类型=${contentType}`);
     },
     [],
@@ -4009,6 +4076,20 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   }, [updateSettings]);
 
   /**
+   * 弹幕开关的**唯一写入口**。
+   *
+   * 比 VSR 简单得多：弹幕是纯展示层，切换不需要重开播放会话、不需要重新解析，
+   * 只要写设置即可 —— `DanmakuOverlay` 监听 `danmakuEnabled`，关掉时立刻清屏
+   * 并停止请求（连 `DanmakuLoader` 一并 dispose），打开时按当前位置补一页。
+   *
+   * 这是有意为之的边界：任何"切弹幕要重载视频"的实现都会让用户丢掉当前进度，
+   * 而弹幕与媒体链路本来就没有耦合。
+   */
+  const setDanmakuEnabled = useCallback((enabled: boolean) => {
+    updateSettings({ danmakuEnabled: enabled });
+  }, [updateSettings]);
+
+  /**
    * ===== 视频增强开关：播放中切换必须**立即**生效 =====
    *
    * ## 只写设置为什么不够
@@ -4294,6 +4375,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // worker 的内容类型：漫剧与短剧在 App-API 上是两套参数（1004 / 1）。
         contentType: series.type === 'comic' ? 1004 : 1,
         autoNext: settings.autoNext,
+        // 小窗要据此选链路与预取产物（见 PipHandoff.vsrEnabled 的说明）：
+        // VSR 关时 open_stream 必被门禁拒绝、prewarm_stream 空转，小窗必须
+        // 直接走整集 mp4 并对它预取，否则每次连播都要现场等 3~7 秒。
+        vsrEnabled,
         episodes: series.episodes.map(item => ({
           id: item.id,
           episodeNumber: item.episodeNumber,
@@ -4522,6 +4607,24 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     let firstTickAt: number | null = null;
     /** 心跳打点节流：每 5 秒记一条位置，用于定位"画面在走、进度条不动"。 */
     let lastTickTraceAt = 0;
+    /**
+     * 掉帧采样的上一拍读数（2026-11-02 新增）。
+     *
+     * ## 为什么要把这个数字记下来
+     *
+     * "连续播放会卡顿 / 掉帧"这类反馈此前**完全无法验证**：日志里只有
+     * `waiting`（那是缓冲，不等于掉帧）和 `timeupdate 心跳`（只证明媒体时钟在走）。
+     * 而画面掉帧时媒体时钟照常前进、`waiting` 一次都不发 —— 于是同一个症状
+     * 可能来自三个完全不同的原因，处置方式却互斥：
+     *
+     *   1. 源帧率低（短剧源实测 30fps，3 倍速播放等于每帧 100ms）→ 补帧才有效；
+     *   2. 合成层开销（VSR 关闭时挂 `.ttv-vsr-off`，视频被推入合成器）→ 摘掉那层即可；
+     *   3. 真解码跟不上（HEVC 没走硬解）→ 要么转 H.264，要么换解码路径。
+     *
+     * `getVideoPlaybackQuality()` 给出的是**解码器真正丢弃的帧数**，是唯一能把
+     * 这三种情况分开的证据。每 5 秒与心跳同频采一次，开销可以忽略（一次同步读）。
+     */
+    let lastQuality = { total: 0, dropped: 0 };
     tracePlayback('首帧-宿主 监听器已绑定 video');
 
     const handleTimeUpdate = () => {
@@ -4591,8 +4694,32 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
       const tickNow = performance.now();
       if (tickNow - lastTickTraceAt >= 5000) {
         lastTickTraceAt = tickNow;
+        // 掉帧增量（每 5 秒一次，与心跳同频）。`totalVideoFrames` 是解码器实际
+        // 输出给合成的帧数，`droppedVideoFrames` 是其中被丢掉的 —— 两者都是累计值，
+        // 所以这里算窗口增量。倍速播放时 total 会随倍速升高（3x ≈ 90 帧/5秒），
+        // 因此"丢帧率"要相对 total 看，而不是绝对数。
+        let dropNote = '';
+        try {
+          const quality = typeof video.getVideoPlaybackQuality === 'function'
+            ? video.getVideoPlaybackQuality()
+            : null;
+          if (quality) {
+            const deltaTotal = Math.max(0, quality.totalVideoFrames - lastQuality.total);
+            const deltaDropped = Math.max(0, quality.droppedVideoFrames - lastQuality.dropped);
+            lastQuality = {
+              total: quality.totalVideoFrames,
+              dropped: quality.droppedVideoFrames,
+            };
+            if (deltaTotal > 0) {
+              const pct = ((deltaDropped / deltaTotal) * 100).toFixed(1);
+              dropNote = ` 帧=${deltaTotal} 丢=${deltaDropped}(${pct}%)`;
+            }
+          }
+        } catch {
+          // 环境不支持 getVideoPlaybackQuality 时不记这一段，心跳照常。
+        }
         tracePlayback(
-          `timeupdate 心跳 位置=${cur.toFixed(2)}s 时长=${dur.toFixed(1)}s 标记会话=${video.dataset.sessionId || '(空)'} 当前会话=${activeSessionRef.current}`,
+          `timeupdate 心跳 位置=${cur.toFixed(2)}s 时长=${dur.toFixed(1)}s 标记会话=${video.dataset.sessionId || '(空)'} 当前会话=${activeSessionRef.current}${dropNote}`,
         );
       }
     };
@@ -5351,6 +5478,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     setPlaybackRate,
     setQuality,
     setVsrEnabled,
+    setDanmakuEnabled,
     playNextEpisode,
     playPrevEpisode,
     toggleSideDrawer: (open) => setIsSideDrawerOpen(prev => open ?? !prev),
@@ -5404,6 +5532,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         setQuality,
         vsrEnabled,
         setVsrEnabled,
+        danmakuEnabled,
+        setDanmakuEnabled,
         playNextEpisode,
         playPrevEpisode,
         toggleSideDrawer: (open) => setIsSideDrawerOpen(prev => open ?? !prev),
@@ -5460,6 +5590,7 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     prewarmEpisode: (seriesId, episodeId, contentType) =>
       actionsRef.current!.prewarmEpisode(seriesId, episodeId, contentType),
     enterPip: () => actionsRef.current!.enterPip(),
+    setDanmakuEnabled: (enabled) => actionsRef.current!.setDanmakuEnabled(enabled),
     dismissStallNotice: () => actionsRef.current!.dismissStallNotice(),
     dismissSeekNotice: () => actionsRef.current!.dismissSeekNotice(),
   }), [

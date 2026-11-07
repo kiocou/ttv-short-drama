@@ -1,10 +1,38 @@
-import { CatalogFilter, CatalogPage, SeriesItem, ShelfFeedPage, ShelfKind, ChannelType } from '../types/catalog';
+import { CatalogFilter, CatalogPage, SeasonApiEntry, SeriesItem, ShelfFeedPage, ShelfKind, ChannelType } from '../types/catalog';
 import { SeriesDetail } from '../types/series';
 import { PlaybackSession, PlaybackSnapshot } from '../types/playback';
 import { WatchHistoryItem } from '../types/history';
 import { FavoriteItem } from '../types/favorite';
 import { UserSettings } from '../types/settings';
 import { MOCK_SERIES_LIST, getSeriesDetail, INITIAL_WATCH_HISTORY } from './mockData';
+
+/** 搜索页热搜里的一条短剧（后端 `hongguo_hot_search` 的返回项）。 */
+export interface HotSearchItem {
+  id: string;
+  title: string;
+  cover: string;
+  episodeCount: number;
+  heat?: string;
+}
+
+/** 热榜里的话题；`query` 是点击后要搜的词。 */
+export interface HotSearchTopic {
+  title: string;
+  heat: string;
+  query: string;
+}
+
+export interface HotSearchBoard {
+  name: string;
+  items: HotSearchItem[];
+  topics: HotSearchTopic[];
+}
+
+/** 搜索页热搜：猜你想搜 + 各热搜榜。 */
+export interface HotSearchData {
+  guesses: HotSearchItem[];
+  boards: HotSearchBoard[];
+}
 
 /** 后端 trace_tail 的一次增量拉取结果（字段名与 Rust 侧 camelCase 一致）。 */
 export interface TraceTail {
@@ -299,6 +327,24 @@ const STORAGE_KEYS = {
   FAVORITES: 'ttv_short_drama_favorites_v1',
 };
 
+/**
+ * 弹幕观感默认值（播放器「弹幕设置」面板的「恢复默认」也用这一份）。
+ *
+ * 单独抽出来是因为默认值有**两处消费方**：`DEFAULT_SETTINGS` 的初始字段与
+ * 面板的恢复按钮——各写一份迟早分叉。显示区域 25% 在窗口化的播放器里恰好
+ * 等于写死 4 行时的旧观感（升级前后不变）。
+ */
+export const DANMAKU_APPEARANCE_DEFAULTS = {
+  danmakuArea: 25,
+  danmakuOpacity: 100,
+  danmakuFontScale: 100,
+  danmakuSpeed: 1,
+  danmakuFont: 'Microsoft YaHei',
+  danmakuColor: '#FFFFFF',
+  danmakuBold: true,
+  danmakuStroke: 'heavy' as const,
+};
+
 export const DEFAULT_SETTINGS: UserSettings = {
   defaultQuality: 'auto',
   autoNext: true,
@@ -315,9 +361,17 @@ export const DEFAULT_SETTINGS: UserSettings = {
   // 默认开：现状（引入 media_enhance 之后）默认就走 VSR 转码链路，
   // 默认关会让老用户升级后行为突变。详见 types/settings.ts 的字段注释。
   vsrEnabled: true,
+  // 默认开：做了弹幕就该装好即见，而不是让用户先去设置页找开关。
+  danmakuEnabled: true,
+  // 弹幕观感默认值（详见 types/settings.ts 字段注释）。
+  ...DANMAKU_APPEARANCE_DEFAULTS,
   // 默认 auto：探测决定用不用系统代理。旧记录缺这个字段时也落到这里，
   // 与修复前的行为一致。详见 types/settings.ts 的字段注释。
   proxyMode: 'auto',
+  // 默认关：联动会暂停播放，必须用户显式开启（详见 types/settings.ts 注释）。
+  agentWatchEnabled: false,
+  // 默认关：自定义源还在灰度（只做了登记 + 测试，没接进发现页）。
+  customSourcesEnabled: false,
 };
 
 function loadStorage<T>(key: string, fallback: T): T {
@@ -452,6 +506,246 @@ export interface GuoSourceStep {
   elapsedMs: number;
 }
 
+/**
+ * 视频源注册表（后端 `source_registry` 的唯一出口）。
+ *
+ * 为什么源清单要过 IPC 而不是前端再存一份常量：2026-11-02 源收敛之前，
+ * 后端 `GUO_SOURCES` 与前端 `guoSources.ts` 是两份手工同步的 19 项清单，
+ * 加/删一个源要改两处，漏一处就漂（历史上漂过一次：前端显示可用、后端门闩不认）。
+ * 现在内置源由后端定义，前端只渲染它返回的结果。
+ */
+export interface BuiltinSourceInfo {
+  id: string;
+  name: string;
+  /** `hongguo` = 红果链路，`anime` = 动漫专区。给前端决定点进去跳哪个视图。 */
+  kind: 'hongguo' | 'anime';
+  description: string;
+  builtin: true;
+  /** 内置源恒为启用：没有开关可关（用户要求固定）。 */
+  enabled: true;
+  removable: false;
+}
+
+/** 用户自己添加的源：一份「苹果 CMS V10」接口定义。 */
+export interface CustomSource {
+  /** 小写字母/数字/`-`/`_`，2~40 字符，全局唯一（内置 id 已占用）。 */
+  id: string;
+  name: string;
+  /** 苹果 CMS 接口根地址，http(s)。 */
+  api: string;
+  enabled: boolean;
+  adult: boolean;
+  kind: 'live' | 'comic' | 'both';
+  /** 默认分类名（展示用）。 */
+  category?: string | null;
+  /** 苹果 CMS 的 `t` 参数（分类 id）。 */
+  typeId?: string | null;
+  /** 额外请求头，有些站点校验 Referer。 */
+  headers?: Record<string, string>;
+  note?: string | null;
+}
+
+/** 「测试」按钮的结果：只回答"这个源现在能不能拉到东西"。 */
+export interface SourceProbeResult {
+  ok: boolean;
+  url: string;
+  total: number;
+  count: number;
+  samples: string[];
+  elapsedMs: number;
+  error?: string | null;
+}
+
+export interface SourceCatalog {
+  builtin: BuiltinSourceInfo[];
+  custom: CustomSource[];
+  /** 本机源文件（`custom-sources.json`）的绝对路径。 */
+  sourcesFile: string;
+  /** 字段说明文件名（项目根的 `视频源格式.txt`）。 */
+  formatDoc: string;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 红果原生客户端（hongguo_api.rs）的返回类型
+//
+// 这些命令都直连 App 接口，分页统一是游标式：`cursor` 由后端产出，
+// 前端原样回传，**不要解析它的内容**（它是 `s1.` / `d1.` 前缀的 base64 JSON，
+// 解析就等于把后端的私有格式抄到前端来，后端一改前端全崩）。
+// ───────────────────────────────────────────────────────────────────────────
+
+/** 一页剧集卡。 */
+export interface HongguoPage {
+  items: SeriesItem[];
+  hasMore: boolean;
+  /** 下一页游标；`null` 表示没有下一页。 */
+  cursor: string | null;
+}
+
+/** 排行榜里的一行。 */
+export interface HongguoRankItem {
+  position: number;
+  series: SeriesItem;
+  /** 服务端给的热度文案，如「2550万热度」；推广行是「平台推荐」。 */
+  score: string;
+  promoted: boolean;
+}
+
+export interface HongguoRankBoard {
+  id: string;
+  name: string;
+  selected: boolean;
+}
+
+export interface HongguoRankContent {
+  id: string;
+  name: string;
+  selected: boolean;
+  boards: HongguoRankBoard[];
+}
+
+/** 短剧排行榜的一页。 */
+export interface HongguoShortRank {
+  items: HongguoRankItem[];
+  contents: HongguoRankContent[];
+  content: string;
+  board: string;
+  hasMore: boolean;
+  cursor: string | null;
+}
+
+/** 筛选面板里的一行与它的选项。 */
+export interface HongguoFilterOption {
+  name: string;
+  value: string;
+}
+
+export interface HongguoFilterRow {
+  key: string;
+  name: string;
+  options: HongguoFilterOption[];
+}
+
+/** 筛选结果的一页；`selections` 是实际生效的筛选，续页时要原样带回。 */
+export interface HongguoFilterPage extends HongguoPage {
+  selections: Record<string, string[]>;
+}
+
+/** 演员粉丝榜的一位。 */
+export interface HongguoActorRankItem {
+  index: number;
+  voteCount: number;
+  actorName: string;
+  actorAvatar: string;
+  /** `person` 的入参。 */
+  userId: string;
+  series: SeriesItem;
+}
+
+/** 活动榜（星粉榜）。 */
+export interface HongguoRanking {
+  listName: string;
+  lists: { id: string; name: string; shortlistedNumber: number }[];
+  items: HongguoActorRankItem[];
+  hasMore: boolean;
+  nextOffset: number;
+}
+
+export interface HongguoEpisode {
+  id: string;
+  seriesId: string;
+  number: number;
+  title: string;
+  durationSeconds: number;
+  cover: string;
+}
+
+/** 详情：在卡片之外补齐状态、付费、分级、多季与计数。 */
+export interface HongguoSeriesDetail {
+  series: SeriesItem;
+  /** 0 更新中，1 已完结。 */
+  status: number;
+  /** 0 免费，1 会员，2 单买。 */
+  payType: number;
+  /** 0 为不受限。 */
+  ageGate: number;
+  isMultiSeason: boolean;
+  /** 集数角标，如「更新至12集」。 */
+  rightText: string;
+  playCount: number;
+  followCount: number;
+  diggCount: number;
+  /** Unix 秒，0 表示没有。 */
+  createdAt: number;
+  episodes: HongguoEpisode[];
+}
+
+export interface HongguoRecommend {
+  cellTitle: string;
+  sessionId: string;
+  items: SeriesItem[];
+}
+
+/** 演员 / 角色主页。 */
+export interface HongguoPerson {
+  userId: string;
+  name: string;
+  description: string;
+  avatarUrl: string;
+  /** 头衔，如「女演员」「虚拟人物」。 */
+  tags: string[];
+  /** 名字下方的小徽标，如星座。 */
+  labels: string[];
+  followers: number;
+  likes: number;
+}
+
+export interface HongguoWork {
+  series: SeriesItem;
+  /** 卡片上的各行，如「爱情」「70集」。 */
+  tags: string[];
+  heat: number;
+  plays: number;
+  coverExpiresAt: number;
+}
+
+export interface HongguoWorkPage {
+  items: HongguoWork[];
+  hasMore: boolean;
+  cursor: string | null;
+}
+
+export interface HongguoNewRelease {
+  series: SeriesItem;
+  online: boolean;
+  /** 预告作品的上线时间（Unix 秒）。 */
+  publishAt: number;
+  categories: string[];
+  heat: string;
+  note: string;
+}
+
+export interface HongguoNewReleasePage {
+  /** 本页对应的日期 YYYYMMDD。 */
+  date: string;
+  /** 日历提供的日期（今天前后各一周）。 */
+  dates: string[];
+  items: HongguoNewRelease[];
+  hasMore: boolean;
+  cursor: string | null;
+}
+
+/** 搜索 tab。只开放短剧相关的四个；小说 / 听书属于书城，后端会拒绝。 */
+export type HongguoSearchTab = 'overall' | 'series' | 'video' | 'discussion';
+
+/** 发现频道。同样只开放短剧相关频道。 */
+export type HongguoDiscoverChannel =
+  | 'recommend'
+  | 'live'
+  | 'comic'
+  | 'home_live'
+  | 'home_comic'
+  | 'find';
+
 export const ipcService = {
   catalog: {
     /**
@@ -516,6 +810,59 @@ export const ipcService = {
         const items = await invokeBackend<SeriesItem[]>('catalog_suggest', { keyword, channel });
         items.forEach(item => channelBySeriesId.set(item.id, item.type));
         return items;
+      } catch {
+        return [];
+      }
+    },
+    /**
+     * 搜索页热搜（猜你想搜 + 各热搜榜）。
+     *
+     * 只有 App 接口提供这组数据，网页源没有对应页面。失败返回 `null` 让调用方
+     * 隐藏区块——热搜是装饰，不该因为它挂了挡住搜索本身。
+     */
+    async hotSearch(): Promise<HotSearchData | null> {
+      if (!isTauriEnvironment()) return null;
+      try {
+        return await invokeBackend<HotSearchData>('hongguo_hot_search');
+      } catch {
+        return null;
+      }
+    },
+    /**
+     * 该系列**全部季**（含当前季、含未上架季），按季号升序（2026-10-29）。
+     *
+     * ## 为什么要这条命令
+     *
+     * 此前系列剧弹窗只能拿"剧名 + 猜出来的季号"反复打网页搜索与 App 联想，而搜索是
+     * 按相关度截断的：35 季的《烬九州》怎么补都缺段，用户把剧名打错一个字更是直接空窗。
+     * 后端按 series id 直接给出权威季表，季号结构化（`seasonIndex`），不再需要猜。
+     *
+     * ## 失败一律返回空数组
+     *
+     * 它是详情页的**增量**来源，不是主数据：查不到就退回搜索链路（见
+     * `services/relatedSeries.ts`），绝不能因为一次抖动把详情页弄红。所以这里
+     * 不做任何错误冒泡，连 `isTauriEnvironment()` 为假（Web 演示模式）也当空表。
+     */
+    async seriesSeasons(seriesId: string): Promise<SeasonApiEntry[]> {
+      if (!seriesId || !isTauriEnvironment()) return [];
+      try {
+        const entries = await invokeBackend<SeasonApiEntry[]>(
+          'catalog_series_seasons',
+          { seriesId },
+        );
+        if (!Array.isArray(entries)) return [];
+        /**
+         * 回填频道：这批 id 是弹窗里可以点进去的入口，而 `series.getDetail` 要靠
+         * `channelBySeriesId` 判断走哪条详情链路（缺了 channel 的动漫/漫剧 id 会被
+         * 路由到红果，表现为"点进去标题是别人的、共 0 集"）。同一系列的季必然同频道，
+         * 所以用当前剧已知的频道代填；当前剧频道未知时（Map 里没有）就跳过，
+         * 不猜。
+         */
+        const inheritedChannel = channelBySeriesId.get(seriesId);
+        if (inheritedChannel) {
+          entries.forEach(entry => rememberChannel(entry.seriesId, inheritedChannel));
+        }
+        return entries;
       } catch {
         return [];
       }
@@ -668,6 +1015,221 @@ async guoCover(seriesId: string): Promise<string | null> {
   },
 
   /**
+   * 红果原生客户端（`hongguo_api.rs`）的能力。
+   *
+   * 与上面的 `catalog` 分开的理由：`catalog` 是**多源聚合**链路（网页 + App + 动漫
+   * 三路合并、带磁盘缓存与 SWR），这里的每一条都是**单一 App 接口的直连**，
+   * 语义更窄但字段更全（tab / 筛选 / 榜单 / 演员 / 日历这些网页源根本没有）。
+   *
+   * 失败策略分两种，别混：
+   * - **主数据**（搜索、发现、详情、榜单、演员）：失败就抛，让页面显示错误，
+   *   不能把"接口挂了"伪装成"没有内容"。
+   * - **增量/装饰**（联想词、轮播提示、相关推荐）：失败返回空，不该拖垮主区块。
+   */
+  hongguo: {
+    /**
+     * 搜索框联想词。返回的是**文本**，不是剧集卡——接口本身只给文本。
+     *
+     * 与 `catalog.searchSuggest`（走 Python worker 的 search 子命令、能给出
+     * 带 id 的分季条目）是两件不同的事，不要互相替代。
+     */
+    async suggest(keyword: string): Promise<string[]> {
+      const trimmed = keyword.trim();
+      if (!trimmed || !isTauriEnvironment()) return [];
+      try {
+        return await invokeBackend<string[]>('hongguo_suggest', { keyword: trimmed });
+      } catch {
+        return [];
+      }
+    },
+
+    /** 搜索框里轮播的提示词。失败返回空数组。 */
+    async searchCues(): Promise<string[]> {
+      if (!isTauriEnvironment()) return [];
+      try {
+        return await invokeBackend<string[]>('hongguo_search_cues');
+      } catch {
+        return [];
+      }
+    },
+
+    /**
+     * 按 tab 与筛选搜索一页。
+     *
+     * `filters` 只在 `tab === 'overall'` 时有效，其余 tab 传了会被后端拒绝
+     * （不是静默忽略——静默忽略会让用户以为筛选生效了）。
+     */
+    async search(input: {
+      keyword: string;
+      tab?: HongguoSearchTab;
+      filters?: string[];
+      cursor?: string | null;
+      pageSize?: number;
+      channel?: string;
+    }): Promise<HongguoPage> {
+      const page = await invokeBackend<HongguoPage>('hongguo_search', {
+        keyword: input.keyword,
+        tab: input.tab,
+        filters: input.filters,
+        cursor: input.cursor ?? null,
+        pageSize: input.pageSize,
+        channel: input.channel,
+      });
+      page.items?.forEach(item => channelBySeriesId.set(item.id, item.type));
+      return page;
+    },
+
+    /** 发现页某个短剧频道的一页；`cursor` 续页。 */
+    async discover(
+      channel: HongguoDiscoverChannel,
+      cursor?: string | null,
+    ): Promise<HongguoPage> {
+      const page = await invokeBackend<HongguoPage>('hongguo_discover', {
+        channel,
+        cursor: cursor ?? null,
+      });
+      page.items?.forEach(item => channelBySeriesId.set(item.id, item.type));
+      return page;
+    },
+
+    /** 短剧排行榜的一页；`content` / `board` 为空用服务端默认榜。 */
+    async shortRank(input: {
+      content?: string;
+      board?: string;
+      cursor?: string | null;
+      channel?: string;
+    }): Promise<HongguoShortRank> {
+      return invokeBackend<HongguoShortRank>('hongguo_short_rank', {
+        content: input.content,
+        board: input.board,
+        cursor: input.cursor ?? null,
+        channel: input.channel,
+      });
+    },
+
+    /** 短剧筛选面板的各选择行。`genre` 空即全部。 */
+    async shortFilterPanel(genre?: string): Promise<HongguoFilterRow[]> {
+      return invokeBackend<HongguoFilterRow[]>('hongguo_short_filter_panel', {
+        genre: genre ?? null,
+      });
+    },
+
+    /**
+     * 按筛选条件查短剧，一页。
+     *
+     * 续页时把上一页返回的 `selections` 原样带回来：游标里记着它是哪一组查询，
+     * 传了不同的筛选后端会直接报错（而不是悄悄换一组结果）。
+     */
+    async shortFilter(input: {
+      selections?: Record<string, string[]>;
+      cursor?: string | null;
+      channel?: string;
+    }): Promise<HongguoFilterPage> {
+      const page = await invokeBackend<HongguoFilterPage>('hongguo_short_filter', {
+        selections: input.selections,
+        cursor: input.cursor ?? null,
+        channel: input.channel,
+      });
+      page.items?.forEach(item => channelBySeriesId.set(item.id, item.type));
+      return page;
+    },
+
+    /** 活动榜（红果演员粉丝榜）。 */
+    async ranking(input?: {
+      activityId?: string;
+      rankListId?: string;
+      channel?: string;
+    }): Promise<HongguoRanking> {
+      return invokeBackend<HongguoRanking>('hongguo_ranking', {
+        activityId: input?.activityId,
+        rankListId: input?.rankListId,
+        channel: input?.channel,
+      });
+    },
+
+    /** 单部短剧详情（含详情字段与全集列表）。 */
+    async seriesDetail(seriesId: string, channel?: string): Promise<HongguoSeriesDetail> {
+      return invokeBackend<HongguoSeriesDetail>('hongguo_series_detail', {
+        seriesId,
+        channel,
+      });
+    },
+
+    /** 批量详情：后端按 10 部一批请求，按请求顺序返回；失败返回空数组。 */
+    async seriesBatch(seriesIds: string[], channel?: string): Promise<HongguoSeriesDetail[]> {
+      if (!seriesIds.length || !isTauriEnvironment()) return [];
+      try {
+        return await invokeBackend<HongguoSeriesDetail[]>('hongguo_series_batch', {
+          seriesIds,
+          channel,
+        });
+      } catch {
+        return [];
+      }
+    },
+
+    /** 合集详情：上游 JSON 原样透传（合集结构各接口不一致，不做二次建模）。 */
+    async album(albumId: string): Promise<unknown | null> {
+      if (!albumId || !isTauriEnvironment()) return null;
+      try {
+        return await invokeBackend<unknown>('hongguo_album', { albumId });
+      } catch {
+        return null;
+      }
+    },
+
+    /** 相关推荐（详情页底部）。失败返回空，不拖垮详情页。 */
+    async seriesRecommend(seriesId: string, channel?: string): Promise<HongguoRecommend | null> {
+      if (!seriesId || !isTauriEnvironment()) return null;
+      try {
+        const rec = await invokeBackend<HongguoRecommend>('hongguo_series_recommend', {
+          seriesId,
+          channel,
+        });
+        rec.items?.forEach(item => channelBySeriesId.set(item.id, item.type));
+        return rec;
+      } catch {
+        return null;
+      }
+    },
+
+    /** 演员 / 角色主页。 */
+    async person(userId: string): Promise<HongguoPerson> {
+      return invokeBackend<HongguoPerson>('hongguo_person', { userId });
+    },
+
+    /** 演员参演作品，一页。 */
+    async personWorks(input: {
+      userId: string;
+      cursor?: string | null;
+      channel?: string;
+    }): Promise<HongguoWorkPage> {
+      const page = await invokeBackend<HongguoWorkPage>('hongguo_person_works', {
+        userId: input.userId,
+        cursor: input.cursor ?? null,
+        channel: input.channel,
+      });
+      page.items?.forEach(w => channelBySeriesId.set(w.series.id, w.series.type));
+      return page;
+    },
+
+    /** 上新日历的一页。`date` 为 YYYYMMDD，空即今天。 */
+    async newReleases(input?: {
+      date?: string;
+      cursor?: string | null;
+      channel?: string;
+    }): Promise<HongguoNewReleasePage> {
+      const page = await invokeBackend<HongguoNewReleasePage>('hongguo_new_releases', {
+        date: input?.date,
+        cursor: input?.cursor ?? null,
+        channel: input?.channel,
+      });
+      page.items?.forEach(r => channelBySeriesId.set(r.series.id, r.series.type));
+      return page;
+    },
+  },
+
+  /**
    * 首页货架「更多」页的分区列表。
    *
    * 走的是**红果 App-API**（榜单 / 最新上架），不是 `catalog.list` 那条多源聚合
@@ -787,6 +1349,44 @@ async guoCover(seriesId: string): Promise<string | null> {
       };
     },
 
+    /**
+     * 原生播放器（mpv 内核 + LSFG 补帧，单窗口）—— 与 WebView2 播放链路并行的第二套入口。
+     *
+     * 为什么单独一条路：补帧引擎捕获不到 WebView2（DXGI/WGC 全黑、GDI 崩溃，
+     * Rust 侧 main.rs 有实测记录），且 WebView2 只能播 H.264，红果源是 HEVC+CENC
+     * —— 必须整集转码。原生播放器直吃直链（解密+硬解），首帧从 3~6 秒降到 1 秒内。
+     */
+    async nativeOpen(input: {
+      vid: string;
+      seriesId?: string;
+      episodeId?: string;
+      title?: string;
+      episode?: number;
+      startSeconds?: number;
+      volume?: number;
+      fg?: boolean;
+      fgMult?: number;
+    }): Promise<{ alive: boolean; position: number; duration: number }> {
+      if (!isTauriEnvironment()) throw new Error('原生播放器仅在桌面应用中可用。');
+      return invokeBackend('native_player_open', { input });
+    },
+
+    /** 原生播放器控制：{cmd:'pause'|'play'|'seek'|'volume'|'speed'|'fg'|'quit', ...} */
+    async nativeSend(command: Record<string, unknown>): Promise<void> {
+      if (!isTauriEnvironment()) return;
+      await invokeBackend('native_player_send', { command });
+    },
+
+    async nativeStatus(): Promise<{ alive: boolean; position: number; duration: number; episode: number; title: string }> {
+      if (!isTauriEnvironment()) return { alive: false, position: 0, duration: 0, episode: 0, title: '' };
+      return invokeBackend('native_player_status');
+    },
+
+    async nativeClose(): Promise<void> {
+      if (!isTauriEnvironment()) return;
+      try { await invokeBackend('native_player_close'); } catch { /* 未运行即幂等 */ }
+    },
+
     async command(sessionId: number, action: 'play' | 'pause' | 'seek' | 'volume' | 'stop', payload?: unknown): Promise<void> {
       if (isTauriEnvironment()) await invokeBackend('playback_command', { sessionId, action, payload });
     },
@@ -880,6 +1480,44 @@ async guoCover(seriesId: string): Promise<string | null> {
     },
 
     /**
+     * 取一页弹幕。
+     *
+     * `startMs` 是窗口起点、`durationMs` 是窗口**终点**（绝对时间，不是长度）。
+     * 协议里 `playlet_item_duration` 收的就是终点，两者一起界定范围——写成长度
+     * 会让服务端返回整集弹幕或者空页。
+     *
+     * 失败要抛而不是返回空列表：调用方据此进入「15 秒冷却后重试」，
+     * 返回空列表会被误判成「这一集真的没人发弹幕」。
+     */
+    async danmaku(
+      seriesId: string,
+      vid: string,
+      startMs: number,
+      durationMs: number,
+    ): Promise<{
+      episodeId: string;
+      startMs: number;
+      nextMs: number;
+      total: number;
+      items: { id: string; text: string; timeMs: number }[];
+    }> {
+      if (!isTauriEnvironment()) throw new Error('弹幕仅在桌面应用中可用。');
+      return invokeBackend('short_drama_app_danmaku', {
+        input: {
+          seriesId,
+          vid,
+          // 视频时钟是小数毫秒（`element.duration * 1000` 几乎必带小数），而
+          // Rust 侧 `DanmakuInput` 是 i64 —— 浮点直接透传会被 Tauri 反序列化
+          // 整单拒绝（trace 里全是 "invalid type: floating point … expected
+          // i64"），表现为「弹幕开关开着却一条都不显示」。在 IPC 边界取整，
+          // 别让浮点漏过这条契约（2026-11-07）。
+          startMs: Math.round(startMs),
+          durationMs: Math.round(durationMs),
+        },
+      });
+    },
+
+    /**
      * **预转下一集的整集 HLS**（用户需求：集与集之间无缝切换）。
      *
      * 后端会把这一集转好放进 `vid-{vid}` 目录，**不占播放会话、不返回地址**，
@@ -889,15 +1527,18 @@ async guoCover(seriesId: string): Promise<string | null> {
      * 正片）。上一集播放期间完全来得及备好下一集 —— 等用户连播到它时，
      * `openStreamNative` 命中已转好的产物，切换**零等待**。
      */
-    async prewarmStreamNative(seriesId: string, vid: string, contentType?: number): Promise<void> {
-      if (!isTauriEnvironment()) return;
+    async prewarmStreamNative(seriesId: string, vid: string, contentType?: number): Promise<boolean> {
+      if (!isTauriEnvironment()) return true;
       try {
         await invokeBackend('short_drama_app_prewarm_stream', {
           input: { seriesId, vid, contentType, quality: 'auto' },
         });
+        return true;
       } catch (error) {
         // 静默：预转失败不该影响任何用户可见行为。
+        // 返回值供连播预取决定要不要重试（签名阶段会被红果偶发静默拒绝）。
         void ipcService.diagnostics.uiLog(`预转未启动（静默） vid=${vid} ${errorText(error, '未知错误')}`);
+        return false;
       }
     },
 
@@ -1091,6 +1732,69 @@ async guoCover(seriesId: string): Promise<string | null> {
       if (isTauriEnvironment()) return invokeBackend<{ freedMb: number }>('cache_clear');
       await new Promise(resolve => setTimeout(resolve, 300));
       return { freedMb: 0 };
+    },
+  },
+
+  /**
+   * 视频源：内置两源固定 + 用户自己添加的自定义源（苹果 CMS 接口）。
+   *
+   * 插件系统那条路已经放弃：它要沙箱、要 IPC 契约、要执行用户代码，而真正需要
+   * 的只是"再接一个苹果 CMS 站点"。现在添加一个源＝往 `custom-sources.json`
+   * 写一条定义，格式见项目根 `视频源格式.txt`。
+   */
+  sources: {
+    async list(): Promise<SourceCatalog> {
+      if (isTauriEnvironment()) return invokeBackend<SourceCatalog>('source_list');
+      // 浏览器预览：与后端同一份内置源，避免预览界面看起来"一个源都没有"。
+      return {
+        builtin: [
+          {
+            id: 'hongguo',
+            name: '红果短剧 / 漫剧',
+            kind: 'hongguo',
+            description: '内置。短剧专区与漫剧次元的默认来源。',
+            builtin: true,
+            enabled: true,
+            removable: false,
+          },
+          {
+            id: 'anime',
+            name: '动漫专区',
+            kind: 'anime',
+            description: '内置。动漫共和国正式源优先，不可用时回落暴风资源。',
+            builtin: true,
+            enabled: true,
+            removable: false,
+          },
+        ],
+        custom: [],
+        sourcesFile: '',
+        formatDoc: '视频源格式.txt',
+      };
+    },
+
+    /** 添加一条自定义源。后端会校验 id/name/api 并把失败原因原样抛回来。 */
+    async add(source: CustomSource): Promise<CustomSource> {
+      if (!isTauriEnvironment()) throw new Error('添加视频源仅在桌面应用中可用。');
+      return invokeBackend<CustomSource>('source_add', { source });
+    },
+
+    /** 删除一条自定义源（返回是否真的删掉了）。 */
+    async remove(id: string): Promise<boolean> {
+      if (!isTauriEnvironment()) throw new Error('删除视频源仅在桌面应用中可用。');
+      return invokeBackend<boolean>('source_remove', { id });
+    },
+
+    /** 启停一条自定义源。 */
+    async toggle(id: string, enabled: boolean): Promise<void> {
+      if (!isTauriEnvironment()) throw new Error('视频源开关仅在桌面应用中可用。');
+      await invokeBackend('source_toggle', { id, enabled });
+    },
+
+    /** 真实请求一次列表接口（「测试」按钮）。 */
+    async probe(id: string): Promise<SourceProbeResult> {
+      if (!isTauriEnvironment()) throw new Error('测试视频源仅在桌面应用中可用。');
+      return invokeBackend<SourceProbeResult>('source_probe', { id });
     },
   },
 
