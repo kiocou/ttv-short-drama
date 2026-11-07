@@ -504,7 +504,7 @@ export const VideoSurface: React.FC = () => {
    *   - 播放位置已经推进（> 0.5s）→ 底部轻提示条，不遮画面、不挡控制条；
    *   - 还没出画（首开就失败）→ 保留全屏卡片，那才是需要用户决策的时刻。
    */
-  const compactError = position > 0.5;
+  const compactError = position > 0.5 || currentView === 'feed';
 
   return (
     <div
@@ -705,7 +705,9 @@ export const VideoSurface: React.FC = () => {
       {uiState.kind === 'error' && (
         <div
           className={
-            compactError
+            currentView === 'feed'
+              ? 'absolute inset-x-0 top-20 flex justify-center px-4 z-30 pointer-events-none'
+              : compactError
               // 已开始播放：只占底部一条，画面与进度条都保持可见。
               ? 'absolute inset-x-0 bottom-24 flex justify-center px-4 z-30 pointer-events-none'
               : 'absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm z-30'
@@ -830,6 +832,7 @@ export const VideoSurface: React.FC = () => {
 
       {/* 悬浮云母控制层 HUD */}
       <PlayerControls
+        feedMode={currentView === 'feed'}
         effectivePlaybackRate={boost?.rate ?? null}
         isVisible={isControlsVisible}
         isLocked={isLocked}

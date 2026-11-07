@@ -200,6 +200,10 @@
   transition: opacity 0.3s ease;
 }
 
+.ttv-hud.is-feed {
+  justify-content: flex-end;
+}
+
 /*
   自动隐藏态（播放中静默 2.5s 后）：整层淡出。
   该类由 PlayerControls 按 isVisible 直接挂在 HUD 元素上——

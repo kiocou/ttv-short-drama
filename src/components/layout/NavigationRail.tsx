@@ -5,6 +5,7 @@ import {
   Bookmark,
   History,
   Settings,
+  Play,
   PanelLeftClose,
   PanelLeftOpen,
 } from 'lucide-react';
@@ -17,7 +18,7 @@ interface NavItem {
 }
 
 export const NavigationRail: React.FC = () => {
-  const { currentView, navigateTo, isNavCollapsed, toggleNavCollapsed } = useAppStore();
+  const { currentView, navigateTo, openFeed, isNavCollapsed, toggleNavCollapsed } = useAppStore();
 
   const navItems: NavItem[] = [
     // 图标按"这一项到底是什么"选，而不是按近义词选：
@@ -26,6 +27,7 @@ export const NavigationRail: React.FC = () => {
     // Bookmark = 追剧收藏（Heart 是"喜欢"，对应的是详情页的点赞语义，不是追更）；
     // History / Settings 本来就准确，不动。
     { id: 'explore', label: '短剧精选', icon: Flame },
+    { id: 'feed', label: '短剧推荐', icon: Play },
     { id: 'anime', label: '动漫专区', icon: Clapperboard },
     { id: 'favorites', label: '我的追剧', icon: Bookmark },
     { id: 'history', label: '观看历史', icon: History },
@@ -91,7 +93,7 @@ export const NavigationRail: React.FC = () => {
               <button
                 key={item.id}
                 type="button"
-                onClick={() => navigateTo(item.id)}
+                onClick={() => item.id === 'feed' ? openFeed() : navigateTo(item.id)}
                 title={isNavCollapsed ? item.label : undefined}
                 className={`group relative flex items-center h-10 w-full rounded-xl transition-colors duration-150 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 active:scale-[0.98] overflow-hidden ${
                   isActive

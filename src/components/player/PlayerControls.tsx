@@ -43,6 +43,8 @@ interface PlayerControlsProps {
   onPointerMove?: (e: React.MouseEvent) => void;
   /** 长按方向键加速时实际生效的速率（未加速为 null），仅用于展示。 */
   effectivePlaybackRate?: number | null;
+  /** 短剧推荐有独立的标题 / 返回层。 */
+  feedMode?: boolean;
 }
 
 export const PlayerControls: React.FC<PlayerControlsProps> = ({
@@ -54,6 +56,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
   onUserActivity,
   onPointerMove,
   effectivePlaybackRate = null,
+  feedMode = false,
 }) => {
   const {
     currentSeries,
@@ -87,7 +90,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
   // 补帧入口已在发布前移除（独立窗口方案不成熟：需要另起 D3D11 窗口、
   // 与主窗口两套音频/进度，且调试徽标漏在界面上）。后端 `frame_interp_set`
   // 命令保留但不再被前端调用。
-  const { goBack } = useAppStore();
+  const { goBack, currentView, navigateTo } = useAppStore();
 
   /**
    * 弹幕观感设置（显示区域/不透明度/字号/速度/字体/粗体/描边）。
@@ -193,7 +196,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
       */}
       {vsrEnabled && (
         <div
-          className={`absolute top-3 right-3 z-40 pointer-events-none flex items-center gap-1.5 rounded-full transition-opacity duration-200 ${
+          className={`absolute ${feedMode ? 'top-16 right-4' : 'top-3 right-3'} z-40 pointer-events-none flex items-center gap-1.5 rounded-full transition-opacity duration-200 ${
             isVisible ? 'opacity-100' : 'opacity-0'
           }`}
           style={{
@@ -236,6 +239,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
       )}
       <PlayerHud
       title={currentSeries?.title || '精彩短剧'}
+      hideHeader={feedMode}
       episodeLabel={episodeBadge}
       position={position}
       duration={duration}
@@ -270,7 +274,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
       onPlayPrev={playPrevEpisode}
       onPlayNext={playNextEpisode}
       onOpenEpisodes={() => toggleSideDrawer()}
-        onBack={goBack}
+        onBack={currentView === 'feed' ? () => navigateTo('explore') : goBack}
         onEnterPip={handleEnterPip}
       />
     </>

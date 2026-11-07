@@ -14,6 +14,7 @@ import { useAppStore } from '../../stores/useAppStore';
 import { useHistoryStore } from '../../stores/useHistoryStore';
 import { usePlaybackActions } from '../../stores/usePlaybackStore';
 import { tracePlayback } from '../../services/playbackTrace';
+import type { WatchHistoryItem } from '../../types/history';
 
 /**
  * 画中画小窗的"回流"处理（主窗口侧，不渲染任何界面）。
@@ -36,7 +37,7 @@ interface PipBridgeContext {
   playback: ReturnType<typeof usePlaybackActions>;
   anime: ReturnType<typeof useAnimePlayer>;
   navigateTo: (view: 'player') => void;
-  loadHistory: () => Promise<void>;
+  loadHistory: () => Promise<WatchHistoryItem[]>;
 }
 
 /** 倍速的合法性兜底：损坏/未就绪的媒体元素可能报出 0 或 NaN。 */

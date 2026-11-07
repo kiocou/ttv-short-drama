@@ -5,7 +5,7 @@ import { ipcService } from '../services/ipc';
 interface HistoryContextType {
   records: WatchHistoryItem[];
   isLoading: boolean;
-  loadHistory: () => Promise<void>;
+  loadHistory: () => Promise<WatchHistoryItem[]>;
   removeRecord: (seriesId: string) => Promise<void>;
   clearHistory: () => Promise<void>;
 }
@@ -16,13 +16,15 @@ export const HistoryProvider: React.FC<{ children: ReactNode }> = ({ children })
   const [records, setRecords] = useState<WatchHistoryItem[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
-  const loadHistory = useCallback(async () => {
+  const loadHistory = useCallback(async (): Promise<WatchHistoryItem[]> => {
     setIsLoading(true);
     try {
       const list = await ipcService.history.list();
       setRecords(list);
+      return list;
     } catch (err) {
       console.warn('History load failed:', err);
+      return [];
     } finally {
       setIsLoading(false);
     }

@@ -1,6 +1,6 @@
-import { SeriesItem, ChannelType } from '../types/catalog';
-import { SeriesDetail, EpisodeItem } from '../types/series';
-import { WatchHistoryItem } from '../types/history';
+import type { SeriesItem, ChannelType } from '../types/catalog';
+import type { SeriesDetail, EpisodeItem } from '../types/series';
+import type { WatchHistoryItem } from '../types/history';
 
 // 公共流媒体测试视频源（高质量、低延迟、多格式兼容）
 const SAMPLE_VIDEOS = [

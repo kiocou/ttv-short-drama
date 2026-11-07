@@ -91,7 +91,13 @@ interface PlaybackContextType {
    * 监听器会留在被丢弃的旧元素上（见 `videoElement` 那段说明）。
    */
   registerVideoElement: (element: HTMLVideoElement | null) => void;
-  openEpisode: (seriesId: string, episodeId?: string, startPosition?: number, qualityOverride?: string) => Promise<void>;
+  openEpisode: (
+    seriesId: string,
+    episodeId?: string,
+    startPosition?: number,
+    qualityOverride?: string,
+    detailOverride?: SeriesDetail,
+  ) => Promise<void>;
   togglePlay: () => void;
   seek: (seconds: number) => void;
   seekRelative: (deltaSeconds: number) => void;
@@ -1218,7 +1224,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 供"只绑定一次"的事件监听器间接调用的稳定引用。
   const playNextEpisodeRef = useRef<() => void>(() => {});
   const openEpisodeRef = useRef<
-    (seriesId: string, episodeId?: string, startPosition?: number, qualityOverride?: string) => Promise<void>
+    (
+      seriesId: string,
+      episodeId?: string,
+      startPosition?: number,
+      qualityOverride?: string,
+      detailOverride?: SeriesDetail,
+    ) => Promise<void>
   >(() => Promise.resolve());
   const saveProgressThrottledRef = useRef<(pos: number, dur: number, force?: boolean) => void>(() => {});
 
@@ -2836,7 +2848,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 入口先收掉画中画小窗：播放权同一时刻只能属于一个窗口。用户在小窗开着的时候
   // 又点了一集，主窗口这边必须先把小窗拆掉，否则两路声音会同时响。同理，从小窗
   // "回到播放器"时这一步是空操作（窗口已经关掉了）。
-  const runOpenEpisode = async (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string) => {
+  const runOpenEpisode = async (
+    seriesId: string,
+    episodeId?: string,
+    startPosition = 0,
+    qualityOverride?: string,
+    detailOverride?: SeriesDetail,
+  ) => {
     /**
      * App 链路（本地解析 / 整集 HLS）没成功时的结局，用于在**最后的公开网页
      * 兜底也失败**时如实报出真正的原因，而不是那句会误导人的
@@ -2935,7 +2953,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
 
     try {
-      const detail = await ipcService.series.getDetail(seriesId);
+      if (detailOverride && detailOverride.id !== seriesId) {
+        throw new Error('推荐剧集详情与播放剧集不一致。');
+      }
+      const detail = detailOverride ?? await ipcService.series.getDetail(seriesId);
       if (activeSessionRef.current !== newSessionId) return; // 已有更新的请求
 
       setCurrentSeries(detail);
@@ -3547,7 +3568,13 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
   // 已经整集重试过的 vid：见 runOpenEpisode 里的"只重试一次"约定。
   const resolveRetriedRef = useRef<Set<string>>(new Set());
   const openInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
-  const openEpisode = (seriesId: string, episodeId?: string, startPosition = 0, qualityOverride?: string): Promise<void> => {
+  const openEpisode = (
+    seriesId: string,
+    episodeId?: string,
+    startPosition = 0,
+    qualityOverride?: string,
+    detailOverride?: SeriesDetail,
+  ): Promise<void> => {
     // 新的一集从哪开始，必须在日志里留一条：用户报"下一集不是从头播"时，
     // 只有这行能和随后的「首帧-宿主 首次 timeupdate 位置=」对上——否则
     // 分不清是起播点传错了，还是换源没重置元素位置。
@@ -3569,7 +3596,10 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     const key = `${seriesId}|${episodeId || ''}|${Math.round(startPosition)}|${qualityOverride || ''}|${enhanceEpochRef.current}`;
     const inflight = openInFlightRef.current.get(key);
     if (inflight) return inflight;
-    const task = runOpenEpisode(seriesId, episodeId, startPosition, qualityOverride)
+    if (detailOverride && detailOverride.id !== seriesId) {
+      return Promise.reject(new Error('推荐剧集详情与播放剧集不一致。'));
+    }
+    const task = runOpenEpisode(seriesId, episodeId, startPosition, qualityOverride, detailOverride)
       .finally(() => {
         if (openInFlightRef.current.get(key) === task) openInFlightRef.current.delete(key);
       });
@@ -5571,8 +5601,8 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
     availableQualities,
     isSideDrawerOpen,
     isDiagnosticsOpen,
-    openEpisode: (seriesId, episodeId, startPosition, qualityOverride) =>
-      actionsRef.current!.openEpisode(seriesId, episodeId, startPosition, qualityOverride),
+    openEpisode: (seriesId, episodeId, startPosition, qualityOverride, detailOverride) =>
+      actionsRef.current!.openEpisode(seriesId, episodeId, startPosition, qualityOverride, detailOverride),
     togglePlay: () => actionsRef.current!.togglePlay(),
     seek: (seconds) => actionsRef.current!.seek(seconds),
     seekRelative: (delta) => actionsRef.current!.seekRelative(delta),

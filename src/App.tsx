@@ -22,6 +22,7 @@ import { SettingsView } from './components/views/SettingsView';
 import { SearchView } from './components/views/SearchView';
 import { ShelfMoreView } from './components/views/ShelfMoreView';
 import { SpotlightView } from './components/views/SpotlightView';
+import { FeedView } from './components/views/FeedView';
 import { VideoSurface } from './components/player/VideoSurface';
 import { AnimeVideoSurface } from './components/player/AnimeVideoSurface';
 import { PipReturnBridge } from './components/player/PipReturnBridge';
@@ -43,7 +44,7 @@ const AppContent: React.FC = () => {
   const { stopPlayback } = usePlaybackActions();
   const { isOpen: isAnimePlayerOpen } = useAnimePlayer();
 
-  const isPlayer = currentView === 'player';
+  const isPlayer = currentView === 'player' || currentView === 'feed';
 
   /**
    * 「详情页」这一个视图层的重挂载闸门。
@@ -125,7 +126,7 @@ const AppContent: React.FC = () => {
         原生窗口全屏已经让窗口铺满屏幕，此时唯一还挡着画面的就是这条 40px
         标题栏——不隐藏它，用户就会觉得"全屏了但视频没放大"。
       */}
-      {!isFullscreen && <TitleBar />}
+      {!isFullscreen && currentView !== 'feed' && <TitleBar />}
 
       {/* 主工作区：持久化常驻渲染，杜绝切换时的卸载闪屏与白屏。
 
@@ -170,6 +171,8 @@ const AppContent: React.FC = () => {
             <AnimeVideoSurface />
           </div>
         )}
+
+        <FeedView />
 
         {/* 导航栏与内容画板：常驻 DOM，视图切换平滑带动画。
             这一层同样**不给 key**：导航栏不该跟着任何视图切换重挂。 */}

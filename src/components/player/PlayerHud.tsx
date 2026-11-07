@@ -140,6 +140,8 @@ const SPEED_OPTIONS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
 export interface PlayerHudProps {
   /** 顶部标题岛：剧名。 */
   title: string;
+  /** 全屏推荐流已有独立标题与返回按钮时，隐藏播放器标题岛和锁定按钮。 */
+  hideHeader?: boolean;
   /** 集数徽章文案（已格式化，例如"第 3 集 · 真相"）。 */
   episodeLabel: string;
   /** 返回按钮的 tooltip（短剧是"返回剧集列表"，动漫是"返回详情"）。 */
@@ -257,6 +259,7 @@ export interface PlayerHudProps {
 
 export const PlayerHud: React.FC<PlayerHudProps> = ({
   title,
+  hideHeader = false,
   episodeLabel,
   backTitle = '返回剧集列表',
   position,
@@ -396,23 +399,25 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
         右侧居中小锁：展开 / 收起播放控制器。
         键盘可达（Enter/Space 都能触发），收起后按 Esc 也能解锁。
       */}
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          onToggleLock();
-        }}
-        className={`ttv-lock crystal-surface${lockShown ? ' is-shown' : ''}${isLocked ? ' is-locked' : ''}`}
-        title={isLocked ? '展开播放控制器 (Esc)' : '收起播放控制器'}
-        aria-label={isLocked ? '展开播放控制器' : '收起播放控制器'}
-        aria-pressed={isLocked}
-      >
-        {isLocked ? <Lock className="w-[18px] h-[18px]" /> : <LockOpen className="w-[18px] h-[18px]" />}
-      </button>
+      {!hideHeader && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleLock();
+          }}
+          className={`ttv-lock crystal-surface${lockShown ? ' is-shown' : ''}${isLocked ? ' is-locked' : ''}`}
+          title={isLocked ? '展开播放控制器 (Esc)' : '收起播放控制器'}
+          aria-label={isLocked ? '展开播放控制器' : '收起播放控制器'}
+          aria-pressed={isLocked}
+        >
+          {isLocked ? <Lock className="w-[18px] h-[18px]" /> : <LockOpen className="w-[18px] h-[18px]" />}
+        </button>
+      )}
 
       {/* HUD 控制层：顶部标题岛 + 底部操控坞 */}
       <div
-        className={`ttv-hud${hudShown ? '' : ' is-hidden'}`}
+        className={`ttv-hud${hideHeader ? ' is-feed' : ''}${hudShown ? '' : ' is-hidden'}`}
         onMouseMove={(e) => {
           // HUD 在光标下方时动画会派发合成 mousemove；有过滤版入口就优先用，
           // 避免合成事件反复重置自动隐藏定时器。
@@ -424,30 +429,32 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
         }}
       >
         {/* 顶部标题岛 */}
-        <div className="ttv-top-bar">
-          <div className="title-crystal-island crystal-surface">
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onBack();
-              }}
-              className="btn-fluent-action"
-              title={backTitle}
-              aria-label={backTitle}
-            >
-              <ArrowLeft className="w-4 h-4" />
-            </button>
+        {!hideHeader && (
+          <div className="ttv-top-bar">
+            <div className="title-crystal-island crystal-surface">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onBack();
+                }}
+                className="btn-fluent-action"
+                title={backTitle}
+                aria-label={backTitle}
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
 
-            <div className="crystal-divider" />
+              <div className="crystal-divider" />
 
-            <div className="flex items-center gap-2 pr-1.5 min-w-0">
-              <span className="drama-title">{title}</span>
-              {/* 动漫播放器在详情返回前拿不到集数，此时不渲染空气泡。 */}
-              {episodeLabel ? <span className="episode-badge">{episodeLabel}</span> : null}
+              <div className="flex items-center gap-2 pr-1.5 min-w-0">
+                <span className="drama-title">{title}</span>
+                {/* 动漫播放器在详情返回前拿不到集数，此时不渲染空气泡。 */}
+                {episodeLabel ? <span className="episode-badge">{episodeLabel}</span> : null}
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         {/* 底部操控坞：进度槽与控件同处一张晶体大卡片 */}
         <div className="ttv-dock" onClick={(e) => e.stopPropagation()}>

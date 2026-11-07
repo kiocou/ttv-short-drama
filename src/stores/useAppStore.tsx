@@ -5,7 +5,7 @@ import type { ChannelType, ShelfKind } from '../types/catalog';
 // `import { ShelfKind } from '../../stores/useAppStore'` 保持有效。
 export type { ShelfKind };
 
-export type AppView = 'explore' | 'anime' | 'detail' | 'player' | 'history' | 'favorites' | 'settings' | 'search' | 'shelf' | 'spotlight';
+export type AppView = 'explore' | 'anime' | 'detail' | 'player' | 'feed' | 'history' | 'favorites' | 'settings' | 'search' | 'shelf' | 'spotlight';
 
 /** 进入「更多」页时冻结下来的上下文：哪个分区、从哪个频道点进来的。 */
 export interface ShelfViewState {
@@ -31,6 +31,8 @@ export interface SpotlightState {
   kind: SpotlightKind;
   channel: ChannelType;
 }
+
+export type FeedChannel = 'drama' | 'comic';
 
 /** 搜索历史：最多保留这么多条，最近搜索排在最前。 */
 const MAX_SEARCH_HISTORY = 12;
@@ -94,6 +96,8 @@ interface AppContextType {
    */
   spotlight: SpotlightState | null;
   openSpotlight: (kind: SpotlightKind, channel: ChannelType) => void;
+  feedChannel: FeedChannel;
+  openFeed: (channel?: FeedChannel) => void;
   navigateTo: (view: AppView, seriesId?: string) => void;
   goBack: () => void;
   setSearchKeyword: (kw: string) => void;
@@ -120,6 +124,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [shelfView, setShelfView] = useState<ShelfViewState | null>(null);
   const [spotlight, setSpotlight] = useState<SpotlightState | null>(null);
+  const [feedChannel, setFeedChannel] = useState<FeedChannel>('drama');
 
   /**
    * 所有 action 都用 `useCallback` + ref 读最新 state，而不是直接从闭包里取。
@@ -189,6 +194,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setCurrentView('spotlight');
   }, []);
 
+  const openFeed = useCallback((channel: FeedChannel = 'drama') => {
+    if (currentViewRef.current !== 'feed') {
+      setPreviousView(currentViewRef.current);
+    }
+    setFeedChannel(channel);
+    setCurrentView('feed');
+  }, []);
+
   const persistSearchHistory = useCallback((next: string[]) => {
     setSearchHistory(next);
     try {
@@ -253,6 +266,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     openShelf,
     spotlight,
     openSpotlight,
+    feedChannel,
+    openFeed,
     navigateTo,
     goBack,
     setSearchKeyword,
@@ -267,6 +282,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     clearSearchHistory, currentView, goBack, isFullscreen,
     isNavCollapsed, navigateTo, openShelf, previousView, removeSearchHistory, removeToast,
     rememberSearch, searchHistory, searchKeyword, selectedSeriesId, shelfView, showToast, spotlight, openSpotlight,
+    feedChannel, openFeed,
     toasts, toggleNavCollapsed,
   ]);
 
