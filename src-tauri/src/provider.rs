@@ -1507,7 +1507,7 @@ fn search_season(title: &str) -> Option<(String, u32, String)> {
     // 这条闸门挡住的是「三十四季」（base 为空）与「第二季的逆袭」（尾部不是量词）
     // 这类本该被拒的标题 —— 放宽成"任意位置出现数字+量词"就会把无关剧并进系列。
     let has_di = marker > 0 && chars[marker - 1] == '第';
-    if !has_di && !(spaced || marker > 0 && is_season_separator(chars[marker - 1])) {
+    if !(has_di || spaced || marker > 0 && is_season_separator(chars[marker - 1])) {
         return None;
     }
     let number = parse_season_number(&chars[start..label_end])?;

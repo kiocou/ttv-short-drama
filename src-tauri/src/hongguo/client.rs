@@ -477,7 +477,7 @@ impl HongguoClient {
                     ));
                 }
                 Ok(None) => {
-                    crate::trace::log("[红果] 并发调用已换好新设备，直接复用".to_string());
+                    crate::trace::log("[红果] 并发调用已换好新设备，直接复用");
                 }
                 Err(reset_error) => {
                     crate::trace::log(format!("[红果] 重置设备失败：{reset_error}"));

@@ -266,7 +266,11 @@ fn attach_gemini(port: u16, backups: &mut Vec<String>) -> Result<(), String> {
         .or_insert_with(|| serde_json::json!({}));
     let hooks = hooks.as_object_mut().ok_or("hooks 不是对象")?;
     backup_once(&path, backups)?;
-    push_hook(hooks, "AfterAgent", agent_entry(port, "gemini", None, "done"));
+    push_hook(
+        hooks,
+        "AfterAgent",
+        agent_entry(port, "gemini", None, "done"),
+    );
     write_json(&path, &root)
 }
 
@@ -308,8 +312,12 @@ fn attach_copilot(port: u16, backups: &mut Vec<String>) -> Result<(), String> {
         ("permissionRequest", "action"),
     ] {
         let command = format!("curl.exe -s -m 1 -o NUL -H \"{MARKER}\" \"http://127.0.0.1:{port}/event?type={event_type}&agent=copilot\"");
-        let list = hooks.entry(event.to_string()).or_insert_with(|| serde_json::json!([]));
-        let arr = list.as_array_mut().ok_or_else(|| format!("{event} 不是数组"))?;
+        let list = hooks
+            .entry(event.to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        let arr = list
+            .as_array_mut()
+            .ok_or_else(|| format!("{event} 不是数组"))?;
         let entry = serde_json::json!({ "type": "command", "command": command });
         let key = serde_json::to_string(&entry).unwrap_or_default();
         let mut exact = false;
@@ -339,32 +347,34 @@ fn attach_cursor(port: u16, backups: &mut Vec<String>) -> Result<(), String> {
     let mut root = read_json(&path)?;
     let root_obj = root.as_object_mut().ok_or("配置根不是对象")?;
     backup_once(&path, backups)?;
-    root_obj.entry("version").or_insert_with(|| serde_json::json!(1));
-    for event in ["stop"] {
-        let list = root_obj
-            .entry(event.to_string())
-            .or_insert_with(|| serde_json::json!([]));
-        let arr = list
-            .as_array_mut()
-            .ok_or_else(|| format!("{event} 不是数组"))?;
-        let command = hook_command(port, "cursor", "done");
-        let key = serde_json::json!({ "command": command });
-        let key_text = serde_json::to_string(&key).unwrap_or_default();
-        arr.retain(|item| {
-            let text = serde_json::to_string(item).unwrap_or_default();
-            !(text.contains(MARKER) || text.contains(LEGACY_MARKER)) || text == key_text
-        });
-        if !arr
-            .iter()
-            .any(|item| serde_json::to_string(item).unwrap_or_default() == key_text)
-        {
-            arr.push(key);
-        }
+    root_obj
+        .entry("version")
+        .or_insert_with(|| serde_json::json!(1));
+    let event = "stop";
+    let list = root_obj
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let arr = list
+        .as_array_mut()
+        .ok_or_else(|| format!("{event} 不是数组"))?;
+    let command = hook_command(port, "cursor", "done");
+    let key = serde_json::json!({ "command": command });
+    let key_text = serde_json::to_string(&key).unwrap_or_default();
+    arr.retain(|item| {
+        let text = serde_json::to_string(item).unwrap_or_default();
+        !(text.contains(MARKER) || text.contains(LEGACY_MARKER)) || text == key_text
+    });
+    if !arr
+        .iter()
+        .any(|item| serde_json::to_string(item).unwrap_or_default() == key_text)
+    {
+        arr.push(key);
     }
     write_json(&path, &root)
 }
 
-const OPENCODE_PLUGIN: &str = r#"// X-TTV-Agent: 1
+fn opencode_plugin(port: u16) -> String {
+    let source = r#"// X-TTV-Agent: 1
 export const TTVAgentNotify = async ({ project, directory }) => ({
   event: async ({ event }) => {
     const types = {
@@ -376,19 +386,24 @@ export const TTVAgentNotify = async ({ project, directory }) => ({
     if (!type) return;
     const projectName = project?.name || directory?.split(/[\\/]/).filter(Boolean).pop() || "";
     const query = new URLSearchParams({ type, agent: "opencode", project: projectName });
-    try { await fetch(`http://127.0.0.1:7812/event?${query}`); } catch {}
+    try {{ await fetch(`http://127.0.0.1:{port}/event?${{query}}`); }} catch {{}
   },
 });
 "#;
+    source.replace("__PORT__", &port.to_string())
+}
 
 fn opencode_plugin_path() -> PathBuf {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"));
-    config.join("opencode").join("plugins").join("ttv-agent-notify.js")
+    config
+        .join("opencode")
+        .join("plugins")
+        .join("ttv-agent-notify.js")
 }
 
-fn attach_opencode(_port: u16, backups: &mut Vec<String>) -> Result<(), String> {
+fn attach_opencode(port: u16, backups: &mut Vec<String>) -> Result<(), String> {
     let path = opencode_plugin_path();
     if path.exists() {
         let text = std::fs::read_to_string(&path).map_err(|e| format!("读取插件失败：{e}"))?;
@@ -400,7 +415,7 @@ fn attach_opencode(_port: u16, backups: &mut Vec<String>) -> Result<(), String> 
     let parent = path.parent().ok_or("插件目录无效")?;
     std::fs::create_dir_all(parent).map_err(|e| format!("创建插件目录失败：{e}"))?;
     let tmp = path.with_extension("ttv-tmp");
-    std::fs::write(&tmp, OPENCODE_PLUGIN).map_err(|e| format!("写入插件失败：{e}"))?;
+    std::fs::write(&tmp, opencode_plugin(port)).map_err(|e| format!("写入插件失败：{e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("替换插件失败：{e}"))?;
     Ok(())
 }
@@ -554,7 +569,11 @@ pub fn agent_attach_all(port: u16) -> AttachReport {
     let mut attached = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
 
-    let jobs: Vec<(&str, fn(u16, &mut Vec<String>) -> Result<(), String>)> = vec![
+    type AttachJob = (
+        &'static str,
+        fn(u16, &mut Vec<String>) -> Result<(), String>,
+    );
+    let jobs: Vec<AttachJob> = vec![
         (
             "claude-code",
             attach_claude as fn(u16, &mut Vec<String>) -> Result<(), String>,
@@ -563,6 +582,7 @@ pub fn agent_attach_all(port: u16) -> AttachReport {
         ("gemini", attach_gemini),
         ("copilot", attach_copilot),
         ("cursor", attach_cursor),
+        ("opencode", attach_opencode),
         ("grok", |p, b| {
             attach_claude_compatible(".grok/hooks/ttv-agent-hook.json", "grok", p, b)
         }),
@@ -583,6 +603,12 @@ pub fn agent_attach_all(port: u16) -> AttachReport {
             "gemini" => home_dir.join(".gemini").exists(),
             "copilot" => home_dir.join(".copilot").exists(),
             "cursor" => home_dir.join(".cursor").exists(),
+            "opencode" => {
+                home_dir.join(".config/opencode").exists()
+                    || std::env::var_os("XDG_CONFIG_HOME")
+                        .map(|dir| PathBuf::from(dir).join("opencode").exists())
+                        .unwrap_or(false)
+            }
             "grok" => home_dir.join(".grok").exists(),
             "codebuddy" => home_dir.join(".codebuddy").exists(),
             "qwen" => home_dir.join(".qwen").exists(),
@@ -613,8 +639,10 @@ pub fn agent_detach_all() -> Vec<String> {
         ".claude/settings.json",
         ".codex/hooks.json",
         ".gemini/settings.json",
+        ".config/opencode/plugins/ttv-agent-notify.js",
         ".cursor/hooks.json",
         ".codebuddy/settings.json",
+        ".copilot/settings.json",
         ".copilot/hooks/hooks.json",
         ".grok/hooks/ttv-agent-hook.json",
         ".qwen/settings.json",
@@ -633,11 +661,18 @@ pub fn agent_detach_all() -> Vec<String> {
         let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
-        if strip_marker(&mut root).0 {
-            if write_json(&path, &root).is_ok() {
-                cleaned.push(rel.to_string());
-            }
+        if strip_marker(&mut root).0 && write_json(&path, &root).is_ok() {
+            cleaned.push(rel.to_string());
         }
+    }
+    let plugin = opencode_plugin_path();
+    if plugin.exists()
+        && std::fs::read_to_string(&plugin)
+            .map(|text| text.contains(MARKER))
+            .unwrap_or(false)
+        && std::fs::remove_file(&plugin).is_ok()
+    {
+        cleaned.push(plugin.to_string_lossy().to_string());
     }
     cleaned
 }

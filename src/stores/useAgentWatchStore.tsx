@@ -154,6 +154,26 @@ export const AgentWatchProvider: React.FC<{ children: ReactNode }> = ({ children
       // 已经有卡片在等用户决定：后续事件只刷新"最近事件"，不叠卡片。
       if (ctx.incoming) return;
 
+      // 已经收起到桌面时只更新现有卡片，不再创建新的呼叫卡或改变播放快照。
+      if (ctx.docked) {
+        const updated = { ...ctx.docked, event };
+        setDocked(updated);
+        const { snapshot } = updated;
+        void showAgentDock({
+          title: snapshot.title,
+          cover: snapshot.cover,
+          episodeNumber: snapshot.episodeNumber,
+          position: snapshot.position,
+          duration: snapshot.duration,
+          agentName: agentDisplayName(event.agent),
+          eventType: event.eventType,
+          message: event.message,
+          project: event.project ?? '',
+          isAnime: snapshot.kind === 'anime',
+        });
+        return;
+      }
+
       // 动漫在播：优先拍动漫快照。
       if (ctx.anime.isOpen && ctx.anime.series && ctx.anime.episode) {
         const snapshot: AgentWatchSnapshot = {

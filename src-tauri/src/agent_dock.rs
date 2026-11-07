@@ -32,8 +32,8 @@ const MAIN_WINDOW_LABEL: &str = "main";
 pub const EVENT_DOCK_STATE: &str = "agent://dock-state";
 
 /// 悬浮窗的默认尺寸。卡片本身是流式布局，窗口留一点透明留白给阴影。
-const DEFAULT_WIDTH: f64 = 396.0;
-const DEFAULT_HEIGHT: f64 = 216.0;
+const DEFAULT_WIDTH: f64 = 352.0;
+const DEFAULT_HEIGHT: f64 = 116.0;
 
 /// 悬浮卡上要展示的内容（主窗口算好下发，悬浮窗只渲染）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
