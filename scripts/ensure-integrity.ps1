@@ -25,6 +25,7 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $exe  = Join-Path $root 'src-tauri\target\debug\ttv-short-drama.exe'
+$ffmpeg = Join-Path $root 'src-tauri\resources\mpv\ffmpeg.exe'
 
 function Get-IntegrityLabel {
     param([string]$Path)
@@ -42,6 +43,48 @@ function Set-Medium {
     } else {
         icacls $Path /setintegritylevel M 2>&1 | Out-Null
     }
+}
+
+function Test-FfmpegAsset {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-Host "[integrity] missing ffmpeg asset: $Path"
+        return $false
+    }
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $buffer = New-Object byte[] 128
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+    } catch {
+        Write-Host "[integrity] cannot read ffmpeg asset: $($_.Exception.Message)"
+        return $false
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+
+    $header = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+    if ($header.StartsWith('version https://git-lfs.github.com/spec/v1')) {
+        Write-Host '[integrity] ffmpeg.exe is still a Git LFS pointer; run git lfs checkout.'
+        return $false
+    }
+    if ($read -lt 2 -or $buffer[0] -ne 0x4D -or $buffer[1] -ne 0x5A) {
+        Write-Host '[integrity] ffmpeg.exe is not a Windows executable.'
+        return $false
+    }
+    if ((Get-Item -LiteralPath $Path).Length -lt 1MB) {
+        Write-Host '[integrity] ffmpeg.exe is unexpectedly small.'
+        return $false
+    }
+
+    & $Path -hide_banner -version 1>$null 2>$null
+    if (-not $? -or $LASTEXITCODE -ne 0) {
+        Write-Host '[integrity] ffmpeg.exe failed to start.'
+        return $false
+    }
+    Write-Host '[integrity] ffmpeg asset is a runnable Windows executable.'
+    return $true
 }
 
 $fixed = $false
@@ -86,6 +129,9 @@ if (Test-Path -LiteralPath $exe) {
 } else {
     Write-Host "[integrity] 尚未构建 exe，跳过。"
 }
+
+# ---- 3. bundled runtime asset ----
+if (-not (Test-FfmpegAsset $ffmpeg)) { $failed = $true }
 
 if ($fixed) { Write-Host "[integrity] 本次已修复。若反复出现，见 修复权限.bat 里的说明。" }
 if ($failed) { exit 1 }
