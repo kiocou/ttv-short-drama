@@ -18,6 +18,7 @@ import {
 } from '../services/animePlayback';
 import { dismissPip, openPip } from '../services/pip';
 import { hintHlsLoadPosition } from '../services/hlsAttach';
+import { retryMutedAutoplay } from '../services/playbackStart';
 import { planSeek } from '../services/seekPlan';
 import type { EpisodeItem, SeriesDetail } from '../types/series';
 // 只借用有界起播这个纯 DOM 工具（不变量 21）：动漫 store 仍然是独立的一份状态，
@@ -465,17 +466,18 @@ export const AnimePlayerProvider: React.FC<{ children: ReactNode }> = ({ childre
         setUiState({ kind: 'playing' });
       } catch (playError) {
         if (sessionRef.current !== sessionId) return;
-        if (playError instanceof DOMException && playError.name === 'NotAllowedError' && !video.muted) {
+        if (playError instanceof DOMException && playError.name === 'NotAllowedError') {
           // 带声音被拒：静音起播，让用户手动恢复声音。
-          video.muted = true;
-          setMutedState(true);
-          mutedRef.current = true;
-          try {
-            await video.play();
+          const startedMuted = await retryMutedAutoplay(video, () => video.play(), () => {
             if (sessionRef.current !== sessionId) return;
+            setMutedState(true);
+            mutedRef.current = true;
+          });
+          if (sessionRef.current !== sessionId) return;
+          if (startedMuted) {
             setIsPlaying(true);
             setUiState({ kind: 'playing' });
-          } catch {
+          } else {
             setIsPlaying(false);
             setUiState({
               kind: 'error',

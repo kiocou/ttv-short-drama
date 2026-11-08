@@ -50,6 +50,23 @@ export const START_DRIFT_LOG_SECONDS = 0.5;
  */
 export const START_NEAR_END_SECONDS = 1;
 
+/** Keep the user's mute preference unchanged unless a muted autoplay retry succeeds. */
+export async function retryMutedAutoplay(
+  video: Pick<HTMLVideoElement, 'muted'>,
+  play: () => Promise<unknown>,
+  onStartedMuted: () => void,
+): Promise<boolean> {
+  if (video.muted) return false;
+  video.muted = true;
+  try {
+    await play();
+    onStartedMuted();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface StartTargetInput {
   /** 调用方期望的起点（秒）。`0` / 负数 / 非有限值一律按"从头"处理。 */
   startPosition: number;

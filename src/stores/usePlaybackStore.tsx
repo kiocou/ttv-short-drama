@@ -6,7 +6,7 @@ import { attachSource, isHlsUrl, detachSource, takeHlsFatal, hintHlsLoadPosition
 import { dismissPip, openPip } from '../services/pip';
 import { redactUrl, tracePlayback } from '../services/playbackTrace';
 import { isBufferComplete, isPlayheadAtPlayableTail } from '../services/playbackTail';
-import { resolveStartTarget } from '../services/playbackStart';
+import { resolveStartTarget, retryMutedAutoplay } from '../services/playbackStart';
 import { planSeek, seekableReached } from '../services/seekPlan';
 import { useSettingsStore } from './useSettingsStore';
 
@@ -1635,15 +1635,12 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
         // 而不是"当前是否已静音"——若视频本来就是静音的（比如上一次自动播放
         // 被拦后被我们静音过），再判断 !video.muted 就会漏判，
         // 把"源是好的、只差用户手势"误报成 error，进而触发删缓存 + 整集重解析。
-        if (!video.muted) {
-          video.muted = true;
+        const startedMuted = await retryMutedAutoplay(video, () => video.play(), () => {
           setIsMuted(true);
-          // 镜像同步：这条兜底路径绕过 setMuted，起播链路读的是 ref。
           isMutedRef.current = true;
-          try {
-            await video.play();
-            return 'ok';
-          } catch { /* 落到下面的 autoplay-blocked */ }
+        });
+        if (startedMuted) {
+          return 'ok';
         }
         noteFailure('自动播放被拒绝（需用户手势）', error);
         return 'autoplay-blocked';
@@ -3068,17 +3065,17 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           setUiState({ kind: 'playing', sessionId: newSessionId, position: animeVideo.currentTime || startPosition });
         } catch (playError) {
           if (activeSessionRef.current !== newSessionId) return; // 会话已作废：不静音重试、不弹错误卡
-          if (playError instanceof DOMException && playError.name === 'NotAllowedError' && !animeVideo.muted) {
-            // WebView 拒绝带声音自动播放：静音起播，让用户手动恢复声音。
-            animeVideo.muted = true;
-            setIsMuted(true);
-            isMutedRef.current = true;
-            try {
-              await animeVideo.play();
-              if (pauseIfStale(newSessionId, animeVideo)) return;
+          if (playError instanceof DOMException && playError.name === 'NotAllowedError') {
+            const startedMuted = await retryMutedAutoplay(animeVideo, () => animeVideo.play(), () => {
+              if (activeSessionRef.current !== newSessionId) return;
+              setIsMuted(true);
+              isMutedRef.current = true;
+            });
+            if (pauseIfStale(newSessionId, animeVideo)) return;
+            if (startedMuted) {
               setIsPlaying(true);
               setUiState({ kind: 'playing', sessionId: newSessionId, position: animeVideo.currentTime });
-            } catch {
+            } else {
               setIsPlaying(false);
               setUiState({ kind: 'error', sessionId: newSessionId, code: 'MEDIA_AUTOPLAY_FAILED', recoverable: true });
             }
@@ -3453,25 +3450,26 @@ export const PlaybackProvider: React.FC<{ children: ReactNode }> = ({ children }
           // 30 秒后无条件摘掉：guo 的源一旦稳定，`duration` 不会再变，留着监听
           // 只会在每次 seek 时白跑一遍 `usableDuration`（它要读 seekable/buffered）。
           window.setTimeout(timelineCleanup, 30000);
-        }).catch((error: unknown) => {
+        }).catch(async (error: unknown) => {
           if (activeSessionRef.current !== newSessionId) return; // 会话已作废：不补播、不弹错误卡
           // WebView2 may reject the first gesture-less attempt only because it has audio.
           // Retry muted so the episode starts, then let the user restore sound explicitly.
-          if (error instanceof DOMException && error.name === 'NotAllowedError' && !video.muted) {
-            video.muted = true;
-            setIsMuted(true);
-            isMutedRef.current = true;
+          if (error instanceof DOMException && error.name === 'NotAllowedError') {
             // 静音重试的源仍是公开直链：play() 挂死时靠有界版本的超时走到
             // MEDIA_AUTOPLAY_FAILED，而不是永久停在 opening。
-            void playBounded(video).then(() => {
-              if (pauseIfStale(newSessionId, video)) return;
+            const startedMuted = await retryMutedAutoplay(video, () => playBounded(video), () => {
+              if (activeSessionRef.current !== newSessionId) return;
+              setIsMuted(true);
+              isMutedRef.current = true;
+            });
+            if (pauseIfStale(newSessionId, video)) return;
+            if (startedMuted) {
               setIsPlaying(true);
               setUiState({ kind: 'playing', sessionId: newSessionId, position: video.currentTime });
-            }).catch(() => {
-              if (activeSessionRef.current !== newSessionId) return; // 会话已作废
+            } else {
               setIsPlaying(false);
               setUiState({ kind: 'error', sessionId: newSessionId, code: 'MEDIA_AUTOPLAY_FAILED', recoverable: true });
-            });
+            }
             return;
           }
           const code = error instanceof DOMException && error.name === 'NotAllowedError'
