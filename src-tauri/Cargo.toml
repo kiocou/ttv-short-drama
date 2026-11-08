@@ -47,6 +47,6 @@ uuid = { version = "1", features = ["v4"] }
 # windows-sys 本就在依赖树里（tao/wry 引入），这里只是把它提为直接依赖并声明
 # 用到的 feature，不新增下载体积。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Registry", "Win32_System_LibraryLoader"] }
 
 

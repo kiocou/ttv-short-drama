@@ -31,6 +31,7 @@
     "verify:feed-source": "node --experimental-strip-types scripts/verify-feed-source.mjs",
     "verify:feed-season-e2e": "node scripts/verify-feed-season-e2e.mjs",
     "verify:autoplay-mute": "node --experimental-strip-types scripts/verify-autoplay-mute.mjs",
+    "verify:native-player-bridge": "node --experimental-strip-types scripts/verify-native-player-bridge.mjs",
     "watch:playback": "node scripts/watch-playback.mjs",
     "tauri": "tauri",
     "verify:buffer-rate": "node scripts/verify-buffer-rate.mjs",

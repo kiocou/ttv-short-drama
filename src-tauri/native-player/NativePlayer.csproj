@@ -26,6 +26,7 @@
   <ItemGroup>
     <!-- LsfgPipeline 的源码只能通过 ProjectReference 编进类库，不能让主项目重复编译。 -->
     <Compile Remove="LsfgPipeline\**" />
+    <Compile Remove="FrameCadenceTests\**" />
   </ItemGroup>
 
   <ItemGroup>
@@ -47,6 +48,7 @@
   <ItemGroup>
     <None Include="shaders\**\*" CopyToOutputDirectory="PreserveNewest" Link="shaders\%(RecursiveDir)%(Filename)%(Extension)" />
     <None Include="LsfgPipeline\blockmatch.hlsl" CopyToOutputDirectory="PreserveNewest" Link="LsfgPipeline\blockmatch.hlsl" />
+    <None Include="..\..\dist\**\*" CopyToOutputDirectory="PreserveNewest" Link="controls\%(RecursiveDir)%(Filename)%(Extension)" />
     <!-- libmpv：mpv.exe 的导出表是 EXE 构建副产物，mpv_create 直接调用会 0xC0000005
          （CRT/TLS 未初始化）。必须用专门的 DLL 构建 libmpv-2.dll（shinchiro mpv-dev 包）。 -->
     <None Include="libmpv-2.dll" CopyToOutputDirectory="PreserveNewest" />

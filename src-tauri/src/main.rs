@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod account_session;
 mod agent_attach;
 mod agent_bridge;
 mod agent_dock;
@@ -1663,6 +1664,107 @@ async fn favorites_list(
         .map_err(|error| error.to_string())?
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountSummary {
+    account_key: String,
+    display_name: String,
+}
+
+#[tauri::command]
+async fn account_session_list(state: State<'_, AppState>) -> Result<Vec<AccountSummary>, String> {
+    let database = std::sync::Arc::clone(&state.database);
+    let accounts = tauri::async_runtime::spawn_blocking(move || database.list_account_sessions())
+        .await
+        .map_err(|error| error.to_string())??;
+    Ok(accounts
+        .into_iter()
+        .map(|(account_key, display_name)| AccountSummary {
+            account_key,
+            display_name,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn account_session_save(
+    account_id: String,
+    display_name: String,
+    session: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    state
+        .database
+        .save_account_session(&account_id, &display_name, session.as_bytes())
+}
+
+#[tauri::command]
+fn account_session_remove(account_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.database.remove_account_session(&account_id)
+}
+
+#[tauri::command]
+fn account_session_status(account_key: String, state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.database.load_account_session(&account_key)?.is_some())
+}
+
+#[tauri::command]
+async fn account_favorites_list(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<FavoriteItem>, String> {
+    let database = std::sync::Arc::clone(&state.database);
+    tauri::async_runtime::spawn_blocking(move || database.list_account_favorites(&account_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn account_favorites_save(
+    account_id: String,
+    item: FavoriteItem,
+    state: State<'_, AppState>,
+) -> Result<FavoriteItem, String> {
+    state.database.save_account_favorite(&account_id, &item)?;
+    state
+        .database
+        .list_account_favorites(&account_id)?
+        .into_iter()
+        .find(|saved| saved.series_id == item.series_id)
+        .ok_or_else(|| "账号收藏写入后回读失败。".to_string())
+}
+
+#[tauri::command]
+fn account_favorites_remove(
+    account_id: String,
+    series_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .database
+        .remove_account_favorite(&account_id, &series_id)?;
+    if state
+        .database
+        .list_account_favorites(&account_id)?
+        .iter()
+        .any(|item| item.series_id == series_id)
+    {
+        return Err("账号收藏移除后回读仍存在。".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn account_history_list(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<WatchHistoryItem>, String> {
+    let database = std::sync::Arc::clone(&state.database);
+    tauri::async_runtime::spawn_blocking(move || database.list_account_history(&account_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 fn favorites_save(item: FavoriteItem, state: State<'_, AppState>) -> Result<(), String> {
     state.database.save_favorite(&item)
@@ -1800,6 +1902,7 @@ fn settings_save(mut settings: UserSettings, state: State<'_, AppState>) -> Resu
     // 这些是"诚实报告边界"，不是丢弃用户输入——相应开关在 UI 上也不提供。
     settings.default_quality = "auto".into();
     settings.preferred_engine = "off".into();
+    settings.frame_interpolation_multiplier = settings.frame_interpolation_multiplier.clamp(2, 5);
     settings.catalog_cache_mb = 0.0;
     // 剧集缓存上限是真实用户设置：清洗旧版 0 哨兵后立即写入清理器，保存即生效。
     settings.playback_cache_mb =
@@ -2112,13 +2215,18 @@ fn configure_webview_browser_arguments() {
 ///   改动的首次运行写一次，并在日志里说明。
 #[cfg(windows)]
 fn apply_windows_gpu_preference() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    apply_windows_gpu_preference_for(&exe);
+}
+
+#[cfg(windows)]
+pub(crate) fn apply_windows_gpu_preference_for(exe: &Path) {
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
     };
 
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
     let Some(exe_text) = exe.to_str() else {
         return;
     };
@@ -2171,6 +2279,9 @@ fn apply_windows_gpu_preference() {
 
 #[cfg(not(windows))]
 fn apply_windows_gpu_preference() {}
+
+#[cfg(not(windows))]
+pub(crate) fn apply_windows_gpu_preference_for(_exe: &Path) {}
 
 fn main() {
     // ⚠️ 必须是**第一行**：把日志的相对时间零点钉在进程启动。
@@ -2508,6 +2619,14 @@ fn main() {
             favorites_list,
             favorites_save,
             favorites_remove,
+            account_session_list,
+            account_session_save,
+            account_session_remove,
+            account_session_status,
+            account_favorites_list,
+            account_favorites_save,
+            account_favorites_remove,
+            account_history_list,
             window_prepare_fullscreen,
             window_finish_fullscreen,
             settings_get,

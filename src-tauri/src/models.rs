@@ -298,6 +298,12 @@ pub struct UserSettings {
     /// `#[serde(default)]` 对 bool 只会给 `false`，所以走 `default_true`。
     #[serde(default = "default_true")]
     pub vsr_enabled: bool,
+    /// Default off; interpolation adds GPU work and frame-time cost.
+    #[serde(default)]
+    pub frame_interpolation_enabled: bool,
+    /// Default 2x for older settings without an explicit multiplier.
+    #[serde(default = "default_frame_interpolation_multiplier")]
+    pub frame_interpolation_multiplier: u32,
     /// 是否显示弹幕（红果 `/novel/commentapi/comment/list/` 的真实弹幕）。
     ///
     /// 纯前端渲染开关：后端只负责按时间窗取数据，是否显示、显示多大的密度
@@ -384,6 +390,10 @@ fn default_proxy_mode() -> String {
     "auto".into()
 }
 
+fn default_frame_interpolation_multiplier() -> u32 {
+    2
+}
+
 /// 弹幕观感默认值（与前端 `DEFAULT_SETTINGS` 对齐，理由见字段注释）。
 fn default_danmaku_area() -> f64 {
     25.0
@@ -426,6 +436,8 @@ impl Default for UserSettings {
             enabled_sources: vec!["hongguo".to_string()],
             launch_sound: true,
             vsr_enabled: true,
+            frame_interpolation_enabled: false,
+            frame_interpolation_multiplier: 2,
             danmaku_enabled: true,
             danmaku_area: 25.0,
             danmaku_opacity: 100.0,
@@ -587,6 +599,8 @@ mod vsr_settings_tests {
             settings.hardware_acceleration,
             "缺字段时按默认开启，而不是让整条保存链路失败"
         );
+        assert!(!settings.frame_interpolation_enabled);
+        assert_eq!(settings.frame_interpolation_multiplier, 2);
     }
 
     // 显式关闭必须被如实接受（开关要真的能关）。

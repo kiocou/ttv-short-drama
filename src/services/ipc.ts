@@ -361,6 +361,8 @@ export const DEFAULT_SETTINGS: UserSettings = {
   // 默认开：现状（引入 media_enhance 之后）默认就走 VSR 转码链路，
   // 默认关会让老用户升级后行为突变。详见 types/settings.ts 的字段注释。
   vsrEnabled: true,
+  frameInterpolationEnabled: false,
+  frameInterpolationMultiplier: 2,
   // 默认开：做了弹幕就该装好即见，而不是让用户先去设置页找开关。
   danmakuEnabled: true,
   // 弹幕观感默认值（详见 types/settings.ts 字段注释）。

@@ -43,7 +43,7 @@ internal static class Program
         Application.ThreadException += (_, e) => Log("FATAL thread: " + e.Exception);
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
-        string? pipe = null, mpvPath = null, shaders = null, hlsl = null, controlsUrl = null, loadJson = null;
+        string? pipe = null, mpvPath = null, shaders = null, hlsl = null, loadJson = null;
         int fg = 1, fgMult = 2;
         for (int i = 0; i < args.Length; i++)
         {
@@ -53,7 +53,6 @@ internal static class Program
                 case "--mpv": mpvPath = args[++i]; break;
                 case "--shaders": shaders = args[++i]; break;
                 case "--hlsl": hlsl = args[++i]; break;
-                case "--controls": controlsUrl = args[++i]; break;
                 case "--load": loadJson = args[++i]; break;
                 case "--load-file":
                     // 从文件读 JSON：命令行传 JSON 会被外壳（PowerShell/批处理）
@@ -83,7 +82,7 @@ internal static class Program
             catch (Exception ex) { Log("bad --load: " + ex.Message); }
         }
         Application.Run(new PlayerForm(pipe, Path.GetFullPath(mpvPath), shaders, hlsl,
-            controlsUrl, initial, fg > 0, Math.Clamp(fgMult, 2, 5)));
+            initial, fg > 0, Math.Clamp(fgMult, 2, 5)));
     }
 
     public static void Log(string s)
@@ -117,7 +116,6 @@ internal sealed class PlayerForm : Form
 
     readonly IpcPipe ipc;
     readonly string mpvExe, shaderDir, hlslDir;
-    readonly string? controlsUrl;
     Mpv mpv = null!;
     ControlsServer http = null!;
     WebView2? webView;
@@ -134,6 +132,7 @@ internal sealed class PlayerForm : Form
     LsfgChain chain = null!;
     Img frameA = null!, frameB = null!;
     int vw = DefaultVW, vh = DefaultVH;
+    Rectangle windowedBounds;
 
     volatile bool running = true;
     volatile bool fgEnabled;
@@ -145,6 +144,10 @@ internal sealed class PlayerForm : Form
     Thread? renderThread;
     readonly Stopwatch swStat = Stopwatch.StartNew();
     long statFrames, statSrc;
+    long nextPresentationTick;
+    readonly object resizeGate = new();
+    Size pendingSwapchainSize;
+    bool swapchainResizePending;
     bool fullscreen;
     volatile bool sizeSynced;
     volatile bool ended;
@@ -156,10 +159,10 @@ internal sealed class PlayerForm : Form
     PlayerBar playerBar = null!;
 
     public PlayerForm(string pipeName, string mpvExePath, string shaders, string hlsl,
-        string? controls, LoadRequest? initial, bool startFg, int startMult)
+        LoadRequest? initial, bool startFg, int startMult)
     {
         ipc = new IpcPipe(pipeName);
-        mpvExe = mpvExePath; shaderDir = shaders; hlslDir = hlsl; controlsUrl = controls;
+        mpvExe = mpvExePath; shaderDir = shaders; hlslDir = hlsl;
         fgEnabled = startFg; fgMult = startMult;
 
         Text = "TTV 播放器";
@@ -208,9 +211,9 @@ internal sealed class PlayerForm : Form
                 InitD3D();
                 InitMpv();
                 InitChain();
-                await InitWebView();
-                http = new ControlsServer(this);
+                http = new ControlsServer(this, Path.Combine(AppContext.BaseDirectory, "controls"));
                 http.Start();
+                await InitWebView();
                 uiTimer.Start();
                 renderThread = new Thread(RenderLoop) { IsBackground = true, Name = "render", Priority = ThreadPriority.Highest };
                 renderThread.Start();
@@ -235,6 +238,12 @@ internal sealed class PlayerForm : Form
         var levels = new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0 };
         D3D11CreateDevice(null, DriverType.Hardware, DeviceCreationFlags.BgraSupport, levels,
             out device, out ctx).CheckError();
+        using (var dxgiDevice = device.QueryInterface<IDXGIDevice>())
+        using (var adapter = dxgiDevice.GetAdapter())
+        {
+            var desc = adapter.Description;
+            Program.Log($"D3D adapter={desc.Description.Trim()} vendor=0x{desc.VendorId:X4} device=0x{desc.DeviceId:X4}");
+        }
         using var fac = DXGI.CreateDXGIFactory1<IDXGIFactory2>();
         swap = fac.CreateSwapChainForHwnd(device, viewport.Handle, new SwapChainDescription1
         {
@@ -245,7 +254,7 @@ internal sealed class PlayerForm : Form
             AlphaMode = Vortice.DXGI.AlphaMode.Unspecified, Flags = SwapChainFlags.None,
         });
         BindBackBuffer();
-        viewport.SizeChanged += (_, _) => BeginInvoke(ResizeSwapchain);
+        viewport.SizeChanged += (_, _) => QueueSwapchainResize();
     }
 
     void BindBackBuffer()
@@ -255,18 +264,36 @@ internal sealed class PlayerForm : Form
         backRtv = device.CreateRenderTargetView(backBuffer);
     }
 
-    void ResizeSwapchain()
+    void QueueSwapchainResize()
     {
         if (IsDisposed) return;
         var size = viewport.ClientSize;
         if (size.Width < 8 || size.Height < 8) return;
+        lock (resizeGate)
+        {
+            pendingSwapchainSize = size;
+            swapchainResizePending = true;
+        }
+        wake.Set();
+    }
+
+    void ApplyPendingSwapchainResize()
+    {
+        Size size;
+        lock (resizeGate)
+        {
+            if (!swapchainResizePending) return;
+            size = pendingSwapchainSize;
+            swapchainResizePending = false;
+        }
+        if (backBuffer != null && backBuffer.Description.Width == size.Width
+            && backBuffer.Description.Height == size.Height) return;
         try
         {
             // ⚠️ ResizeBuffers 之前**必须释放所有 buffer 引用**（RTV + Texture），
-            // 否则 DXGI 返回 DXGI_ERROR_INVALID_CALL，swapchain 尺寸保持不变。
-            // 旧代码先 Resize 再释放，异常被 catch 吞掉 —— 表现就是 backBuffer
-            // 一直停在初始尺寸（实测 540x701），画面 letterbox 偏移出黑边。
+            // 且必须与画面自检串行：staging texture 尺寸不跟随会导致 Map 指针失效。
             ctx.UnsetRenderTargets();
+            selfCheckTex?.Dispose(); selfCheckTex = null;
             backRtv?.Dispose(); backRtv = null!;
             backBuffer?.Dispose(); backBuffer = null!;
             swap.ResizeBuffers(0, (uint)size.Width, (uint)size.Height, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
@@ -344,15 +371,16 @@ internal sealed class PlayerForm : Form
 
     async Task InitWebView()
     {
-        if (controlsUrl == null) return;
+        if (http == null) return;
         try
         {
             webView = new WebView2
             {
                 Dock = DockStyle.Fill,
-                DefaultBackgroundColor = Color.FromArgb(24, 24, 30),
+                DefaultBackgroundColor = Color.Transparent,
             };
-            barHost.Controls.Add(webView);
+            Controls.Add(webView);
+            webView.BringToFront();
             // WinForms 控件没有 WebView2Environment 静态类（那是 WPF 的）；
             // 用户数据目录通过 CreationProperties 指定，然后无参 Ensure 即可。
             webView.CreationProperties = new CoreWebView2CreationProperties
@@ -364,10 +392,47 @@ internal sealed class PlayerForm : Form
             webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
             webView.CoreWebView2.Settings.IsZoomControlEnabled = false;
             webView.CoreWebView2.Settings.AreDevToolsEnabled = Debugger.IsAttached;
-            webView.CoreWebView2.Navigate(controlsUrl);
-            Program.Log("webview controls -> " + controlsUrl);
+            var pageUrl = http.NativePageUrl;
+            webView.CoreWebView2.NavigationCompleted += (_, args) =>
+            {
+                if (args.IsSuccess)
+                {
+                    BeginInvoke(() =>
+                    {
+                        if (IsDisposed || webView == null) return;
+                        barHost.Visible = false;
+                        webView.BringToFront();
+                    });
+                }
+                else
+                {
+                    Program.Log($"webview controls navigation failed: {args.WebErrorStatus}");
+                    BeginInvoke(() =>
+                    {
+                        if (IsDisposed || webView == null) return;
+                        Controls.Remove(webView);
+                        webView.Dispose();
+                        webView = null;
+                        barHost.Visible = true;
+                        playerBar.Visible = true;
+                    });
+                }
+            };
+            webView.CoreWebView2.Navigate(pageUrl);
+            Program.Log("webview controls -> " + pageUrl);
         }
-        catch (Exception ex) { Program.Log("webview init failed（控制条退化）: " + ex.Message); }
+        catch (Exception ex)
+        {
+            Program.Log("webview init failed（回退原生控制条）: " + ex.Message);
+            if (webView != null)
+            {
+                Controls.Remove(webView);
+                webView.Dispose();
+                webView = null;
+            }
+            barHost.Visible = true;
+            playerBar.Visible = true;
+        }
     }
 
     // ───────────────────────── 装载 ─────────────────────────
@@ -390,6 +455,7 @@ internal sealed class PlayerForm : Form
         hasFramePair = false;
         sizeSynced = false;      // 新的一集：等 mpv 解密后重新确认真实尺寸
         ended = false;
+        Interlocked.Exchange(ref nextPresentationTick, 0);
         totalSeconds = Math.Max(0.1, req.total);
 
         mpv.SetPropertyDouble("volume", Math.Clamp(req.volume, 0, 100));
@@ -453,6 +519,7 @@ internal sealed class PlayerForm : Form
             wake.Reset();
             try
             {
+                ApplyPendingSwapchainResize();
                 uint flags = mpv.RenderUpdate();
                 if ((flags & Mpv.MPV_RENDER_UPDATE_FRAME) != 0)
                 {
@@ -532,7 +599,12 @@ internal sealed class PlayerForm : Form
                 // 播到末尾 / 无更多帧 → ended。收到新 load 或 seek 后清除。
                 if (mpv.GetPropertyFlag("eof-reached"))
                 {
-                    if (!ended) { ended = true; Program.Log($"ended at {lastPos:F1}s"); }
+                    if (!ended)
+                    {
+                        ended = true;
+                        Program.Log($"ended at {lastPos:F1}s");
+                        ipc.SendEvent(new { @event = "ended", pos = Math.Round(lastPos, 2), dur = totalSeconds });
+                    }
                 }
                 else if (ended && pos > 0 && pos < totalSeconds - 0.5) ended = false;
 
@@ -559,8 +631,23 @@ internal sealed class PlayerForm : Form
                     wake.Wait(80);
                     continue;
                 }
-                if (fgEnabled && hasFramePair && srcFps > 5)
+                int targetFps = fgEnabled && srcFps > 5
+                    ? FrameCadence.TargetFps(srcFps, fgMult)
+                    : 0;
+                if (fgEnabled && hasFramePair && targetFps > 0)
                 {
+                    long interval = FrameCadence.IntervalTicks(targetFps, Stopwatch.Frequency);
+                    var schedule = FrameCadence.Evaluate(
+                        Stopwatch.GetTimestamp(),
+                        Interlocked.Read(ref nextPresentationTick),
+                        interval,
+                        Stopwatch.Frequency);
+                    if (!schedule.Due)
+                    {
+                        wake.Wait(schedule.WaitMilliseconds);
+                        continue;
+                    }
+                    Interlocked.Exchange(ref nextPresentationTick, schedule.NextTick);
                     double t = (pos * srcFps) % 1.0;
                     if (t < 0) t += 1.0;
                     chain.RunFrame(frameA, frameB, (float)t);
@@ -584,7 +671,7 @@ internal sealed class PlayerForm : Form
                 if (swStat.ElapsedMilliseconds >= 2000)
                 {
                     double outFps = statFrames * 1000.0 / swStat.ElapsedMilliseconds;
-                    Program.Log($"out={outFps:F1}fps src={statSrc} fg={(fgEnabled ? fgMult + "X" : "off")} pos={lastPos:F1}s");
+                    Program.Log($"out={outFps:F1}fps src={statSrc} fg={(targetFps > 0 ? $"{fgMult}X target={targetFps}fps" : "off")} pos={lastPos:F1}s");
                     statFrames = 0; statSrc = 0;
                     swStat.Restart();
                     ipc.SendEvent(new { @event = "progress", pos = Math.Round(lastPos, 2), dur = totalSeconds });
@@ -612,13 +699,18 @@ internal sealed class PlayerForm : Form
         try
         {
             var d = backBuffer.Description;
-            selfCheckTex ??= device.CreateTexture2D(new Texture2DDescription
+            if (selfCheckTex == null || !ReadbackTexture.Matches(
+                selfCheckTex.Description.Width, selfCheckTex.Description.Height, d.Width, d.Height))
             {
-                Width = d.Width, Height = d.Height, MipLevels = 1, ArraySize = 1,
-                Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Staging, BindFlags = BindFlags.None,
-                CPUAccessFlags = CpuAccessFlags.Read, MiscFlags = ResourceOptionFlags.None,
-            });
+                selfCheckTex?.Dispose();
+                selfCheckTex = device.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = d.Width, Height = d.Height, MipLevels = 1, ArraySize = 1,
+                    Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Staging, BindFlags = BindFlags.None,
+                    CPUAccessFlags = CpuAccessFlags.Read, MiscFlags = ResourceOptionFlags.None,
+                });
+            }
             ctx.CopyResource(selfCheckTex, backBuffer);
             var map = ctx.Map(selfCheckTex, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
             try
@@ -691,6 +783,8 @@ internal sealed class PlayerForm : Form
     {
         fgEnabled = on;
         fgMult = Math.Clamp(mult, 2, 5);
+        Interlocked.Exchange(ref nextPresentationTick, 0);
+        ipc.SendEvent(new { @event = "frame-interpolation", enabled = fgEnabled, mult = fgMult });
         Program.Log($"fg -> {on} {fgMult}X");
     }
 
@@ -763,18 +857,20 @@ internal sealed class PlayerForm : Form
 
     void ToggleFullscreen()
     {
-        fullscreen = !fullscreen;
-        if (fullscreen)
+        if (!fullscreen)
         {
-            barHost.Visible = false;
+            windowedBounds = Bounds;
+            fullscreen = true;
             FormBorderStyle = FormBorderStyle.None;
             WindowState = FormWindowState.Maximized;
         }
         else
         {
-            barHost.Visible = true;
+            fullscreen = false;
             FormBorderStyle = FormBorderStyle.Sizable;
             WindowState = FormWindowState.Normal;
+            if (windowedBounds.Width > 0 && windowedBounds.Height > 0)
+                Bounds = windowedBounds;
         }
     }
 
@@ -785,6 +881,7 @@ internal sealed class PlayerForm : Form
     public double GetDuration() => Math.Max(mpv?.GetPropertyDouble("duration") ?? 0, totalSeconds);
     public double GetVolume() => mpv?.GetPropertyDouble("volume") ?? 100;
     public double GetSpeed() => mpv?.GetPropertyDouble("speed") ?? 1.0;
+    public bool IsFullscreen() => fullscreen;
     public bool IsFgOn() => fgEnabled;
     public int GetFgMult() => fgMult;
     public void PrevEpisode() => ipc.SendEvent(new { @event = "prev", pos = Math.Round(lastPos, 2) });
@@ -799,6 +896,7 @@ internal sealed class PlayerForm : Form
         double pos = lastPos;
         ipc.SendEvent(new { @event = "closed", pos = Math.Round(pos, 2), dur = totalSeconds });
         try { mpv.Dispose(); } catch { }
+        try { selfCheckTex?.Dispose(); } catch { }
         try { chain.Dispose(); } catch { }
         try { http?.Stop(); } catch { }
         try { ipc.Dispose(); } catch { }

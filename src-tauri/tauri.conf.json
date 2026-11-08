@@ -4,8 +4,8 @@
   "version": "0.2.33",
   "identifier": "com.ttv.shortdrama",
   "build": {
-    "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 5175 --strictPort",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run build && dotnet build src-tauri/native-player/NativePlayer.csproj --configuration Release && npm run dev -- --host 127.0.0.1 --port 5175 --strictPort",
+    "beforeBuildCommand": "npm run build && dotnet build src-tauri/native-player/NativePlayer.csproj --configuration Release",
     "devUrl": "http://127.0.0.1:5175",
     "frontendDist": "../dist"
   },
@@ -51,12 +51,13 @@
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
-    "resources": [
-      "resources/python",
-      "resources/shortdrama-worker",
-      "resources/mpv",
-      "resources/guo-core"
-    ],
+    "resources": {
+      "resources/python": "resources/python",
+      "resources/shortdrama-worker": "resources/shortdrama-worker",
+      "resources/mpv": "resources/mpv",
+      "resources/guo-core": "resources/guo-core",
+      "native-player/bin/Release/net10.0-windows": "native-player"
+    },
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",

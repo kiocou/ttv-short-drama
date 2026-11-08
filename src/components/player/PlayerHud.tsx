@@ -14,6 +14,7 @@ import {
   Maximize,
   PictureInPicture2,
   Minimize,
+  X,
   ArrowLeft,
   Layers,
   Lock,
@@ -122,6 +123,13 @@ export interface PlayerQualityOption {
   resolution: string;
 }
 
+export interface FrameInterpolationControl {
+  enabled: boolean;
+  multiplier: number;
+  onEnabledChange: (enabled: boolean) => void;
+  onMultiplierChange: (multiplier: number) => void;
+}
+
 /**
  * 源没探到任何档位时的唯一选项。
  *
@@ -187,6 +195,10 @@ export interface PlayerHudProps {
    * 任何 store —— 动漫进度条读到短剧 store 那次事故就是打破这条边界的代价。
    */
   vsrEnabled: boolean;
+  /** Hide RTX VSR when this HUD controls a native renderer. */
+  hideVsr?: boolean;
+  /** Native LSFG state, shown in the existing video enhancement panel. */
+  frameInterpolation?: FrameInterpolationControl;
   /**
    * 弹幕开关的当前状态（唯一真相是 `settings.danmakuEnabled`）。
    *
@@ -239,6 +251,9 @@ export interface PlayerHudProps {
   onToggleLock: () => void;
   /** 交给画中画小窗播放（独立置顶窗口，可拖动、可拉伸改大小）。 */
   onEnterPip: () => void;
+  showPip?: boolean;
+  onClose?: () => void;
+  showClose?: boolean;
   onToggleFullscreen: () => void;
   onUserActivity: () => void;
   /** 指针移动统一入口（带合成事件过滤），容器层已过滤后传入。 */
@@ -254,6 +269,7 @@ export interface PlayerHudProps {
   onPlayPrev: () => void;
   onPlayNext: () => void;
   onOpenEpisodes: () => void;
+  showEpisodes?: boolean;
   onBack: () => void;
 }
 
@@ -276,6 +292,8 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   currentQuality,
   qualityOptions,
   vsrEnabled,
+  hideVsr = false,
+  frameInterpolation,
   onToggleVsr,
   danmakuEnabled,
   onToggleDanmaku,
@@ -285,6 +303,9 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   vsrAppliesToSource = true,
   onToggleLock,
   onEnterPip,
+  showPip = true,
+  onClose,
+  showClose = false,
   onToggleFullscreen,
   onUserActivity,
   onPointerMove,
@@ -298,6 +319,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
   onPlayPrev,
   onPlayNext,
   onOpenEpisodes,
+  showEpisodes = true,
   onBack,
 }) => {
   // 弹窗状态
@@ -878,7 +900,7 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                   </div>
                 )}
 
-                <div className="relative">
+                {(!hideVsr || frameInterpolation) && <div className="relative">
                   <button
                     type="button"
                     onClick={(e) => {
@@ -889,8 +911,8 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       setShowVolumeSlider(false);
                       setShowDanmakuSettings(false);
                     }}
-                    className={`btn-text-action${vsrEnabled ? ' is-on' : ''}`}
-                    title="视频增强：VSR 超分（实时生效）"
+                    className={`btn-text-action${vsrEnabled || frameInterpolation?.enabled ? ' is-on' : ''}`}
+                    title="视频增强"
                     aria-haspopup="dialog"
                     aria-expanded={showEnhanceMenu}
                     aria-controls="ttv-enhance-panel"
@@ -917,11 +939,11 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                     <div className="ttv-enhance-head">
                       <span className="ttv-enhance-head-title">视频增强</span>
                       <span className="ttv-enhance-head-hint">
-                        {vsrAppliesToSource ? '切换后立即重载本集' : '只作用于短剧 / 漫剧'}
+                        {frameInterpolation ? '播放中实时生效' : vsrAppliesToSource ? '切换后立即重载本集' : '只作用于短剧 / 漫剧'}
                       </span>
                     </div>
 
-                    <button
+                    {!hideVsr && <button
                       type="button"
                       role="switch"
                       aria-checked={vsrEnabled}
@@ -944,11 +966,45 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                       <span className={`ttv-enhance-switch${vsrEnabled ? ' is-on' : ''}`} aria-hidden="true">
                         <span className="ttv-enhance-knob" />
                       </span>
-                    </button>
+                    </button>}
+                    {frameInterpolation && (
+                      <>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={frameInterpolation.enabled}
+                          aria-label="视频补帧"
+                          onClick={() => frameInterpolation.onEnabledChange(!frameInterpolation.enabled)}
+                          className="ttv-enhance-row"
+                        >
+                          <span className="ttv-enhance-label">
+                            <span className="ttv-enhance-title">视频补帧</span>
+                            <span className="ttv-enhance-desc">LSFG 实时插帧，H.264 输入；关闭后回到普通播放。</span>
+                          </span>
+                          <span className={`ttv-enhance-switch${frameInterpolation.enabled ? ' is-on' : ''}`} aria-hidden="true">
+                            <span className="ttv-enhance-knob" />
+                          </span>
+                        </button>
+                        <div className="ttv-frame-multipliers" role="group" aria-label="视频补帧倍率">
+                          {[2, 3, 4, 5].map(multiplier => (
+                            <button
+                              key={multiplier}
+                              type="button"
+                              aria-pressed={frameInterpolation.multiplier === multiplier}
+                              disabled={!frameInterpolation.enabled}
+                              onClick={() => frameInterpolation.onMultiplierChange(multiplier)}
+                              className={`ttv-frame-multiplier${frameInterpolation.multiplier === multiplier ? ' is-active' : ''}`}
+                            >
+                              {multiplier}x
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    )}
                   </div>
-                </div>
+                </div>}
 
-                <button
+                {showEpisodes && <button
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -959,9 +1015,9 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                 >
                   <Layers className="w-3.5 h-3.5" />
                   <span>选集</span>
-                </button>
+                </button>}
 
-                <button
+                {showPip && <button
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -972,7 +1028,20 @@ export const PlayerHud: React.FC<PlayerHudProps> = ({
                   aria-label="画中画小窗播放"
                 >
                   <PictureInPicture2 className="w-4 h-4" />
-                </button>
+                </button>}
+
+                {showClose && onClose && <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onClose();
+                  }}
+                  className="btn-fluent-action"
+                  title="关闭原生播放器并返回"
+                  aria-label="关闭播放器"
+                >
+                  <X className="w-4 h-4" />
+                </button>}
 
                 <button
                   type="button"

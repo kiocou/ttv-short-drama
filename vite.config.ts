@@ -1,5 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const projectRoot = fileURLToPath(new URL('.', import.meta.url));
 
 /**
  * 判断某路径是否应当被文件监听忽略。
@@ -38,6 +42,14 @@ function ignoreWatcherErrors() {
 
 export default defineConfig({
   plugins: [react(), ignoreWatcherErrors()],
+  build: {
+    rollupOptions: {
+      input: {
+        main: resolve(projectRoot, 'index.html'),
+        nativePlayer: resolve(projectRoot, 'native-player.html'),
+      },
+    },
+  },
   server: {
     host: "127.0.0.1",
     port: 5175,

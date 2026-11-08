@@ -48,6 +48,10 @@ export const SettingsProvider: React.FC<{ children: ReactNode }> = ({ children }
           vsrEnabled: saved.vsrEnabled !== false,
           // 弹幕与 VSR 同一套归一：旧记录没有这个字段，默认开。
           danmakuEnabled: saved.danmakuEnabled !== false,
+          frameInterpolationEnabled: saved.frameInterpolationEnabled === true,
+          frameInterpolationMultiplier: [2, 3, 4, 5].includes(saved.frameInterpolationMultiplier)
+            ? saved.frameInterpolationMultiplier as 2 | 3 | 4 | 5
+            : 2,
           // 弹幕观感（2026-11-07 新增）：旧记录缺字段时展开后是 undefined，
           // 滑条会渲染成空值——逐项归一到默认，与 Rust 侧 serde default 对齐。
           // 速度档与描边类型同时做非法值回落，防止手改过的记录把面板卡死。

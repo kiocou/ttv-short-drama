@@ -276,6 +276,7 @@ pub async fn open<R: Runtime>(app: AppHandle<R>, req: Value) -> Result<PlayerSta
 
     let exe = find_player_exe(&app)
         .ok_or_else(|| "找不到 NativePlayer.exe（先构建 src-tauri/native-player）".to_string())?;
+    crate::apply_windows_gpu_preference_for(&exe);
     let pipe = format!(
         "ttv-player-{}-{}",
         std::process::id(),
@@ -336,15 +337,7 @@ pub async fn open<R: Runtime>(app: AppHandle<R>, req: Value) -> Result<PlayerSta
         });
     }
 
-    spawn_event_reader(
-        app.clone(),
-        pipe.clone(),
-        state,
-        series_id,
-        episode_id,
-        title,
-        load_path,
-    );
+    spawn_event_reader(app.clone(), pipe.clone(), state, load_path);
 
     crate::trace::log(format!(
         "[原生播放器] 已启动 vid={vid} ep={episode} 管线={vw}x{vh} 管道={pipe}"
@@ -357,9 +350,6 @@ fn spawn_event_reader<R: Runtime>(
     app: AppHandle<R>,
     pipe: String,
     state: Arc<Mutex<PlayerState>>,
-    series_id: String,
-    episode_id: String,
-    title: String,
     load_path: PathBuf,
 ) {
     std::thread::spawn(move || {
@@ -380,8 +370,22 @@ fn spawn_event_reader<R: Runtime>(
         }
         let Some(write_end) = conn else {
             crate::trace::log("[原生播放器] 管道连接失败（播放器未起来？）");
-            if let Ok(mut st) = state.lock() {
+            let snapshot = if let Ok(mut st) = state.lock() {
                 st.alive = false;
+                st.clone()
+            } else {
+                PlayerState::default()
+            };
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit(
+                    "native-player-error",
+                    json!({
+                        "seriesId": snapshot.series_id,
+                        "episodeId": snapshot.episode_id,
+                        "position": snapshot.position,
+                        "message": "原生播放器未能连接。",
+                    }),
+                );
             }
             return;
         };
@@ -407,6 +411,7 @@ fn spawn_event_reader<R: Runtime>(
             }
         }
 
+        let mut received_closed = false;
         let mut lines = BufReader::new(read_end).lines();
         while let Some(Ok(line)) = lines.next() {
             let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -427,60 +432,143 @@ fn spawn_event_reader<R: Runtime>(
                         }
                         st.clone()
                     };
-                    if !series_id.is_empty() {
-                        save_history(&app, &series_id, &episode_id, &title, &snapshot);
+                    if !snapshot.series_id.is_empty() {
+                        save_history(&app, &snapshot);
                     }
                 }
                 "ended" => {
-                    if let Ok(mut st) = state.lock() {
+                    let snapshot = if let Ok(mut st) = state.lock() {
                         if let Some(p) = v.get("pos").and_then(Value::as_f64) {
                             st.position = p;
                         }
-                    }
+                        st.clone()
+                    } else {
+                        PlayerState::default()
+                    };
                     crate::trace::log("[原生播放器] 本集播完");
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.emit(
+                            "native-player-ended",
+                            json!({ "seriesId": snapshot.series_id, "episodeId": snapshot.episode_id }),
+                        );
+                    }
                 }
                 "closed" => {
-                    if let Ok(mut st) = state.lock() {
+                    received_closed = true;
+                    let snapshot = if let Ok(mut st) = state.lock() {
                         st.alive = false;
                         if let Some(p) = v.get("pos").and_then(Value::as_f64) {
                             st.position = p;
                         }
-                    }
+                        st.clone()
+                    } else {
+                        PlayerState::default()
+                    };
                     crate::trace::log("[原生播放器] 窗口关闭");
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.emit(
+                            "native-player-closed",
+                            json!({
+                                "seriesId": snapshot.series_id,
+                                "episodeId": snapshot.episode_id,
+                                "position": snapshot.position,
+                            }),
+                        );
+                    }
                     break;
                 }
                 "prev" | "next" => {
                     // 播放器的上下集按钮：把意图转给前端（前端持有剧集列表）
                     crate::trace::log(format!("[原生播放器] 用户点了{event}"));
                     if let Some(win) = app.get_webview_window("main") {
+                        let snapshot = state
+                            .lock()
+                            .map(|current| current.clone())
+                            .unwrap_or_default();
                         let _ = win.emit(
                             "native-player-navigate",
-                            json!({ "dir": event, "pos": v.get("pos").cloned().unwrap_or(json!(0.0)) }),
+                            json!({ "dir": event, "seriesId": snapshot.series_id, "episodeId": snapshot.episode_id, "pos": v.get("pos").cloned().unwrap_or(json!(0.0)) }),
                         );
                     }
                 }
                 "error" => {
                     let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
                     crate::trace::log(format!("[原生播放器] 错误：{msg}"));
+                    let snapshot = state
+                        .lock()
+                        .map(|current| current.clone())
+                        .unwrap_or_default();
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.emit(
+                            "native-player-error",
+                            json!({
+                                "seriesId": snapshot.series_id,
+                                "episodeId": snapshot.episode_id,
+                                "position": snapshot.position,
+                                "message": msg,
+                            }),
+                        );
+                    }
+                }
+                "frame-interpolation" => {
+                    let enabled = v.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                    let multiplier = v
+                        .get("mult")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(2)
+                        .clamp(2, 5) as u32;
+                    let state_store = app.state::<crate::AppState>();
+                    match state_store.database.settings_get() {
+                        Ok(mut settings) => {
+                            settings.frame_interpolation_enabled = enabled;
+                            settings.frame_interpolation_multiplier = multiplier;
+                            if let Err(error) = state_store.database.settings_save(&settings) {
+                                crate::trace::log(format!(
+                                    "[原生播放器] 补帧设置保存失败：{error}"
+                                ));
+                            } else if let Some(win) = app.get_webview_window("main") {
+                                let _ = win.emit(
+                                    "native-player-frame-interpolation",
+                                    json!({
+                                        "enabled": enabled,
+                                        "multiplier": multiplier,
+                                    }),
+                                );
+                            }
+                        }
+                        Err(error) => crate::trace::log(format!(
+                            "[原生播放器] 读取设置失败，补帧偏好未保存：{error}"
+                        )),
+                    }
                 }
                 _ => {}
             }
         }
-        if let Ok(mut st) = state.lock() {
+        let snapshot = if let Ok(mut st) = state.lock() {
             st.alive = false;
+            st.clone()
+        } else {
+            PlayerState::default()
+        };
+        if !received_closed {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit(
+                    "native-player-error",
+                    json!({
+                        "seriesId": snapshot.series_id,
+                        "episodeId": snapshot.episode_id,
+                        "position": snapshot.position,
+                        "message": "原生播放器已意外退出。",
+                    }),
+                );
+            }
         }
         crate::trace::log("[原生播放器] 事件流结束");
     });
 }
 
 /// 落观看历史：与 WebView2 链路共用同一张表，切回去续播位置一致。
-fn save_history<R: Runtime>(
-    app: &AppHandle<R>,
-    series_id: &str,
-    episode_id: &str,
-    title: &str,
-    st: &PlayerState,
-) {
+fn save_history<R: Runtime>(app: &AppHandle<R>, st: &PlayerState) {
     let state = app.state::<crate::AppState>();
     let pct = if st.duration > 0.5 {
         ((st.position / st.duration) * 100.0)
@@ -490,9 +578,9 @@ fn save_history<R: Runtime>(
         0
     };
     let item = crate::models::WatchHistoryItem {
-        series_id: series_id.to_owned(),
-        episode_id: episode_id.to_owned(),
-        title: title.to_owned(),
+        series_id: st.series_id.clone(),
+        episode_id: st.episode_id.clone(),
+        title: st.title.clone(),
         series_cover: String::new(),
         episode_number: st.episode,
         total_episodes: 0,

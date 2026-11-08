@@ -1,10 +1,11 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { usePlaybackStore } from '../../stores/usePlaybackStore';
 import { useSettingsStore } from '../../stores/useSettingsStore';
-import { ipcService } from '../../services/ipc';
+import { errorText, ipcService, isTauriEnvironment } from '../../services/ipc';
 import { useAppStore } from '../../stores/useAppStore';
 import { PlayerHud } from './PlayerHud';
 import type { DanmakuSettings } from './PlayerHud';
+import { listen } from '@tauri-apps/api/event';
 import { Sparkles, Zap } from 'lucide-react';
 
 /**
@@ -18,18 +19,8 @@ import { Sparkles, Zap } from 'lucide-react';
 /**
  * 「原生播放」入口开关（mpv + LSFG 补帧那套独立播放器）。
  *
- * 2026-11-01 按需求**暂时搁置**：新的原生播放器先不开发，播放页右上角那个
- * 入口不再显示。代码整体保留在这里 —— 它不是死代码，`handleOpenNative` 的
- * 链路（`ipcService.playback.nativeOpen` / 后端 `native_open`）都还是通的，
- * 将来要继续做只需要把这个常量改回 `true`。
- *
- * 顺带记一个当时的观感问题：按钮用的是 `ttv-lock crystal-surface` 那套晶体
- * 样式，而 `ttv-lock` 原本是给**正方形图标按钮**（锁）写的，宽度被压到只能
- * 放一个图标。塞进「原生播放」四个字之后文字被迫竖排折行，又贴着窗口右上角，
- * 看上去就是一块被裁掉的白方块 —— 这也是它显得难看的直接原因。恢复时请给它
- * 单独的类名，不要复用 `ttv-lock`。
  */
-const NATIVE_PLAYER_ENTRY_ENABLED = false;
+const NATIVE_PLAYER_ENTRY_ENABLED = true;
 
 interface PlayerControlsProps {
   isVisible: boolean;
@@ -61,6 +52,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
   const {
     currentSeries,
     currentEpisode,
+    openEpisode,
     isPlaying,
     position,
     duration,
@@ -87,10 +79,9 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
     enterPip,
   } = usePlaybackStore();
 
-  // 补帧入口已在发布前移除（独立窗口方案不成熟：需要另起 D3D11 窗口、
-  // 与主窗口两套音频/进度，且调试徽标漏在界面上）。后端 `frame_interp_set`
-  // 命令保留但不再被前端调用。
-  const { goBack, currentView, navigateTo } = useAppStore();
+  const { goBack, currentView, navigateTo, showToast } = useAppStore();
+  const [nativeEpisodeId, setNativeEpisodeId] = useState<string | null>(null);
+  const returningToDetail = useRef(false);
 
   /**
    * 弹幕观感设置（显示区域/不透明度/字号/速度/字体/粗体/描边）。
@@ -137,9 +128,13 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
    *
    * 打开后**暂停本窗口的播放**：否则两套音频会同时出声。
    */
-  const handleOpenNative = async () => {
+  const handleOpenNative = async (
+    frameInterpolationEnabled = settings.frameInterpolationEnabled,
+    frameInterpolationMultiplier = settings.frameInterpolationMultiplier,
+  ) => {
     const ep = currentEpisode;
     if (!ep) return;
+    setNativeEpisodeId(ep.id);
     try {
       await ipcService.playback.nativeOpen({
         vid: ep.id,
@@ -149,16 +144,147 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
         episode: ep.episodeNumber,
         startSeconds: position,
         volume: Math.round(volume * 100),
-        fg: true,
-        fgMult: 2,
+        fg: frameInterpolationEnabled,
+        fgMult: frameInterpolationMultiplier,
       });
+      returningToDetail.current = false;
       if (isPlaying) togglePlay();
     } catch (error) {
+      setNativeEpisodeId(null);
+      if (frameInterpolationEnabled) updateSettings({ frameInterpolationEnabled: false });
+      showToast(errorText(error, '无法启动原生播放器'), 'error');
       void ipcService.diagnostics.uiLog(
-        `原生播放器打开失败 ${error instanceof Error ? error.message : String(error)}`,
+        `原生播放器打开失败 ${errorText(error, '未知错误')}`,
       );
     }
   };
+
+  const frameInterpolation = {
+    enabled: settings.frameInterpolationEnabled,
+    multiplier: settings.frameInterpolationMultiplier,
+    onEnabledChange: (enabled: boolean) => {
+      updateSettings({ frameInterpolationEnabled: enabled });
+      if (enabled) void handleOpenNative(true, settings.frameInterpolationMultiplier);
+      else if (nativeEpisodeId) {
+        void ipcService.playback.nativeSend({ cmd: 'fg', on: false, mult: settings.frameInterpolationMultiplier })
+          .catch(error => showToast(errorText(error, '关闭视频补帧失败'), 'error'));
+      }
+    },
+    onMultiplierChange: (multiplier: number) => {
+      if (![2, 3, 4, 5].includes(multiplier)) return;
+      const value = multiplier as 2 | 3 | 4 | 5;
+      updateSettings({ frameInterpolationMultiplier: value });
+      if (nativeEpisodeId) {
+        void ipcService.playback.nativeSend({ cmd: 'fg', on: true, mult: value })
+          .catch(error => showToast(errorText(error, '设置补帧倍率失败'), 'error'));
+      }
+    },
+  };
+
+  useEffect(() => {
+    if (!isTauriEnvironment() || !currentSeries) return;
+    let unlisten: (() => void) | undefined;
+    void listen<{ seriesId: string; episodeId: string; position: number; message: string }>('native-player-error', event => {
+      const { seriesId, episodeId, position, message } = event.payload;
+      if (seriesId !== currentSeries.id || episodeId !== nativeEpisodeId) return;
+      setNativeEpisodeId(null);
+      showToast(message || '原生播放器失败，正在切回普通播放', 'warning');
+      navigateTo('player', seriesId);
+      void openEpisode(seriesId, episodeId, Math.max(0, position), currentQuality).catch(error => {
+        showToast(errorText(error, '普通播放器回退失败'), 'error');
+      });
+    }).then(value => { unlisten = value; });
+    return () => unlisten?.();
+  }, [currentQuality, currentSeries, navigateTo, nativeEpisodeId, openEpisode, showToast]);
+
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+    let unlisten: (() => void) | undefined;
+    void listen<{ dir: 'prev' | 'next'; seriesId: string; episodeId: string }>(
+      'native-player-navigate',
+      event => {
+        const { dir, seriesId, episodeId } = event.payload;
+        if (!currentSeries || seriesId !== currentSeries.id) return;
+        const index = currentSeries.episodes.findIndex(episode => episode.id === episodeId);
+        const target = currentSeries.episodes[index + (dir === 'next' ? 1 : -1)];
+        if (!target) return;
+        setNativeEpisodeId(target.id);
+        void ipcService.playback.nativeOpen({
+          vid: target.id,
+          seriesId,
+          episodeId: target.id,
+          title: currentSeries.title,
+          episode: target.episodeNumber,
+          startSeconds: 0,
+          volume: Math.round(volume * 100),
+          fg: settings.frameInterpolationEnabled,
+          fgMult: settings.frameInterpolationMultiplier,
+        }).catch(error => showToast(errorText(error, '切换原生播放器集数失败'), 'error'));
+      },
+    ).then(value => { unlisten = value; });
+    return () => unlisten?.();
+  }, [currentSeries, settings.frameInterpolationEnabled, settings.frameInterpolationMultiplier, showToast, volume]);
+
+  useEffect(() => {
+    if (!isTauriEnvironment() || !currentSeries || !settings.autoNext) return;
+    let unlisten: (() => void) | undefined;
+    void listen<{ seriesId: string; episodeId: string }>('native-player-ended', event => {
+      const { seriesId, episodeId } = event.payload;
+      if (seriesId !== currentSeries.id || episodeId !== nativeEpisodeId) return;
+      const index = currentSeries.episodes.findIndex(episode => episode.id === episodeId);
+      const next = currentSeries.episodes[index + 1];
+      if (!next) {
+        returningToDetail.current = true;
+        void ipcService.playback.nativeClose();
+        return;
+      }
+      setNativeEpisodeId(next.id);
+      void ipcService.playback.nativeOpen({
+        vid: next.id,
+        seriesId,
+        episodeId: next.id,
+        title: currentSeries.title,
+        episode: next.episodeNumber,
+        startSeconds: 0,
+        volume: Math.round(volume * 100),
+        fg: settings.frameInterpolationEnabled,
+        fgMult: settings.frameInterpolationMultiplier,
+      }).catch(error => showToast(errorText(error, '自动播放下一集失败'), 'error'));
+    }).then(value => { unlisten = value; });
+    return () => unlisten?.();
+  }, [currentSeries, nativeEpisodeId, settings.autoNext, settings.frameInterpolationEnabled, settings.frameInterpolationMultiplier, showToast, volume]);
+
+  useEffect(() => {
+    if (!isTauriEnvironment() || !currentSeries) return;
+    let unlisten: (() => void) | undefined;
+    void listen<{ seriesId: string; episodeId: string; position: number }>('native-player-closed', event => {
+      const { seriesId, episodeId, position } = event.payload;
+      if (seriesId !== currentSeries.id || episodeId !== nativeEpisodeId) return;
+      setNativeEpisodeId(null);
+      if (returningToDetail.current) {
+        returningToDetail.current = false;
+        navigateTo('detail', seriesId);
+        return;
+      }
+      navigateTo('player', seriesId);
+      void openEpisode(seriesId, episodeId, Math.max(0, position), currentQuality).catch(error => {
+        showToast(errorText(error, '返回原播放器失败'), 'error');
+      });
+    }).then(value => { unlisten = value; });
+    return () => unlisten?.();
+  }, [currentQuality, currentSeries, navigateTo, nativeEpisodeId, openEpisode, showToast]);
+
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+    let unlisten: (() => void) | undefined;
+    void listen<{ enabled: boolean; multiplier: 2 | 3 | 4 | 5 }>('native-player-frame-interpolation', event => {
+      updateSettings({
+        frameInterpolationEnabled: event.payload.enabled,
+        frameInterpolationMultiplier: event.payload.multiplier,
+      });
+    }).then(value => { unlisten = value; });
+    return () => unlisten?.();
+  }, [updateSettings]);
 
   // 集数徽章文案。
   //
@@ -220,13 +346,11 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
         </div>
       )}
 
-      {/* 原生播放器入口：已按需求搁置（见文件顶部 NATIVE_PLAYER_ENTRY_ENABLED）。
-          保留 JSX 而不是删掉，是为了让 `handleOpenNative` / `Zap` 仍被引用，
-          同时将来恢复只是改一个布尔值。 */}
+      {/* 独立 LibMPV 预览入口；WebView 播放面仍保留作为回退。 */}
       {NATIVE_PLAYER_ENTRY_ENABLED && (
         <button
           type="button"
-          onClick={handleOpenNative}
+          onClick={() => void handleOpenNative()}
           title="用原生播放器播放（mpv 硬解 + 补帧，首帧更快）"
           className={`absolute top-3 right-3 z-40 pointer-events-auto transition-opacity duration-200 ${
             isVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
@@ -255,6 +379,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
       currentQuality={currentQuality}
       qualityOptions={availableQualities}
       vsrEnabled={vsrEnabled}
+      frameInterpolation={frameInterpolation}
       onToggleVsr={setVsrEnabled}
       danmakuEnabled={danmakuEnabled}
       onToggleDanmaku={setDanmakuEnabled}

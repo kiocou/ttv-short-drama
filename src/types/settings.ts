@@ -50,6 +50,9 @@ export interface UserSettings {
    * 保持「默认开」——现状默认就走 VSR 链路，默认关等于让老用户行为突变。
    */
   vsrEnabled: boolean;
+  /** LibMPV/LSFG interpolation is opt-in and uses 2x when no multiplier was saved. */
+  frameInterpolationEnabled: boolean;
+  frameInterpolationMultiplier: 2 | 3 | 4 | 5;
   /**
    * 是否显示弹幕。
    *
