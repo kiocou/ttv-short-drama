@@ -48,13 +48,27 @@ export const FeedView: React.FC = () => {
     if (!active) return;
     const start = { x: 0, y: 0, valid: false };
     let lastGestureAt = 0;
-    const trigger = (deltaX: number, deltaY: number, event?: Event) => {
+    let suppressVideoClick = false;
+    let clearSuppressedClick: number | undefined;
+    const trigger = (deltaX: number, deltaY: number, event?: Event, suppressClick = false) => {
       const direction = feedGestureDirection(deltaX, deltaY);
       if (!direction || Date.now() - lastGestureAt < 550) return;
       lastGestureAt = Date.now();
       event?.preventDefault();
+      if (suppressClick) {
+        suppressVideoClick = true;
+        window.clearTimeout(clearSuppressedClick);
+        clearSuppressedClick = window.setTimeout(() => { suppressVideoClick = false; }, 500);
+      }
       if (direction === 'next') feed.nextEpisode();
       else feed.previousEpisode();
+    };
+    const onClickCapture = (event: MouseEvent) => {
+      if (!suppressVideoClick || !(event.target instanceof HTMLVideoElement)) return;
+      suppressVideoClick = false;
+      window.clearTimeout(clearSuppressedClick);
+      event.preventDefault();
+      event.stopImmediatePropagation();
     };
     const onWheel = (event: WheelEvent) => {
       if (isInteractiveTarget(event.target)) return;
@@ -72,7 +86,7 @@ export const FeedView: React.FC = () => {
     const onPointerUp = (event: PointerEvent) => {
       if (!start.valid) return;
       start.valid = false;
-      trigger(event.clientX - start.x, event.clientY - start.y);
+      trigger(event.clientX - start.x, event.clientY - start.y, undefined, true);
     };
     const onPointerCancel = () => {
       start.valid = false;
@@ -89,10 +103,11 @@ export const FeedView: React.FC = () => {
     const onTouchEnd = (event: TouchEvent) => {
       if (!start.valid || event.changedTouches.length === 0) return;
       start.valid = false;
-      trigger(event.changedTouches[0].clientX - start.x, event.changedTouches[0].clientY - start.y);
+      trigger(event.changedTouches[0].clientX - start.x, event.changedTouches[0].clientY - start.y, undefined, true);
     };
 
     window.addEventListener('wheel', onWheel, { passive: false });
+    window.addEventListener('click', onClickCapture, true);
     window.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('pointercancel', onPointerCancel);
@@ -100,11 +115,13 @@ export const FeedView: React.FC = () => {
     window.addEventListener('touchend', onTouchEnd, { passive: true });
     return () => {
       window.removeEventListener('wheel', onWheel);
+      window.removeEventListener('click', onClickCapture, true);
       window.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('pointercancel', onPointerCancel);
       window.removeEventListener('touchstart', onTouchStart);
       window.removeEventListener('touchend', onTouchEnd);
+      window.clearTimeout(clearSuppressedClick);
     };
   }, [active, feed.nextEpisode, feed.previousEpisode]);
 
